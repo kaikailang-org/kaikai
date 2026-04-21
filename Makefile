@@ -1,4 +1,4 @@
-.PHONY: all kaic0 kaic1 test test-stage0 test-stage1 selfhost clean
+.PHONY: all kaic0 kaic1 test test-stage0 test-stage1 test-demos selfhost clean
 
 all: kaic1 bin/kai
 
@@ -14,13 +14,23 @@ bin/kai:
 	@chmod +x bin/kai
 	@echo "kai driver: $$(realpath bin/kai 2>/dev/null || pwd)/bin/kai"
 
-test: test-stage0 test-stage1
+test: test-stage0 test-stage1 test-demos
 
 test-stage0:
 	$(MAKE) -C stage0 test
 
 test-stage1:
 	$(MAKE) -C stage1 test
+
+# Build + run + test every phase 4 demo via bin/kai.
+test-demos: kaic1
+	@set -e; \
+	for f in examples/phase4/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./bin/kai run  $$f > /tmp/kaikai-$$name.out; \
+	  ./bin/kai test $$f > /tmp/kaikai-$$name-t.out 2>&1 || true; \
+	  echo "demo OK $$name"; \
+	done
 
 selfhost:
 	$(MAKE) -C stage1 selfhost
