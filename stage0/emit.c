@@ -45,6 +45,13 @@ typedef struct {
 typedef struct {
     FILE *out;
     int   had_error;
+    int   test_mode;
+
+    /* Active description for an enclosing `test "…" { ... }`, used so
+       `assert` can report the owning test on failure. NULL when not
+       inside a test block. */
+    const char *cur_test_desc_start;   /* raw span, includes quotes */
+    size_t      cur_test_desc_len;
 
     SymEntry *fns;      size_t n_fns, cap_fns;
     SymEntry *variants; size_t n_variants, cap_variants;
@@ -885,11 +892,43 @@ static void emit_stmt(E *e, Node *n) {
     if (!n) return;
     switch (n->kind) {
         case N_LET:       emit_let(e, n); return;
-        case N_ASSERT:
-            fputs("{ KaiValue *_c = ", e->out);
-            emit_expr(e, n->children[0]);
-            fputs("; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
+        case N_ASSERT: {
+            const char *msg_expr = NULL;
+            if (n->v.flags & 0x1) {
+                /* assert cond, msg — msg is an expression; stringify and
+                   pass to kai_test_fail / kai_prelude_panic. */
+                msg_expr = "";
+            }
+            if (e->test_mode) {
+                fputs("{ KaiValue *_c = ", e->out);
+                emit_expr(e, n->children[0]);
+                if (n->v.flags & 0x1) {
+                    fputs("; if (!kai_truthy(_c)) { KaiValue *_m = ", e->out);
+                    emit_expr(e, n->children[1]);
+                    fputs("; kai_test_fail(", e->out);
+                    if (e->cur_test_desc_start) {
+                        fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
+                    } else {
+                        fputs("\"\"", e->out);
+                    }
+                    fputs(", (_m && _m->tag == KAI_STR) ? _m->as.s.bytes : \"assertion failed\"); return; } }", e->out);
+                } else {
+                    fputs("; if (!kai_truthy(_c)) { kai_test_fail(", e->out);
+                    if (e->cur_test_desc_start) {
+                        fprintf(e->out, "%.*s", (int) e->cur_test_desc_len, e->cur_test_desc_start);
+                    } else {
+                        fputs("\"\"", e->out);
+                    }
+                    fputs(", \"assertion failed\"); return; } }", e->out);
+                }
+            } else {
+                fputs("{ KaiValue *_c = ", e->out);
+                emit_expr(e, n->children[0]);
+                fputs("; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } }", e->out);
+            }
+            (void) msg_expr;
             return;
+        }
         case N_EXPR_STMT:
             fputs("{ KaiValue *_ = ", e->out);
             emit_expr(e, n->children[0]);
@@ -954,6 +993,26 @@ static int has_main(Node *prog) {
     return 0;
 }
 
+static void emit_test_fn(E *e, int id, Node *t) {
+    /* t->name is the raw description string literal with quotes. */
+    e->cur_test_desc_start = t->name;
+    e->cur_test_desc_len   = t->name_len;
+
+    fprintf(e->out, "static void _kai_test_%d(void) {\n", id);
+    fprintf(e->out, "    kai_test_begin(%.*s);\n",
+            (int) t->name_len, t->name);
+    fputs("    KaiValue *_body = ", e->out);
+    if (t->n_children >= 1) emit_expr(e, t->children[0]);
+    else                    fputs("kai_unit()", e->out);
+    fputs(";\n", e->out);
+    fputs("    kai_decref(_body);\n", e->out);
+    fputs("    kai_test_pass();\n", e->out);
+    fputs("}\n\n", e->out);
+
+    e->cur_test_desc_start = NULL;
+    e->cur_test_desc_len   = 0;
+}
+
 /* ---------- top-level passes ---------- */
 
 static void register_top_level_fns(E *e, Node *prog) {
@@ -1007,10 +1066,11 @@ static void collect_all_lambdas(E *e, Node *prog) {
     }
 }
 
-int kai_emit(Node *program, FILE *out) {
+int kai_emit(Node *program, FILE *out, int test_mode) {
     E e;
     memset(&e, 0, sizeof(e));
     e.out = out;
+    e.test_mode = test_mode;
 
     register_top_level_fns(&e, program);
     register_builtin_variants(&e);
@@ -1061,7 +1121,24 @@ int kai_emit(Node *program, FILE *out) {
         emit_lambda_helper_def(&e, &e.lams[i]);
     }
 
-    if (has_main(program)) {
+    /* Test functions (always emitted; only wired into main in test_mode). */
+    int n_tests = 0;
+    for (size_t i = 0; i < program->n_children; ++i) {
+        Node *d = program->children[i];
+        if (d && d->kind == N_TEST) {
+            emit_test_fn(&e, n_tests, d);
+            n_tests++;
+        }
+    }
+
+    if (test_mode) {
+        fputs("int main(void) {\n", out);
+        for (int i = 0; i < n_tests; ++i) {
+            fprintf(out, "    _kai_test_%d();\n", i);
+        }
+        fputs("    return kai_test_summary();\n"
+              "}\n", out);
+    } else if (has_main(program)) {
         fputs("int main(void) {\n"
               "    KaiValue *_result = kai_main();\n"
               "    kai_decref(_result);\n"

@@ -37,10 +37,11 @@ static char *read_file(const char *path, size_t *out_len) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [--tokens|--ast] <file.kai>\n"
+            "usage: %s [--tokens|--ast|--test] <file.kai>\n"
             "  default     lex, parse, check, and emit C to stdout\n"
             "  --tokens    print the token stream and exit\n"
             "  --ast       parse and print the AST and exit\n"
+            "  --test      emit C wired to a test runner (runs test blocks)\n"
             "  -h, --help  this help\n",
             prog);
 }
@@ -49,11 +50,13 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     int dump_tokens = 0;
     int dump_ast    = 0;
+    int test_mode   = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (strcmp(a, "--tokens") == 0) { dump_tokens = 1; continue; }
         if (strcmp(a, "--ast")    == 0) { dump_ast    = 1; continue; }
+        if (strcmp(a, "--test")   == 0) { test_mode   = 1; continue; }
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(argv[0]); return 0; }
         if (a[0] == '-') { fprintf(stderr, "unknown flag: %s\n", a); usage(argv[0]); return 2; }
         if (path)       { fprintf(stderr, "only one input file supported\n"); return 2; }
@@ -107,7 +110,7 @@ int main(int argc, char **argv) {
     }
 
     /* Emit C to stdout. */
-    rc = kai_emit(prog, stdout);
+    rc = kai_emit(prog, stdout, test_mode);
 
     kai_free_node(prog);
     free(src);

@@ -673,24 +673,29 @@ static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)      
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 
-static int kai_test_count_total   = 0;
-static int kai_test_count_passed  = 0;
+static int         kai_test_count_total  = 0;
+static int         kai_test_count_passed = 0;
+static const char *kai_test_current      = NULL;
 
 static void kai_test_begin(const char *desc) {
-    (void) desc;
     kai_test_count_total++;
+    kai_test_current = desc;
 }
 
 static void kai_test_pass(void) {
     kai_test_count_passed++;
+    fprintf(stderr, "  ok   %s\n", kai_test_current ? kai_test_current : "");
 }
 
 static void kai_test_fail(const char *desc, const char *msg) {
-    fprintf(stderr, "  FAIL: %s\n    %s\n", desc, msg ? msg : "assertion failed");
+    fprintf(stderr, "  FAIL %s : %s\n",
+            desc ? desc : "",
+            msg  ? msg  : "assertion failed");
 }
 
 static int kai_test_summary(void) {
-    fprintf(stderr, "%d/%d tests passed\n", kai_test_count_passed, kai_test_count_total);
+    fprintf(stderr, "\n%d/%d tests passed\n",
+            kai_test_count_passed, kai_test_count_total);
     return (kai_test_count_passed == kai_test_count_total) ? 0 : 1;
 }
 

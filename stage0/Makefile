@@ -4,7 +4,7 @@ SRCS    := main.c lexer.c ast.c parser.c check.c emit.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := kaic0
 
-.PHONY: all clean test
+.PHONY: all clean test test-run test-blocks
 
 all: $(TARGET)
 
@@ -16,10 +16,32 @@ $(TARGET): $(OBJS)
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+	rm -rf build
 
-test: $(TARGET)
+build:
+	@mkdir -p build
+
+# End-to-end: compile each example to a native binary and run it.
+test-run: $(TARGET) build
 	@set -e; \
 	for f in ../examples/minimal/*.kai; do \
-	  echo "parsing $$f"; \
-	  ./$(TARGET) $$f; \
+	  name=$$(basename $$f .kai); \
+	  echo "=== run $$name ==="; \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) build/$$name.c -I . -o build/$$name; \
+	  ./build/$$name; \
 	done
+
+# Compile each example with --test and run its test blocks.
+test-blocks: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  echo "=== tests $$name ==="; \
+	  ./$(TARGET) --test $$f > build/$$name-t.c; \
+	  $(CC) build/$$name-t.c -I . -o build/$$name-t; \
+	  ./build/$$name-t; \
+	done
+
+# Full MVP verification: both targets above.
+test: test-run test-blocks
