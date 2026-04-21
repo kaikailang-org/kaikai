@@ -4292,11 +4292,13 @@ fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EV
 
 fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
                     fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # kai_assert_check consults kai_test_in_progress at runtime and either
+  # aborts (outside a test) or longjmps to the test harness (inside one),
+  # so the emitter doesn't need to know whether it's in test mode.
+  # `opt_msg` is ignored for now — we always pass the generic string,
+  # matching stage 0's out-of-test panic path.
   let cc = emit_expr(src, cond, fns, variants, lams)
-  concat_all([
-    "{ KaiValue *_c = ", cc,
-    "; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } } "
-  ])
+  concat_all(["kai_assert_check(", cc, ", \"assertion failed\"); "])
 }
 
 # ---- declaration emission ----
@@ -4382,6 +4384,75 @@ fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [La
     }
   }))
 
+# ---- test function emission (always emitted; only called from int main
+#      when test_mode is on) ----
+
+fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
+                fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # desc_span is the raw source of the description including its quotes,
+  # so it's already a valid C string literal. We wrap the body in
+  # setjmp/longjmp: kai_assert_check inside the body can longjmp us out
+  # on failure, and the test still counts as a tried test.
+  let body_c = emit_expr(src, body, fns, variants, lams)
+  concat_all([
+    "static void _kai_test_", int_to_string(id), "(void) {\n",
+    "    kai_test_begin(", desc_span, ");\n",
+    "    if (setjmp(kai_test_jmp) == 0) {\n",
+    "        kai_test_in_progress = 1;\n",
+    "        KaiValue *_body = ", body_c, ";\n",
+    "        kai_decref(_body);\n",
+    "        kai_test_in_progress = 0;\n",
+    "        kai_test_pass();\n",
+    "    } else {\n",
+    "        kai_test_in_progress = 0;\n",
+    "    }\n",
+    "}\n\n"
+  ])
+}
+
+fn test_decls(decls: [Decl]) : [Decl] =
+  filter(decls, (d) => match d { DTest(_, _, _, _) -> true _ -> false })
+
+fn emit_one_test(src: String, fns: [EFn], variants: [EVar], lams: [LamInfo],
+                 id_d: DeclWithId) : String {
+  match id_d {
+    DWI(id, d) -> match d {
+      DTest(desc_span, body, _, _) -> emit_test_fn(src, id, desc_span, body, fns, variants, lams)
+      _ -> ""
+    }
+  }
+}
+
+# Helper pair to zip index with decl for clean iteration.
+type DeclWithId = DWI(Int, Decl)
+
+fn number_tests_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DTest(_, _, _, _) -> number_tests_loop(rest, id + 1, [DWI(id, d), ...acc])
+      _ -> number_tests_loop(rest, id, acc)
+    }
+  }
+}
+
+fn number_tests(decls: [Decl]) : [DeclWithId] =
+  number_tests_loop(decls, 0, [])
+
+fn emit_all_tests(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let numbered = number_tests(decls)
+  concat_all(map(numbered, (dwi) => emit_one_test(src, fns, variants, lams, dwi)))
+}
+
+fn test_count(decls: [Decl]) : Int = list_length(test_decls(decls))
+
+fn test_call_list(n: Int, i: Int) : String {
+  if i >= n { "" }
+  else {
+    concat_all(["    _kai_test_", int_to_string(i), "();\n", test_call_list(n, i + 1)])
+  }
+}
+
 fn has_main_decl(decls: [Decl]) : Bool {
   match decls {
     [] -> false
@@ -4394,8 +4465,14 @@ fn has_main_decl(decls: [Decl]) : Bool {
 
 fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
   if test_mode {
-    # milestone 9 will fill in test enumeration; for now, empty shell.
-    "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    return kai_test_summary();\n}\n"
+    let n = test_count(decls)
+    concat_all([
+      "int main(int argc, char **argv) {\n",
+      "    kai_set_args(argc, argv);\n",
+      test_call_list(n, 0),
+      "    return kai_test_summary();\n",
+      "}\n"
+    ])
   } else if has_main_decl(decls) {
     "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    KaiValue *_result = kai_main();\n    kai_decref(_result);\n    return 0;\n}\n"
   } else {
@@ -4416,8 +4493,9 @@ fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : Str
   let lam_fwd = emit_lam_forward_decls(lams)
   let bodies = fn_bodies(src, decls, fns, variants, lams)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants)
+  let tests = emit_all_tests(src, decls, fns, variants, lams)
   let main_wr = emit_main_wrapper(decls, test_mode)
-  concat_all([header, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, main_wr])
+  concat_all([header, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, tests, main_wr])
 }
 
 # ====================================================================

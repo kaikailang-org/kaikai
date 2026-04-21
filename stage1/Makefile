@@ -76,7 +76,24 @@ test-run: $(TARGET) build
 	    || { echo "run DIFF $$name"; diff build/$$name-s0.out build/$$name.out; exit 1; }; \
 	done
 
-test: test-tokens test-ast test-check test-run
+# Compile each example with --test and run its tests. Compare stderr
+# (which is where kai_test_* writes) against stage 0's equivalent.
+test-blocks: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --test $$f > build/$$name-t.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t; \
+	  ./build/$$name-t 2> build/$$name-t.err || true; \
+	  $(STAGE0) --test $$f > build/$$name-t-s0.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s0.c -o build/$$name-t-s0; \
+	  ./build/$$name-t-s0 2> build/$$name-t-s0.err || true; \
+	  diff -q build/$$name-t.err build/$$name-t-s0.err > /dev/null \
+	    && echo "tests OK $$name" \
+	    || { echo "tests DIFF $$name"; diff build/$$name-t-s0.err build/$$name-t.err; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-check test-run test-blocks
 
 clean:
 	rm -rf build $(TARGET)

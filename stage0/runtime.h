@@ -23,6 +23,7 @@
 #ifndef KAI_RUNTIME_H
 #define KAI_RUNTIME_H
 
+#include <setjmp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -918,6 +919,8 @@ static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n
 static int         kai_test_count_total  = 0;
 static int         kai_test_count_passed = 0;
 static const char *kai_test_current      = NULL;
+static jmp_buf     kai_test_jmp;
+static int         kai_test_in_progress  = 0;
 
 static void kai_test_begin(const char *desc) {
     kai_test_count_total++;
@@ -939,6 +942,23 @@ static int kai_test_summary(void) {
     fprintf(stderr, "\n%d/%d tests passed\n",
             kai_test_count_passed, kai_test_count_total);
     return (kai_test_count_passed == kai_test_count_total) ? 0 : 1;
+}
+
+/* Runtime-aware assert: called from every emitted `assert`. Inside an
+   active test (kai_test_in_progress) it prints a failure and longjmps
+   back to the test harness so the next test can run. Otherwise it
+   aborts the process via kai_prelude_panic, matching stage 0's
+   non-test-mode behaviour. */
+static void kai_assert_check(KaiValue *cond, const char *msg) {
+    int ok = kai_truthy(cond);
+    kai_decref(cond);
+    if (ok) return;
+    if (kai_test_in_progress) {
+        kai_test_fail(kai_test_current, msg ? msg : "assertion failed");
+        longjmp(kai_test_jmp, 1);
+    } else {
+        kai_prelude_panic(kai_str(msg ? msg : "assertion failed"));
+    }
 }
 
 #if defined(__GNUC__) || defined(__clang__)
