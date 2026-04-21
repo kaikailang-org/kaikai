@@ -41,6 +41,15 @@ test-ast: $(TARGET) build
 	    || { echo "ast FAIL $$name"; exit 1; }; \
 	done
 
+# --types smoke test: every top-level decl gets a signature dumped.
+test-types: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai $(SRC); do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
+	    || { echo "types FAIL $$name"; exit 1; }; \
+	done
+
 # Checker: undefined-name resolution runs clean on every example.
 test-check: $(TARGET) build
 	@set -e; \
@@ -94,7 +103,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-check test-run test-blocks
+test: test-tokens test-ast test-types test-check test-run test-blocks
 
 clean:
 	rm -rf build $(TARGET)

@@ -4505,6 +4505,134 @@ fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : Str
 }
 
 # ====================================================================
+# semantic types (M2a)
+# ====================================================================
+#
+# The checker uses `Ty` for semantic (resolved) types. This is distinct
+# from the syntactic `TypeExpr` carried on AST nodes. M2a introduces
+# the representation plus a resolver from TypeExpr to Ty and a
+# signature extractor for top-level decls; actual type inference lands
+# in M2b+.
+
+type Ty
+  = TyInt
+  | TyReal
+  | TyBool
+  | TyString
+  | TyChar
+  | TyUnit
+  | TyListT(Ty)                         # resolved list type
+  | TyFnT([Ty], Ty)                     # resolved function type
+  | TyCon(String, [Ty])                 # user-defined type constructor application
+  | TyVarT(Int)                         # unification variable
+  | TyAny                               # placeholder for "not yet resolved"
+
+fn resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, resolve_ty)
+
+fn resolve_ty(t: TypeExpr) : Ty {
+  match t.tkind {
+    TyName(name, targs) -> {
+      if name == "Int" { TyInt }
+      else if name == "Real" { TyReal }
+      else if name == "Bool" { TyBool }
+      else if name == "String" { TyString }
+      else if name == "Char" { TyChar }
+      else if name == "Unit" { TyUnit }
+      else { TyCon(name, resolve_ty_list(targs)) }
+    }
+    TyList(inner) -> TyListT(resolve_ty(inner))
+    TyFn(fps, fret) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret))
+  }
+}
+
+fn param_ty(pm: Param) : Ty {
+  match pm.ptype {
+    Some(te) -> resolve_ty(te)
+    None -> TyAny
+  }
+}
+
+# Extract the declared signature of a top-level decl, or None if the
+# decl has no signature shape (DType, DImport).
+fn sig_of_decl(d: Decl) : Option[Ty] {
+  match d {
+    DFn(_, _, params, opt_ret, _, _, _) -> {
+      let pts = map(params, param_ty)
+      let ret = match opt_ret {
+        Some(rty) -> resolve_ty(rty)
+        None -> TyUnit
+      }
+      Some(TyFnT(pts, ret))
+    }
+    _ -> None
+  }
+}
+
+# Render a Ty back as kaikai surface syntax. Inverse of resolve_ty
+# modulo unknown-constructor handling.
+fn ty_string_list(ts: [Ty]) : [String] = map(ts, ty_to_string)
+
+fn ty_to_string(t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyListT(inner) -> cat3("[", ty_to_string(inner), "]")
+    TyFnT(ps, ret) ->
+      concat_all([
+        "(", join_with(ty_string_list(ps), ", "), ") -> ", ty_to_string(ret)
+      ])
+    TyCon(cname, tas) -> {
+      match tas {
+        [] -> cname
+        _ -> concat_all([cname, "[", join_with(ty_string_list(tas), ", "), "]"])
+      }
+    }
+    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyAny -> "?"
+  }
+}
+
+# Dump the declared signature (or shape) of every top-level decl. Used
+# by `--types`; does not attempt to infer bodies, just surfaces what
+# the user wrote.
+fn dump_decl_type(d: Decl) : Unit {
+  match d {
+    DFn(is_pub, name, _, _, _, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      match sig_of_decl(d) {
+        Some(ty) -> print("#{pub_s}fn #{name} : #{ty_to_string(ty)} @#{int_to_string(line)}:#{int_to_string(col)}")
+        None -> ()
+      }
+    }
+    DType(is_pub, name, tparams, _, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      let tps = match tparams {
+        [] -> ""
+        _ -> concat_all(["[", join_with(tparams, ", "), "]"])
+      }
+      print("#{pub_s}type #{name}#{tps} @#{int_to_string(line)}:#{int_to_string(col)}")
+    }
+    DTest(desc, _, line, col) ->
+      print("test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+    DImport(ik, line, col) -> {
+      match ik {
+        IkPath(p) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkAlias(p, a) -> print("import #{p} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkSelective(p, _) -> print("import #{p} @#{int_to_string(line)}:#{int_to_string(col)}")
+      }
+    }
+  }
+}
+
+fn dump_types(decls: [Decl]) : Unit {
+  decls |> each(dump_decl_type)
+}
+
+# ====================================================================
 # cli + driver
 # ====================================================================
 
@@ -4512,6 +4640,7 @@ type Mode
   = MDefault
   | MTokens
   | MAst
+  | MTypes
   | MTest
   | MHelp
 
@@ -4534,6 +4663,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MTokens))
       } else if a == "--ast" {
         parse_cli_loop(more, cli_with_mode(opts, MAst))
+      } else if a == "--types" {
+        parse_cli_loop(more, cli_with_mode(opts, MTypes))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "-h" or a == "--help" {
@@ -4562,6 +4693,7 @@ fn usage() : Unit {
   eprint("  --prelude <file>   include <file>'s decls before the input")
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
+  eprint("  --types            print declared top-level signatures and exit")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
 }
@@ -4602,6 +4734,7 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
             let all_decls = list_append(prelude_decls, own_decls)
             match mode {
               MAst -> { dump_program(all_decls); 0 }
+              MTypes -> { dump_types(own_decls); 0 }
               _ -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
