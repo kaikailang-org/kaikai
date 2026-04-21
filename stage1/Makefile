@@ -1,5 +1,5 @@
 CC      ?= cc
-CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -g -O0
+CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
 STAGE0  := ../stage0/kaic0
 TARGET  := kaic1
 SRC     := compiler.kai
@@ -34,7 +34,20 @@ test-tokens: $(TARGET) build
 	    || { echo "tokens DIFF $$name"; diff build/s0-$$name.tok build/s1-$$name.tok | head; exit 1; }; \
 	done
 
-test: test-tokens
+# Verify parser: --ast must produce some output without crashing on every
+# minimal example and on stage 1's own source. Byte-for-byte AST
+# equivalence against stage 0 is not attempted — stage 0 uses a different
+# dump format. Real equivalence is checked downstream when the emitter
+# compares C output.
+test-ast: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai compiler.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --ast $$f > build/s1-$$name.ast && echo "ast OK $$name" \
+	    || { echo "ast FAIL $$name"; exit 1; }; \
+	done
+
+test: test-tokens test-ast
 
 clean:
 	rm -rf build $(TARGET)

@@ -615,6 +615,2142 @@ fn report_errors(path: String, src: String, tokens: [Token]) : Int {
 }
 
 # ====================================================================
+# AST types
+# ====================================================================
+
+# Expressions carry their source position on the wrapper, so variants
+# stay compact. Pattern matching on expressions therefore destructures
+# the record to reach `.kind`, then matches the sum.
+
+type Expr = { kind: ExprKind, line: Int, col: Int }
+
+type ExprKind
+  = EInt(Int)
+  | EReal(Real)
+  | EBool(Bool)
+  | EChar(Char)
+  | EStr(String, Bool)                      # raw source span (includes quotes), is_triple
+  | EUnit
+  | EVar(String)
+  | EUnder                                  # `_` (pattern context only, but lexer produces it anywhere)
+  | EPlaceholder                            # `.` placeholder (stage 1 extension; stage 0 rejects)
+  | ECall(Expr, [Expr])
+  | EField(Expr, String)
+  | EIndex(Expr, Expr)
+  | EBinop(String, Expr, Expr)
+  | EUnop(String, Expr)                     # "-" or "not"
+  | EIf(Expr, Expr, Option[Expr])
+  | EMatch(Expr, [Arm])
+  | ELambda([Param], Expr)
+  | ERecordLit(String, [FieldInit])
+  | EList([ListElem])
+  | ERange(Expr, Expr, Option[Expr])
+  | EBlock([Stmt], Option[Expr])
+  | EPipe(Expr, Expr)
+
+type ListElem = ElPlain(Expr) | ElSpread(Expr)
+
+type Arm = Arm(Pattern, Option[Expr], Expr)
+
+type FieldInit = FI(String, Expr)
+
+type Param = { pname: String, ptype: Option[TypeExpr], pline: Int, pcol: Int }
+
+type Stmt
+  = SLet(Pattern, Option[TypeExpr], Expr)
+  | SAssert(Expr, Option[Expr])
+  | SExprStmt(Expr)
+
+type Pattern = { pkind: PatKind, line: Int, col: Int }
+
+type PatKind
+  = PWild
+  | PLit(Expr)                              # literal pattern (stores an Expr of literal shape)
+  | PBind(String)
+  | PList([Pattern], Option[String])         # fixed sub-patterns, optional rest binder name
+  | PVariant(String, [Pattern])
+  | PVariantRecord(String, [PField])
+  | PRecord([PField])
+
+type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
+
+type TypeExpr = { tkind: TyKind, line: Int, col: Int }
+
+type TyKind
+  = TyName(String, [TypeExpr])              # Name or Name[T1, T2, ...]
+  | TyList(TypeExpr)
+  | TyFn([TypeExpr], TypeExpr)
+
+type Decl
+  = DFn(Bool, String, [Param], Option[TypeExpr], Expr, Int, Int)
+  | DType(Bool, String, [String], TypeBody, Int, Int)
+  | DTest(String, Expr, Int, Int)
+  | DImport(ImportKind, Int, Int)
+
+type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant])
+type FieldDecl = FD(String, TypeExpr)
+type Variant = Var(String, [TypeExpr])
+
+type ImportKind
+  = IkPath(String)
+  | IkAlias(String, String)
+  | IkSelective(String, [String])
+
+# ---- small constructors ----
+fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col }
+fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
+fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
+
+# ====================================================================
+# parser state
+# ====================================================================
+#
+# The Parser is immutable; each helper returns a new one with `rest`
+# advanced and `had_error` possibly flipped. We don't carry a token
+# index — `rest` is the unconsumed suffix of the token list, so
+# p_advance is O(1) (takes tail). Peek-ahead uses list destructuring
+# up to depth 3, which covers every lookahead stage 0 does.
+
+type Parser = { file: String, src: String, rest: [Token], had_error: Bool }
+
+# A result = a new parser plus an optional payload. `None` means the
+# parser failed (had_error is set on `p`). This mirrors stage 0's
+# error-then-stop style.
+
+type PExpr   = { p: Parser, r: Option[Expr] }
+type PStmt   = { p: Parser, r: Option[Stmt] }
+type PPat    = { p: Parser, r: Option[Pattern] }
+type PTy     = { p: Parser, r: Option[TypeExpr] }
+type PDecl   = { p: Parser, r: Option[Decl] }
+type PArm    = { p: Parser, r: Option[Arm] }
+type PParam  = { p: Parser, r: Option[Param] }
+type PFI     = { p: Parser, r: Option[FieldInit] }
+type PVar    = { p: Parser, r: Option[Variant] }
+type PFD     = { p: Parser, r: Option[FieldDecl] }
+type PPF     = { p: Parser, r: Option[PField] }
+type PEL     = { p: Parser, r: Option[ListElem] }
+
+fn parser_new(file: String, src: String, toks: [Token]) : Parser =
+  Parser { file: file, src: src, rest: toks, had_error: false }
+
+fn p_mark_err(p: Parser) : Parser =
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true }
+
+fn p_advance(p: Parser) : Parser {
+  match p.rest {
+    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1, had_error: p.had_error }
+    [] -> p
+  }
+}
+
+# A sentinel EOF token used when peeking past the list end. In practice
+# the tokenizer always appends a TkEof, so we rarely hit this.
+fn eof_tok() : Token = Token { kind: TkEof, line: 0, col: 0, start: 0, length: 0 }
+
+fn p_peek(p: Parser) : Token {
+  match p.rest {
+    [t, ...rs] -> t
+    [] -> eof_tok()
+  }
+}
+
+fn p_peek1(p: Parser) : Token {
+  match p.rest {
+    [_, t, ...rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+fn p_peek2(p: Parser) : Token {
+  match p.rest {
+    [_, _, t, ...rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+# Token-kind comparison by structural case (TkError is the only payload-
+# carrying variant, and we never compare it for equality in the parser).
+fn tk_is(a: TokKind, b: TokKind) : Bool {
+  match a {
+    TkEof        -> match b { TkEof -> true _ -> false }
+    TkNewline    -> match b { TkNewline -> true _ -> false }
+    TkAnd        -> match b { TkAnd -> true _ -> false }
+    TkAs         -> match b { TkAs -> true _ -> false }
+    TkAssert     -> match b { TkAssert -> true _ -> false }
+    TkElse       -> match b { TkElse -> true _ -> false }
+    TkFalse      -> match b { TkFalse -> true _ -> false }
+    TkFn         -> match b { TkFn -> true _ -> false }
+    TkIf         -> match b { TkIf -> true _ -> false }
+    TkImport     -> match b { TkImport -> true _ -> false }
+    TkLet        -> match b { TkLet -> true _ -> false }
+    TkMatch      -> match b { TkMatch -> true _ -> false }
+    TkNot        -> match b { TkNot -> true _ -> false }
+    TkOr         -> match b { TkOr -> true _ -> false }
+    TkPub        -> match b { TkPub -> true _ -> false }
+    TkTest       -> match b { TkTest -> true _ -> false }
+    TkTrue       -> match b { TkTrue -> true _ -> false }
+    TkType       -> match b { TkType -> true _ -> false }
+    TkInt        -> match b { TkInt -> true _ -> false }
+    TkReal       -> match b { TkReal -> true _ -> false }
+    TkChar       -> match b { TkChar -> true _ -> false }
+    TkString     -> match b { TkString -> true _ -> false }
+    TkIdent      -> match b { TkIdent -> true _ -> false }
+    TkUnderscore -> match b { TkUnderscore -> true _ -> false }
+    TkLparen     -> match b { TkLparen -> true _ -> false }
+    TkRparen     -> match b { TkRparen -> true _ -> false }
+    TkLbracket   -> match b { TkLbracket -> true _ -> false }
+    TkRbracket   -> match b { TkRbracket -> true _ -> false }
+    TkLbrace     -> match b { TkLbrace -> true _ -> false }
+    TkRbrace     -> match b { TkRbrace -> true _ -> false }
+    TkComma      -> match b { TkComma -> true _ -> false }
+    TkColon      -> match b { TkColon -> true _ -> false }
+    TkSemi       -> match b { TkSemi -> true _ -> false }
+    TkDot        -> match b { TkDot -> true _ -> false }
+    TkDotDot     -> match b { TkDotDot -> true _ -> false }
+    TkEllipsis   -> match b { TkEllipsis -> true _ -> false }
+    TkEq         -> match b { TkEq -> true _ -> false }
+    TkArrow      -> match b { TkArrow -> true _ -> false }
+    TkFatArrow   -> match b { TkFatArrow -> true _ -> false }
+    TkPipe       -> match b { TkPipe -> true _ -> false }
+    TkPipeApply  -> match b { TkPipeApply -> true _ -> false }
+    TkPlus       -> match b { TkPlus -> true _ -> false }
+    TkMinus      -> match b { TkMinus -> true _ -> false }
+    TkStar       -> match b { TkStar -> true _ -> false }
+    TkSlash      -> match b { TkSlash -> true _ -> false }
+    TkSlashSlash -> match b { TkSlashSlash -> true _ -> false }
+    TkPercent    -> match b { TkPercent -> true _ -> false }
+    TkEqEq       -> match b { TkEqEq -> true _ -> false }
+    TkNeq        -> match b { TkNeq -> true _ -> false }
+    TkLt         -> match b { TkLt -> true _ -> false }
+    TkGt         -> match b { TkGt -> true _ -> false }
+    TkLe         -> match b { TkLe -> true _ -> false }
+    TkGe         -> match b { TkGe -> true _ -> false }
+    TkBang       -> match b { TkBang -> true _ -> false }
+    TkError(_)   -> false
+  }
+}
+
+fn p_at(p: Parser, k: TokKind) : Bool = tk_is(p_peek(p).kind, k)
+
+fn p_try_consume(p: Parser, k: TokKind) : Option[Parser] {
+  if p_at(p, k) { Some(p_advance(p)) } else { None }
+}
+
+fn p_skip_newlines(p: Parser) : Parser {
+  if p_at(p, TkNewline) { p_skip_newlines(p_advance(p)) } else { p }
+}
+
+fn p_skip_newlines_and_semis(p: Parser) : Parser {
+  if p_at(p, TkNewline) or p_at(p, TkSemi) { p_skip_newlines_and_semis(p_advance(p)) }
+  else { p }
+}
+
+fn p_error(p: Parser, t: Token, msg: String) : Parser {
+  if p.had_error { p }
+  else {
+    eprint("#{p.file}:#{int_to_string(t.line)}:#{int_to_string(t.col)}: error: #{msg}")
+    p_mark_err(p)
+  }
+}
+
+fn p_error_here(p: Parser, msg: String) : Parser = p_error(p, p_peek(p), msg)
+
+fn p_expect(p: Parser, k: TokKind, msg: String) : PExpr {
+  # PExpr is a misnomer — we just reuse the record structure. We return
+  # an Expr-less PExpr; callers that need the consumed token use
+  # p_expect_tok instead. This variant is a convenience for "advance
+  # past a required delimiter".
+  if p_at(p, k) { PExpr { p: p_advance(p), r: Some(mk_expr(EUnit, 0, 0)) } }
+  else { PExpr { p: p_error_here(p, msg), r: None } }
+}
+
+# Same, but returns the consumed token in the Option payload slot (as an
+# EStr carrying the raw span — caller decodes).
+fn p_expect_tok(p: Parser, k: TokKind, msg: String) : Token {
+  if p_at(p, k) { p_peek(p) }
+  else { eof_tok() }
+}
+
+fn is_upper_ident(src: String, t: Token) : Bool {
+  match char_at(src, t.start) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
+  }
+}
+
+fn tok_source(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+# ====================================================================
+# literal decoders
+# ====================================================================
+
+fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
+  if i >= n { if neg { 0 - acc } else { acc } }
+  else {
+    match char_at(s, i) {
+      None -> if neg { 0 - acc } else { acc }
+      Some(c) -> {
+        if c == '_' { decode_int_loop(s, i + 1, n, acc, neg) }
+        else if ch_is_digit(c) {
+          let d = char_to_int(c) - char_to_int('0')
+          decode_int_loop(s, i + 1, n, acc * 10 + d, neg)
+        } else {
+          if neg { 0 - acc } else { acc }
+        }
+      }
+    }
+  }
+}
+
+fn decode_int(span: String) : Int {
+  let n = string_length(span)
+  if n == 0 { 0 }
+  else {
+    match char_at(span, 0) {
+      Some(c) -> if c == '-' { decode_int_loop(span, 1, n, 0, true) }
+                 else { decode_int_loop(span, 0, n, 0, false) }
+      None -> 0
+    }
+  }
+}
+
+fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '_' { strip_underscores_loop(s, i + 1, n, acc) }
+        else { strip_underscores_loop(s, i + 1, n, string_concat(acc, "#{c}")) }
+      }
+    }
+  }
+}
+
+fn decode_real(span: String) : Real {
+  let clean = strip_underscores_loop(span, 0, string_length(span), "")
+  match string_to_real(clean) {
+    Some(r) -> r
+    None -> 0.0
+  }
+}
+
+fn decode_char_escape(c: Char) : Char {
+  if c == 'n' { '\n' }
+  else if c == 't' { '\t' }
+  else if c == 'r' { '\r' }
+  else if c == '\\' { '\\' }
+  else if c == '\'' { '\'' }
+  else if c == '"' { '"' }
+  else if c == '0' { int_to_char(0) }
+  else { c }
+}
+
+fn decode_hex_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '}' { acc }
+        else {
+          let v =
+            if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
+            else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
+            else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
+            else { 0 }
+          decode_hex_loop(s, i + 1, n, acc * 16 + v)
+        }
+      }
+    }
+  }
+}
+
+# span is the raw char literal including surrounding quotes: 'a', '\n', '\u{2603}'
+fn decode_char(span: String) : Char {
+  let n = string_length(span)
+  if n < 2 { int_to_char(0) }
+  else {
+    match char_at(span, 1) {
+      None -> int_to_char(0)
+      Some(c1) -> {
+        if c1 == '\\' {
+          match char_at(span, 2) {
+            None -> int_to_char(0)
+            Some(c2) -> {
+              if c2 == 'u' {
+                int_to_char(decode_hex_loop(span, 4, n - 1, 0))
+              } else {
+                decode_char_escape(c2)
+              }
+            }
+          }
+        } else {
+          c1
+        }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# precedence climbing: forward declarations
+# ====================================================================
+#
+# These are implemented below. Listed here as a reading aid.
+#  parse_expr   -> parse_pipe
+#  parse_pipe   -> parse_or ("|>" parse_or)*
+#  parse_or     -> parse_and ("or" parse_and)*
+#  parse_and    -> parse_cmp ("and" parse_cmp)*
+#  parse_cmp    -> parse_add (cmpop parse_add)?        (no chains)
+#  parse_add    -> parse_mul ([+-] parse_mul)*
+#  parse_mul    -> parse_unary ([*/%//] parse_unary)*
+#  parse_unary  -> ("-" | "not")? parse_postfix
+#  parse_postfix-> parse_primary (call | field | index)*
+#  parse_primary-> literal | ident | "(" expr ")" | if | match | block | record | list | lambda
+
+fn op_of_tok(k: TokKind) : String {
+  match k {
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkSlashSlash -> "//" TkPercent -> "%"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
+    TkAnd -> "and" TkOr -> "or"
+    _ -> "?"
+  }
+}
+
+# ====================================================================
+# expression parsing
+# ====================================================================
+
+fn ok_e(p: Parser, e: Expr) : PExpr = PExpr { p: p, r: Some(e) }
+fn err_e(p: Parser) : PExpr = PExpr { p: p, r: None }
+fn ok_s(p: Parser, s: Stmt) : PStmt = PStmt { p: p, r: Some(s) }
+fn err_s(p: Parser) : PStmt = PStmt { p: p, r: None }
+fn ok_p(p: Parser, x: Pattern) : PPat = PPat { p: p, r: Some(x) }
+fn err_p(p: Parser) : PPat = PPat { p: p, r: None }
+fn ok_t(p: Parser, x: TypeExpr) : PTy = PTy { p: p, r: Some(x) }
+fn err_t(p: Parser) : PTy = PTy { p: p, r: None }
+fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x) }
+fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None }
+fn ok_a(p: Parser, x: Arm) : PArm = PArm { p: p, r: Some(x) }
+fn err_a(p: Parser) : PArm = PArm { p: p, r: None }
+fn ok_pm(p: Parser, x: Param) : PParam = PParam { p: p, r: Some(x) }
+fn err_pm(p: Parser) : PParam = PParam { p: p, r: None }
+fn ok_fi(p: Parser, x: FieldInit) : PFI = PFI { p: p, r: Some(x) }
+fn err_fi(p: Parser) : PFI = PFI { p: p, r: None }
+fn ok_v(p: Parser, x: Variant) : PVar = PVar { p: p, r: Some(x) }
+fn err_v(p: Parser) : PVar = PVar { p: p, r: None }
+fn ok_fd(p: Parser, x: FieldDecl) : PFD = PFD { p: p, r: Some(x) }
+fn err_fd(p: Parser) : PFD = PFD { p: p, r: None }
+fn ok_pf(p: Parser, x: PField) : PPF = PPF { p: p, r: Some(x) }
+fn err_pf(p: Parser) : PPF = PPF { p: p, r: None }
+fn ok_el(p: Parser, x: ListElem) : PEL = PEL { p: p, r: Some(x) }
+fn err_el(p: Parser) : PEL = PEL { p: p, r: None }
+
+fn parse_expr(p: Parser) : PExpr = parse_pipe(p)
+
+fn parse_pipe(p: Parser) : PExpr {
+  let r = parse_or(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_pipe_rest(r.p, lhs)
+  }
+}
+
+fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkPipeApply) {
+    let t = p_peek(p)
+    let p1 = p_skip_newlines(p_advance(p))
+    let r = parse_or(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn parse_or(p: Parser) : PExpr {
+  let r = parse_and(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_or_rest(r.p, lhs)
+  }
+}
+
+fn parse_or_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkOr) {
+    let t = p_peek(p)
+    let r = parse_and(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn parse_and(p: Parser) : PExpr {
+  let r = parse_cmp(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_and_rest(r.p, lhs)
+  }
+}
+
+fn parse_and_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkAnd) {
+    let t = p_peek(p)
+    let r = parse_cmp(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn is_cmp_tok(k: TokKind) : Bool {
+  tk_is(k, TkEqEq) or tk_is(k, TkNeq) or tk_is(k, TkLt) or tk_is(k, TkGt) or tk_is(k, TkLe) or tk_is(k, TkGe)
+}
+
+fn parse_cmp(p: Parser) : PExpr {
+  let r = parse_add(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> {
+      let t = p_peek(r.p)
+      if is_cmp_tok(t.kind) {
+        let op = op_of_tok(t.kind)
+        let r2 = parse_add(p_skip_newlines(p_advance(r.p)))
+        match r2.r {
+          None -> err_e(r2.p)
+          Some(rhs) -> ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+        }
+      } else { ok_e(r.p, lhs) }
+    }
+  }
+}
+
+fn parse_add(p: Parser) : PExpr {
+  let r = parse_mul(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_add_rest(r.p, lhs)
+  }
+}
+
+fn parse_add_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkPlus) or tk_is(t.kind, TkMinus) {
+    let op = op_of_tok(t.kind)
+    let r = parse_mul(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+    }
+  } else { ok_e(p, lhs) }
+}
+
+fn parse_mul(p: Parser) : PExpr {
+  let r = parse_unary(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_mul_rest(r.p, lhs)
+  }
+}
+
+fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkStar) or tk_is(t.kind, TkSlash) or tk_is(t.kind, TkSlashSlash) or tk_is(t.kind, TkPercent) {
+    let op = op_of_tok(t.kind)
+    let r = parse_unary(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+    }
+  } else { ok_e(p, lhs) }
+}
+
+fn parse_unary(p: Parser) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkMinus) {
+    let r = parse_unary(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> ok_e(r.p, mk_expr(EUnop("-", e), t.line, t.col))
+    }
+  } else if tk_is(t.kind, TkNot) {
+    let r = parse_unary(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> ok_e(r.p, mk_expr(EUnop("not", e), t.line, t.col))
+    }
+  } else {
+    parse_postfix(p)
+  }
+}
+
+fn parse_postfix(p: Parser) : PExpr {
+  let r = parse_primary(p)
+  match r.r {
+    None -> r
+    Some(e) -> parse_postfix_rest(r.p, e)
+  }
+}
+
+fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLparen) {
+    let args_r = parse_call_args(p_advance(p))
+    match args_r.r {
+      None -> err_e(args_r.p)
+      Some(xs) -> parse_postfix_rest(args_r.p, mk_expr(ECall(lhs, xs), t.line, t.col))
+    }
+  } else if tk_is(t.kind, TkDot) {
+    let p1 = p_advance(p)
+    let id = p_peek(p1)
+    if tk_is(id.kind, TkIdent) {
+      let name = tok_source(p.src, id)
+      parse_postfix_rest(p_advance(p1), mk_expr(EField(lhs, name), t.line, t.col))
+    } else {
+      err_e(p_error_here(p1, "expected field name after `.`"))
+    }
+  } else if tk_is(t.kind, TkLbracket) {
+    let p1 = p_advance(p)
+    let r = parse_expr(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(idx) -> {
+        let closed = p_expect(r.p, TkRbracket, "expected `]` after index")
+        match closed.r {
+          None -> err_e(closed.p)
+          Some(_) -> parse_postfix_rest(closed.p, mk_expr(EIndex(lhs, idx), t.line, t.col))
+        }
+      }
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+# Parse the argument list of a call. Position is AT the token after the
+# opening `(`. Returns with `(` already consumed by caller, `)` to be
+# consumed here. Newlines between args are allowed.
+type PArgs = { p: Parser, r: Option[[Expr]] }
+
+fn ok_args(p: Parser, xs: [Expr]) : PArgs = PArgs { p: p, r: Some(xs) }
+fn err_args(p: Parser) : PArgs = PArgs { p: p, r: None }
+
+fn parse_call_args(p: Parser) : PArgs {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRparen) { ok_args(p_advance(p0), []) }
+  else { parse_call_args_loop(p0, []) }
+}
+
+fn parse_call_args_loop(p: Parser, acc: [Expr]) : PArgs {
+  let r = parse_expr(p_skip_newlines(p))
+  match r.r {
+    None -> err_args(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) { parse_call_args_loop(p_skip_newlines(p_advance(p1)), [e, ...acc]) }
+      else if p_at(p1, TkRparen) {
+        ok_args(p_advance(p1), list_reverse([e, ...acc]))
+      }
+      else { err_args(p_error_here(p1, "expected `,` or `)` in call arguments")) }
+    }
+  }
+}
+
+# ====================================================================
+# primary expressions — placeholders for later implementations
+# ====================================================================
+
+fn parse_primary(p: Parser) : PExpr {
+  let t = p_peek(p)
+  match t.kind {
+    TkInt -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EInt(decode_int(span)), t.line, t.col))
+    }
+    TkReal -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EReal(decode_real(span)), t.line, t.col))
+    }
+    TkTrue  -> ok_e(p_advance(p), mk_expr(EBool(true),  t.line, t.col))
+    TkFalse -> ok_e(p_advance(p), mk_expr(EBool(false), t.line, t.col))
+    TkChar  -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EChar(decode_char(span)), t.line, t.col))
+    }
+    TkString -> {
+      let span = tok_source(p.src, t)
+      let is_triple =
+        string_length(span) >= 6 and
+        match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
+      ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col))
+    }
+    TkUnderscore -> ok_e(p_advance(p), mk_expr(EUnder, t.line, t.col))
+    TkDot -> ok_e(p_advance(p), mk_expr(EPlaceholder, t.line, t.col))
+    TkIdent -> parse_ident_primary(p, t)
+    TkLparen -> parse_paren_or_lambda(p, t)
+    TkLbracket -> parse_list_or_range(p, t)
+    TkLbrace -> parse_block(p, t)
+    TkIf -> parse_if(p, t)
+    TkMatch -> parse_match(p, t)
+    _ -> err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+fn parse_ident_primary(p: Parser, t: Token) : PExpr {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  # Lambda: `name => body`
+  if p_at(p1, TkFatArrow) {
+    let p2 = p_advance(p1)
+    let r = parse_expr(p2)
+    match r.r {
+      None -> err_e(r.p)
+      Some(body) -> {
+        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
+        ok_e(r.p, mk_expr(ELambda([param], body), t.line, t.col))
+      }
+    }
+  }
+  # Record literal: `Name { ... }` — but only when the name is Uppercase.
+  else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) {
+    parse_record_lit(p1, name, t)
+  }
+  # Plain variable reference.
+  else {
+    ok_e(p1, mk_expr(EVar(name), t.line, t.col))
+  }
+}
+
+fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
+  # `{` is next. Consume it.
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbrace) {
+    ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, []), tname.line, tname.col))
+  } else {
+    parse_record_fields_loop(p1, [], type_name, tname)
+  }
+}
+
+fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if not tk_is(tk.kind, TkIdent) {
+    err_e(p_error(p0, tk, "expected field name in record literal"))
+  } else {
+    let fname = tok_source(p0.src, tk)
+    let p1 = p_advance(p0)
+    if not p_at(p1, TkColon) {
+      err_e(p_error_here(p1, "expected `:` after field name"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let r = parse_expr(p2)
+      match r.r {
+        None -> err_e(r.p)
+        Some(val) -> {
+          let acc1 = [FI(fname, val), ...acc]
+          let p3 = p_skip_newlines(r.p)
+          if p_at(p3, TkComma) {
+            parse_record_fields_loop(p_skip_newlines(p_advance(p3)), acc1, type_name, tname)
+          } else if p_at(p3, TkRbrace) {
+            ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
+          } else {
+            err_e(p_error_here(p3, "expected `,` or `}` in record literal"))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr {
+  # We need to distinguish:
+  #   (expr)                  — grouping
+  #   ()                       — unit
+  #   () => expr               — zero-arg lambda
+  #   (a, b, ...) => expr      — multi-arg lambda
+  #   (a) => expr              — single-arg lambda (parenthesised)
+  # Strategy: speculatively parse a lambda-param list. If followed by
+  # `=>`, it's a lambda. Otherwise it was a parenthesised expression
+  # and we re-parse from the original position.
+  let p1 = p_skip_newlines(p_advance(p))
+  # Empty parens: unit, or zero-arg lambda.
+  if p_at(p1, TkRparen) {
+    let p2 = p_advance(p1)
+    if p_at(p2, TkFatArrow) {
+      let p3 = p_advance(p2)
+      let r = parse_expr(p3)
+      match r.r {
+        None -> err_e(r.p)
+        Some(body) -> ok_e(r.p, mk_expr(ELambda([], body), t.line, t.col))
+      }
+    } else {
+      ok_e(p2, mk_expr(EUnit, t.line, t.col))
+    }
+  } else {
+    # Try lambda: tentatively scan for an ident list ending with `)` `=>`.
+    match try_parse_lambda_params(p1) {
+      Some(res) -> {
+        let r = parse_expr(res.p)
+        match r.r {
+          None -> err_e(r.p)
+          Some(body) -> ok_e(r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
+        }
+      }
+      None -> {
+        # Fall back to `( expr )`.
+        let r = parse_expr(p1)
+        match r.r {
+          None -> err_e(r.p)
+          Some(e) -> {
+            let p2 = p_skip_newlines(r.p)
+            if p_at(p2, TkRparen) { ok_e(p_advance(p2), e) }
+            else { err_e(p_error_here(p2, "expected `)` after expression")) }
+          }
+        }
+      }
+    }
+  }
+}
+
+# A lambda parameter list is a comma-separated sequence of identifiers
+# (optionally with `: Type` annotations) followed by `)` then `=>`.
+# This scan is non-destructive: it returns the parser advanced past the
+# `=>` on success, None on failure.
+type LamParams = { p: Parser, params: [Param] }
+
+fn try_parse_lambda_params(p: Parser) : Option[LamParams] {
+  try_parse_lambda_params_loop(p, [])
+}
+
+fn try_parse_lambda_params_loop(p: Parser, acc: [Param]) : Option[LamParams] {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) { None }
+  else {
+    let name = tok_source(p.src, t)
+    let p1 = p_advance(p)
+    # Optional `: Type`
+    let p2_opt =
+      if p_at(p1, TkColon) {
+        let r = parse_type(p_advance(p1))
+        match r.r {
+          None -> None
+          Some(_) -> Some(r.p)
+        }
+      } else {
+        Some(p1)
+      }
+    match p2_opt {
+      None -> None
+      Some(p2) -> {
+        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
+        let acc1 = [param, ...acc]
+        if p_at(p2, TkComma) {
+          try_parse_lambda_params_loop(p_skip_newlines(p_advance(p2)), acc1)
+        } else if p_at(p2, TkRparen) {
+          let p3 = p_advance(p2)
+          if p_at(p3, TkFatArrow) {
+            Some(LamParams { p: p_advance(p3), params: list_reverse(acc1) })
+          } else { None }
+        } else { None }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# list / range
+# ====================================================================
+
+fn parse_list_or_range(p: Parser, t: Token) : PExpr {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_e(p_advance(p1), mk_expr(EList([]), t.line, t.col))
+  } else {
+    # Parse first element (could start with `...`).
+    parse_first_list_elem(p1, t)
+  }
+}
+
+fn parse_first_list_elem(p: Parser, t: Token) : PExpr {
+  if p_at(p, TkEllipsis) {
+    let r = parse_expr(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> parse_list_rest(r.p, [ElSpread(e)], t)
+    }
+  } else {
+    let r = parse_expr(p)
+    match r.r {
+      None -> err_e(r.p)
+      Some(first) -> {
+        # Range: `[ a .. b ]` or `[ a .. b .. step ]`.
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkDotDot) {
+          let r2 = parse_expr(p_skip_newlines(p_advance(p1)))
+          match r2.r {
+            None -> err_e(r2.p)
+            Some(to) -> {
+              let p2 = p_skip_newlines(r2.p)
+              if p_at(p2, TkDotDot) {
+                let r3 = parse_expr(p_skip_newlines(p_advance(p2)))
+                match r3.r {
+                  None -> err_e(r3.p)
+                  Some(step) -> {
+                    let p3 = p_skip_newlines(r3.p)
+                    if p_at(p3, TkRbracket) {
+                      ok_e(p_advance(p3), mk_expr(ERange(first, to, Some(step)), t.line, t.col))
+                    } else { err_e(p_error_here(p3, "expected `]` at end of range")) }
+                  }
+                }
+              } else if p_at(p2, TkRbracket) {
+                ok_e(p_advance(p2), mk_expr(ERange(first, to, None), t.line, t.col))
+              } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
+            }
+          }
+        } else {
+          parse_list_rest(p1, [ElPlain(first)], t)
+        }
+      }
+    }
+  }
+}
+
+fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), mk_expr(EList(list_reverse(acc)), t.line, t.col))
+  } else if p_at(p0, TkComma) {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkEllipsis) {
+      let r = parse_expr(p_advance(p1))
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> parse_list_rest(r.p, [ElSpread(e), ...acc], t)
+      }
+    } else {
+      let r = parse_expr(p1)
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> parse_list_rest(r.p, [ElPlain(e), ...acc], t)
+      }
+    }
+  } else {
+    err_e(p_error_here(p0, "expected `,` or `]` in list"))
+  }
+}
+
+# ====================================================================
+# block, if, match
+# ====================================================================
+
+fn parse_block(p: Parser, t: Token) : PExpr {
+  # `{` is at current position.
+  let p1 = p_skip_newlines_and_semis(p_advance(p))
+  parse_block_body(p1, [], t)
+}
+
+fn parse_block_body(p: Parser, stmts: [Stmt], t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_expr(EBlock(list_reverse(stmts), None), t.line, t.col))
+  } else {
+    let r = parse_stmt(p0)
+    match r.r {
+      None -> err_e(r.p)
+      Some(s) -> {
+        let p1 = p_skip_newlines_and_semis(r.p)
+        if p_at(p1, TkRbrace) {
+          # If the last stmt was an expression statement, it becomes the
+          # block's final expression.
+          match s {
+            SExprStmt(e) -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse(stmts), Some(e)), t.line, t.col))
+            _ -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse([s, ...stmts]), None), t.line, t.col))
+          }
+        } else {
+          parse_block_body(p1, [s, ...stmts], t)
+        }
+      }
+    }
+  }
+}
+
+fn parse_stmt(p: Parser) : PStmt {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLet) {
+    parse_let(p, t)
+  } else if tk_is(t.kind, TkAssert) {
+    parse_assert(p, t)
+  } else {
+    let r = parse_expr(p)
+    match r.r {
+      None -> err_s(r.p)
+      Some(e) -> ok_s(r.p, SExprStmt(e))
+    }
+  }
+}
+
+fn parse_let(p: Parser, t: Token) : PStmt {
+  let p1 = p_advance(p)
+  let rp = parse_pattern(p1)
+  match rp.r {
+    None -> err_s(rp.p)
+    Some(pat) -> {
+      # Optional `: Type` annotation.
+      let pa = p_skip_newlines(rp.p)
+      let ty_opt_r =
+        if p_at(pa, TkColon) {
+          let rt = parse_type(p_advance(pa))
+          match rt.r {
+            None -> PTy { p: rt.p, r: None }
+            Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+          }
+        } else {
+          PTy { p: pa, r: None }
+        }
+      if ty_opt_r.p.had_error and not pa.had_error { err_s(ty_opt_r.p) }
+      else {
+        let p_eq = p_skip_newlines(ty_opt_r.p)
+        if not p_at(p_eq, TkEq) {
+          err_s(p_error_here(p_eq, "expected `=` in let binding"))
+        } else {
+          let p_rhs = p_skip_newlines(p_advance(p_eq))
+          let re = parse_expr(p_rhs)
+          match re.r {
+            None -> err_s(re.p)
+            Some(rhs) -> ok_s(re.p, SLet(pat, ty_opt_r.r, rhs))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_assert(p: Parser, t: Token) : PStmt {
+  let p1 = p_advance(p)
+  let re = parse_expr(p1)
+  match re.r {
+    None -> err_s(re.p)
+    Some(cond) -> {
+      if p_at(re.p, TkComma) {
+        let p2 = p_skip_newlines(p_advance(re.p))
+        let rm = parse_expr(p2)
+        match rm.r {
+          None -> err_s(rm.p)
+          Some(msg) -> ok_s(rm.p, SAssert(cond, Some(msg)))
+        }
+      } else {
+        ok_s(re.p, SAssert(cond, None))
+      }
+    }
+  }
+}
+
+fn parse_if(p: Parser, t: Token) : PExpr {
+  let p1 = p_advance(p)
+  let rc = parse_expr(p1)
+  match rc.r {
+    None -> err_e(rc.p)
+    Some(cond) -> {
+      # Then-block
+      let p2 = p_skip_newlines(rc.p)
+      if not p_at(p2, TkLbrace) {
+        err_e(p_error_here(p2, "expected `{` after `if` condition"))
+      } else {
+        let tb = p_peek(p2)
+        let rt = parse_block(p2, tb)
+        match rt.r {
+          None -> err_e(rt.p)
+          Some(then_e) -> {
+            let p3 = p_skip_newlines(rt.p)
+            if p_at(p3, TkElse) {
+              let p4 = p_skip_newlines(p_advance(p3))
+              if p_at(p4, TkIf) {
+                let te = p_peek(p4)
+                let re = parse_if(p4, te)
+                match re.r {
+                  None -> err_e(re.p)
+                  Some(else_e) -> ok_e(re.p, mk_expr(EIf(cond, then_e, Some(else_e)), t.line, t.col))
+                }
+              } else if p_at(p4, TkLbrace) {
+                let teb = p_peek(p4)
+                let re = parse_block(p4, teb)
+                match re.r {
+                  None -> err_e(re.p)
+                  Some(else_e) -> ok_e(re.p, mk_expr(EIf(cond, then_e, Some(else_e)), t.line, t.col))
+                }
+              } else {
+                err_e(p_error_here(p4, "expected `if` or `{` after `else`"))
+              }
+            } else {
+              ok_e(rc.p, mk_expr(EIf(cond, then_e, None), t.line, t.col))
+              # Note: we return with p3's state (unchanged) since there is no else.
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_match(p: Parser, t: Token) : PExpr {
+  let p1 = p_advance(p)
+  let rs = parse_expr(p1)
+  match rs.r {
+    None -> err_e(rs.p)
+    Some(scrut) -> {
+      let p2 = p_skip_newlines(rs.p)
+      if not p_at(p2, TkLbrace) {
+        err_e(p_error_here(p2, "expected `{` after `match` expression"))
+      } else {
+        parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut, t)
+      }
+    }
+  }
+}
+
+fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_expr(EMatch(scrut, list_reverse(acc)), t.line, t.col))
+  } else {
+    let ra = parse_arm(p0)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_match_arms(ra.p, [arm, ...acc], scrut, t)
+    }
+  }
+}
+
+fn parse_arm(p: Parser) : PArm {
+  let rp = parse_pattern(p)
+  match rp.r {
+    None -> err_a(rp.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(rp.p)
+      # Optional guard: `if expr`.
+      let guard_opt_r =
+        if p_at(p1, TkIf) {
+          let rg = parse_expr(p_advance(p1))
+          match rg.r {
+            None -> PExpr { p: rg.p, r: None }
+            Some(g) -> PExpr { p: rg.p, r: Some(g) }
+          }
+        } else {
+          PExpr { p: p1, r: None }
+        }
+      match guard_opt_r.r {
+        None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
+          parse_arm_body(guard_opt_r.p, pat, None)
+        }
+        Some(_) -> parse_arm_body(guard_opt_r.p, pat, guard_opt_r.r)
+      }
+    }
+  }
+}
+
+fn parse_arm_body(p: Parser, pat: Pattern, guard: Option[Expr]) : PArm {
+  let p1 = p_skip_newlines(p)
+  if not p_at(p1, TkArrow) {
+    err_a(p_error_here(p1, "expected `->` in match arm"))
+  } else {
+    let p2 = p_skip_newlines(p_advance(p1))
+    let rb = parse_expr(p2)
+    match rb.r {
+      None -> err_a(rb.p)
+      Some(body) -> ok_a(rb.p, Arm(pat, guard, body))
+    }
+  }
+}
+
+# ====================================================================
+# patterns
+# ====================================================================
+
+fn parse_pattern(p: Parser) : PPat {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkUnderscore) {
+    ok_p(p_advance(p), mk_pat(PWild, t.line, t.col))
+  } else if tk_is(t.kind, TkInt) {
+    let span = tok_source(p.src, t)
+    let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
+    ok_p(p_advance(p), mk_pat(PLit(lit), t.line, t.col))
+  } else if tk_is(t.kind, TkReal) {
+    let span = tok_source(p.src, t)
+    let lit = mk_expr(EReal(decode_real(span)), t.line, t.col)
+    ok_p(p_advance(p), mk_pat(PLit(lit), t.line, t.col))
+  } else if tk_is(t.kind, TkTrue) {
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EBool(true), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkFalse) {
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EBool(false), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkChar) {
+    let span = tok_source(p.src, t)
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EChar(decode_char(span)), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkString) {
+    let span = tok_source(p.src, t)
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EStr(span, false), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkMinus) {
+    let nxt = p_peek1(p)
+    if tk_is(nxt.kind, TkInt) {
+      let span = tok_source(p.src, nxt)
+      let v = 0 - decode_int(span)
+      let p1 = p_advance(p_advance(p))
+      ok_p(p1, mk_pat(PLit(mk_expr(EInt(v), t.line, t.col)), t.line, t.col))
+    } else {
+      err_p(p_error_here(p, "expected literal after `-` in pattern"))
+    }
+  } else if tk_is(t.kind, TkLbracket) {
+    parse_list_pattern(p, t)
+  } else if tk_is(t.kind, TkIdent) {
+    parse_ident_pattern(p, t)
+  } else {
+    err_p(p_error_here(p, "expected pattern"))
+  }
+}
+
+fn parse_list_pattern(p: Parser, t: Token) : PPat {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_p(p_advance(p1), mk_pat(PList([], None), t.line, t.col))
+  } else {
+    parse_list_pattern_loop(p1, [], None, t)
+  }
+}
+
+fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: Token) : PPat {
+  if p_at(p, TkEllipsis) {
+    # Spread binder.
+    let p1 = p_advance(p)
+    let id = p_peek(p1)
+    if not tk_is(id.kind, TkIdent) {
+      err_p(p_error_here(p1, "expected identifier after `...` in list pattern"))
+    } else {
+      let name = tok_source(p1.src, id)
+      let p2 = p_skip_newlines(p_advance(p1))
+      if p_at(p2, TkRbracket) {
+        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some(name)), t.line, t.col))
+      } else {
+        err_p(p_error_here(p2, "expected `]` after spread pattern"))
+      }
+    }
+  } else {
+    let r = parse_pattern(p)
+    match r.r {
+      None -> err_p(r.p)
+      Some(pat) -> {
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkComma) {
+          parse_list_pattern_loop(p_skip_newlines(p_advance(p1)), [pat, ...acc], None, t)
+        } else if p_at(p1, TkRbracket) {
+          ok_p(p_advance(p1), mk_pat(PList(list_reverse([pat, ...acc]), None), t.line, t.col))
+        } else {
+          err_p(p_error_here(p1, "expected `,` or `]` in list pattern"))
+        }
+      }
+    }
+  }
+}
+
+fn parse_ident_pattern(p: Parser, t: Token) : PPat {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if is_upper_ident(p.src, t) and p_at(p1, TkLparen) {
+    # Variant with positional sub-patterns.
+    let p2 = p_skip_newlines(p_advance(p1))
+    if p_at(p2, TkRparen) {
+      ok_p(p_advance(p2), mk_pat(PVariant(name, []), t.line, t.col))
+    } else {
+      parse_variant_sub_patterns(p2, [], name, t)
+    }
+  } else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) {
+    # Variant-record pattern: parse as record, wrap in PVariantRecord.
+    let p2 = p_skip_newlines(p_advance(p1))
+    parse_record_pattern_fields(p2, [], Some(name), t)
+  } else if is_upper_ident(p.src, t) {
+    # Bare uppercase ident: 0-arg variant.
+    ok_p(p1, mk_pat(PVariant(name, []), t.line, t.col))
+  } else {
+    ok_p(p1, mk_pat(PBind(name), t.line, t.col))
+  }
+}
+
+fn parse_variant_sub_patterns(p: Parser, acc: [Pattern], name: String, t: Token) : PPat {
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(sub) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_variant_sub_patterns(p_skip_newlines(p_advance(p1)), [sub, ...acc], name, t)
+      } else if p_at(p1, TkRparen) {
+        ok_p(p_advance(p1), mk_pat(PVariant(name, list_reverse([sub, ...acc])), t.line, t.col))
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in variant pattern"))
+      }
+    }
+  }
+}
+
+fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t: Token) : PPat {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    let p1 = p_advance(p0)
+    match ctor {
+      None -> ok_p(p1, mk_pat(PRecord(list_reverse(acc)), t.line, t.col))
+      Some(name) -> ok_p(p1, mk_pat(PVariantRecord(name, list_reverse(acc)), t.line, t.col))
+    }
+  } else {
+    let fn_t = p_peek(p0)
+    if not tk_is(fn_t.kind, TkIdent) {
+      err_p(p_error(p0, fn_t, "expected field name in record pattern"))
+    } else {
+      let fname = tok_source(p0.src, fn_t)
+      let p1 = p_advance(p0)
+      let sub_r =
+        if p_at(p1, TkColon) {
+          let r = parse_pattern(p_advance(p1))
+          match r.r {
+            None -> PPat { p: r.p, r: None }
+            Some(sp) -> PPat { p: r.p, r: Some(sp) }
+          }
+        } else {
+          PPat { p: p1, r: Some(mk_pat(PBind(fname), fn_t.line, fn_t.col)) }
+        }
+      match sub_r.r {
+        None -> err_p(sub_r.p)
+        Some(sub) -> {
+          let is_short = not p_at(p1, TkColon)
+          let pf = PField(fname, sub, is_short)
+          let p2 = p_skip_newlines(sub_r.p)
+          if p_at(p2, TkComma) {
+            parse_record_pattern_fields(p_skip_newlines(p_advance(p2)), [pf, ...acc], ctor, t)
+          } else if p_at(p2, TkRbrace) {
+            parse_record_pattern_fields(p2, [pf, ...acc], ctor, t)
+          } else {
+            err_p(p_error_here(p2, "expected `,` or `}` in record pattern"))
+          }
+        }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# type expressions
+# ====================================================================
+
+fn parse_type(p: Parser) : PTy {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLbracket) {
+    let p1 = p_advance(p)
+    let r = parse_type(p1)
+    match r.r {
+      None -> err_t(r.p)
+      Some(inner) -> {
+        if p_at(r.p, TkRbracket) {
+          ok_t(p_advance(r.p), mk_ty(TyList(inner), t.line, t.col))
+        } else {
+          err_t(p_error_here(r.p, "expected `]` in list type"))
+        }
+      }
+    }
+  } else if tk_is(t.kind, TkLparen) {
+    parse_fn_type(p, t)
+  } else if tk_is(t.kind, TkIdent) {
+    parse_named_type(p, t)
+  } else {
+    err_t(p_error_here(p, "expected type"))
+  }
+}
+
+fn parse_named_type(p: Parser, t: Token) : PTy {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if p_at(p1, TkLbracket) {
+    # Generic type: Name[T1, T2, ...]
+    let p2 = p_skip_newlines(p_advance(p1))
+    parse_type_args_loop(p2, [], name, t)
+  } else {
+    ok_t(p1, mk_ty(TyName(name, []), t.line, t.col))
+  }
+}
+
+fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PTy {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_type_args_loop(p_skip_newlines(p_advance(p1)), [arg, ...acc], name, t)
+      } else if p_at(p1, TkRbracket) {
+        ok_t(p_advance(p1), mk_ty(TyName(name, list_reverse([arg, ...acc])), t.line, t.col))
+      } else {
+        err_t(p_error_here(p1, "expected `,` or `]` after type arguments"))
+      }
+    }
+  }
+}
+
+fn parse_fn_type(p: Parser, t: Token) : PTy {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    let p2 = p_advance(p1)
+    if not p_at(p2, TkArrow) {
+      err_t(p_error_here(p2, "expected `->` in function type"))
+    } else {
+      let r = parse_type(p_advance(p2))
+      match r.r {
+        None -> err_t(r.p)
+        Some(ret) -> ok_t(r.p, mk_ty(TyFn([], ret), t.line, t.col))
+      }
+    }
+  } else {
+    parse_fn_type_args(p1, [], t)
+  }
+}
+
+fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_fn_type_args(p_skip_newlines(p_advance(p1)), [arg, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let p2 = p_advance(p1)
+        if not p_at(p2, TkArrow) {
+          err_t(p_error_here(p2, "expected `->` in function type"))
+        } else {
+          let rr = parse_type(p_advance(p2))
+          match rr.r {
+            None -> err_t(rr.p)
+            Some(ret) -> ok_t(rr.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret), t.line, t.col))
+          }
+        }
+      } else {
+        err_t(p_error_here(p1, "expected `,` or `)` in function type args"))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# declarations
+# ====================================================================
+
+fn parse_decl(p: Parser) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let t = p_peek(p0)
+  let is_pub_r =
+    if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName("", []), 0, 0)) } }
+    else { PTy { p: p0, r: None } }
+  let is_pub =
+    match is_pub_r.r { Some(_) -> true None -> false }
+  let p1 = is_pub_r.p
+  let hd = p_peek(p1)
+  if tk_is(hd.kind, TkFn) {
+    parse_fn_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkType) {
+    parse_type_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkTest) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
+    else { parse_test_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkImport) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
+    else { parse_import_decl(p_advance(p1), hd) }
+  } else {
+    err_d(p_error(p1, hd, "expected `fn`, `type`, `test`, or `import`"))
+  }
+}
+
+fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected function name"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    if not p_at(p1, TkLparen) {
+      err_d(p_error_here(p1, "expected `(` after function name"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let params_r = parse_fn_params(p2, [])
+      match params_r.r {
+        None -> err_d(params_r.p)
+        Some(params) -> {
+          let p3 = p_skip_newlines(params_r.p)
+          # Optional `: ReturnType`
+          let ret_r =
+            if p_at(p3, TkColon) {
+              let rt = parse_type(p_advance(p3))
+              match rt.r {
+                None -> PTy { p: rt.p, r: None }
+                Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+              }
+            } else {
+              PTy { p: p3, r: None }
+            }
+          if ret_r.p.had_error and not p3.had_error { err_d(ret_r.p) }
+          else {
+            let p4 = p_skip_newlines(ret_r.p)
+            # Body: `= expr` or `{ block }`.
+            if p_at(p4, TkEq) {
+              let p5 = p_skip_newlines(p_advance(p4))
+              let rb = parse_expr(p5)
+              match rb.r {
+                None -> err_d(rb.p)
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+              }
+            } else if p_at(p4, TkLbrace) {
+              let tb = p_peek(p4)
+              let rb = parse_block(p4, tb)
+              match rb.r {
+                None -> err_d(rb.p)
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+              }
+            } else {
+              err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+type PParams = { p: Parser, r: Option[[Param]] }
+
+fn parse_fn_params(p: Parser, acc: [Param]) : PParams {
+  if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let t = p_peek(p)
+    if not tk_is(t.kind, TkIdent) {
+      PParams { p: p_error(p, t, "expected parameter name"), r: None }
+    } else {
+      let name = tok_source(p.src, t)
+      let p1 = p_advance(p)
+      if not p_at(p1, TkColon) {
+        PParams { p: p_error_here(p1, "expected `:` after parameter name"), r: None }
+      } else {
+        let rt = parse_type(p_advance(p1))
+        match rt.r {
+          None -> PParams { p: rt.p, r: None }
+          Some(ty) -> {
+            let param = Param { pname: name, ptype: Some(ty), pline: t.line, pcol: t.col }
+            let p2 = p_skip_newlines(rt.p)
+            if p_at(p2, TkComma) {
+              parse_fn_params(p_skip_newlines(p_advance(p2)), [param, ...acc])
+            } else if p_at(p2, TkRparen) {
+              PParams { p: p_advance(p2), r: Some(list_reverse([param, ...acc])) }
+            } else {
+              PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `type`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let p1n = p_skip_newlines(p1)
+    # Optional type params `[a, b, c]`.
+    let tparams_r =
+      if p_at(p1n, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1n)), [])
+      } else {
+        PTParams { p: p1n, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let p2 = p_skip_newlines(tparams_r.p)
+        if not p_at(p2, TkEq) {
+          err_d(p_error_here(p2, "expected `=` in type declaration"))
+        } else {
+          let p3 = p_skip_newlines(p_advance(p2))
+          parse_type_body(p3, is_pub, name, tparams, t)
+        }
+      }
+    }
+  }
+}
+
+type PTParams = { p: Parser, r: Option[[String]] }
+
+fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
+  } else {
+    let name = tok_source(p.src, t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkComma) {
+      parse_type_params_loop(p_skip_newlines(p_advance(p1)), [name, ...acc])
+    } else if p_at(p1, TkRbracket) {
+      PTParams { p: p_advance(p1), r: Some(list_reverse([name, ...acc])) }
+    } else {
+      PTParams { p: p_error_here(p1, "expected `,` or `]` after type parameter"), r: None }
+    }
+  }
+}
+
+fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  if p_at(p, TkLbrace) {
+    let p1 = p_skip_newlines(p_advance(p))
+    parse_record_body(p1, [], is_pub, name, tparams, t)
+  } else {
+    # Sum or alias: check for an uppercase ident followed by `(` OR
+    # followed eventually by `|` to decide. Simpler approach: try to
+    # parse as sum; if the first variant is followed by `|`, continue
+    # as sum; otherwise, fall back to alias. But stage 1 mirrors stage
+    # 0: use the same heuristic — if the first token is Uppercase and
+    # the next is `(` OR further along we see `|`, treat as sum.
+    let hd = p_peek(p)
+    if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
+      # Decide by lookahead.
+      let is_sum = looks_like_sum(p)
+      if is_sum {
+        parse_sum_body(p, [], is_pub, name, tparams, t)
+      } else {
+        let rt = parse_type(p)
+        match rt.r {
+          None -> err_d(rt.p)
+          Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+        }
+      }
+    } else {
+      let rt = parse_type(p)
+      match rt.r {
+        None -> err_d(rt.p)
+        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+      }
+    }
+  }
+}
+
+# Mirror of stage 0's looks_like_sum heuristic: scan ahead for `|` or
+# for `Uppercase(` indicating a variant with payload.
+fn looks_like_sum(p: Parser) : Bool {
+  let hd = p_peek(p)
+  let nxt = p_peek1(p)
+  if is_upper_ident(p.src, hd) and tk_is(nxt.kind, TkLparen) { true }
+  else { looks_like_sum_scan(p.rest, 0) }
+}
+
+fn looks_like_sum_scan(toks: [Token], depth: Int) : Bool {
+  match toks {
+    [] -> false
+    [t, ...rs] -> {
+      match t.kind {
+        TkEof -> false
+        TkLparen -> looks_like_sum_scan(rs, depth + 1)
+        TkLbracket -> looks_like_sum_scan(rs, depth + 1)
+        TkLbrace -> looks_like_sum_scan(rs, depth + 1)
+        TkRparen -> looks_like_sum_scan(rs, depth - 1)
+        TkRbracket -> looks_like_sum_scan(rs, depth - 1)
+        TkRbrace -> looks_like_sum_scan(rs, depth - 1)
+        TkPipe -> if depth == 0 { true } else { looks_like_sum_scan(rs, depth) }
+        TkNewline -> if depth == 0 { looks_like_sum_after_nl(rs) }
+                     else { looks_like_sum_scan(rs, depth) }
+        _ -> looks_like_sum_scan(rs, depth)
+      }
+    }
+  }
+}
+
+fn looks_like_sum_after_nl(toks: [Token]) : Bool {
+  match toks {
+    [] -> false
+    [t, ...rs] -> {
+      match t.kind {
+        TkNewline -> looks_like_sum_after_nl(rs)
+        TkPipe -> true
+        _ -> false
+      }
+    }
+  }
+}
+
+fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col))
+  } else {
+    let ft = p_peek(p0)
+    if not tk_is(ft.kind, TkIdent) {
+      err_d(p_error(p0, ft, "expected field name in record type"))
+    } else {
+      let fname = tok_source(p0.src, ft)
+      let p1 = p_advance(p0)
+      if not p_at(p1, TkColon) {
+        err_d(p_error_here(p1, "expected `:` after field name"))
+      } else {
+        let rt = parse_type(p_advance(p1))
+        match rt.r {
+          None -> err_d(rt.p)
+          Some(ty) -> {
+            let fd = FD(fname, ty)
+            let p2 = p_skip_newlines(rt.p)
+            if p_at(p2, TkComma) {
+              parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, t)
+            } else if p_at(p2, TkRbrace) {
+              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col))
+            } else {
+              err_d(p_error_here(p2, "expected `,` or `}` in record type"))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let vt = p_peek(p0)
+  if not tk_is(vt.kind, TkIdent) or not is_upper_ident(p0.src, vt) {
+    err_d(p_error(p0, vt, "expected variant constructor name"))
+  } else {
+    let vname = tok_source(p0.src, vt)
+    let p1 = p_advance(p0)
+    let args_r =
+      if p_at(p1, TkLparen) {
+        parse_variant_args(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PVariantArgs { p: p1, r: Some([]) }
+      }
+    match args_r.r {
+      None -> err_d(args_r.p)
+      Some(vargs) -> {
+        let vnode = Var(vname, vargs)
+        let p2 = p_skip_newlines(args_r.p)
+        if p_at(p2, TkPipe) {
+          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, t)
+        } else {
+          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col))
+        }
+      }
+    }
+  }
+}
+
+type PVariantArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+fn parse_variant_args(p: Parser, acc: [TypeExpr]) : PVariantArgs {
+  if p_at(p, TkRparen) { PVariantArgs { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let r = parse_type(p)
+    match r.r {
+      None -> PVariantArgs { p: r.p, r: None }
+      Some(ty) -> {
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkComma) {
+          parse_variant_args(p_skip_newlines(p_advance(p1)), [ty, ...acc])
+        } else if p_at(p1, TkRparen) {
+          PVariantArgs { p: p_advance(p1), r: Some(list_reverse([ty, ...acc])) }
+        } else {
+          PVariantArgs { p: p_error_here(p1, "expected `,` or `)` in variant payload"), r: None }
+        }
+      }
+    }
+  }
+}
+
+fn parse_test_decl(p: Parser, t: Token) : PDecl {
+  let desc_t = p_peek(p)
+  if not tk_is(desc_t.kind, TkString) {
+    err_d(p_error(p, desc_t, "expected string description after `test`"))
+  } else {
+    let desc_span = tok_source(p.src, desc_t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkLbrace) {
+      err_d(p_error_here(p1, "expected `{` for test body"))
+    } else {
+      let tb = p_peek(p1)
+      let rb = parse_block(p1, tb)
+      match rb.r {
+        None -> err_d(rb.p)
+        Some(body) -> ok_d(rb.p, DTest(desc_span, body, t.line, t.col))
+      }
+    }
+  }
+}
+
+fn parse_import_decl(p: Parser, t: Token) : PDecl {
+  # For stage 1 MVP, imports are structurally parsed but not resolved.
+  # Accept: `import a.b.c`, `import a.b.c as X`, `import a.b.c.{f, g}`.
+  let first = p_peek(p)
+  if not tk_is(first.kind, TkIdent) {
+    err_d(p_error(p, first, "expected module name after `import`"))
+  } else {
+    parse_import_path(p_advance(p), tok_source(p.src, first), t)
+  }
+}
+
+fn parse_import_path(p: Parser, acc_path: String, t: Token) : PDecl {
+  if p_at(p, TkDot) {
+    let p1 = p_advance(p)
+    let nxt = p_peek(p1)
+    if tk_is(nxt.kind, TkIdent) {
+      let seg = tok_source(p1.src, nxt)
+      parse_import_path(p_advance(p1), string_concat(string_concat(acc_path, "."), seg), t)
+    } else if tk_is(nxt.kind, TkLbrace) {
+      # Selective: `.{a, b}`
+      parse_import_selectives(p_skip_newlines(p_advance(p1)), [], acc_path, t)
+    } else {
+      err_d(p_error_here(p1, "expected identifier or `{` after `.`"))
+    }
+  } else if p_at(p, TkAs) {
+    let p1 = p_advance(p)
+    let nxt = p_peek(p1)
+    if not tk_is(nxt.kind, TkIdent) {
+      err_d(p_error(p1, nxt, "expected alias name after `as`"))
+    } else {
+      let alias = tok_source(p1.src, nxt)
+      ok_d(p_advance(p1), DImport(IkAlias(acc_path, alias), t.line, t.col))
+    }
+  } else {
+    ok_d(p, DImport(IkPath(acc_path), t.line, t.col))
+  }
+}
+
+fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let nxt = p_peek(p0)
+  if not tk_is(nxt.kind, TkIdent) {
+    err_d(p_error(p0, nxt, "expected identifier in selective import"))
+  } else {
+    let name = tok_source(p0.src, nxt)
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkComma) {
+      parse_import_selectives(p_skip_newlines(p_advance(p1)), [name, ...acc], path, t)
+    } else if p_at(p1, TkRbrace) {
+      ok_d(p_advance(p1), DImport(IkSelective(path, list_reverse([name, ...acc])), t.line, t.col))
+    } else {
+      err_d(p_error_here(p1, "expected `,` or `}` in selective import"))
+    }
+  }
+}
+
+# ====================================================================
+# program
+# ====================================================================
+
+fn parse_program_loop(p: Parser, acc: [Decl]) : PParser {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkEof) { PParser { p: p0, decls: Some(list_reverse(acc)) } }
+  else {
+    let r = parse_decl(p0)
+    match r.r {
+      None -> PParser { p: r.p, decls: None }
+      Some(d) -> parse_program_loop(r.p, [d, ...acc])
+    }
+  }
+}
+
+type PParser = { p: Parser, decls: Option[[Decl]] }
+
+fn parse_program(file: String, src: String, toks: [Token]) : PParser {
+  parse_program_loop(parser_new(file, src, toks), [])
+}
+
+# ====================================================================
+# AST dumper (for --ast)
+# ====================================================================
+#
+# The format is indented nesting, one node per line. It does not try
+# to match stage 0's kai_dump_ast byte-for-byte; the value here is to
+# help visually inspect stage 1's parser while the emitter is being
+# written.
+
+fn indent_of(depth: Int) : String {
+  if depth == 0 { "" } else { string_concat("  ", indent_of(depth - 1)) }
+}
+
+fn emit_line(depth: Int, s: String) : Unit = print("#{indent_of(depth)}#{s}")
+
+fn dump_expr(e: Expr, depth: Int) : Unit {
+  match e.kind {
+    EInt(n) -> emit_line(depth, "int #{int_to_string(n)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EReal(r) -> emit_line(depth, "real #{real_to_string(r)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EBool(b) -> {
+      let s = if b { "true" } else { "false" }
+      emit_line(depth, "bool #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    }
+    EChar(c) -> emit_line(depth, "char '#{c}' @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EStr(s, _) -> emit_line(depth, "string #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnit -> emit_line(depth, "unit @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EVar(name) -> emit_line(depth, "ident #{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnder -> emit_line(depth, "_ @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EPlaceholder -> emit_line(depth, ". @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    ECall(callee, xs) -> {
+      emit_line(depth, "call @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(callee, depth + 1)
+      xs |> each((a) => dump_expr(a, depth + 1))
+    }
+    EField(base, name) -> {
+      emit_line(depth, "field .#{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(base, depth + 1)
+    }
+    EIndex(base, idx) -> {
+      emit_line(depth, "index @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(base, depth + 1)
+      dump_expr(idx, depth + 1)
+    }
+    EBinop(op, a, b) -> {
+      emit_line(depth, "binop #{op} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
+    EUnop(op, x) -> {
+      emit_line(depth, "unop #{op} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(x, depth + 1)
+    }
+    EIf(c, a, opt_b) -> {
+      emit_line(depth, "if @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(c, depth + 1)
+      dump_expr(a, depth + 1)
+      match opt_b { Some(b) -> dump_expr(b, depth + 1) None -> () }
+    }
+    EMatch(scrut, arms) -> {
+      emit_line(depth, "match @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(scrut, depth + 1)
+      arms |> each((a) => dump_arm(a, depth + 1))
+    }
+    ELambda(params, body) -> {
+      emit_line(depth, "lambda @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      params |> each((pm) => emit_line(depth + 1, "param #{pm.pname}"))
+      dump_expr(body, depth + 1)
+    }
+    ERecordLit(name, fields) -> {
+      emit_line(depth, "record #{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      fields |> each((fi) => dump_field_init(fi, depth + 1))
+    }
+    EList(elems) -> {
+      emit_line(depth, "list @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      elems |> each((el) => dump_list_elem(el, depth + 1))
+    }
+    ERange(a, b, opt_step) -> {
+      emit_line(depth, "range @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+      match opt_step { Some(s) -> dump_expr(s, depth + 1) None -> () }
+    }
+    EBlock(stmts, opt_final) -> {
+      emit_line(depth, "block @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      stmts |> each((s) => dump_stmt(s, depth + 1))
+      match opt_final { Some(fe) -> dump_expr(fe, depth + 1) None -> () }
+    }
+    EPipe(a, b) -> {
+      emit_line(depth, "pipe @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
+  }
+}
+
+fn dump_arm(a: Arm, depth: Int) : Unit {
+  emit_line(depth, "arm")
+  match a {
+    Arm(pat, guard, body) -> {
+      dump_pat(pat, depth + 1)
+      match guard { Some(g) -> { emit_line(depth + 1, "guard"); dump_expr(g, depth + 2) } None -> () }
+      dump_expr(body, depth + 1)
+    }
+  }
+}
+
+fn dump_field_init(fi: FieldInit, depth: Int) : Unit {
+  match fi {
+    FI(name, val) -> {
+      emit_line(depth, "field_init #{name}")
+      dump_expr(val, depth + 1)
+    }
+  }
+}
+
+fn dump_list_elem(el: ListElem, depth: Int) : Unit {
+  match el {
+    ElPlain(e) -> dump_expr(e, depth)
+    ElSpread(e) -> {
+      emit_line(depth, "spread")
+      dump_expr(e, depth + 1)
+    }
+  }
+}
+
+fn dump_stmt(s: Stmt, depth: Int) : Unit {
+  match s {
+    SLet(pat, opt_ty, rhs) -> {
+      emit_line(depth, "let")
+      dump_pat(pat, depth + 1)
+      match opt_ty { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_expr(rhs, depth + 1)
+    }
+    SAssert(cond, opt_msg) -> {
+      emit_line(depth, "assert")
+      dump_expr(cond, depth + 1)
+      match opt_msg { Some(m) -> dump_expr(m, depth + 1) None -> () }
+    }
+    SExprStmt(e) -> dump_expr(e, depth)
+  }
+}
+
+fn dump_pat(pat: Pattern, depth: Int) : Unit {
+  match pat.pkind {
+    PWild -> emit_line(depth, "pat _ @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PLit(e) -> {
+      emit_line(depth, "pat_lit @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_expr(e, depth + 1)
+    }
+    PBind(name) -> emit_line(depth, "pat_bind #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PList(pats, opt_rest) -> {
+      emit_line(depth, "pat_list @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      pats |> each((pp) => dump_pat(pp, depth + 1))
+      match opt_rest { Some(r) -> emit_line(depth + 1, "...#{r}") None -> () }
+    }
+    PVariant(name, subs) -> {
+      emit_line(depth, "pat_variant #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      subs |> each((pp) => dump_pat(pp, depth + 1))
+    }
+    PVariantRecord(name, fields) -> {
+      emit_line(depth, "pat_variant_record #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(pf, depth + 1))
+    }
+    PRecord(fields) -> {
+      emit_line(depth, "pat_record @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(pf, depth + 1))
+    }
+  }
+}
+
+fn dump_pfield(pf: PField, depth: Int) : Unit {
+  match pf {
+    PField(name, sub, short) -> {
+      let suffix = if short { " (shorthand)" } else { "" }
+      emit_line(depth, "pat_field #{name}#{suffix}")
+      dump_pat(sub, depth + 1)
+    }
+  }
+}
+
+fn dump_type(ty: TypeExpr, depth: Int) : Unit {
+  match ty.tkind {
+    TyName(name, targs) -> {
+      emit_line(depth, "ty_name #{name} @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(a, depth + 1))
+    }
+    TyList(inner) -> {
+      emit_line(depth, "ty_list @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(inner, depth + 1)
+    }
+    TyFn(targs, ret) -> {
+      emit_line(depth, "ty_fn @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(a, depth + 1))
+      dump_type(ret, depth + 1)
+    }
+  }
+}
+
+fn dump_decl(d: Decl, depth: Int) : Unit {
+  match d {
+    DFn(is_pub, name, params, opt_ret, body, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(pm, depth + 1))
+      match opt_ret { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_expr(body, depth + 1)
+    }
+    DType(is_pub, name, tparams, body, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "type #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
+      dump_type_body(body, depth + 1)
+    }
+    DTest(desc, body, line, col) -> {
+      emit_line(depth, "test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(body, depth + 1)
+    }
+    DImport(ik, line, col) -> {
+      match ik {
+        IkPath(path) -> emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkAlias(path, a) -> emit_line(depth, "import #{path} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkSelective(path, names) -> {
+          emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+          names |> each((n) => emit_line(depth + 1, "sel #{n}"))
+        }
+      }
+    }
+  }
+}
+
+fn dump_param(pm: Param, depth: Int) : Unit {
+  emit_line(depth, "param #{pm.pname} @#{int_to_string(pm.pline)}:#{int_to_string(pm.pcol)}")
+  match pm.ptype { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+}
+
+fn dump_type_body(tb: TypeBody, depth: Int) : Unit {
+  match tb {
+    TBAlias(ty) -> {
+      emit_line(depth, "ty_alias")
+      dump_type(ty, depth + 1)
+    }
+    TBRecord(fields) -> {
+      emit_line(depth, "ty_record")
+      fields |> each((fd) => dump_field_decl(fd, depth + 1))
+    }
+    TBSum(variants) -> {
+      emit_line(depth, "ty_sum")
+      variants |> each((v) => dump_variant(v, depth + 1))
+    }
+  }
+}
+
+fn dump_field_decl(fd: FieldDecl, depth: Int) : Unit {
+  match fd {
+    FD(name, ty) -> {
+      emit_line(depth, "field_decl #{name}")
+      dump_type(ty, depth + 1)
+    }
+  }
+}
+
+fn dump_variant(v: Variant, depth: Int) : Unit {
+  match v {
+    Var(name, vargs) -> {
+      emit_line(depth, "variant #{name}")
+      vargs |> each((a) => dump_type(a, depth + 1))
+    }
+  }
+}
+
+fn dump_program(decls: [Decl]) : Unit {
+  print("program")
+  decls |> each((d) => dump_decl(d, 1))
+}
+
+# ====================================================================
 # cli + driver
 # ====================================================================
 
@@ -673,9 +2809,18 @@ fn compile_source(path: String, mode: Mode, src: String) : Int {
     _ -> {
       if lex_errs != 0 { lex_errs }
       else {
-        # Milestone 3 stub: later milestones parse, check, and emit here.
-        print("/* stage1 placeholder: parser/checker/emitter not yet wired */")
-        0
+        let parsed = parse_program(path, src, tokens)
+        match parsed.decls {
+          None -> 1
+          Some(decls) -> match mode {
+            MAst -> { dump_program(decls); 0 }
+            _ -> {
+              # Milestone 4 stub: later milestones check and emit here.
+              print("/* stage1 placeholder: checker/emitter not yet wired */")
+              0
+            }
+          }
+        }
       }
     }
   }
