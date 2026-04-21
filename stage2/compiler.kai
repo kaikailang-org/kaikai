@@ -4904,6 +4904,189 @@ fn dump_env(env: TyEnv) : Unit =
   list_reverse(env.entries) |> each(dump_env_entry)
 
 # ====================================================================
+# substitution + unification (M2c)
+# ====================================================================
+#
+# A Subst maps type-variable ids to types. It is applied to a type by
+# walking structurally and replacing each TyVarT(n) whose n has a
+# binding in the substitution. Unification takes two types and either
+# extends a substitution so the two become equal or reports failure.
+#
+# The occurs check prevents infinite types: unifying `?t0` with
+# `[?t0]` would otherwise loop, so we refuse.
+#
+# Instantiation turns a TyScheme into a Ty by replacing each bound id
+# with a fresh TyVarT drawn from the environment's counter. Each call
+# site of a polymorphic function gets its own fresh vars.
+
+# Kaikai-minimal doesn't have bare tuples, so we wrap (Int, Ty) in a
+# single-variant sum SB. The Subst record holds `[SB]`.
+type SBind = SB(Int, Ty)
+
+type Subst = { binds: [SBind] }
+
+fn subst_empty() : Subst = Subst { binds: [] }
+
+fn subst_lookup_loop(bs: [SBind], v: Int) : Option[Ty] {
+  match bs {
+    [] -> None
+    [b, ...rest] -> match b {
+      SB(k, ty) -> if k == v { Some(ty) } else { subst_lookup_loop(rest, v) }
+    }
+  }
+}
+
+fn subst_lookup(s: Subst, v: Int) : Option[Ty] = subst_lookup_loop(s.binds, v)
+
+fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst =
+  Subst { binds: [SB(v, ty), ...s.binds] }
+
+# Apply the substitution to a type. Recurses structurally; resolves
+# `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
+# chained binding `?t0 -> ?t1 -> Int` collapses to `Int`.
+fn apply_ty(s: Subst, t: Ty) : Ty {
+  match t {
+    TyInt    -> t
+    TyReal   -> t
+    TyBool   -> t
+    TyString -> t
+    TyChar   -> t
+    TyUnit   -> t
+    TyAny    -> t
+    TyVarT(n) -> match subst_lookup(s, n) {
+      Some(t2) -> apply_ty(s, t2)
+      None     -> t
+    }
+    TyListT(inner) -> TyListT(apply_ty(s, inner))
+    TyFnT(params, ret) -> TyFnT(apply_tys(s, params), apply_ty(s, ret))
+    TyCon(name, args) -> TyCon(name, apply_tys(s, args))
+  }
+}
+
+fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = map(ts, (t) => apply_ty(s, t))
+
+# Does TyVarT(v) appear inside `ty` after applying the substitution?
+# Used as the occurs check in unify.
+fn occurs_any(v: Int, ts: [Ty], s: Subst) : Bool {
+  match ts {
+    [] -> false
+    [t, ...rest] -> if occurs(v, t, s) { true } else { occurs_any(v, rest, s) }
+  }
+}
+
+fn occurs(v: Int, t: Ty, s: Subst) : Bool {
+  let t1 = apply_ty(s, t)
+  match t1 {
+    TyVarT(n) -> n == v
+    TyListT(inner) -> occurs(v, inner, s)
+    TyFnT(params, ret) -> occurs_any(v, [ret, ...params], s)
+    TyCon(_, args) -> occurs_any(v, args, s)
+    _ -> false
+  }
+}
+
+# Unify two types under substitution `s`. Returns Some(s') with the
+# extended substitution, or None on failure. The caller is responsible
+# for reporting the mismatch at the right source position.
+fn unify(t1: Ty, t2: Ty, s: Subst) : Option[Subst] {
+  let a = apply_ty(s, t1)
+  let b = apply_ty(s, t2)
+  match a {
+    TyVarT(n) -> match b {
+      TyVarT(m) -> if n == m { Some(s) } else { Some(subst_extend(s, n, b)) }
+      _ -> if occurs(n, b, s) { None } else { Some(subst_extend(s, n, b)) }
+    }
+    _ -> match b {
+      TyVarT(m) -> if occurs(m, a, s) { None } else { Some(subst_extend(s, m, a)) }
+      _ -> unify_heads(a, b, s)
+    }
+  }
+}
+
+# Neither side is a var: must match head-symbol + structure.
+fn unify_list(xs: [Ty], ys: [Ty], s: Subst) : Option[Subst] {
+  match xs {
+    [] -> match ys { [] -> Some(s) _ -> None }
+    [x, ...xr] -> match ys {
+      [] -> None
+      [y, ...yr] -> match unify(x, y, s) {
+        None -> None
+        Some(s1) -> unify_list(xr, yr, s1)
+      }
+    }
+  }
+}
+
+fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
+  match a {
+    TyInt    -> match b { TyInt    -> Some(s) _ -> None }
+    TyReal   -> match b { TyReal   -> Some(s) _ -> None }
+    TyBool   -> match b { TyBool   -> Some(s) _ -> None }
+    TyString -> match b { TyString -> Some(s) _ -> None }
+    TyChar   -> match b { TyChar   -> Some(s) _ -> None }
+    TyUnit   -> match b { TyUnit   -> Some(s) _ -> None }
+    # TyAny unifies with anything until typed holes and error reporting
+    # land; it's the "I don't know yet" placeholder.
+    TyAny    -> Some(s)
+    TyListT(a1) -> match b {
+      TyListT(b1) -> unify(a1, b1, s)
+      _ -> None
+    }
+    TyFnT(ap, ar) -> match b {
+      TyFnT(bp, br) -> match unify_list(ap, bp, s) {
+        None -> None
+        Some(s1) -> unify(ar, br, s1)
+      }
+      _ -> None
+    }
+    TyCon(an, aa) -> match b {
+      TyCon(bn, ba) -> if an == bn { unify_list(aa, ba, s) } else { None }
+      _ -> None
+    }
+    TyVarT(_) -> None                                  # handled in unify
+  }
+}
+
+# ---- instantiation ----
+#
+# Turn a TyScheme into (fresh Ty, updated env). Each bound var in the
+# scheme is replaced by a freshly-generated TyVarT; everywhere the
+# bound id appears inside the scheme body, we substitute the fresh
+# id. The env's `fresh` counter advances by one per bound var.
+
+fn fresh_var(env: TyEnv) : TyEnv =
+  TyEnv { entries: env.entries, fresh: env.fresh + 1 }
+
+fn advance_fresh(env: TyEnv, n: Int) : TyEnv =
+  if n <= 0 { env } else { advance_fresh(fresh_var(env), n - 1) }
+
+fn mk_fresh_subst_loop(vars: [Int], start: Int, acc: [SBind]) : [SBind] {
+  match vars {
+    [] -> acc
+    [v, ...rest] -> mk_fresh_subst_loop(rest, start + 1, [SB(v, TyVarT(start)), ...acc])
+  }
+}
+
+fn mk_fresh_subst(vars: [Int], start: Int) : Subst =
+  Subst { binds: mk_fresh_subst_loop(vars, start, []) }
+
+# Turn a TyScheme into a pair `(env-with-advanced-counter, ty)` where
+# every bound var in the scheme has been replaced by a fresh TyVarT
+# drawn from the counter.
+type Instantiated = { env: TyEnv, ty: Ty }
+
+fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
+  match sc {
+    Scheme(vars, body) -> {
+      let start = env.fresh
+      let env1 = advance_fresh(env, list_length(vars))
+      let sub = mk_fresh_subst(vars, start)
+      Instantiated { env: env1, ty: apply_ty(sub, body) }
+    }
+  }
+}
+
+# ====================================================================
 # cli + driver
 # ====================================================================
 
