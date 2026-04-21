@@ -3493,15 +3493,13 @@ fn emit_pat_test_list_loop(src: String, pats: [Pattern], has_rest: Bool,
     if has_rest { "1" }
     else { concat_all([cur, " && ", cur, "->tag == KAI_NIL"]) }
   } else {
-    let sep = if i == 0 { "" } else { " && " }
     let head = cat2(cur, "->as.cons.head")
     let tail = cat2(cur, "->as.cons.tail")
-    # Find the i-th pattern.
     let pi = list_nth(pats, i)
     let head_test = emit_pat_test(src, pi, head, fns, variants, lams)
     let cons_guard = concat_all([cur, " && ", cur, "->tag == KAI_CONS"])
     concat_all([
-      sep, cons_guard, " && ", head_test, " && ",
+      cons_guard, " && ", head_test, " && ",
       emit_pat_test_list_loop(src, pats, has_rest, tail, i + 1, n_fixed, fns, variants, lams)
     ])
   }

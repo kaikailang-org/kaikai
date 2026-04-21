@@ -93,6 +93,26 @@ test-blocks: $(TARGET) build
 	    || { echo "tests DIFF $$name"; diff build/$$name-t-s0.err build/$$name-t.err; exit 1; }; \
 	done
 
+# Self-hosting: build kaic1b (stage 1 compiled by stage 1), verify it
+# compiles the same examples to the same outputs, and reach a fixed
+# point where running kaic1b on its own source is byte-identical.
+selfhost: $(TARGET) build
+	@set -e; \
+	./$(TARGET) compiler.kai > build/kaic1b.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/kaic1b.c -o build/kaic1b; \
+	./build/kaic1b compiler.kai > build/kaic1c.c; \
+	diff -q build/kaic1b.c build/kaic1c.c > /dev/null \
+	  && echo "self-hosting fixed point: OK" \
+	  || { echo "self-hosting fixed point: DIFF"; exit 1; }; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./build/kaic1b $$f    > build/$$name-b.c; \
+	  ./$(TARGET)    $$f    > build/$$name-a.c; \
+	  diff -q build/$$name-a.c build/$$name-b.c > /dev/null \
+	    && echo "emit OK $$name" \
+	    || { echo "emit DIFF $$name (kaic1 vs kaic1b)"; diff build/$$name-a.c build/$$name-b.c | head; exit 1; }; \
+	done
+
 test: test-tokens test-ast test-check test-run test-blocks
 
 clean:
