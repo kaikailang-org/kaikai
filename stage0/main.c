@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "ast.h"
+#include "check.h"
 #include "lexer.h"
 #include "parser.h"
 
@@ -91,11 +92,17 @@ int main(int argc, char **argv) {
 
     if (dump_ast) {
         kai_dump_ast(prog);
-    } else {
-        printf("kaic0: %s: parsed OK (%zu top-level decls)\n", path, prog->n_children);
+        kai_free_node(prog);
+        free(src);
+        return 0;
+    }
+
+    int rc = kai_check(prog, path, src);
+    if (rc == 0) {
+        printf("kaic0: %s: checked OK (%zu top-level decls)\n", path, prog->n_children);
     }
 
     kai_free_node(prog);
     free(src);
-    return 0;
+    return rc;
 }
