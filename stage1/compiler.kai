@@ -3308,8 +3308,8 @@ fn unop_cname(op: String) : Option[String] {
   else { None }
 }
 
-fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar]) : String =
-  join_with(map(args_e, (a) => emit_expr(src, a, fns, variants)), ", ")
+fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  join_with(map(args_e, (a) => emit_expr(src, a, fns, variants, lams)), ", ")
 
 fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
   if n_args == 0 {
@@ -3322,8 +3322,8 @@ fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
   }
 }
 
-fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [EVar]) : String {
-  let call_args = emit_call_args(src, args_e, fns, variants)
+fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let call_args = emit_call_args(src, args_e, fns, variants, lams)
   match f.kind {
     EVar(callee) -> {
       match evar_find(variants, callee) {
@@ -3343,7 +3343,7 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
       }
     }
     _ -> {
-      let fc = emit_expr(src, f, fns, variants)
+      let fc = emit_expr(src, f, fns, variants, lams)
       concat_all([
         "kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
         ", (KaiValue *[]){", call_args, "})"
@@ -3352,14 +3352,12 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
   }
 }
 
-# Emit a pipe `lhs |> rhs`. stage 0 specialises the common case where rhs
-# is a call: the left side becomes the first argument, prepended.
-fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar]) : String {
-  let lhs_c = emit_expr(src, lhs, fns, variants)
+fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let lhs_c = emit_expr(src, lhs, fns, variants, lams)
   match rhs.kind {
     ECall(f, args_e) -> match f.kind {
       EVar(callee) -> {
-        let rest_args = emit_call_args(src, args_e, fns, variants)
+        let rest_args = emit_call_args(src, args_e, fns, variants, lams)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
         match evar_find(variants, callee) {
           Some(_) -> emit_variant_call(callee, list_length(args_e) + 1, args_all)
@@ -3378,8 +3376,8 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
         }
       }
       _ -> {
-        let fc = emit_expr(src, f, fns, variants)
-        let rest_args = emit_call_args(src, args_e, fns, variants)
+        let fc = emit_expr(src, f, fns, variants, lams)
+        let rest_args = emit_call_args(src, args_e, fns, variants, lams)
         let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
         concat_all([
           "kai_apply(", fc, ", ", int_to_string(list_length(args_e) + 1),
@@ -3388,7 +3386,6 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
       }
     }
     EVar(callee) -> {
-      # `xs |> f` — single-arg application of f.
       match evar_find(variants, callee) {
         Some(_) -> emit_variant_call(callee, 1, lhs_c)
         None -> match prelude_find(callee) {
@@ -3404,60 +3401,829 @@ fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar
       }
     }
     _ -> concat_all([
-      "kai_apply(", emit_expr(src, rhs, fns, variants),
+      "kai_apply(", emit_expr(src, rhs, fns, variants, lams),
       ", 1, (KaiValue *[]){", lhs_c, "})"
     ])
   }
 }
 
 fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
-                   fns: [EFn], variants: [EVar]) : String {
-  let a = emit_expr(src, from, fns, variants)
-  let b = emit_expr(src, to, fns, variants)
+                   fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let a = emit_expr(src, from, fns, variants, lams)
+  let b = emit_expr(src, to, fns, variants, lams)
   match opt_step {
     None -> cat5("kai_range(", a, ", ", b, ")")
     Some(s) -> {
-      let sc = emit_expr(src, s, fns, variants)
+      let sc = emit_expr(src, s, fns, variants, lams)
       concat_all(["kai_range_step(", a, ", ", b, ", ", sc, ")"])
     }
   }
 }
 
-fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar]) : String {
+# ---- list literal emission ----
+
+fn emit_list_tail(src: String, elems: [ListElem], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match elems {
+    [] -> "kai_nil()"
+    [el, ...rest] -> match el {
+      ElPlain(x) -> concat_all([
+        "kai_cons(", emit_expr(src,x, fns, variants, lams), ", ",
+        emit_list_tail(src, rest, fns, variants, lams), ")"
+      ])
+      ElSpread(x) -> concat_all([
+        "kai_prelude_list_append(", emit_expr(src,x, fns, variants, lams), ", ",
+        emit_list_tail(src, rest, fns, variants, lams), ")"
+      ])
+    }
+  }
+}
+
+fn emit_list_expr(src: String, elems: [ListElem], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  emit_list_tail(src, elems, fns, variants, lams)
+
+# ---- record literal emission ----
+
+fn emit_field_init_val(src: String, fi: FieldInit, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fi { FI(_, val) -> emit_expr(src,val, fns, variants, lams) }
+}
+
+fn emit_field_init_name(fi: FieldInit) : String {
+  match fi { FI(name, _) -> cat3("\"", name, "\"") }
+}
+
+fn emit_record_lit(src: String, fields: [FieldInit], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n = list_length(fields)
+  let vals = join_with(map(fields, (fi) => emit_field_init_val(src, fi, fns, variants, lams)), ", ")
+  let names = join_with(map(fields, emit_field_init_name), ", ")
+  concat_all([
+    "kai_record(", int_to_string(n),
+    ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
+  ])
+}
+
+# ---- match: pattern test + bind emission ----
+
+fn emit_pat_test(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pat.pkind {
+    PWild -> "1"
+    PBind(_) -> "1"
+    PLit(e) -> concat_all(["kai_eq(", scr, ", ", emit_expr(src,e, fns, variants, lams), ")"])
+    PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, fns, variants, lams)
+    PVariant(name, subs) -> emit_pat_test_variant(src, name, subs, scr, fns, variants, lams)
+    PVariantRecord(name, fields) -> emit_pat_test_variant_record(src, name, fields, scr, fns, variants, lams)
+    PRecord(fields) -> emit_pat_test_record(src, fields, scr, fns, variants, lams)
+  }
+}
+
+fn emit_pat_test_list(src: String, pats: [Pattern], opt_rest: Option[String],
+                      scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n_fixed = list_length(pats)
+  let has_rest = match opt_rest { Some(_) -> true None -> false }
+  if n_fixed == 0 and not has_rest {
+    concat_all(["(", scr, " && ", scr, "->tag == KAI_NIL)"])
+  } else {
+    cat3("(", emit_pat_test_list_loop(src, pats, has_rest, scr, 0, n_fixed, fns, variants, lams), ")")
+  }
+}
+
+fn emit_pat_test_list_loop(src: String, pats: [Pattern], has_rest: Bool,
+                            cur: String, i: Int, n_fixed: Int,
+                            fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  if i >= n_fixed {
+    if has_rest { "1" }
+    else { concat_all([cur, " && ", cur, "->tag == KAI_NIL"]) }
+  } else {
+    let sep = if i == 0 { "" } else { " && " }
+    let head = cat2(cur, "->as.cons.head")
+    let tail = cat2(cur, "->as.cons.tail")
+    # Find the i-th pattern.
+    let pi = list_nth(pats, i)
+    let head_test = emit_pat_test(src, pi, head, fns, variants, lams)
+    let cons_guard = concat_all([cur, " && ", cur, "->tag == KAI_CONS"])
+    concat_all([
+      sep, cons_guard, " && ", head_test, " && ",
+      emit_pat_test_list_loop(src, pats, has_rest, tail, i + 1, n_fixed, fns, variants, lams)
+    ])
+  }
+}
+
+fn list_nth(xs: [Pattern], i: Int) : Pattern {
+  match xs {
+    [] -> mk_pat(PWild, 0, 0)
+    [h, ...rest] -> if i == 0 { h } else { list_nth(rest, i - 1) }
+  }
+}
+
+fn emit_pat_test_variant(src: String, name: String, subs: [Pattern],
+                         scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let base = concat_all([
+    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
+    scr, "->as.var.variant_name, \"", name, "\") == 0"
+  ])
+  cat3(base, emit_pat_test_variant_subs(src, subs, scr, 0, fns, variants, lams), ")")
+}
+
+fn emit_pat_test_variant_subs(src: String, subs: [Pattern], scr: String, i: Int,
+                              fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
+      let t = emit_pat_test(src, sp, sub_scr, fns, variants, lams)
+      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, scr, i + 1, fns, variants, lams)])
+    }
+  }
+}
+
+fn emit_pat_test_record(src: String, fields: [PField], scr: String,
+                        fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let base = concat_all(["(", scr, " && ", scr, "->tag == KAI_RECORD"])
+  cat3(base, emit_pat_test_record_fields(src, fields, scr, fns, variants, lams), ")")
+}
+
+fn emit_pat_test_record_fields(src: String, fields: [PField], scr: String,
+                               fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fields {
+    [] -> ""
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let tmp = concat_all(["kai_field(", scr, ", \"", name, "\")"])
+        let t = emit_pat_test(src, sub, tmp, fns, variants, lams)
+        concat_all([" && (", t, ")", emit_pat_test_record_fields(src, rest, scr, fns, variants, lams)])
+      }
+    }
+  }
+}
+
+fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr: String,
+                                 fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # Variant with record destructuring: first check variant tag, then
+  # record fields are accessed via kai_field on the scrutinee itself
+  # because the emit side stores records directly in variants.
+  let base = concat_all([
+    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
+    scr, "->as.var.variant_name, \"", name, "\") == 0"
+  ])
+  cat3(base, emit_pat_test_record_fields(src, fields, scr, fns, variants, lams), ")")
+}
+
+fn emit_pat_binds(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pat.pkind {
+    PWild -> ""
+    PLit(_) -> ""
+    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+    PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, fns, variants, lams)
+    PVariant(_, subs) -> emit_pat_binds_variant(src, subs, scr, 0, fns, variants, lams)
+    PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
+    PRecord(fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
+  }
+}
+
+fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
+                       cur: String, i: Int, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pats {
+    [] -> match opt_rest {
+      Some(name) -> concat_all(["KaiValue *kai_", name, " = ", cur, "; "])
+      None -> ""
+    }
+    [p, ...rest] -> {
+      let head = cat2(cur, "->as.cons.head")
+      let tail = cat2(cur, "->as.cons.tail")
+      cat2(emit_pat_binds(src, p, head, fns, variants, lams),
+           emit_pat_binds_list(src, rest, opt_rest, tail, i + 1, fns, variants, lams))
+    }
+  }
+}
+
+fn emit_pat_binds_variant(src: String, subs: [Pattern], scr: String, i: Int,
+                          fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
+      cat2(emit_pat_binds(src, sp, sub_scr, fns, variants, lams),
+           emit_pat_binds_variant(src, rest, scr, i + 1, fns, variants, lams))
+    }
+  }
+}
+
+fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
+                          fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fields {
+    [] -> ""
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let tmp = concat_all(["kai_field(", scr, ", \"", name, "\")"])
+        cat2(emit_pat_binds(src, sub, tmp, fns, variants, lams),
+             emit_pat_binds_record(src, rest, scr, fns, variants, lams))
+      }
+    }
+  }
+}
+
+fn emit_match_arms(src: String, arms: [Arm], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  concat_all(map(arms, (a) => emit_match_arm(src, a, fns, variants, lams)))
+
+fn emit_match_arm(src: String, a: Arm, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match a {
+    Arm(pat, opt_guard, body) -> {
+      let pt = emit_pat_test(src, pat, "_scr", fns, variants, lams)
+      let binds = emit_pat_binds(src, pat, "_scr", fns, variants, lams)
+      let body_c = emit_expr(src,body, fns, variants, lams)
+      match opt_guard {
+        Some(g) -> {
+          let gc = emit_expr(src,g, fns, variants, lams)
+          concat_all([
+            "    if (", pt, ") { ", binds,
+            "if (kai_truthy(", gc, ")) { _r = ", body_c, "; break; } }\n"
+          ])
+        }
+        None -> concat_all([
+          "    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"
+        ])
+      }
+    }
+  }
+}
+
+fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let sc = emit_expr(src,scrut, fns, variants, lams)
+  concat_all([
+    "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
+    emit_match_arms(src, arms, fns, variants, lams),
+    "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
+    "} while (0); _r; })"
+  ])
+}
+
+# ---- string interpolation ----
+#
+# The raw span includes quotes: either 1 quote on each side for single-
+# or 3 quotes for triple. We walk the body (between the quotes) and
+# split into literal / expression parts at each `#{...}` boundary, then
+# chain them via kai_string_concat wrapping each expression in
+# kai_to_string.
+
+type IPart = IpLit(String, String) | IpExp(String)   # lit: body_slice, raw_literal; exp: body_slice
+
+fn interp_is_triple(span: String) : Bool {
+  let n = string_length(span)
+  if n < 6 { false }
+  else {
+    match char_at(span, 0) {
+      Some(c) -> c == '"' and match char_at(span, 1) {
+        Some(c2) -> c2 == '"' and match char_at(span, 2) {
+          Some(c3) -> c3 == '"'
+          None -> false
+        }
+        None -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Walk the inner body of a string span between (start, end), accumulating
+# parts. At `#{`, open a new IpExp until the balanced `}`; otherwise
+# grow the current literal span.
+type IScan = { parts: [IPart], lit_start: Int, i: Int }
+
+fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] {
+  if st.i >= end { finish_iscan(span, end, st) }
+  else {
+    match char_at(span, st.i) {
+      None -> finish_iscan(span, end, st)
+      Some(c) -> {
+        let nxt = match char_at(span, st.i + 1) { Some(c2) -> c2 None -> ' ' }
+        if c == '#' and nxt == '{' and st.i + 1 < end {
+          let lit_part =
+            if st.i > st.lit_start {
+              let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
+              [IpLit(piece, cat3("\"", piece, "\""))]
+            } else { [] }
+          let expr_start = st.i + 2
+          let expr_end = iscan_expr_end(span, expr_start, end, 1)
+          let expr_src = string_slice(span, expr_start, expr_end - expr_start)
+          let new_parts = list_append(st.parts, list_append(lit_part, [IpExp(expr_src)]))
+          let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
+          iscan_collect(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
+        } else {
+          iscan_collect(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
+        }
+      }
+    }
+  }
+}
+
+fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
+  if depth == 0 or i >= end { i }
+  else {
+    match char_at(span, i) {
+      None -> i
+      Some(c) -> {
+        if c == '{' { iscan_expr_end(span, i + 1, end, depth + 1) }
+        else if c == '}' {
+          if depth == 1 { i }
+          else { iscan_expr_end(span, i + 1, end, depth - 1) }
+        }
+        else { iscan_expr_end(span, i + 1, end, depth) }
+      }
+    }
+  }
+}
+
+fn finish_iscan(span: String, end: Int, st: IScan) : [IPart] {
+  if st.lit_start < end {
+    let piece = string_slice(span, st.lit_start, end - st.lit_start)
+    list_append(st.parts, [IpLit(piece, cat3("\"", piece, "\""))])
+  } else {
+    st.parts
+  }
+}
+
+fn emit_interp_parts(src: String, parts: [IPart], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match parts {
+    [] -> "kai_str(\"\")"
+    [p] -> emit_interp_part(src, p, fns, variants, lams)
+    [p, ...rest] -> concat_all([
+      "kai_string_concat(",
+      emit_interp_part(src, p, fns, variants, lams),
+      ", ",
+      emit_interp_parts(src, rest, fns, variants, lams),
+      ")"
+    ])
+  }
+}
+
+fn emit_interp_part(src: String, p: IPart, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match p {
+    IpLit(_, raw) -> cat3("kai_str(", raw, ")")
+    IpExp(expr_src) -> {
+      let toks = tokenize(expr_src)
+      let prs = parser_new("<interp>", expr_src, toks)
+      let r = parse_expr(prs)
+      match r.r {
+        Some(e) -> cat3("kai_to_string(", emit_expr(src,e, fns, variants, lams), ")")
+        None -> "kai_str(\"\")"
+      }
+    }
+  }
+}
+
+fn emit_string_expr(src: String, span: String, is_triple: Bool, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  # Fast path: if no `#{` appears, emit as a plain C literal.
+  if not has_interp(span, body_start, body_end) {
+    cat3("kai_str(", span, ")")
+  } else {
+    let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+    emit_interp_parts(src, parts, fns, variants, lams)
+  }
+}
+
+fn has_interp(span: String, i: Int, end: Int) : Bool {
+  if i + 1 >= end { false }
+  else {
+    match char_at(span, i) {
+      Some(c) -> {
+        if c == '#' {
+          match char_at(span, i + 1) {
+            Some(c2) -> if c2 == '{' { true } else { has_interp(span, i + 1, end) }
+            None -> false
+          }
+        } else { has_interp(span, i + 1, end) }
+      }
+      None -> false
+    }
+  }
+}
+
+# ---- lambda collection + emission ----
+#
+# We pre-walk the program building a list of LamInfo entries; each entry
+# gets a unique id and records the lambda's params, its free variables
+# (its closure captures), and its body. At emit time the lambda
+# expression is replaced with `kai_closure(&_kai_lam_<id>, arity,
+# n_caps, captures)`; the body is emitted as a separate function later.
+
+type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
+
+fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
+  match lams {
+    [] -> None
+    [l, ...rest] -> match l {
+      LamInfo(_, ln, cl, _, _, _) ->
+        if ln == line and cl == col { Some(l) }
+        else { find_lam(rest, line, col) }
+    }
+  }
+}
+
+# Free variables of an expression, given the lambda's own params and the
+# program's globals. We skip descent into nested ELambdas (each gets its
+# own capture set), and re-parse string interpolations so identifiers
+# hidden inside #{...} get captured too.
+fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] {
+  match x.kind {
+    EInt(_)  -> acc
+    EReal(_) -> acc
+    EBool(_) -> acc
+    EChar(_) -> acc
+    EStr(span, is_triple) -> fv_interp(span, is_triple, own, globals, acc)
+    EUnit -> acc
+    EVar(name) -> {
+      if list_has(own, name) { acc }
+      else if list_has(globals, name) { acc }
+      else if list_has(acc, name) { acc }
+      else { [name, ...acc] }
+    }
+    EUnder -> acc
+    EPlaceholder -> acc
+    ECall(f, xs) -> fv_exprs(xs, own, globals, fv_expr(f, own, globals, acc))
+    EField(base, _) -> fv_expr(base, own, globals, acc)
+    EIndex(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EBinop(_, a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EUnop(_, inner) -> fv_expr(inner, own, globals, acc)
+    EIf(c, a, opt_b) -> {
+      let acc1 = fv_expr(a, own, globals, fv_expr(c, own, globals, acc))
+      match opt_b { Some(b) -> fv_expr(b, own, globals, acc1) None -> acc1 }
+    }
+    EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
+    ELambda(_, _) -> acc                      # nested lambdas collect their own
+    ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
+    EList(elems) -> fv_list_elems(elems, own, globals, acc)
+    ERange(a, b, opt_step) -> {
+      let acc1 = fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+      match opt_step { Some(s) -> fv_expr(s, own, globals, acc1) None -> acc1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let acc1 = fv_stmts(stmts, own, globals, acc)
+      match opt_final { Some(f) -> fv_expr(f, own, globals, acc1) None -> acc1 }
+    }
+    EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+  }
+}
+
+fn fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> acc
+    [h, ...rest] -> fv_exprs(rest, own, globals, fv_expr(h, own, globals, acc))
+  }
+}
+
+fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [String] {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own, globals, acc) None -> acc }
+        fv_arms(rest, own, globals, fv_expr(body, own, globals, acc1))
+      }
+    }
+  }
+}
+
+fn fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, val) -> fv_field_inits(rest, own, globals, fv_expr(val, own, globals, acc))
+    }
+  }
+}
+
+fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]) : [String] {
+  match es {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+      ElSpread(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+    }
+  }
+}
+
+fn fv_stmts(ss: [Stmt], own: [String], globals: [String], acc: [String]) : [String] {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> fv_stmts(rest, own, globals, fv_stmt(s, own, globals, acc))
+  }
+}
+
+fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] {
+  match s {
+    SLet(_, _, rhs) -> fv_expr(rhs, own, globals, acc)
+    SAssert(c, opt_m) -> {
+      let acc1 = fv_expr(c, own, globals, acc)
+      match opt_m { Some(m) -> fv_expr(m, own, globals, acc1) None -> acc1 }
+    }
+    SExprStmt(x) -> fv_expr(x, own, globals, acc)
+  }
+}
+
+fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  fv_interp_parts(parts, own, globals, acc)
+}
+
+fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [String]) : [String] {
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> fv_interp_parts(rest, own, globals, acc)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let acc1 = match r.r {
+          Some(e) -> fv_expr(e, own, globals, acc)
+          None -> acc
+        }
+        fv_interp_parts(rest, own, globals, acc1)
+      }
+    }
+  }
+}
+
+# ---- lambda collection pass ----
+
+type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String] }
+
+fn lc_new(globals: [String]) : LamCollect = LamCollect { next_id: 0, lams: [], globals: globals }
+
+fn params_to_names(ps: [Param]) : [String] =
+  map(ps, (pm) => pm.pname)
+
+fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
+  match x.kind {
+    EInt(_)  -> st
+    EReal(_) -> st
+    EBool(_) -> st
+    EChar(_) -> st
+    EStr(span, is_triple) -> collect_interp(span, is_triple, st)
+    EUnit -> st
+    EVar(_) -> st
+    EUnder -> st
+    EPlaceholder -> st
+    ECall(f, xs) -> collect_exprs(xs, collect_expr(f, st))
+    EField(base, _) -> collect_expr(base, st)
+    EIndex(a, b) -> collect_expr(b, collect_expr(a, st))
+    EBinop(_, a, b) -> collect_expr(b, collect_expr(a, st))
+    EUnop(_, inner) -> collect_expr(inner, st)
+    EIf(c, a, opt_b) -> {
+      let s1 = collect_expr(a, collect_expr(c, st))
+      match opt_b { Some(b) -> collect_expr(b, s1) None -> s1 }
+    }
+    EMatch(scr, arms) -> collect_arms(arms, collect_expr(scr, st))
+    ELambda(params, body) -> {
+      let id = st.next_id
+      let own = params_to_names(params)
+      let caps = fv_expr(body, own, st.globals, [])
+      let info = LamInfo(id, x.line, x.col, params, caps, body)
+      let st1 = LamCollect { next_id: id + 1, lams: list_append(st.lams, [info]), globals: st.globals }
+      collect_expr(body, st1)
+    }
+    ERecordLit(_, fields) -> collect_field_inits(fields, st)
+    EList(elems) -> collect_list_elems(elems, st)
+    ERange(a, b, opt_step) -> {
+      let s1 = collect_expr(b, collect_expr(a, st))
+      match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let s1 = collect_stmts(stmts, st)
+      match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+    }
+    EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+  }
+}
+
+fn collect_exprs(xs: [Expr], st: LamCollect) : LamCollect {
+  match xs {
+    [] -> st
+    [h, ...rest] -> collect_exprs(rest, collect_expr(h, st))
+  }
+}
+
+fn collect_arms(arms: [Arm], st: LamCollect) : LamCollect {
+  match arms {
+    [] -> st
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let s1 = match opt_g { Some(g) -> collect_expr(g, st) None -> st }
+        collect_arms(rest, collect_expr(body, s1))
+      }
+    }
+  }
+}
+
+fn collect_field_inits(fs: [FieldInit], st: LamCollect) : LamCollect {
+  match fs {
+    [] -> st
+    [f, ...rest] -> match f {
+      FI(_, val) -> collect_field_inits(rest, collect_expr(val, st))
+    }
+  }
+}
+
+fn collect_list_elems(es: [ListElem], st: LamCollect) : LamCollect {
+  match es {
+    [] -> st
+    [el, ...rest] -> match el {
+      ElPlain(x) -> collect_list_elems(rest, collect_expr(x, st))
+      ElSpread(x) -> collect_list_elems(rest, collect_expr(x, st))
+    }
+  }
+}
+
+fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect {
+  match ss {
+    [] -> st
+    [s, ...rest] -> collect_stmts(rest, collect_stmt(s, st))
+  }
+}
+
+fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
+  match s {
+    SLet(_, _, rhs) -> collect_expr(rhs, st)
+    SAssert(c, opt_m) -> {
+      let s1 = collect_expr(c, st)
+      match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
+    }
+    SExprStmt(x) -> collect_expr(x, st)
+  }
+}
+
+fn collect_interp(span: String, is_triple: Bool, st: LamCollect) : LamCollect {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  collect_interp_parts(parts, st)
+}
+
+fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
+  match parts {
+    [] -> st
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> collect_interp_parts(rest, st)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let st1 = match r.r { Some(e) -> collect_expr(e, st) None -> st }
+        collect_interp_parts(rest, st1)
+      }
+    }
+  }
+}
+
+fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
+  match d {
+    DFn(_, _, _, _, body, _, _) -> collect_expr(body, st)
+    DType(_, _, _, _, _, _) -> st
+    DTest(_, body, _, _) -> collect_expr(body, st)
+    DImport(_, _, _) -> st
+  }
+}
+
+fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
+  match ds {
+    [] -> st
+    [d, ...rest] -> collect_decls(rest, collect_decl(d, st))
+  }
+}
+
+# Globals: prelude names + user fn names + variant ctor names. Used as a
+# cheap "this ident does not need to be captured" test.
+fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
+fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
+
+fn build_globals(fns: [EFn], variants: [EVar]) : [String] {
+  let p = prelude_names()
+  let f = map(fns, efn_name)
+  let v = map(variants, evar_name)
+  list_append(p, list_append(f, v))
+}
+
+# ---- lambda helper emission ----
+
+fn emit_lam_arg_reads(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    KaiValue *kai_", p.pname, " = args[", int_to_string(i), "];\n",
+      emit_lam_arg_reads(rest, i + 1)
+    ])
+  }
+}
+
+fn emit_lam_cap_reads(caps: [String], i: Int) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "    KaiValue *kai_", c, " = self->as.clo.captures[", int_to_string(i), "];\n",
+      emit_lam_cap_reads(rest, i + 1)
+    ])
+  }
+}
+
+fn emit_lam_helper(src: String, l: LamInfo, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match l {
+    LamInfo(id, _, _, params, caps, body) -> {
+      let arg_reads = emit_lam_arg_reads(params, 0)
+      let cap_reads = emit_lam_cap_reads(caps, 0)
+      let body_c = emit_expr(src,body, fns, variants, lams)
+      concat_all([
+        "static KaiValue *_kai_lam_", int_to_string(id),
+        "(KaiValue *self, KaiValue **args, int n) {\n",
+        "    (void) self; (void) n;\n",
+        arg_reads, cap_reads,
+        "    return ", body_c, ";\n}\n\n"
+      ])
+    }
+  }
+}
+
+fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar]) : String =
+  concat_all(map(lams, (l) => emit_lam_helper(src, l, fns, variants, lams)))
+
+fn emit_one_lam_forward(l: LamInfo) : String =
+  match l {
+    LamInfo(id, _, _, _, _, _) ->
+      concat_all(["static KaiValue *_kai_lam_", int_to_string(id), "(KaiValue *, KaiValue **, int);\n"])
+  }
+
+fn emit_lam_forward_decls(lams: [LamInfo]) : String =
+  concat_all(map(lams, emit_one_lam_forward))
+
+fn emit_closure_caps(caps: [String]) : String =
+  join_with(map(caps, (c) => cat2("kai_", c)), ", ")
+
+fn emit_lambda_ref(x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match find_lam(lams, x.line, x.col) {
+    None -> "kai_unit() /* lambda: missing info */"
+    Some(l) -> match l {
+      LamInfo(id, _, _, params, caps, _) -> {
+        let arity = list_length(params)
+        let n_caps = list_length(caps)
+        if n_caps == 0 {
+          concat_all([
+            "kai_closure(&_kai_lam_", int_to_string(id),
+            ", ", int_to_string(arity), ", 0, NULL)"
+          ])
+        } else {
+          concat_all([
+            "kai_closure(&_kai_lam_", int_to_string(id),
+            ", ", int_to_string(arity), ", ", int_to_string(n_caps),
+            ", (KaiValue *[]){", emit_closure_caps(caps), "})"
+          ])
+        }
+      }
+    }
+  }
+}
+
+# ---- full emit_expr (with lambda support) ----
+
+fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match x.kind {
     EInt(n)      -> cat3("kai_int(", int_to_string(n), "LL)")
     EReal(r)     -> cat3("kai_real(", real_to_string(r), ")")
     EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
     EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
-    EStr(span, _) -> cat3("kai_str(", span, ")")
+    EStr(span, is_triple) -> emit_string_expr(src, span, is_triple, fns, variants, lams)
     EUnit        -> "kai_unit()"
     EVar(name)   -> emit_ident_value(name, fns, variants)
     EUnder       -> "kai_unit() /* _ */"
     EPlaceholder -> "kai_unit() /* placeholder */"
-    ECall(f, args_e) -> emit_call_expr(src, f, args_e, fns, variants)
+    ECall(f, args_e) -> emit_call_expr(src, f, args_e, fns, variants, lams)
     EField(base, fname) -> {
-      let b = emit_expr(src, base, fns, variants)
+      let b = emit_expr(src, base, fns, variants, lams)
       cat5("kai_field(", b, ", \"", fname, "\")")
     }
     EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
     EBinop(op, a, b) -> {
       if op == "and" {
         concat_all([
-          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants),
-          "; kai_truthy(_a) ? ", emit_expr(src, b, fns, variants),
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams),
+          "; kai_truthy(_a) ? ", emit_expr(src, b, fns, variants, lams),
           " : kai_bool(0); })"
         ])
       } else if op == "or" {
         concat_all([
-          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants),
-          "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants), "; })"
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams),
+          "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants, lams), "; })"
         ])
       } else {
         match binop_cname(op) {
           Some(cn) -> concat_all([
             cn, "(",
-            emit_expr(src, a, fns, variants), ", ",
-            emit_expr(src, b, fns, variants), ")"
+            emit_expr(src, a, fns, variants, lams), ", ",
+            emit_expr(src, b, fns, variants, lams), ")"
           ])
           None -> cat3("kai_unit() /* unknown binop: ", op, " */")
         }
@@ -3465,68 +4231,68 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar]) : String {
     }
     EUnop(op, inner) -> {
       match unop_cname(op) {
-        Some(cn) -> concat_all([cn, "(", emit_expr(src, inner, fns, variants), ")"])
+        Some(cn) -> concat_all([cn, "(", emit_expr(src, inner, fns, variants, lams), ")"])
         None -> cat3("kai_unit() /* unknown unop: ", op, " */")
       }
     }
     EIf(c, a, opt_b) -> {
-      let cc = emit_expr(src, c, fns, variants)
-      let tc = emit_expr(src, a, fns, variants)
+      let cc = emit_expr(src, c, fns, variants, lams)
+      let tc = emit_expr(src, a, fns, variants, lams)
       let ec = match opt_b {
-        Some(eb) -> emit_expr(src, eb, fns, variants)
+        Some(eb) -> emit_expr(src, eb, fns, variants, lams)
         None -> "kai_unit()"
       }
       concat_all(["(kai_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
     }
-    EMatch(_, _) -> "kai_unit() /* match: milestone 8 */"
-    ELambda(_, _) -> "kai_unit() /* lambda: milestone 8 */"
-    ERecordLit(_, _) -> "kai_unit() /* record_lit: milestone 8 */"
-    EList(_) -> "kai_unit() /* list: milestone 8 */"
-    ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, fns, variants)
+    EMatch(scr, arms) -> emit_match_expr(src, scr, arms, fns, variants, lams)
+    ELambda(_, _) -> emit_lambda_ref(x, fns, variants, lams)
+    ERecordLit(_, fields) -> emit_record_lit(src, fields, fns, variants, lams)
+    EList(elems) -> emit_list_expr(src, elems, fns, variants, lams)
+    ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, fns, variants, lams)
     EBlock(stmts, opt_final) -> {
       match stmts {
         [] -> match opt_final {
-          Some(fe) -> emit_expr(src, fe, fns, variants)
+          Some(fe) -> emit_expr(src, fe, fns, variants, lams)
           None -> "kai_unit()"
         }
         _ -> {
-          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants)))
+          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants, lams)))
           let final_out = match opt_final {
-            Some(fe) -> cat2(emit_expr(src, fe, fns, variants), "; ")
+            Some(fe) -> cat2(emit_expr(src, fe, fns, variants, lams), "; ")
             None -> "kai_unit(); "
           }
           cat4("({ ", stmt_out, final_out, "})")
         }
       }
     }
-    EPipe(a, b) -> emit_pipe_expr(src, a, b, fns, variants)
+    EPipe(a, b) -> emit_pipe_expr(src, a, b, fns, variants, lams)
   }
 }
 
-fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar]) : String {
+fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match s {
-    SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, fns, variants)
-    SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, fns, variants)
-    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants), "; (void) _; } ")
+    SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, fns, variants, lams)
+    SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, fns, variants, lams)
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants, lams), "; (void) _; } ")
   }
 }
 
-fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EVar]) : String {
-  let rhs_c = emit_expr(src, rhs, fns, variants)
+fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let rhs_c = emit_expr(src, rhs, fns, variants, lams)
   match pat.pkind {
     PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
     PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
-    _ -> cat3("/* let pattern: milestone 8 */ KaiValue *_letv = ", rhs_c, "; ")
+    _ -> {
+      # Destructuring let: bind a temp, then run pattern binds.
+      let binds = emit_pat_binds(src, pat, "_letv", fns, variants, lams)
+      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "} "])
+    }
   }
 }
 
 fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
-                    fns: [EFn], variants: [EVar]) : String {
-  # Inside test_mode the runner function wraps each test and returns on
-  # failure. Out of test_mode we panic. Stage 0 chooses based on the
-  # enclosing block's mode; stage 1 treats every assert identically for
-  # now — assertions outside tests panic, matching stage 0's behaviour.
-  let cc = emit_expr(src, cond, fns, variants)
+                    fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let cc = emit_expr(src, cond, fns, variants, lams)
   concat_all([
     "{ KaiValue *_c = ", cc,
     "; if (!kai_truthy(_c)) { kai_prelude_panic(kai_str(\"assertion failed\")); } } "
@@ -3560,11 +4326,11 @@ fn emit_thunk_forward(d: Decl) : String {
   }
 }
 
-fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar]) : String {
+fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   match d {
     DFn(_, name, params, _, body, _, _) -> {
       let sig = emit_fn_signature(name, params)
-      let body_c = emit_expr(src, body, fns, variants)
+      let body_c = emit_expr(src, body, fns, variants, lams)
       cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
     }
     _ -> ""
@@ -3608,10 +4374,10 @@ fn fn_forward_decls(decls: [Decl]) : String =
 fn thunk_forward_decls(decls: [Decl]) : String =
   concat_all(map(decls, emit_thunk_forward))
 
-fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar]) : String =
+fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
   concat_all(map(decls, (d) => {
     match d {
-      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants), emit_fn_thunk(d))
+      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
       _ -> ""
     }
   }))
@@ -3640,12 +4406,18 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
 fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : String {
   let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
+  let globals = build_globals(fns, variants)
+  let st0 = lc_new(globals)
+  let st = collect_decls(decls, st0)
+  let lams = st.lams
   let header = "/* generated by kaikai stage 1 */\n#include \"runtime.h\"\n\n"
   let fwd = fn_forward_decls(decls)
   let thunk_fwd = thunk_forward_decls(decls)
-  let bodies = fn_bodies(src, decls, fns, variants)
+  let lam_fwd = emit_lam_forward_decls(lams)
+  let bodies = fn_bodies(src, decls, fns, variants, lams)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, variants)
   let main_wr = emit_main_wrapper(decls, test_mode)
-  cat5(header, fwd, cat2("\n", thunk_fwd), cat2("\n", bodies), main_wr)
+  concat_all([header, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, main_wr])
 }
 
 # ====================================================================
