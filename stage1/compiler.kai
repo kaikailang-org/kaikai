@@ -1,13 +1,622 @@
 # stage 1: kaikai compiler, written in kaikai-minimal.
 #
-# This file is compiled by stage 0 (the C bootstrap) into a native binary
-# (`kaic1`). kaic1 then compiles kaikai source to portable C, the same way
-# kaic0 does today, with the feature set growing in subsequent milestones
-# until it can compile stage 1 itself (the self-hosting checkpoint).
-#
-# Layout: one file for now. See docs/stage1-design.md.
+# This file is compiled by stage 0 (the C bootstrap) into `kaic1`. kaic1
+# then compiles kaikai source to portable C. The module starts with
+# shared utilities, then grows a lexer, parser, checker, and emitter in
+# successive milestones. See docs/stage1-design.md.
 
-# ---- cli + driver ----
+# ====================================================================
+# char classification helpers
+# ====================================================================
+
+fn ch_is_digit(c: Char) : Bool = c >= '0' and c <= '9'
+fn ch_is_lower(c: Char) : Bool = c >= 'a' and c <= 'z'
+fn ch_is_upper(c: Char) : Bool = c >= 'A' and c <= 'Z'
+fn ch_is_alpha(c: Char) : Bool = ch_is_lower(c) or ch_is_upper(c) or c == '_'
+fn ch_is_alnum(c: Char) : Bool = ch_is_alpha(c) or ch_is_digit(c)
+fn ch_is_space(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r'
+
+# ====================================================================
+# token kinds + tokens
+# ====================================================================
+
+type TokKind
+  = TkEof
+  | TkNewline
+  # keywords (alphabetical)
+  | TkAnd | TkAs | TkAssert | TkElse | TkFalse | TkFn | TkIf | TkImport
+  | TkLet | TkMatch | TkNot | TkOr | TkPub | TkTest | TkTrue | TkType
+  # literals
+  | TkInt | TkReal | TkChar | TkString
+  # identifiers
+  | TkIdent | TkUnderscore
+  # punctuation
+  | TkLparen | TkRparen | TkLbracket | TkRbracket | TkLbrace | TkRbrace
+  | TkComma | TkColon | TkSemi | TkDot | TkDotDot | TkEllipsis
+  # operators
+  | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply
+  | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
+  | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
+  | TkBang
+  # error token carries a human-readable message
+  | TkError(String)
+
+type Token = { kind: TokKind, line: Int, col: Int, start: Int, length: Int }
+
+# Convenience constructor — fewer characters at call sites.
+fn tok(kind: TokKind, line: Int, col: Int, start: Int, end: Int) : Token {
+  Token { kind: kind, line: line, col: col, start: start, length: end - start }
+}
+
+# Mnemonic for token kinds (for --tokens dump). Keep in sync with TokKind.
+fn tk_name(k: TokKind) : String {
+  match k {
+    TkEof -> "EOF"
+    TkNewline -> "NEWLINE"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkElse -> "else"
+    TkFalse -> "false" TkFn -> "fn" TkIf -> "if" TkImport -> "import"
+    TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
+    TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
+    TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
+    TkIdent -> "IDENT" TkUnderscore -> "_"
+    TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
+    TkLbrace -> "{" TkRbrace -> "}"
+    TkComma -> "," TkColon -> ":" TkSemi -> ";"
+    TkDot -> "." TkDotDot -> ".." TkEllipsis -> "..."
+    TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
+    TkPipe -> "|" TkPipeApply -> "|>"
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkSlashSlash -> "//" TkPercent -> "%"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!"
+    TkError(_) -> "ERROR"
+  }
+}
+
+# ====================================================================
+# lexer state + helpers
+# ====================================================================
+
+type Lexer = { src: String, pos: Int, line: Int, col: Int }
+
+fn lex_new(src: String) : Lexer = Lexer { src: src, pos: 0, line: 1, col: 1 }
+
+fn lex_at_end(l: Lexer) : Bool = l.pos >= string_length(l.src)
+
+fn lex_peek_at(l: Lexer, off: Int) : Option[Char] =
+  char_at(l.src, l.pos + off)
+
+fn lex_peek(l: Lexer) : Option[Char] = lex_peek_at(l, 0)
+
+fn lex_advance(l: Lexer) : Lexer {
+  match char_at(l.src, l.pos) {
+    None -> l
+    Some(c) -> {
+      if c == '\n' {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line + 1, col: 1 }
+      } else {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line, col: l.col + 1 }
+      }
+    }
+  }
+}
+
+# Pair of lexer state + emitted token. Used everywhere the scanner
+# returns both a new position and a produced token.
+type LexStep = Step(Lexer, Token)
+
+# Returns true if the next char matches `want` (and does not consume it).
+fn lex_peek_is(l: Lexer, want: Char) : Bool {
+  match lex_peek(l) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+fn lex_peek2_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 1) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+fn lex_peek3_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 2) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+# ====================================================================
+# whitespace and comments
+# ====================================================================
+
+fn lex_skip_comment(l: Lexer) : Lexer {
+  # `#` already consumed. Stop at newline or EOF; the newline itself is a
+  # token and stays for the main loop to emit.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if c == '\n' { l } else { lex_skip_comment(lex_advance(l)) }
+  }
+}
+
+fn lex_skip_ws(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_space(c) { lex_skip_ws(lex_advance(l)) }
+      else if c == '#' { lex_skip_ws(lex_skip_comment(lex_advance(l))) }
+      else { l }
+    }
+  }
+}
+
+# ====================================================================
+# identifiers and keywords
+# ====================================================================
+
+fn lex_scan_ident_rest(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if ch_is_alnum(c) { lex_scan_ident_rest(lex_advance(l)) } else { l }
+  }
+}
+
+fn keyword_kind(text: String) : TokKind {
+  if text == "and" { TkAnd }
+  else if text == "as" { TkAs }
+  else if text == "assert" { TkAssert }
+  else if text == "else" { TkElse }
+  else if text == "false" { TkFalse }
+  else if text == "fn" { TkFn }
+  else if text == "if" { TkIf }
+  else if text == "import" { TkImport }
+  else if text == "let" { TkLet }
+  else if text == "match" { TkMatch }
+  else if text == "not" { TkNot }
+  else if text == "or" { TkOr }
+  else if text == "pub" { TkPub }
+  else if text == "test" { TkTest }
+  else if text == "true" { TkTrue }
+  else if text == "type" { TkType }
+  else { TkIdent }
+}
+
+fn lex_ident(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l2 = lex_scan_ident_rest(l)
+  let text = string_slice(l.src, start, l2.pos - start)
+  let kind =
+    if string_length(text) == 1 and text == "_" {
+      TkUnderscore
+    } else {
+      keyword_kind(text)
+    }
+  Step(l2, tok(kind, sl, sc, start, l2.pos))
+}
+
+# ====================================================================
+# numbers
+# ====================================================================
+
+fn lex_scan_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_digit(c) or c == '_' { lex_scan_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+fn lex_number(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_scan_digits(l)
+  # Fractional part: only when `.` is followed by a digit. `x..y` (range)
+  # and `x.field` (access) must be left alone.
+  let after_frac_kind =
+    if lex_peek_is(l1, '.') {
+      match lex_peek_at(l1, 1) {
+        Some(d) -> if ch_is_digit(d) { Some(true) } else { Some(false) }
+        None -> Some(false)
+      }
+    } else {
+      Some(false)
+    }
+  let l2 =
+    match after_frac_kind {
+      Some(true) -> lex_scan_digits(lex_advance(lex_advance(l1)))
+      _ -> l1
+    }
+  let is_real1 = match after_frac_kind { Some(true) -> true _ -> false }
+  # Exponent part: `e` or `E`, optional sign, digits.
+  let has_exp =
+    match lex_peek(l2) {
+      Some(c) -> c == 'e' or c == 'E'
+      None -> false
+    }
+  if has_exp {
+    let l3 = lex_advance(l2)
+    let l4 =
+      match lex_peek(l3) {
+        Some(c) -> if c == '+' or c == '-' { lex_advance(l3) } else { l3 }
+        None -> l3
+      }
+    match lex_peek(l4) {
+      Some(d) -> {
+        if ch_is_digit(d) {
+          let l5 = lex_scan_digits(l4)
+          Step(l5, tok(TkReal, sl, sc, start, l5.pos))
+        } else {
+          Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                       sl, sc, start, l4.pos))
+        }
+      }
+      None -> {
+        Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                     sl, sc, start, l4.pos))
+      }
+    }
+  } else {
+    let kind = if is_real1 { TkReal } else { TkInt }
+    Step(l2, tok(kind, sl, sc, start, l2.pos))
+  }
+}
+
+# ====================================================================
+# strings
+# ====================================================================
+
+# Walk a string literal consuming chars until the closing `"` (or `"""`).
+# Handles backslash escapes and `#{...}` interpolation (nested braces).
+# Return the lexer positioned past the closing quote, plus the kind of
+# token to emit (TkString or TkError(msg)).
+
+type StrResult = StrOk(Lexer) | StrErr(Lexer, String)
+
+# Skip past a nested {...} block inside interpolation, counting braces.
+fn lex_skip_interp(l: Lexer, depth: Int) : StrResult {
+  if depth == 0 { StrOk(l) }
+  else {
+    match lex_peek(l) {
+      None -> StrErr(l, "unterminated interpolation in string")
+      Some(c) -> {
+        if c == '{' { lex_skip_interp(lex_advance(l), depth + 1) }
+        else if c == '}' { lex_skip_interp(lex_advance(l), depth - 1) }
+        else if c == '"' {
+          # Skip a nested string literal inside the interpolation.
+          match lex_skip_inner_string(lex_advance(l)) {
+            StrOk(l2) -> lex_skip_interp(l2, depth)
+            StrErr(l2, msg) -> StrErr(l2, msg)
+          }
+        } else {
+          lex_skip_interp(lex_advance(l), depth)
+        }
+      }
+    }
+  }
+}
+
+fn lex_skip_inner_string(l: Lexer) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string inside interpolation")
+    Some(c) -> {
+      if c == '"' { StrOk(lex_advance(l)) }
+      else if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string inside interpolation")
+          Some(_) -> lex_skip_inner_string(lex_advance(l1))
+        }
+      } else {
+        lex_skip_inner_string(lex_advance(l))
+      }
+    }
+  }
+}
+
+fn lex_string_body(l: Lexer, triple: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string")
+          Some(_) -> lex_string_body(lex_advance(l1), triple)
+        }
+      } else if c == '#' and lex_peek2_is(l, '{') {
+        let l1 = lex_advance(lex_advance(l))
+        match lex_skip_interp(l1, 1) {
+          StrOk(l2) -> lex_string_body(l2, triple)
+          StrErr(l2, msg) -> StrErr(l2, msg)
+        }
+      } else if triple {
+        if c == '"' and lex_peek2_is(l, '"') and lex_peek3_is(l, '"') {
+          StrOk(lex_advance(lex_advance(lex_advance(l))))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      } else {
+        if c == '\n' {
+          StrErr(l, "unterminated string (newline in single-line string)")
+        } else if c == '"' {
+          StrOk(lex_advance(l))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      }
+    }
+  }
+}
+
+fn lex_string(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                  # consume opening "
+  let triple = lex_peek_is(l1, '"') and lex_peek2_is(l1, '"')
+  let l2 = if triple { lex_advance(lex_advance(l1)) } else { l1 }
+  match lex_string_body(l2, triple) {
+    StrOk(l3) -> Step(l3, tok(TkString, sl, sc, start, l3.pos))
+    StrErr(l3, msg) -> Step(l3, tok(TkError(msg), sl, sc, start, l3.pos))
+  }
+}
+
+# ====================================================================
+# char literals
+# ====================================================================
+
+fn lex_char_skip_u_escape(l: Lexer) : Lexer {
+  # We're past `\u`; consume `{HHHH}`.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '}' { lex_advance(l) }
+      else { lex_char_skip_u_escape(lex_advance(l)) }
+    }
+  }
+}
+
+fn lex_char(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                 # consume opening '
+  match lex_peek(l1) {
+    None -> Step(l1, tok(TkError("unterminated char literal"),
+                         sl, sc, start, l1.pos))
+    Some(c) -> {
+      let l2 =
+        if c == '\\' {
+          let la = lex_advance(l1)
+          match lex_peek(la) {
+            None -> la
+            Some(e) -> {
+              if e == 'u' and lex_peek2_is(la, '{') {
+                lex_char_skip_u_escape(lex_advance(lex_advance(la)))
+              } else {
+                lex_advance(la)
+              }
+            }
+          }
+        } else {
+          # One byte of a UTF-8 codepoint. For the stage-0-compatible
+          # subset we treat multi-byte characters structurally: consume
+          # one byte and trust the closing quote to appear.
+          lex_advance(l1)
+        }
+      if lex_peek_is(l2, '\'') {
+        Step(lex_advance(l2), tok(TkChar, sl, sc, start, l2.pos + 1))
+      } else {
+        Step(l2, tok(TkError("unterminated char literal"),
+                     sl, sc, start, l2.pos))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# punctuation and operators
+# ====================================================================
+
+fn lex_punct(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  match lex_peek(l) {
+    None -> Step(l, tok(TkEof, sl, sc, start, start))
+    Some(c) -> {
+      let l1 = lex_advance(l)
+      if c == '(' { Step(l1, tok(TkLparen, sl, sc, start, l1.pos)) }
+      else if c == ')' { Step(l1, tok(TkRparen, sl, sc, start, l1.pos)) }
+      else if c == '[' { Step(l1, tok(TkLbracket, sl, sc, start, l1.pos)) }
+      else if c == ']' { Step(l1, tok(TkRbracket, sl, sc, start, l1.pos)) }
+      else if c == '{' { Step(l1, tok(TkLbrace, sl, sc, start, l1.pos)) }
+      else if c == '}' { Step(l1, tok(TkRbrace, sl, sc, start, l1.pos)) }
+      else if c == ',' { Step(l1, tok(TkComma, sl, sc, start, l1.pos)) }
+      else if c == ':' { Step(l1, tok(TkColon, sl, sc, start, l1.pos)) }
+      else if c == ';' { Step(l1, tok(TkSemi, sl, sc, start, l1.pos)) }
+      else if c == '+' { Step(l1, tok(TkPlus, sl, sc, start, l1.pos)) }
+      else if c == '*' { Step(l1, tok(TkStar, sl, sc, start, l1.pos)) }
+      else if c == '%' { Step(l1, tok(TkPercent, sl, sc, start, l1.pos)) }
+      else if c == '-' {
+        if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkArrow, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkMinus, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '/' {
+        if lex_peek_is(l1, '/') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkSlashSlash, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkSlash, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '=' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkEqEq, sl, sc, start, l2.pos))
+        } else if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkFatArrow, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkEq, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '<' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkLe, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkLt, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '>' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkGe, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkGt, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '!' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkNeq, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkBang, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '|' {
+        if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkPipeApply, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkPipe, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '.' {
+        if lex_peek_is(l1, '.') and lex_peek2_is(l1, '.') {
+          let l2 = lex_advance(lex_advance(l1))
+          Step(l2, tok(TkEllipsis, sl, sc, start, l2.pos))
+        } else if lex_peek_is(l1, '.') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkDotDot, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkDot, sl, sc, start, l1.pos))
+        }
+      }
+      else {
+        let msg = string_concat("unexpected character '", string_concat("#{c}", "'"))
+        Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# dispatch: one token
+# ====================================================================
+
+fn lex_next(l: Lexer) : LexStep {
+  let l0 = lex_skip_ws(l)
+  let sl = l0.line
+  let sc = l0.col
+  match lex_peek(l0) {
+    None -> Step(l0, tok(TkEof, sl, sc, l0.pos, l0.pos))
+    Some(c) -> {
+      if c == '\n' {
+        let l1 = lex_advance(l0)
+        Step(l1, tok(TkNewline, sl, sc, l0.pos, l1.pos))
+      }
+      else if ch_is_alpha(c) { lex_ident(l0) }
+      else if ch_is_digit(c) { lex_number(l0) }
+      else if c == '"' { lex_string(l0) }
+      else if c == '\'' { lex_char(l0) }
+      else { lex_punct(l0) }
+    }
+  }
+}
+
+# Build the full token list. Accumulate in reverse for O(1) prepend, then
+# list_reverse once at the end.
+fn lex_loop(l: Lexer, acc: [Token]) : [Token] {
+  match lex_next(l) {
+    Step(l1, t) -> {
+      let acc1 = [t, ...acc]
+      match t.kind {
+        TkEof -> list_reverse(acc1)
+        _ -> lex_loop(l1, acc1)
+      }
+    }
+  }
+}
+
+fn tokenize(src: String) : [Token] {
+  lex_loop(lex_new(src), [])
+}
+
+# ====================================================================
+# token dump (for --tokens)
+# ====================================================================
+
+fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+fn tok_line_str(t: Token) : String = int_to_string(t.line)
+fn tok_col_str(t: Token)  : String = int_to_string(t.col)
+
+fn dump_token(src: String, t: Token) : Unit {
+  match t.kind {
+    TkNewline -> print("#{tok_line_str(t)}:#{tok_col_str(t)}  NEWLINE")
+    TkError(msg) -> eprint("#{tok_line_str(t)}:#{tok_col_str(t)}  ERROR  #{msg}")
+    _ -> {
+      let text = tok_text(src, t)
+      print("#{tok_line_str(t)}:#{tok_col_str(t)}  #{tk_name(t.kind)}  \"#{text}\"")
+    }
+  }
+}
+
+fn dump_tokens(src: String, tokens: [Token]) : Unit {
+  tokens |> each((t) => dump_token(src, t))
+}
+
+# ====================================================================
+# error scanning
+# ====================================================================
+
+fn report_one_error(path: String, t: Token, msg: String) : Unit {
+  eprint("#{path}:#{tok_line_str(t)}:#{tok_col_str(t)}: error: #{msg}")
+}
+
+fn report_errors_loop(path: String, ts: [Token], count: Int) : Int {
+  match ts {
+    [] -> count
+    [t, ...rest] -> match t.kind {
+      TkError(msg) -> {
+        report_one_error(path, t, msg)
+        report_errors_loop(path, rest, count + 1)
+      }
+      _ -> report_errors_loop(path, rest, count)
+    }
+  }
+}
+
+# Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).
+fn report_errors(path: String, src: String, tokens: [Token]) : Int {
+  if report_errors_loop(path, tokens, 0) > 0 { 1 } else { 0 }
+}
+
+# ====================================================================
+# cli + driver
+# ====================================================================
 
 type Mode
   = MDefault
@@ -53,29 +662,21 @@ fn usage() : Unit {
 }
 
 fn compile_source(path: String, mode: Mode, src: String) : Int {
-  # Milestone 2 stub: acknowledge that we received the source.
-  # Subsequent milestones replace this body with lex/parse/check/emit.
-  eprint("stage1 skeleton: #{path} (#{int_to_string(string_length(src))} bytes)")
+  let tokens = tokenize(src)
+  let lex_errs = report_errors(path, src, tokens)
   match mode {
-    MDefault -> {
-      print("/* stage1 placeholder: pipeline not yet wired */")
-      0
-    }
     MTokens -> {
-      eprint("stage1: --tokens not yet implemented")
-      1
+      dump_tokens(src, tokens)
+      lex_errs
     }
-    MAst -> {
-      eprint("stage1: --ast not yet implemented")
-      1
-    }
-    MTest -> {
-      eprint("stage1: --test not yet implemented")
-      1
-    }
-    MHelp -> {
-      usage()
-      0
+    MHelp -> { usage(); 0 }
+    _ -> {
+      if lex_errs != 0 { lex_errs }
+      else {
+        # Milestone 3 stub: later milestones parse, check, and emit here.
+        print("/* stage1 placeholder: parser/checker/emitter not yet wired */")
+        0
+      }
     }
   }
 }

@@ -20,16 +20,21 @@ build/stage1.c: $(SRC) $(STAGE0) | build
 $(TARGET): build/stage1.c
 	$(CC) $(CFLAGS) -I ../stage0 $< -o $@
 
-# End-to-end: stage 1 must at least reach the placeholder body on every
-# example used to verify stage 0. Milestones 6+ replace this with real
-# compilation, byte-compared against stage 0 output.
-test: $(TARGET) build
+# Compare stage 1's --tokens output against stage 0's (normalized to
+# ignore whitespace differences, since stage 0 uses fixed-width columns).
+# Milestones 6+ extend this to parser/emitter checks against stage 0.
+test-tokens: $(TARGET) build
 	@set -e; \
-	for f in ../examples/minimal/*.kai; do \
-	  echo "=== stage1 on $$(basename $$f) ==="; \
-	  ./$(TARGET) $$f > /dev/null; \
+	for f in ../examples/minimal/*.kai compiler.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --tokens $$f | awk '{$$1=$$1; print}' > build/s1-$$name.tok; \
+	  $(STAGE0) --tokens $$f   | awk '{$$1=$$1; print}' > build/s0-$$name.tok; \
+	  diff -q build/s0-$$name.tok build/s1-$$name.tok > /dev/null \
+	    && echo "tokens OK $$name" \
+	    || { echo "tokens DIFF $$name"; diff build/s0-$$name.tok build/s1-$$name.tok | head; exit 1; }; \
 	done
-	@echo "stage1 skeleton ran to completion on all examples."
+
+test: test-tokens
 
 clean:
 	rm -rf build $(TARGET)

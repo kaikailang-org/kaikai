@@ -226,6 +226,46 @@ static void add_capture(LamInfo *info, const char *name, size_t len) {
     info->n_caps++;
 }
 
+static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info);
+
+/* Interpolations inside string literals are not part of the main AST:
+   they are re-parsed at emit time. Free-variable collection therefore
+   has to re-parse them too, or closures written as e.g.
+       (t) => eprint("#{outer}: ...")
+   will fail to capture `outer`. Keep this in lock-step with the logic
+   in emit_string_expr. */
+static void collect_free_vars_in_string(E *e, Node *s, Node *lam, LamInfo *info) {
+    const char *src = s->name;
+    if (!src || s->name_len < 2) return;
+    int triple = (s->v.flags & 0x1) != 0;
+    size_t start = triple ? 3 : 1;
+    size_t end   = triple ? s->name_len - 3 : s->name_len - 1;
+    size_t i = start;
+    while (i < end) {
+        if (src[i] == '#' && i + 1 < end && src[i + 1] == '{') {
+            i += 2;
+            size_t expr_start = i;
+            int depth = 1;
+            while (i < end && depth > 0) {
+                if      (src[i] == '{') depth++;
+                else if (src[i] == '}') { depth--; if (depth == 0) break; }
+                ++i;
+            }
+            size_t ntk = 0;
+            Token *toks = kai_lex("<interp>", src + expr_start, i - expr_start, &ntk);
+            Node *en = kai_parse_expr_standalone("<interp>", src + expr_start, toks, ntk);
+            if (en) {
+                collect_free_vars(e, en, lam, info);
+                kai_free_node(en);
+            }
+            free(toks);
+            if (i < end) i++;                 /* past } */
+        } else {
+            ++i;
+        }
+    }
+}
+
 static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
     if (!n) return;
     if (n->kind == N_LAMBDA) return;         /* inner lambdas have their own */
@@ -234,6 +274,10 @@ static void collect_free_vars(E *e, Node *n, Node *lam, LamInfo *info) {
             !is_global_name(e, n->name, n->name_len)) {
             add_capture(info, n->name, n->name_len);
         }
+        return;
+    }
+    if (n->kind == N_STRING) {
+        collect_free_vars_in_string(e, n, lam, info);
         return;
     }
     if (n->kind == N_FIELD) {

@@ -431,39 +431,44 @@ static Node *parse_type_decl(P *p, int is_pub, int line, int col) {
 
         int looks_like_sum = 0;
         if (is_uppercase_ident(head, p->src)) {
-            /* Look ahead to see if a `|` appears before a newline that
-               would terminate. The sum form requires at least one `|`
-               between the first variant and the next, because a single
-               TypeName is an alias. BUT the design doc grammar says sum
-               is "Variant ('|' Variant)*" so one variant alone is legal
-               as a sum with one constructor. Resolve by: if after parsing
-               a candidate variant we see `|`, it's a sum; otherwise treat
-               the IDENT as an alias type. */
-            /* We need to peek past the potential variant payload (parens).
-               Strategy: walk tokens until we find either `|` (sum), or a
-               newline that is structurally a decl terminator. Paren depth
-               tracked. */
-            size_t j = p->i;
-            int depth = 0;
-            while (j < p->n) {
-                TokenKind k = p->toks[j].kind;
-                if (k == TK_EOF) break;
-                if (k == TK_LPAREN || k == TK_LBRACKET || k == TK_LBRACE) depth++;
-                else if (k == TK_RPAREN || k == TK_RBRACKET || k == TK_RBRACE) depth--;
-                else if (depth == 0) {
-                    if (k == TK_PIPE)   { looks_like_sum = 1; break; }
-                    if (k == TK_NEWLINE) {
-                        /* Continue: newline between variants is allowed. */
-                        /* Scan past newlines — if next is `|`, it's sum; else end. */
-                        size_t m = j + 1;
-                        while (m < p->n && p->toks[m].kind == TK_NEWLINE) m++;
-                        if (m < p->n && p->toks[m].kind == TK_PIPE) {
-                            looks_like_sum = 1;
+            /* A bare `Uppercase(` right after `=` unambiguously marks a
+               variant with arguments: named types never carry parens
+               (generic args use `[...]`). Accept the decl as a sum even
+               if it has a single variant — otherwise `type X = Foo(A)`
+               is misread as an alias to `Foo` with a dangling `(`. */
+            const Token *after_head = (p->i + 1 < p->n) ? &p->toks[p->i + 1] : NULL;
+            if (after_head && after_head->kind == TK_LPAREN) {
+                looks_like_sum = 1;
+            }
+            /* Otherwise fall back to "scan for a `|` before the decl
+               ends". The sum form requires at least one `|` between the
+               first variant and the next, because a single TypeName is
+               indistinguishable from an alias. Parentheses mark variant
+               payload and are tracked to avoid mistaking a `|` inside a
+               function type for the variant separator. */
+            if (!looks_like_sum) {
+                size_t j = p->i;
+                int depth = 0;
+                while (j < p->n) {
+                    TokenKind k = p->toks[j].kind;
+                    if (k == TK_EOF) break;
+                    if (k == TK_LPAREN || k == TK_LBRACKET || k == TK_LBRACE) depth++;
+                    else if (k == TK_RPAREN || k == TK_RBRACKET || k == TK_RBRACE) depth--;
+                    else if (depth == 0) {
+                        if (k == TK_PIPE)   { looks_like_sum = 1; break; }
+                        if (k == TK_NEWLINE) {
+                            /* Continue: newline between variants is allowed. */
+                            /* Scan past newlines — if next is `|`, it's sum; else end. */
+                            size_t m = j + 1;
+                            while (m < p->n && p->toks[m].kind == TK_NEWLINE) m++;
+                            if (m < p->n && p->toks[m].kind == TK_PIPE) {
+                                looks_like_sum = 1;
+                            }
+                            break;
                         }
-                        break;
                     }
+                    j++;
                 }
-                j++;
             }
         }
         p->i = save;
