@@ -2751,6 +2751,350 @@ fn dump_program(decls: [Decl]) : Unit {
 }
 
 # ====================================================================
+# checker: name resolution
+# ====================================================================
+#
+# Mirrors stage 0's `check.c`. No type inference, no exhaustiveness —
+# just "every identifier is bound somewhere in scope." Top-level names
+# (fns, type constructors, imported names) are pre-registered so
+# forward references work. Each scope introduced by a block, match
+# arm, lambda, or function body is pushed and popped as the walker
+# enters and leaves. Errors accumulate into `had_error`; the driver
+# returns 1 when that flag is set.
+
+type Env = { scopes: [[String]], had_error: Bool, file: String }
+
+fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file }
+
+fn env_push(e: Env) : Env =
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file }
+
+fn env_pop(e: Env) : Env {
+  match e.scopes {
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file }
+    _ -> e
+  }
+}
+
+fn env_add(e: Env, name: String) : Env {
+  match e.scopes {
+    [top, ...rest] ->
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file }
+    _ -> e
+  }
+}
+
+fn list_has(names: [String], target: String) : Bool {
+  match names {
+    [] -> false
+    [n, ...rest] -> if n == target { true } else { list_has(rest, target) }
+  }
+}
+
+fn scopes_has(scopes: [[String]], target: String) : Bool {
+  match scopes {
+    [] -> false
+    [top, ...rest] -> if list_has(top, target) { true } else { scopes_has(rest, target) }
+  }
+}
+
+fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
+
+fn env_mark_err(e: Env) : Env =
+  Env { scopes: e.scopes, had_error: true, file: e.file }
+
+fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
+  eprint("#{e.file}:#{int_to_string(line)}:#{int_to_string(col)}: error: #{msg}")
+  env_mark_err(e)
+}
+
+# ---- prelude seeding (kept in sync with stage 0's PRELUDE) ----
+
+fn prelude_names() : [String] {
+  [
+    "print", "eprint", "read_file", "write_file", "read_line", "args",
+    "exit", "panic",
+    "int_to_string", "real_to_string", "string_to_int", "string_to_real",
+    "string_length", "string_concat", "string_split", "string_contains", "char_at",
+    "string_slice", "char_to_int", "int_to_char",
+    "list_length", "list_append", "list_reverse",
+    "map", "filter", "reduce", "each",
+    "Some", "None", "Ok", "Err"
+  ]
+}
+
+fn add_all(e: Env, names: [String]) : Env =
+  reduce(names, e, (acc, n) => env_add(acc, n))
+
+# ---- pattern bindings: walk a pattern and add its bound names ----
+
+fn bind_pat(e: Env, pat: Pattern) : Env {
+  match pat.pkind {
+    PWild -> e
+    PLit(_) -> e
+    PBind(name) -> env_add(e, name)
+    PList(pats, opt_rest) -> {
+      let e1 = bind_pats_loop(e, pats)
+      match opt_rest {
+        Some(rname) -> env_add(e1, rname)
+        None -> e1
+      }
+    }
+    PVariant(_, subs) -> bind_pats_loop(e, subs)
+    PVariantRecord(_, fields) -> bind_pfields_loop(e, fields)
+    PRecord(fields) -> bind_pfields_loop(e, fields)
+  }
+}
+
+fn bind_pats_loop(e: Env, ps: [Pattern]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> bind_pats_loop(bind_pat(e, p), rest)
+  }
+}
+
+fn bind_pfields_loop(e: Env, fs: [PField]) : Env {
+  match fs {
+    [] -> e
+    [pf, ...rest] -> bind_pfields_loop(bind_pfield(e, pf), rest)
+  }
+}
+
+fn bind_pfield(e: Env, pf: PField) : Env {
+  match pf {
+    # Shorthand `{ x }` binds `x` directly; the parser already builds the
+    # equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
+    PField(_, sub, _) -> bind_pat(e, sub)
+  }
+}
+
+# ---- expression walker ----
+
+fn chk_expr(e: Env, x: Expr) : Env {
+  match x.kind {
+    EInt(_)    -> e
+    EReal(_)   -> e
+    EBool(_)   -> e
+    EChar(_)   -> e
+    EStr(_, _) -> e
+    EUnit      -> e
+    EUnder     -> e
+    EPlaceholder -> e
+    EVar(name) -> {
+      if env_has(e, name) { e }
+      else { chk_error(e, x.line, x.col, "undefined name `#{name}`") }
+    }
+    ECall(f, xs) -> {
+      let e1 = chk_expr(e, f)
+      chk_exprs(e1, xs)
+    }
+    EField(base, _) -> chk_expr(e, base)
+    EIndex(base, idx) -> chk_expr(chk_expr(e, base), idx)
+    EBinop(_, a, b) -> chk_expr(chk_expr(e, a), b)
+    EUnop(_, inner) -> chk_expr(e, inner)
+    EIf(c, a, opt_b) -> {
+      let e1 = chk_expr(chk_expr(e, c), a)
+      match opt_b {
+        Some(b) -> chk_expr(e1, b)
+        None -> e1
+      }
+    }
+    EMatch(scrut, arms) -> {
+      let e1 = chk_expr(e, scrut)
+      chk_arms(e1, arms)
+    }
+    ELambda(params, body) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    ERecordLit(_, fields) -> chk_field_inits(e, fields)
+    EList(elems) -> chk_list_elems(e, elems)
+    ERange(a, b, opt_step) -> {
+      let e1 = chk_expr(chk_expr(e, a), b)
+      match opt_step { Some(s) -> chk_expr(e1, s) None -> e1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let e1 = env_push(e)
+      let e2 = chk_stmts(e1, stmts)
+      let e3 = match opt_final { Some(f) -> chk_expr(e2, f) None -> e2 }
+      env_pop(e3)
+    }
+    EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+  }
+}
+
+fn chk_exprs(e: Env, xs: [Expr]) : Env {
+  match xs {
+    [] -> e
+    [h, ...rest] -> chk_exprs(chk_expr(e, h), rest)
+  }
+}
+
+fn chk_field_inits(e: Env, fs: [FieldInit]) : Env {
+  match fs {
+    [] -> e
+    [f, ...rest] -> match f {
+      FI(_, val) -> chk_field_inits(chk_expr(e, val), rest)
+    }
+  }
+}
+
+fn chk_list_elems(e: Env, es: [ListElem]) : Env {
+  match es {
+    [] -> e
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> chk_list_elems(chk_expr(e, x), rest)
+      ElSpread(x) -> chk_list_elems(chk_expr(e, x), rest)
+    }
+  }
+}
+
+fn chk_arms(e: Env, arms: [Arm]) : Env {
+  match arms {
+    [] -> e
+    [a, ...rest] -> chk_arms(chk_arm(e, a), rest)
+  }
+}
+
+fn chk_arm(e: Env, a: Arm) : Env {
+  match a {
+    Arm(pat, guard, body) -> {
+      let e1 = env_push(e)
+      let e2 = bind_pat(e1, pat)
+      let e3 = match guard { Some(g) -> chk_expr(e2, g) None -> e2 }
+      let e4 = chk_expr(e3, body)
+      env_pop(e4)
+    }
+  }
+}
+
+fn chk_stmts(e: Env, ss: [Stmt]) : Env {
+  match ss {
+    [] -> e
+    [s, ...rest] -> chk_stmts(chk_stmt(e, s), rest)
+  }
+}
+
+fn chk_stmt(e: Env, s: Stmt) : Env {
+  match s {
+    SLet(pat, _, rhs) -> {
+      let e1 = chk_expr(e, rhs)
+      bind_pat(e1, pat)
+    }
+    SAssert(cond, opt_msg) -> {
+      let e1 = chk_expr(e, cond)
+      match opt_msg { Some(m) -> chk_expr(e1, m) None -> e1 }
+    }
+    SExprStmt(x) -> chk_expr(e, x)
+  }
+}
+
+fn add_params(e: Env, ps: [Param]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> add_params(env_add(e, p.pname), rest)
+  }
+}
+
+# ---- declaration walkers ----
+
+fn chk_decl(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, _, params, _, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    DType(_, _, _, _, _, _) -> e
+    DTest(_, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = chk_expr(e1, body)
+      env_pop(e2)
+    }
+    DImport(_, _, _) -> e
+  }
+}
+
+fn chk_decls(e: Env, ds: [Decl]) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> chk_decls(chk_decl(e, d), rest)
+  }
+}
+
+# ---- top-level pre-registration ----
+
+fn register_decls(e: Env, ds: [Decl]) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> register_decls(register_one(e, d), rest)
+  }
+}
+
+fn register_one(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, name, _, _, _, _, _) -> env_add(e, name)
+    DType(_, name, _, body, _, _) -> {
+      let e1 = env_add(e, name)
+      match body {
+        TBSum(variants) -> register_variants(e1, variants)
+        _ -> e1
+      }
+    }
+    DTest(_, _, _, _) -> e
+    DImport(ik, _, _) -> register_import(e, ik)
+  }
+}
+
+fn register_variants(e: Env, vs: [Variant]) : Env {
+  match vs {
+    [] -> e
+    [v, ...rest] -> match v {
+      Var(name, _) -> register_variants(env_add(e, name), rest)
+    }
+  }
+}
+
+# For imports we add just the surface name: the last segment of the
+# dotted path, the alias, or each selected name. Stage 0 does the
+# same; deeper module resolution is a stage 2 concern.
+fn last_segment(path: String) : String {
+  last_segment_loop(path, string_length(path) - 1, string_length(path))
+}
+
+fn last_segment_loop(s: String, i: Int, end: Int) : String {
+  if i < 0 { string_slice(s, 0, end) }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, i + 1, end - i - 1) }
+                 else { last_segment_loop(s, i - 1, end) }
+      None -> string_slice(s, 0, end)
+    }
+  }
+}
+
+fn register_import(e: Env, ik: ImportKind) : Env {
+  match ik {
+    IkPath(path) -> env_add(e, last_segment(path))
+    IkAlias(_, alias) -> env_add(e, alias)
+    IkSelective(_, names) -> add_all(e, names)
+  }
+}
+
+# ---- entry point ----
+
+fn check_program(file: String, decls: [Decl]) : Int {
+  let e0 = env_new(file)
+  let e1 = add_all(e0, prelude_names())
+  let e2 = register_decls(e1, decls)
+  let e3 = chk_decls(e2, decls)
+  if e3.had_error { 1 } else { 0 }
+}
+
+# ====================================================================
 # cli + driver
 # ====================================================================
 
@@ -2815,9 +3159,13 @@ fn compile_source(path: String, mode: Mode, src: String) : Int {
           Some(decls) -> match mode {
             MAst -> { dump_program(decls); 0 }
             _ -> {
-              # Milestone 4 stub: later milestones check and emit here.
-              print("/* stage1 placeholder: checker/emitter not yet wired */")
-              0
+              let chk = check_program(path, decls)
+              if chk != 0 { chk }
+              else {
+                # Milestone 5 stub: the emitter lands next.
+                print("/* stage1 placeholder: emitter not yet wired */")
+                0
+              }
             }
           }
         }

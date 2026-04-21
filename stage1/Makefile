@@ -47,7 +47,18 @@ test-ast: $(TARGET) build
 	    || { echo "ast FAIL $$name"; exit 1; }; \
 	done
 
-test: test-tokens test-ast
+# Run the full pipeline (lex + parse + check) without emission on every
+# example. Exit status is the check result; no undefined names allowed.
+test-check: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai compiler.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > /dev/null \
+	    && echo "check OK $$name" \
+	    || { echo "check FAIL $$name"; exit 1; }; \
+	done
+
+test: test-tokens test-ast test-check
 
 clean:
 	rm -rf build $(TARGET)
