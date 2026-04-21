@@ -1,0 +1,4649 @@
+# stage 2: kaikai compiler, targeting full kaikai.
+#
+# Milestone 1 starts as a verbatim copy of stage 1's source. It is
+# compiled by stage 1 (`../stage1/kaic1`) into `kaic2`, which behaves
+# as a drop-in replacement for kaic1 — same tokens, same AST shape,
+# same emitted C. From this baseline the compiler grows: HM-extended
+# checker, LLVM backend, monomorphised generics, Perceus, modules,
+# effects + handlers, fibers + scheduler, structured concurrency, and
+# typed holes. See `docs/stage2-design.md`.
+#
+# Invariant during the early milestones: `make test` in stage2/ must
+# pass by diffing every artefact against stage 1's output. Any stage 2
+# feature that diverges must be explicitly gated behind a flag so the
+# parity tests keep working until parity is retired (post self-host).
+
+# ====================================================================
+# char classification helpers
+# ====================================================================
+
+fn ch_is_digit(c: Char) : Bool = c >= '0' and c <= '9'
+fn ch_is_lower(c: Char) : Bool = c >= 'a' and c <= 'z'
+fn ch_is_upper(c: Char) : Bool = c >= 'A' and c <= 'Z'
+fn ch_is_alpha(c: Char) : Bool = ch_is_lower(c) or ch_is_upper(c) or c == '_'
+fn ch_is_alnum(c: Char) : Bool = ch_is_alpha(c) or ch_is_digit(c)
+fn ch_is_space(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r'
+
+# ====================================================================
+# token kinds + tokens
+# ====================================================================
+
+type TokKind
+  = TkEof
+  | TkNewline
+  # keywords (alphabetical)
+  | TkAnd | TkAs | TkAssert | TkElse | TkFalse | TkFn | TkIf | TkImport
+  | TkLet | TkMatch | TkNot | TkOr | TkPub | TkTest | TkTrue | TkType
+  # literals
+  | TkInt | TkReal | TkChar | TkString
+  # identifiers
+  | TkIdent | TkUnderscore
+  # punctuation
+  | TkLparen | TkRparen | TkLbracket | TkRbracket | TkLbrace | TkRbrace
+  | TkComma | TkColon | TkSemi | TkDot | TkDotDot | TkEllipsis
+  # operators
+  | TkEq | TkArrow | TkFatArrow | TkPipe | TkPipeApply
+  | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
+  | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
+  | TkBang
+  # error token carries a human-readable message
+  | TkError(String)
+
+type Token = { kind: TokKind, line: Int, col: Int, start: Int, length: Int }
+
+# Convenience constructor — fewer characters at call sites.
+fn tok(kind: TokKind, line: Int, col: Int, start: Int, end: Int) : Token {
+  Token { kind: kind, line: line, col: col, start: start, length: end - start }
+}
+
+# Mnemonic for token kinds (for --tokens dump). Keep in sync with TokKind.
+fn tk_name(k: TokKind) : String {
+  match k {
+    TkEof -> "EOF"
+    TkNewline -> "NEWLINE"
+    TkAnd -> "and" TkAs -> "as" TkAssert -> "assert" TkElse -> "else"
+    TkFalse -> "false" TkFn -> "fn" TkIf -> "if" TkImport -> "import"
+    TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
+    TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
+    TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
+    TkIdent -> "IDENT" TkUnderscore -> "_"
+    TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
+    TkLbrace -> "{" TkRbrace -> "}"
+    TkComma -> "," TkColon -> ":" TkSemi -> ";"
+    TkDot -> "." TkDotDot -> ".." TkEllipsis -> "..."
+    TkEq -> "=" TkArrow -> "->" TkFatArrow -> "=>"
+    TkPipe -> "|" TkPipeApply -> "|>"
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkSlashSlash -> "//" TkPercent -> "%"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
+    TkLe -> "<=" TkGe -> ">=" TkBang -> "!"
+    TkError(_) -> "ERROR"
+  }
+}
+
+# ====================================================================
+# lexer state + helpers
+# ====================================================================
+
+type Lexer = { src: String, pos: Int, line: Int, col: Int }
+
+fn lex_new(src: String) : Lexer = Lexer { src: src, pos: 0, line: 1, col: 1 }
+
+fn lex_at_end(l: Lexer) : Bool = l.pos >= string_length(l.src)
+
+fn lex_peek_at(l: Lexer, off: Int) : Option[Char] =
+  char_at(l.src, l.pos + off)
+
+fn lex_peek(l: Lexer) : Option[Char] = lex_peek_at(l, 0)
+
+fn lex_advance(l: Lexer) : Lexer {
+  match char_at(l.src, l.pos) {
+    None -> l
+    Some(c) -> {
+      if c == '\n' {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line + 1, col: 1 }
+      } else {
+        Lexer { src: l.src, pos: l.pos + 1, line: l.line, col: l.col + 1 }
+      }
+    }
+  }
+}
+
+# Pair of lexer state + emitted token. Used everywhere the scanner
+# returns both a new position and a produced token.
+type LexStep = Step(Lexer, Token)
+
+# Returns true if the next char matches `want` (and does not consume it).
+fn lex_peek_is(l: Lexer, want: Char) : Bool {
+  match lex_peek(l) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+fn lex_peek2_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 1) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+fn lex_peek3_is(l: Lexer, want: Char) : Bool {
+  match lex_peek_at(l, 2) {
+    None -> false
+    Some(c) -> c == want
+  }
+}
+
+# ====================================================================
+# whitespace and comments
+# ====================================================================
+
+fn lex_skip_comment(l: Lexer) : Lexer {
+  # `#` already consumed. Stop at newline or EOF; the newline itself is a
+  # token and stays for the main loop to emit.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if c == '\n' { l } else { lex_skip_comment(lex_advance(l)) }
+  }
+}
+
+fn lex_skip_ws(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_space(c) { lex_skip_ws(lex_advance(l)) }
+      else if c == '#' { lex_skip_ws(lex_skip_comment(lex_advance(l))) }
+      else { l }
+    }
+  }
+}
+
+# ====================================================================
+# identifiers and keywords
+# ====================================================================
+
+fn lex_scan_ident_rest(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> if ch_is_alnum(c) { lex_scan_ident_rest(lex_advance(l)) } else { l }
+  }
+}
+
+fn keyword_kind(text: String) : TokKind {
+  if text == "and" { TkAnd }
+  else if text == "as" { TkAs }
+  else if text == "assert" { TkAssert }
+  else if text == "else" { TkElse }
+  else if text == "false" { TkFalse }
+  else if text == "fn" { TkFn }
+  else if text == "if" { TkIf }
+  else if text == "import" { TkImport }
+  else if text == "let" { TkLet }
+  else if text == "match" { TkMatch }
+  else if text == "not" { TkNot }
+  else if text == "or" { TkOr }
+  else if text == "pub" { TkPub }
+  else if text == "test" { TkTest }
+  else if text == "true" { TkTrue }
+  else if text == "type" { TkType }
+  else { TkIdent }
+}
+
+fn lex_ident(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l2 = lex_scan_ident_rest(l)
+  let text = string_slice(l.src, start, l2.pos - start)
+  let kind =
+    if string_length(text) == 1 and text == "_" {
+      TkUnderscore
+    } else {
+      keyword_kind(text)
+    }
+  Step(l2, tok(kind, sl, sc, start, l2.pos))
+}
+
+# ====================================================================
+# numbers
+# ====================================================================
+
+fn lex_scan_digits(l: Lexer) : Lexer {
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if ch_is_digit(c) or c == '_' { lex_scan_digits(lex_advance(l)) }
+      else { l }
+    }
+  }
+}
+
+fn lex_number(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_scan_digits(l)
+  # Fractional part: only when `.` is followed by a digit. `x..y` (range)
+  # and `x.field` (access) must be left alone.
+  let after_frac_kind =
+    if lex_peek_is(l1, '.') {
+      match lex_peek_at(l1, 1) {
+        Some(d) -> if ch_is_digit(d) { Some(true) } else { Some(false) }
+        None -> Some(false)
+      }
+    } else {
+      Some(false)
+    }
+  let l2 =
+    match after_frac_kind {
+      Some(true) -> lex_scan_digits(lex_advance(lex_advance(l1)))
+      _ -> l1
+    }
+  let is_real1 = match after_frac_kind { Some(true) -> true _ -> false }
+  # Exponent part: `e` or `E`, optional sign, digits.
+  let has_exp =
+    match lex_peek(l2) {
+      Some(c) -> c == 'e' or c == 'E'
+      None -> false
+    }
+  if has_exp {
+    let l3 = lex_advance(l2)
+    let l4 =
+      match lex_peek(l3) {
+        Some(c) -> if c == '+' or c == '-' { lex_advance(l3) } else { l3 }
+        None -> l3
+      }
+    match lex_peek(l4) {
+      Some(d) -> {
+        if ch_is_digit(d) {
+          let l5 = lex_scan_digits(l4)
+          Step(l5, tok(TkReal, sl, sc, start, l5.pos))
+        } else {
+          Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                       sl, sc, start, l4.pos))
+        }
+      }
+      None -> {
+        Step(l4, tok(TkError("malformed number: expected digits after exponent"),
+                     sl, sc, start, l4.pos))
+      }
+    }
+  } else {
+    let kind = if is_real1 { TkReal } else { TkInt }
+    Step(l2, tok(kind, sl, sc, start, l2.pos))
+  }
+}
+
+# ====================================================================
+# strings
+# ====================================================================
+
+# Walk a string literal consuming chars until the closing `"` (or `"""`).
+# Handles backslash escapes and `#{...}` interpolation (nested braces).
+# Return the lexer positioned past the closing quote, plus the kind of
+# token to emit (TkString or TkError(msg)).
+
+type StrResult = StrOk(Lexer) | StrErr(Lexer, String)
+
+# Skip past a nested {...} block inside interpolation, counting braces.
+fn lex_skip_interp(l: Lexer, depth: Int) : StrResult {
+  if depth == 0 { StrOk(l) }
+  else {
+    match lex_peek(l) {
+      None -> StrErr(l, "unterminated interpolation in string")
+      Some(c) -> {
+        if c == '{' { lex_skip_interp(lex_advance(l), depth + 1) }
+        else if c == '}' { lex_skip_interp(lex_advance(l), depth - 1) }
+        else if c == '"' {
+          # Skip a nested string literal inside the interpolation.
+          match lex_skip_inner_string(lex_advance(l)) {
+            StrOk(l2) -> lex_skip_interp(l2, depth)
+            StrErr(l2, msg) -> StrErr(l2, msg)
+          }
+        } else {
+          lex_skip_interp(lex_advance(l), depth)
+        }
+      }
+    }
+  }
+}
+
+fn lex_skip_inner_string(l: Lexer) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string inside interpolation")
+    Some(c) -> {
+      if c == '"' { StrOk(lex_advance(l)) }
+      else if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string inside interpolation")
+          Some(_) -> lex_skip_inner_string(lex_advance(l1))
+        }
+      } else {
+        lex_skip_inner_string(lex_advance(l))
+      }
+    }
+  }
+}
+
+fn lex_string_body(l: Lexer, triple: Bool) : StrResult {
+  match lex_peek(l) {
+    None -> StrErr(l, "unterminated string")
+    Some(c) -> {
+      if c == '\\' {
+        let l1 = lex_advance(l)
+        match lex_peek(l1) {
+          None -> StrErr(l1, "unterminated string")
+          Some(_) -> lex_string_body(lex_advance(l1), triple)
+        }
+      } else if c == '#' and lex_peek2_is(l, '{') {
+        let l1 = lex_advance(lex_advance(l))
+        match lex_skip_interp(l1, 1) {
+          StrOk(l2) -> lex_string_body(l2, triple)
+          StrErr(l2, msg) -> StrErr(l2, msg)
+        }
+      } else if triple {
+        if c == '"' and lex_peek2_is(l, '"') and lex_peek3_is(l, '"') {
+          StrOk(lex_advance(lex_advance(lex_advance(l))))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      } else {
+        if c == '\n' {
+          StrErr(l, "unterminated string (newline in single-line string)")
+        } else if c == '"' {
+          StrOk(lex_advance(l))
+        } else {
+          lex_string_body(lex_advance(l), triple)
+        }
+      }
+    }
+  }
+}
+
+fn lex_string(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                  # consume opening "
+  let triple = lex_peek_is(l1, '"') and lex_peek2_is(l1, '"')
+  let l2 = if triple { lex_advance(lex_advance(l1)) } else { l1 }
+  match lex_string_body(l2, triple) {
+    StrOk(l3) -> Step(l3, tok(TkString, sl, sc, start, l3.pos))
+    StrErr(l3, msg) -> Step(l3, tok(TkError(msg), sl, sc, start, l3.pos))
+  }
+}
+
+# ====================================================================
+# char literals
+# ====================================================================
+
+fn lex_char_skip_u_escape(l: Lexer) : Lexer {
+  # We're past `\u`; consume `{HHHH}`.
+  match lex_peek(l) {
+    None -> l
+    Some(c) -> {
+      if c == '}' { lex_advance(l) }
+      else { lex_char_skip_u_escape(lex_advance(l)) }
+    }
+  }
+}
+
+fn lex_char(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  let l1 = lex_advance(l)                 # consume opening '
+  match lex_peek(l1) {
+    None -> Step(l1, tok(TkError("unterminated char literal"),
+                         sl, sc, start, l1.pos))
+    Some(c) -> {
+      let l2 =
+        if c == '\\' {
+          let la = lex_advance(l1)
+          match lex_peek(la) {
+            None -> la
+            Some(e) -> {
+              if e == 'u' and lex_peek2_is(la, '{') {
+                lex_char_skip_u_escape(lex_advance(lex_advance(la)))
+              } else {
+                lex_advance(la)
+              }
+            }
+          }
+        } else {
+          # One byte of a UTF-8 codepoint. For the stage-0-compatible
+          # subset we treat multi-byte characters structurally: consume
+          # one byte and trust the closing quote to appear.
+          lex_advance(l1)
+        }
+      if lex_peek_is(l2, '\'') {
+        Step(lex_advance(l2), tok(TkChar, sl, sc, start, l2.pos + 1))
+      } else {
+        Step(l2, tok(TkError("unterminated char literal"),
+                     sl, sc, start, l2.pos))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# punctuation and operators
+# ====================================================================
+
+fn lex_punct(l: Lexer) : LexStep {
+  let start = l.pos
+  let sl = l.line
+  let sc = l.col
+  match lex_peek(l) {
+    None -> Step(l, tok(TkEof, sl, sc, start, start))
+    Some(c) -> {
+      let l1 = lex_advance(l)
+      if c == '(' { Step(l1, tok(TkLparen, sl, sc, start, l1.pos)) }
+      else if c == ')' { Step(l1, tok(TkRparen, sl, sc, start, l1.pos)) }
+      else if c == '[' { Step(l1, tok(TkLbracket, sl, sc, start, l1.pos)) }
+      else if c == ']' { Step(l1, tok(TkRbracket, sl, sc, start, l1.pos)) }
+      else if c == '{' { Step(l1, tok(TkLbrace, sl, sc, start, l1.pos)) }
+      else if c == '}' { Step(l1, tok(TkRbrace, sl, sc, start, l1.pos)) }
+      else if c == ',' { Step(l1, tok(TkComma, sl, sc, start, l1.pos)) }
+      else if c == ':' { Step(l1, tok(TkColon, sl, sc, start, l1.pos)) }
+      else if c == ';' { Step(l1, tok(TkSemi, sl, sc, start, l1.pos)) }
+      else if c == '+' { Step(l1, tok(TkPlus, sl, sc, start, l1.pos)) }
+      else if c == '*' { Step(l1, tok(TkStar, sl, sc, start, l1.pos)) }
+      else if c == '%' { Step(l1, tok(TkPercent, sl, sc, start, l1.pos)) }
+      else if c == '-' {
+        if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkArrow, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkMinus, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '/' {
+        if lex_peek_is(l1, '/') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkSlashSlash, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkSlash, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '=' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkEqEq, sl, sc, start, l2.pos))
+        } else if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkFatArrow, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkEq, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '<' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkLe, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkLt, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '>' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkGe, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkGt, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '!' {
+        if lex_peek_is(l1, '=') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkNeq, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkBang, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '|' {
+        if lex_peek_is(l1, '>') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkPipeApply, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkPipe, sl, sc, start, l1.pos))
+        }
+      }
+      else if c == '.' {
+        if lex_peek_is(l1, '.') and lex_peek2_is(l1, '.') {
+          let l2 = lex_advance(lex_advance(l1))
+          Step(l2, tok(TkEllipsis, sl, sc, start, l2.pos))
+        } else if lex_peek_is(l1, '.') {
+          let l2 = lex_advance(l1)
+          Step(l2, tok(TkDotDot, sl, sc, start, l2.pos))
+        } else {
+          Step(l1, tok(TkDot, sl, sc, start, l1.pos))
+        }
+      }
+      else {
+        let msg = string_concat("unexpected character '", string_concat("#{c}", "'"))
+        Step(l1, tok(TkError(msg), sl, sc, start, l1.pos))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# dispatch: one token
+# ====================================================================
+
+fn lex_next(l: Lexer) : LexStep {
+  let l0 = lex_skip_ws(l)
+  let sl = l0.line
+  let sc = l0.col
+  match lex_peek(l0) {
+    None -> Step(l0, tok(TkEof, sl, sc, l0.pos, l0.pos))
+    Some(c) -> {
+      if c == '\n' {
+        let l1 = lex_advance(l0)
+        Step(l1, tok(TkNewline, sl, sc, l0.pos, l1.pos))
+      }
+      else if ch_is_alpha(c) { lex_ident(l0) }
+      else if ch_is_digit(c) { lex_number(l0) }
+      else if c == '"' { lex_string(l0) }
+      else if c == '\'' { lex_char(l0) }
+      else { lex_punct(l0) }
+    }
+  }
+}
+
+# Build the full token list. Accumulate in reverse for O(1) prepend, then
+# list_reverse once at the end.
+fn lex_loop(l: Lexer, acc: [Token]) : [Token] {
+  match lex_next(l) {
+    Step(l1, t) -> {
+      let acc1 = [t, ...acc]
+      match t.kind {
+        TkEof -> list_reverse(acc1)
+        _ -> lex_loop(l1, acc1)
+      }
+    }
+  }
+}
+
+fn tokenize(src: String) : [Token] {
+  lex_loop(lex_new(src), [])
+}
+
+# ====================================================================
+# token dump (for --tokens)
+# ====================================================================
+
+fn tok_text(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+fn tok_line_str(t: Token) : String = int_to_string(t.line)
+fn tok_col_str(t: Token)  : String = int_to_string(t.col)
+
+fn dump_token(src: String, t: Token) : Unit {
+  match t.kind {
+    TkNewline -> print("#{tok_line_str(t)}:#{tok_col_str(t)}  NEWLINE")
+    TkError(msg) -> eprint("#{tok_line_str(t)}:#{tok_col_str(t)}  ERROR  #{msg}")
+    _ -> {
+      let text = tok_text(src, t)
+      print("#{tok_line_str(t)}:#{tok_col_str(t)}  #{tk_name(t.kind)}  \"#{text}\"")
+    }
+  }
+}
+
+fn dump_tokens(src: String, tokens: [Token]) : Unit {
+  tokens |> each((t) => dump_token(src, t))
+}
+
+# ====================================================================
+# error scanning
+# ====================================================================
+
+fn report_one_error(path: String, t: Token, msg: String) : Unit {
+  eprint("#{path}:#{tok_line_str(t)}:#{tok_col_str(t)}: error: #{msg}")
+}
+
+fn report_errors_loop(path: String, ts: [Token], count: Int) : Int {
+  match ts {
+    [] -> count
+    [t, ...rest] -> match t.kind {
+      TkError(msg) -> {
+        report_one_error(path, t, msg)
+        report_errors_loop(path, rest, count + 1)
+      }
+      _ -> report_errors_loop(path, rest, count)
+    }
+  }
+}
+
+# Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).
+fn report_errors(path: String, src: String, tokens: [Token]) : Int {
+  if report_errors_loop(path, tokens, 0) > 0 { 1 } else { 0 }
+}
+
+# ====================================================================
+# AST types
+# ====================================================================
+
+# Expressions carry their source position on the wrapper, so variants
+# stay compact. Pattern matching on expressions therefore destructures
+# the record to reach `.kind`, then matches the sum.
+
+type Expr = { kind: ExprKind, line: Int, col: Int }
+
+type ExprKind
+  = EInt(Int)
+  | EReal(Real)
+  | EBool(Bool)
+  | EChar(Char)
+  | EStr(String, Bool)                      # raw source span (includes quotes), is_triple
+  | EUnit
+  | EVar(String)
+  | EUnder                                  # `_` (pattern context only, but lexer produces it anywhere)
+  | EPlaceholder                            # `.` placeholder (stage 1 extension; stage 0 rejects)
+  | ECall(Expr, [Expr])
+  | EField(Expr, String)
+  | EIndex(Expr, Expr)
+  | EBinop(String, Expr, Expr)
+  | EUnop(String, Expr)                     # "-" or "not"
+  | EIf(Expr, Expr, Option[Expr])
+  | EMatch(Expr, [Arm])
+  | ELambda([Param], Expr)
+  | ERecordLit(String, [FieldInit])
+  | EList([ListElem])
+  | ERange(Expr, Expr, Option[Expr])
+  | EBlock([Stmt], Option[Expr])
+  | EPipe(Expr, Expr)
+
+type ListElem = ElPlain(Expr) | ElSpread(Expr)
+
+type Arm = Arm(Pattern, Option[Expr], Expr)
+
+type FieldInit = FI(String, Expr)
+
+type Param = { pname: String, ptype: Option[TypeExpr], pline: Int, pcol: Int }
+
+type Stmt
+  = SLet(Pattern, Option[TypeExpr], Expr)
+  | SAssert(Expr, Option[Expr])
+  | SExprStmt(Expr)
+
+type Pattern = { pkind: PatKind, line: Int, col: Int }
+
+type PatKind
+  = PWild
+  | PLit(Expr)                              # literal pattern (stores an Expr of literal shape)
+  | PBind(String)
+  | PList([Pattern], Option[String])         # fixed sub-patterns, optional rest binder name
+  | PVariant(String, [Pattern])
+  | PVariantRecord(String, [PField])
+  | PRecord([PField])
+
+type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
+
+type TypeExpr = { tkind: TyKind, line: Int, col: Int }
+
+type TyKind
+  = TyName(String, [TypeExpr])              # Name or Name[T1, T2, ...]
+  | TyList(TypeExpr)
+  | TyFn([TypeExpr], TypeExpr)
+
+type Decl
+  = DFn(Bool, String, [Param], Option[TypeExpr], Expr, Int, Int)
+  | DType(Bool, String, [String], TypeBody, Int, Int)
+  | DTest(String, Expr, Int, Int)
+  | DImport(ImportKind, Int, Int)
+
+type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant])
+type FieldDecl = FD(String, TypeExpr)
+type Variant = Var(String, [TypeExpr])
+
+type ImportKind
+  = IkPath(String)
+  | IkAlias(String, String)
+  | IkSelective(String, [String])
+
+# ---- small constructors ----
+fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col }
+fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
+fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
+
+# ====================================================================
+# parser state
+# ====================================================================
+#
+# The Parser is immutable; each helper returns a new one with `rest`
+# advanced and `had_error` possibly flipped. We don't carry a token
+# index — `rest` is the unconsumed suffix of the token list, so
+# p_advance is O(1) (takes tail). Peek-ahead uses list destructuring
+# up to depth 3, which covers every lookahead stage 0 does.
+
+type Parser = { file: String, src: String, rest: [Token], had_error: Bool }
+
+# A result = a new parser plus an optional payload. `None` means the
+# parser failed (had_error is set on `p`). This mirrors stage 0's
+# error-then-stop style.
+
+type PExpr   = { p: Parser, r: Option[Expr] }
+type PStmt   = { p: Parser, r: Option[Stmt] }
+type PPat    = { p: Parser, r: Option[Pattern] }
+type PTy     = { p: Parser, r: Option[TypeExpr] }
+type PDecl   = { p: Parser, r: Option[Decl] }
+type PArm    = { p: Parser, r: Option[Arm] }
+type PParam  = { p: Parser, r: Option[Param] }
+type PFI     = { p: Parser, r: Option[FieldInit] }
+type PVar    = { p: Parser, r: Option[Variant] }
+type PFD     = { p: Parser, r: Option[FieldDecl] }
+type PPF     = { p: Parser, r: Option[PField] }
+type PEL     = { p: Parser, r: Option[ListElem] }
+
+fn parser_new(file: String, src: String, toks: [Token]) : Parser =
+  Parser { file: file, src: src, rest: toks, had_error: false }
+
+fn p_mark_err(p: Parser) : Parser =
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true }
+
+fn p_advance(p: Parser) : Parser {
+  match p.rest {
+    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1, had_error: p.had_error }
+    [] -> p
+  }
+}
+
+# A sentinel EOF token used when peeking past the list end. In practice
+# the tokenizer always appends a TkEof, so we rarely hit this.
+fn eof_tok() : Token = Token { kind: TkEof, line: 0, col: 0, start: 0, length: 0 }
+
+fn p_peek(p: Parser) : Token {
+  match p.rest {
+    [t, ...rs] -> t
+    [] -> eof_tok()
+  }
+}
+
+fn p_peek1(p: Parser) : Token {
+  match p.rest {
+    [_, t, ...rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+fn p_peek2(p: Parser) : Token {
+  match p.rest {
+    [_, _, t, ...rs] -> t
+    _ -> eof_tok()
+  }
+}
+
+# Token-kind comparison by structural case (TkError is the only payload-
+# carrying variant, and we never compare it for equality in the parser).
+fn tk_is(a: TokKind, b: TokKind) : Bool {
+  match a {
+    TkEof        -> match b { TkEof -> true _ -> false }
+    TkNewline    -> match b { TkNewline -> true _ -> false }
+    TkAnd        -> match b { TkAnd -> true _ -> false }
+    TkAs         -> match b { TkAs -> true _ -> false }
+    TkAssert     -> match b { TkAssert -> true _ -> false }
+    TkElse       -> match b { TkElse -> true _ -> false }
+    TkFalse      -> match b { TkFalse -> true _ -> false }
+    TkFn         -> match b { TkFn -> true _ -> false }
+    TkIf         -> match b { TkIf -> true _ -> false }
+    TkImport     -> match b { TkImport -> true _ -> false }
+    TkLet        -> match b { TkLet -> true _ -> false }
+    TkMatch      -> match b { TkMatch -> true _ -> false }
+    TkNot        -> match b { TkNot -> true _ -> false }
+    TkOr         -> match b { TkOr -> true _ -> false }
+    TkPub        -> match b { TkPub -> true _ -> false }
+    TkTest       -> match b { TkTest -> true _ -> false }
+    TkTrue       -> match b { TkTrue -> true _ -> false }
+    TkType       -> match b { TkType -> true _ -> false }
+    TkInt        -> match b { TkInt -> true _ -> false }
+    TkReal       -> match b { TkReal -> true _ -> false }
+    TkChar       -> match b { TkChar -> true _ -> false }
+    TkString     -> match b { TkString -> true _ -> false }
+    TkIdent      -> match b { TkIdent -> true _ -> false }
+    TkUnderscore -> match b { TkUnderscore -> true _ -> false }
+    TkLparen     -> match b { TkLparen -> true _ -> false }
+    TkRparen     -> match b { TkRparen -> true _ -> false }
+    TkLbracket   -> match b { TkLbracket -> true _ -> false }
+    TkRbracket   -> match b { TkRbracket -> true _ -> false }
+    TkLbrace     -> match b { TkLbrace -> true _ -> false }
+    TkRbrace     -> match b { TkRbrace -> true _ -> false }
+    TkComma      -> match b { TkComma -> true _ -> false }
+    TkColon      -> match b { TkColon -> true _ -> false }
+    TkSemi       -> match b { TkSemi -> true _ -> false }
+    TkDot        -> match b { TkDot -> true _ -> false }
+    TkDotDot     -> match b { TkDotDot -> true _ -> false }
+    TkEllipsis   -> match b { TkEllipsis -> true _ -> false }
+    TkEq         -> match b { TkEq -> true _ -> false }
+    TkArrow      -> match b { TkArrow -> true _ -> false }
+    TkFatArrow   -> match b { TkFatArrow -> true _ -> false }
+    TkPipe       -> match b { TkPipe -> true _ -> false }
+    TkPipeApply  -> match b { TkPipeApply -> true _ -> false }
+    TkPlus       -> match b { TkPlus -> true _ -> false }
+    TkMinus      -> match b { TkMinus -> true _ -> false }
+    TkStar       -> match b { TkStar -> true _ -> false }
+    TkSlash      -> match b { TkSlash -> true _ -> false }
+    TkSlashSlash -> match b { TkSlashSlash -> true _ -> false }
+    TkPercent    -> match b { TkPercent -> true _ -> false }
+    TkEqEq       -> match b { TkEqEq -> true _ -> false }
+    TkNeq        -> match b { TkNeq -> true _ -> false }
+    TkLt         -> match b { TkLt -> true _ -> false }
+    TkGt         -> match b { TkGt -> true _ -> false }
+    TkLe         -> match b { TkLe -> true _ -> false }
+    TkGe         -> match b { TkGe -> true _ -> false }
+    TkBang       -> match b { TkBang -> true _ -> false }
+    TkError(_)   -> false
+  }
+}
+
+fn p_at(p: Parser, k: TokKind) : Bool = tk_is(p_peek(p).kind, k)
+
+fn p_try_consume(p: Parser, k: TokKind) : Option[Parser] {
+  if p_at(p, k) { Some(p_advance(p)) } else { None }
+}
+
+fn p_skip_newlines(p: Parser) : Parser {
+  if p_at(p, TkNewline) { p_skip_newlines(p_advance(p)) } else { p }
+}
+
+fn p_skip_newlines_and_semis(p: Parser) : Parser {
+  if p_at(p, TkNewline) or p_at(p, TkSemi) { p_skip_newlines_and_semis(p_advance(p)) }
+  else { p }
+}
+
+fn p_error(p: Parser, t: Token, msg: String) : Parser {
+  if p.had_error { p }
+  else {
+    eprint("#{p.file}:#{int_to_string(t.line)}:#{int_to_string(t.col)}: error: #{msg}")
+    p_mark_err(p)
+  }
+}
+
+fn p_error_here(p: Parser, msg: String) : Parser = p_error(p, p_peek(p), msg)
+
+fn p_expect(p: Parser, k: TokKind, msg: String) : PExpr {
+  # PExpr is a misnomer — we just reuse the record structure. We return
+  # an Expr-less PExpr; callers that need the consumed token use
+  # p_expect_tok instead. This variant is a convenience for "advance
+  # past a required delimiter".
+  if p_at(p, k) { PExpr { p: p_advance(p), r: Some(mk_expr(EUnit, 0, 0)) } }
+  else { PExpr { p: p_error_here(p, msg), r: None } }
+}
+
+# Same, but returns the consumed token in the Option payload slot (as an
+# EStr carrying the raw span — caller decodes).
+fn p_expect_tok(p: Parser, k: TokKind, msg: String) : Token {
+  if p_at(p, k) { p_peek(p) }
+  else { eof_tok() }
+}
+
+fn is_upper_ident(src: String, t: Token) : Bool {
+  match char_at(src, t.start) {
+    Some(c) -> c >= 'A' and c <= 'Z'
+    None -> false
+  }
+}
+
+fn tok_source(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+# ====================================================================
+# literal decoders
+# ====================================================================
+
+fn decode_int_loop(s: String, i: Int, n: Int, acc: Int, neg: Bool) : Int {
+  if i >= n { if neg { 0 - acc } else { acc } }
+  else {
+    match char_at(s, i) {
+      None -> if neg { 0 - acc } else { acc }
+      Some(c) -> {
+        if c == '_' { decode_int_loop(s, i + 1, n, acc, neg) }
+        else if ch_is_digit(c) {
+          let d = char_to_int(c) - char_to_int('0')
+          decode_int_loop(s, i + 1, n, acc * 10 + d, neg)
+        } else {
+          if neg { 0 - acc } else { acc }
+        }
+      }
+    }
+  }
+}
+
+fn decode_int(span: String) : Int {
+  let n = string_length(span)
+  if n == 0 { 0 }
+  else {
+    match char_at(span, 0) {
+      Some(c) -> if c == '-' { decode_int_loop(span, 1, n, 0, true) }
+                 else { decode_int_loop(span, 0, n, 0, false) }
+      None -> 0
+    }
+  }
+}
+
+fn strip_underscores_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '_' { strip_underscores_loop(s, i + 1, n, acc) }
+        else { strip_underscores_loop(s, i + 1, n, string_concat(acc, "#{c}")) }
+      }
+    }
+  }
+}
+
+fn decode_real(span: String) : Real {
+  let clean = strip_underscores_loop(span, 0, string_length(span), "")
+  match string_to_real(clean) {
+    Some(r) -> r
+    None -> 0.0
+  }
+}
+
+fn decode_char_escape(c: Char) : Char {
+  if c == 'n' { '\n' }
+  else if c == 't' { '\t' }
+  else if c == 'r' { '\r' }
+  else if c == '\\' { '\\' }
+  else if c == '\'' { '\'' }
+  else if c == '"' { '"' }
+  else if c == '0' { int_to_char(0) }
+  else { c }
+}
+
+fn decode_hex_loop(s: String, i: Int, n: Int, acc: Int) : Int {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None -> acc
+      Some(c) -> {
+        if c == '}' { acc }
+        else {
+          let v =
+            if ch_is_digit(c) { char_to_int(c) - char_to_int('0') }
+            else if c >= 'a' and c <= 'f' { char_to_int(c) - char_to_int('a') + 10 }
+            else if c >= 'A' and c <= 'F' { char_to_int(c) - char_to_int('A') + 10 }
+            else { 0 }
+          decode_hex_loop(s, i + 1, n, acc * 16 + v)
+        }
+      }
+    }
+  }
+}
+
+# span is the raw char literal including surrounding quotes: 'a', '\n', '\u{2603}'
+fn decode_char(span: String) : Char {
+  let n = string_length(span)
+  if n < 2 { int_to_char(0) }
+  else {
+    match char_at(span, 1) {
+      None -> int_to_char(0)
+      Some(c1) -> {
+        if c1 == '\\' {
+          match char_at(span, 2) {
+            None -> int_to_char(0)
+            Some(c2) -> {
+              if c2 == 'u' {
+                int_to_char(decode_hex_loop(span, 4, n - 1, 0))
+              } else {
+                decode_char_escape(c2)
+              }
+            }
+          }
+        } else {
+          c1
+        }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# precedence climbing: forward declarations
+# ====================================================================
+#
+# These are implemented below. Listed here as a reading aid.
+#  parse_expr   -> parse_pipe
+#  parse_pipe   -> parse_or ("|>" parse_or)*
+#  parse_or     -> parse_and ("or" parse_and)*
+#  parse_and    -> parse_cmp ("and" parse_cmp)*
+#  parse_cmp    -> parse_add (cmpop parse_add)?        (no chains)
+#  parse_add    -> parse_mul ([+-] parse_mul)*
+#  parse_mul    -> parse_unary ([*/%//] parse_unary)*
+#  parse_unary  -> ("-" | "not")? parse_postfix
+#  parse_postfix-> parse_primary (call | field | index)*
+#  parse_primary-> literal | ident | "(" expr ")" | if | match | block | record | list | lambda
+
+fn op_of_tok(k: TokKind) : String {
+  match k {
+    TkPlus -> "+" TkMinus -> "-" TkStar -> "*" TkSlash -> "/"
+    TkSlashSlash -> "//" TkPercent -> "%"
+    TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">" TkLe -> "<=" TkGe -> ">="
+    TkAnd -> "and" TkOr -> "or"
+    _ -> "?"
+  }
+}
+
+# ====================================================================
+# expression parsing
+# ====================================================================
+
+fn ok_e(p: Parser, e: Expr) : PExpr = PExpr { p: p, r: Some(e) }
+fn err_e(p: Parser) : PExpr = PExpr { p: p, r: None }
+fn ok_s(p: Parser, s: Stmt) : PStmt = PStmt { p: p, r: Some(s) }
+fn err_s(p: Parser) : PStmt = PStmt { p: p, r: None }
+fn ok_p(p: Parser, x: Pattern) : PPat = PPat { p: p, r: Some(x) }
+fn err_p(p: Parser) : PPat = PPat { p: p, r: None }
+fn ok_t(p: Parser, x: TypeExpr) : PTy = PTy { p: p, r: Some(x) }
+fn err_t(p: Parser) : PTy = PTy { p: p, r: None }
+fn ok_d(p: Parser, x: Decl) : PDecl = PDecl { p: p, r: Some(x) }
+fn err_d(p: Parser) : PDecl = PDecl { p: p, r: None }
+fn ok_a(p: Parser, x: Arm) : PArm = PArm { p: p, r: Some(x) }
+fn err_a(p: Parser) : PArm = PArm { p: p, r: None }
+fn ok_pm(p: Parser, x: Param) : PParam = PParam { p: p, r: Some(x) }
+fn err_pm(p: Parser) : PParam = PParam { p: p, r: None }
+fn ok_fi(p: Parser, x: FieldInit) : PFI = PFI { p: p, r: Some(x) }
+fn err_fi(p: Parser) : PFI = PFI { p: p, r: None }
+fn ok_v(p: Parser, x: Variant) : PVar = PVar { p: p, r: Some(x) }
+fn err_v(p: Parser) : PVar = PVar { p: p, r: None }
+fn ok_fd(p: Parser, x: FieldDecl) : PFD = PFD { p: p, r: Some(x) }
+fn err_fd(p: Parser) : PFD = PFD { p: p, r: None }
+fn ok_pf(p: Parser, x: PField) : PPF = PPF { p: p, r: Some(x) }
+fn err_pf(p: Parser) : PPF = PPF { p: p, r: None }
+fn ok_el(p: Parser, x: ListElem) : PEL = PEL { p: p, r: Some(x) }
+fn err_el(p: Parser) : PEL = PEL { p: p, r: None }
+
+fn parse_expr(p: Parser) : PExpr = parse_pipe(p)
+
+fn parse_pipe(p: Parser) : PExpr {
+  let r = parse_or(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_pipe_rest(r.p, lhs)
+  }
+}
+
+fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkPipeApply) {
+    let t = p_peek(p)
+    let p1 = p_skip_newlines(p_advance(p))
+    let r = parse_or(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn parse_or(p: Parser) : PExpr {
+  let r = parse_and(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_or_rest(r.p, lhs)
+  }
+}
+
+fn parse_or_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkOr) {
+    let t = p_peek(p)
+    let r = parse_and(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_or_rest(r.p, mk_expr(EBinop("or", lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn parse_and(p: Parser) : PExpr {
+  let r = parse_cmp(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_and_rest(r.p, lhs)
+  }
+}
+
+fn parse_and_rest(p: Parser, lhs: Expr) : PExpr {
+  if p_at(p, TkAnd) {
+    let t = p_peek(p)
+    let r = parse_cmp(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_and_rest(r.p, mk_expr(EBinop("and", lhs, rhs), t.line, t.col))
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+fn is_cmp_tok(k: TokKind) : Bool {
+  tk_is(k, TkEqEq) or tk_is(k, TkNeq) or tk_is(k, TkLt) or tk_is(k, TkGt) or tk_is(k, TkLe) or tk_is(k, TkGe)
+}
+
+fn parse_cmp(p: Parser) : PExpr {
+  let r = parse_add(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> {
+      let t = p_peek(r.p)
+      if is_cmp_tok(t.kind) {
+        let op = op_of_tok(t.kind)
+        let r2 = parse_add(p_skip_newlines(p_advance(r.p)))
+        match r2.r {
+          None -> err_e(r2.p)
+          Some(rhs) -> ok_e(r2.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+        }
+      } else { ok_e(r.p, lhs) }
+    }
+  }
+}
+
+fn parse_add(p: Parser) : PExpr {
+  let r = parse_mul(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_add_rest(r.p, lhs)
+  }
+}
+
+fn parse_add_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkPlus) or tk_is(t.kind, TkMinus) {
+    let op = op_of_tok(t.kind)
+    let r = parse_mul(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_add_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+    }
+  } else { ok_e(p, lhs) }
+}
+
+fn parse_mul(p: Parser) : PExpr {
+  let r = parse_unary(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_mul_rest(r.p, lhs)
+  }
+}
+
+fn parse_mul_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkStar) or tk_is(t.kind, TkSlash) or tk_is(t.kind, TkSlashSlash) or tk_is(t.kind, TkPercent) {
+    let op = op_of_tok(t.kind)
+    let r = parse_unary(p_skip_newlines(p_advance(p)))
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> parse_mul_rest(r.p, mk_expr(EBinop(op, lhs, rhs), t.line, t.col))
+    }
+  } else { ok_e(p, lhs) }
+}
+
+fn parse_unary(p: Parser) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkMinus) {
+    let r = parse_unary(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> ok_e(r.p, mk_expr(EUnop("-", e), t.line, t.col))
+    }
+  } else if tk_is(t.kind, TkNot) {
+    let r = parse_unary(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> ok_e(r.p, mk_expr(EUnop("not", e), t.line, t.col))
+    }
+  } else {
+    parse_postfix(p)
+  }
+}
+
+fn parse_postfix(p: Parser) : PExpr {
+  let r = parse_primary(p)
+  match r.r {
+    None -> r
+    Some(e) -> parse_postfix_rest(r.p, e)
+  }
+}
+
+fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLparen) {
+    let args_r = parse_call_args(p_advance(p))
+    match args_r.r {
+      None -> err_e(args_r.p)
+      Some(xs) -> parse_postfix_rest(args_r.p, mk_expr(ECall(lhs, xs), t.line, t.col))
+    }
+  } else if tk_is(t.kind, TkDot) {
+    let p1 = p_advance(p)
+    let id = p_peek(p1)
+    if tk_is(id.kind, TkIdent) {
+      let name = tok_source(p.src, id)
+      parse_postfix_rest(p_advance(p1), mk_expr(EField(lhs, name), t.line, t.col))
+    } else {
+      err_e(p_error_here(p1, "expected field name after `.`"))
+    }
+  } else if tk_is(t.kind, TkLbracket) {
+    let p1 = p_advance(p)
+    let r = parse_expr(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(idx) -> {
+        let closed = p_expect(r.p, TkRbracket, "expected `]` after index")
+        match closed.r {
+          None -> err_e(closed.p)
+          Some(_) -> parse_postfix_rest(closed.p, mk_expr(EIndex(lhs, idx), t.line, t.col))
+        }
+      }
+    }
+  } else {
+    ok_e(p, lhs)
+  }
+}
+
+# Parse the argument list of a call. Position is AT the token after the
+# opening `(`. Returns with `(` already consumed by caller, `)` to be
+# consumed here. Newlines between args are allowed.
+type PArgs = { p: Parser, r: Option[[Expr]] }
+
+fn ok_args(p: Parser, xs: [Expr]) : PArgs = PArgs { p: p, r: Some(xs) }
+fn err_args(p: Parser) : PArgs = PArgs { p: p, r: None }
+
+fn parse_call_args(p: Parser) : PArgs {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRparen) { ok_args(p_advance(p0), []) }
+  else { parse_call_args_loop(p0, []) }
+}
+
+fn parse_call_args_loop(p: Parser, acc: [Expr]) : PArgs {
+  let r = parse_expr(p_skip_newlines(p))
+  match r.r {
+    None -> err_args(r.p)
+    Some(e) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) { parse_call_args_loop(p_skip_newlines(p_advance(p1)), [e, ...acc]) }
+      else if p_at(p1, TkRparen) {
+        ok_args(p_advance(p1), list_reverse([e, ...acc]))
+      }
+      else { err_args(p_error_here(p1, "expected `,` or `)` in call arguments")) }
+    }
+  }
+}
+
+# ====================================================================
+# primary expressions — placeholders for later implementations
+# ====================================================================
+
+fn parse_primary(p: Parser) : PExpr {
+  let t = p_peek(p)
+  match t.kind {
+    TkInt -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EInt(decode_int(span)), t.line, t.col))
+    }
+    TkReal -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EReal(decode_real(span)), t.line, t.col))
+    }
+    TkTrue  -> ok_e(p_advance(p), mk_expr(EBool(true),  t.line, t.col))
+    TkFalse -> ok_e(p_advance(p), mk_expr(EBool(false), t.line, t.col))
+    TkChar  -> {
+      let span = tok_source(p.src, t)
+      ok_e(p_advance(p), mk_expr(EChar(decode_char(span)), t.line, t.col))
+    }
+    TkString -> {
+      let span = tok_source(p.src, t)
+      let is_triple =
+        string_length(span) >= 6 and
+        match char_at(span, 0) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 1) { Some(c) -> c == '"' _ -> false } and
+        match char_at(span, 2) { Some(c) -> c == '"' _ -> false }
+      ok_e(p_advance(p), mk_expr(EStr(span, is_triple), t.line, t.col))
+    }
+    TkUnderscore -> ok_e(p_advance(p), mk_expr(EUnder, t.line, t.col))
+    TkDot -> ok_e(p_advance(p), mk_expr(EPlaceholder, t.line, t.col))
+    TkIdent -> parse_ident_primary(p, t)
+    TkLparen -> parse_paren_or_lambda(p, t)
+    TkLbracket -> parse_list_or_range(p, t)
+    TkLbrace -> parse_block(p, t)
+    TkIf -> parse_if(p, t)
+    TkMatch -> parse_match(p, t)
+    _ -> err_e(p_error_here(p, "expected expression"))
+  }
+}
+
+fn parse_ident_primary(p: Parser, t: Token) : PExpr {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  # Lambda: `name => body`
+  if p_at(p1, TkFatArrow) {
+    let p2 = p_advance(p1)
+    let r = parse_expr(p2)
+    match r.r {
+      None -> err_e(r.p)
+      Some(body) -> {
+        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
+        ok_e(r.p, mk_expr(ELambda([param], body), t.line, t.col))
+      }
+    }
+  }
+  # Record literal: `Name { ... }` — but only when the name is Uppercase.
+  else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) {
+    parse_record_lit(p1, name, t)
+  }
+  # Plain variable reference.
+  else {
+    ok_e(p1, mk_expr(EVar(name), t.line, t.col))
+  }
+}
+
+fn parse_record_lit(p: Parser, type_name: String, tname: Token) : PExpr {
+  # `{` is next. Consume it.
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbrace) {
+    ok_e(p_advance(p1), mk_expr(ERecordLit(type_name, []), tname.line, tname.col))
+  } else {
+    parse_record_fields_loop(p1, [], type_name, tname)
+  }
+}
+
+fn parse_record_fields_loop(p: Parser, acc: [FieldInit], type_name: String, tname: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  let tk = p_peek(p0)
+  if not tk_is(tk.kind, TkIdent) {
+    err_e(p_error(p0, tk, "expected field name in record literal"))
+  } else {
+    let fname = tok_source(p0.src, tk)
+    let p1 = p_advance(p0)
+    if not p_at(p1, TkColon) {
+      err_e(p_error_here(p1, "expected `:` after field name"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let r = parse_expr(p2)
+      match r.r {
+        None -> err_e(r.p)
+        Some(val) -> {
+          let acc1 = [FI(fname, val), ...acc]
+          let p3 = p_skip_newlines(r.p)
+          if p_at(p3, TkComma) {
+            parse_record_fields_loop(p_skip_newlines(p_advance(p3)), acc1, type_name, tname)
+          } else if p_at(p3, TkRbrace) {
+            ok_e(p_advance(p3), mk_expr(ERecordLit(type_name, list_reverse(acc1)), tname.line, tname.col))
+          } else {
+            err_e(p_error_here(p3, "expected `,` or `}` in record literal"))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr {
+  # We need to distinguish:
+  #   (expr)                  — grouping
+  #   ()                       — unit
+  #   () => expr               — zero-arg lambda
+  #   (a, b, ...) => expr      — multi-arg lambda
+  #   (a) => expr              — single-arg lambda (parenthesised)
+  # Strategy: speculatively parse a lambda-param list. If followed by
+  # `=>`, it's a lambda. Otherwise it was a parenthesised expression
+  # and we re-parse from the original position.
+  let p1 = p_skip_newlines(p_advance(p))
+  # Empty parens: unit, or zero-arg lambda.
+  if p_at(p1, TkRparen) {
+    let p2 = p_advance(p1)
+    if p_at(p2, TkFatArrow) {
+      let p3 = p_advance(p2)
+      let r = parse_expr(p3)
+      match r.r {
+        None -> err_e(r.p)
+        Some(body) -> ok_e(r.p, mk_expr(ELambda([], body), t.line, t.col))
+      }
+    } else {
+      ok_e(p2, mk_expr(EUnit, t.line, t.col))
+    }
+  } else {
+    # Try lambda: tentatively scan for an ident list ending with `)` `=>`.
+    match try_parse_lambda_params(p1) {
+      Some(res) -> {
+        let r = parse_expr(res.p)
+        match r.r {
+          None -> err_e(r.p)
+          Some(body) -> ok_e(r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
+        }
+      }
+      None -> {
+        # Fall back to `( expr )`.
+        let r = parse_expr(p1)
+        match r.r {
+          None -> err_e(r.p)
+          Some(e) -> {
+            let p2 = p_skip_newlines(r.p)
+            if p_at(p2, TkRparen) { ok_e(p_advance(p2), e) }
+            else { err_e(p_error_here(p2, "expected `)` after expression")) }
+          }
+        }
+      }
+    }
+  }
+}
+
+# A lambda parameter list is a comma-separated sequence of identifiers
+# (optionally with `: Type` annotations) followed by `)` then `=>`.
+# This scan is non-destructive: it returns the parser advanced past the
+# `=>` on success, None on failure.
+type LamParams = { p: Parser, params: [Param] }
+
+fn try_parse_lambda_params(p: Parser) : Option[LamParams] {
+  try_parse_lambda_params_loop(p, [])
+}
+
+fn try_parse_lambda_params_loop(p: Parser, acc: [Param]) : Option[LamParams] {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) { None }
+  else {
+    let name = tok_source(p.src, t)
+    let p1 = p_advance(p)
+    # Optional `: Type`
+    let p2_opt =
+      if p_at(p1, TkColon) {
+        let r = parse_type(p_advance(p1))
+        match r.r {
+          None -> None
+          Some(_) -> Some(r.p)
+        }
+      } else {
+        Some(p1)
+      }
+    match p2_opt {
+      None -> None
+      Some(p2) -> {
+        let param = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
+        let acc1 = [param, ...acc]
+        if p_at(p2, TkComma) {
+          try_parse_lambda_params_loop(p_skip_newlines(p_advance(p2)), acc1)
+        } else if p_at(p2, TkRparen) {
+          let p3 = p_advance(p2)
+          if p_at(p3, TkFatArrow) {
+            Some(LamParams { p: p_advance(p3), params: list_reverse(acc1) })
+          } else { None }
+        } else { None }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# list / range
+# ====================================================================
+
+fn parse_list_or_range(p: Parser, t: Token) : PExpr {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_e(p_advance(p1), mk_expr(EList([]), t.line, t.col))
+  } else {
+    # Parse first element (could start with `...`).
+    parse_first_list_elem(p1, t)
+  }
+}
+
+fn parse_first_list_elem(p: Parser, t: Token) : PExpr {
+  if p_at(p, TkEllipsis) {
+    let r = parse_expr(p_advance(p))
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> parse_list_rest(r.p, [ElSpread(e)], t)
+    }
+  } else {
+    let r = parse_expr(p)
+    match r.r {
+      None -> err_e(r.p)
+      Some(first) -> {
+        # Range: `[ a .. b ]` or `[ a .. b .. step ]`.
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkDotDot) {
+          let r2 = parse_expr(p_skip_newlines(p_advance(p1)))
+          match r2.r {
+            None -> err_e(r2.p)
+            Some(to) -> {
+              let p2 = p_skip_newlines(r2.p)
+              if p_at(p2, TkDotDot) {
+                let r3 = parse_expr(p_skip_newlines(p_advance(p2)))
+                match r3.r {
+                  None -> err_e(r3.p)
+                  Some(step) -> {
+                    let p3 = p_skip_newlines(r3.p)
+                    if p_at(p3, TkRbracket) {
+                      ok_e(p_advance(p3), mk_expr(ERange(first, to, Some(step)), t.line, t.col))
+                    } else { err_e(p_error_here(p3, "expected `]` at end of range")) }
+                  }
+                }
+              } else if p_at(p2, TkRbracket) {
+                ok_e(p_advance(p2), mk_expr(ERange(first, to, None), t.line, t.col))
+              } else { err_e(p_error_here(p2, "expected `]` at end of range")) }
+            }
+          }
+        } else {
+          parse_list_rest(p1, [ElPlain(first)], t)
+        }
+      }
+    }
+  }
+}
+
+fn parse_list_rest(p: Parser, acc: [ListElem], t: Token) : PExpr {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbracket) {
+    ok_e(p_advance(p0), mk_expr(EList(list_reverse(acc)), t.line, t.col))
+  } else if p_at(p0, TkComma) {
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkEllipsis) {
+      let r = parse_expr(p_advance(p1))
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> parse_list_rest(r.p, [ElSpread(e), ...acc], t)
+      }
+    } else {
+      let r = parse_expr(p1)
+      match r.r {
+        None -> err_e(r.p)
+        Some(e) -> parse_list_rest(r.p, [ElPlain(e), ...acc], t)
+      }
+    }
+  } else {
+    err_e(p_error_here(p0, "expected `,` or `]` in list"))
+  }
+}
+
+# ====================================================================
+# block, if, match
+# ====================================================================
+
+fn parse_block(p: Parser, t: Token) : PExpr {
+  # `{` is at current position.
+  let p1 = p_skip_newlines_and_semis(p_advance(p))
+  parse_block_body(p1, [], t)
+}
+
+fn parse_block_body(p: Parser, stmts: [Stmt], t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_expr(EBlock(list_reverse(stmts), None), t.line, t.col))
+  } else {
+    let r = parse_stmt(p0)
+    match r.r {
+      None -> err_e(r.p)
+      Some(s) -> {
+        let p1 = p_skip_newlines_and_semis(r.p)
+        if p_at(p1, TkRbrace) {
+          # If the last stmt was an expression statement, it becomes the
+          # block's final expression.
+          match s {
+            SExprStmt(e) -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse(stmts), Some(e)), t.line, t.col))
+            _ -> ok_e(p_advance(p1), mk_expr(EBlock(list_reverse([s, ...stmts]), None), t.line, t.col))
+          }
+        } else {
+          parse_block_body(p1, [s, ...stmts], t)
+        }
+      }
+    }
+  }
+}
+
+fn parse_stmt(p: Parser) : PStmt {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLet) {
+    parse_let(p, t)
+  } else if tk_is(t.kind, TkAssert) {
+    parse_assert(p, t)
+  } else {
+    let r = parse_expr(p)
+    match r.r {
+      None -> err_s(r.p)
+      Some(e) -> ok_s(r.p, SExprStmt(e))
+    }
+  }
+}
+
+fn parse_let(p: Parser, t: Token) : PStmt {
+  let p1 = p_advance(p)
+  let rp = parse_pattern(p1)
+  match rp.r {
+    None -> err_s(rp.p)
+    Some(pat) -> {
+      # Optional `: Type` annotation.
+      let pa = p_skip_newlines(rp.p)
+      let ty_opt_r =
+        if p_at(pa, TkColon) {
+          let rt = parse_type(p_advance(pa))
+          match rt.r {
+            None -> PTy { p: rt.p, r: None }
+            Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+          }
+        } else {
+          PTy { p: pa, r: None }
+        }
+      if ty_opt_r.p.had_error and not pa.had_error { err_s(ty_opt_r.p) }
+      else {
+        let p_eq = p_skip_newlines(ty_opt_r.p)
+        if not p_at(p_eq, TkEq) {
+          err_s(p_error_here(p_eq, "expected `=` in let binding"))
+        } else {
+          let p_rhs = p_skip_newlines(p_advance(p_eq))
+          let re = parse_expr(p_rhs)
+          match re.r {
+            None -> err_s(re.p)
+            Some(rhs) -> ok_s(re.p, SLet(pat, ty_opt_r.r, rhs))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_assert(p: Parser, t: Token) : PStmt {
+  let p1 = p_advance(p)
+  let re = parse_expr(p1)
+  match re.r {
+    None -> err_s(re.p)
+    Some(cond) -> {
+      if p_at(re.p, TkComma) {
+        let p2 = p_skip_newlines(p_advance(re.p))
+        let rm = parse_expr(p2)
+        match rm.r {
+          None -> err_s(rm.p)
+          Some(msg) -> ok_s(rm.p, SAssert(cond, Some(msg)))
+        }
+      } else {
+        ok_s(re.p, SAssert(cond, None))
+      }
+    }
+  }
+}
+
+fn parse_if(p: Parser, t: Token) : PExpr {
+  let p1 = p_advance(p)
+  let rc = parse_expr(p1)
+  match rc.r {
+    None -> err_e(rc.p)
+    Some(cond) -> {
+      # Then-block
+      let p2 = p_skip_newlines(rc.p)
+      if not p_at(p2, TkLbrace) {
+        err_e(p_error_here(p2, "expected `{` after `if` condition"))
+      } else {
+        let tb = p_peek(p2)
+        let rt = parse_block(p2, tb)
+        match rt.r {
+          None -> err_e(rt.p)
+          Some(then_e) -> {
+            let p3 = p_skip_newlines(rt.p)
+            if p_at(p3, TkElse) {
+              let p4 = p_skip_newlines(p_advance(p3))
+              if p_at(p4, TkIf) {
+                let te = p_peek(p4)
+                let re = parse_if(p4, te)
+                match re.r {
+                  None -> err_e(re.p)
+                  Some(else_e) -> ok_e(re.p, mk_expr(EIf(cond, then_e, Some(else_e)), t.line, t.col))
+                }
+              } else if p_at(p4, TkLbrace) {
+                let teb = p_peek(p4)
+                let re = parse_block(p4, teb)
+                match re.r {
+                  None -> err_e(re.p)
+                  Some(else_e) -> ok_e(re.p, mk_expr(EIf(cond, then_e, Some(else_e)), t.line, t.col))
+                }
+              } else {
+                err_e(p_error_here(p4, "expected `if` or `{` after `else`"))
+              }
+            } else {
+              ok_e(rc.p, mk_expr(EIf(cond, then_e, None), t.line, t.col))
+              # Note: we return with p3's state (unchanged) since there is no else.
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_match(p: Parser, t: Token) : PExpr {
+  let p1 = p_advance(p)
+  let rs = parse_expr(p1)
+  match rs.r {
+    None -> err_e(rs.p)
+    Some(scrut) -> {
+      let p2 = p_skip_newlines(rs.p)
+      if not p_at(p2, TkLbrace) {
+        err_e(p_error_here(p2, "expected `{` after `match` expression"))
+      } else {
+        parse_match_arms(p_skip_newlines(p_advance(p2)), [], scrut, t)
+      }
+    }
+  }
+}
+
+fn parse_match_arms(p: Parser, acc: [Arm], scrut: Expr, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  if p_at(p0, TkRbrace) {
+    ok_e(p_advance(p0), mk_expr(EMatch(scrut, list_reverse(acc)), t.line, t.col))
+  } else {
+    let ra = parse_arm(p0)
+    match ra.r {
+      None -> err_e(ra.p)
+      Some(arm) -> parse_match_arms(ra.p, [arm, ...acc], scrut, t)
+    }
+  }
+}
+
+fn parse_arm(p: Parser) : PArm {
+  let rp = parse_pattern(p)
+  match rp.r {
+    None -> err_a(rp.p)
+    Some(pat) -> {
+      let p1 = p_skip_newlines(rp.p)
+      # Optional guard: `if expr`.
+      let guard_opt_r =
+        if p_at(p1, TkIf) {
+          let rg = parse_expr(p_advance(p1))
+          match rg.r {
+            None -> PExpr { p: rg.p, r: None }
+            Some(g) -> PExpr { p: rg.p, r: Some(g) }
+          }
+        } else {
+          PExpr { p: p1, r: None }
+        }
+      match guard_opt_r.r {
+        None -> if guard_opt_r.p.had_error { err_a(guard_opt_r.p) } else {
+          parse_arm_body(guard_opt_r.p, pat, None)
+        }
+        Some(_) -> parse_arm_body(guard_opt_r.p, pat, guard_opt_r.r)
+      }
+    }
+  }
+}
+
+fn parse_arm_body(p: Parser, pat: Pattern, guard: Option[Expr]) : PArm {
+  let p1 = p_skip_newlines(p)
+  if not p_at(p1, TkArrow) {
+    err_a(p_error_here(p1, "expected `->` in match arm"))
+  } else {
+    let p2 = p_skip_newlines(p_advance(p1))
+    let rb = parse_expr(p2)
+    match rb.r {
+      None -> err_a(rb.p)
+      Some(body) -> ok_a(rb.p, Arm(pat, guard, body))
+    }
+  }
+}
+
+# ====================================================================
+# patterns
+# ====================================================================
+
+fn parse_pattern(p: Parser) : PPat {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkUnderscore) {
+    ok_p(p_advance(p), mk_pat(PWild, t.line, t.col))
+  } else if tk_is(t.kind, TkInt) {
+    let span = tok_source(p.src, t)
+    let lit = mk_expr(EInt(decode_int(span)), t.line, t.col)
+    ok_p(p_advance(p), mk_pat(PLit(lit), t.line, t.col))
+  } else if tk_is(t.kind, TkReal) {
+    let span = tok_source(p.src, t)
+    let lit = mk_expr(EReal(decode_real(span)), t.line, t.col)
+    ok_p(p_advance(p), mk_pat(PLit(lit), t.line, t.col))
+  } else if tk_is(t.kind, TkTrue) {
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EBool(true), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkFalse) {
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EBool(false), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkChar) {
+    let span = tok_source(p.src, t)
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EChar(decode_char(span)), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkString) {
+    let span = tok_source(p.src, t)
+    ok_p(p_advance(p), mk_pat(PLit(mk_expr(EStr(span, false), t.line, t.col)), t.line, t.col))
+  } else if tk_is(t.kind, TkMinus) {
+    let nxt = p_peek1(p)
+    if tk_is(nxt.kind, TkInt) {
+      let span = tok_source(p.src, nxt)
+      let v = 0 - decode_int(span)
+      let p1 = p_advance(p_advance(p))
+      ok_p(p1, mk_pat(PLit(mk_expr(EInt(v), t.line, t.col)), t.line, t.col))
+    } else {
+      err_p(p_error_here(p, "expected literal after `-` in pattern"))
+    }
+  } else if tk_is(t.kind, TkLbracket) {
+    parse_list_pattern(p, t)
+  } else if tk_is(t.kind, TkIdent) {
+    parse_ident_pattern(p, t)
+  } else {
+    err_p(p_error_here(p, "expected pattern"))
+  }
+}
+
+fn parse_list_pattern(p: Parser, t: Token) : PPat {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRbracket) {
+    ok_p(p_advance(p1), mk_pat(PList([], None), t.line, t.col))
+  } else {
+    parse_list_pattern_loop(p1, [], None, t)
+  }
+}
+
+fn parse_list_pattern_loop(p: Parser, acc: [Pattern], rest: Option[String], t: Token) : PPat {
+  if p_at(p, TkEllipsis) {
+    # Spread binder.
+    let p1 = p_advance(p)
+    let id = p_peek(p1)
+    if not tk_is(id.kind, TkIdent) {
+      err_p(p_error_here(p1, "expected identifier after `...` in list pattern"))
+    } else {
+      let name = tok_source(p1.src, id)
+      let p2 = p_skip_newlines(p_advance(p1))
+      if p_at(p2, TkRbracket) {
+        ok_p(p_advance(p2), mk_pat(PList(list_reverse(acc), Some(name)), t.line, t.col))
+      } else {
+        err_p(p_error_here(p2, "expected `]` after spread pattern"))
+      }
+    }
+  } else {
+    let r = parse_pattern(p)
+    match r.r {
+      None -> err_p(r.p)
+      Some(pat) -> {
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkComma) {
+          parse_list_pattern_loop(p_skip_newlines(p_advance(p1)), [pat, ...acc], None, t)
+        } else if p_at(p1, TkRbracket) {
+          ok_p(p_advance(p1), mk_pat(PList(list_reverse([pat, ...acc]), None), t.line, t.col))
+        } else {
+          err_p(p_error_here(p1, "expected `,` or `]` in list pattern"))
+        }
+      }
+    }
+  }
+}
+
+fn parse_ident_pattern(p: Parser, t: Token) : PPat {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if is_upper_ident(p.src, t) and p_at(p1, TkLparen) {
+    # Variant with positional sub-patterns.
+    let p2 = p_skip_newlines(p_advance(p1))
+    if p_at(p2, TkRparen) {
+      ok_p(p_advance(p2), mk_pat(PVariant(name, []), t.line, t.col))
+    } else {
+      parse_variant_sub_patterns(p2, [], name, t)
+    }
+  } else if is_upper_ident(p.src, t) and p_at(p1, TkLbrace) {
+    # Variant-record pattern: parse as record, wrap in PVariantRecord.
+    let p2 = p_skip_newlines(p_advance(p1))
+    parse_record_pattern_fields(p2, [], Some(name), t)
+  } else if is_upper_ident(p.src, t) {
+    # Bare uppercase ident: 0-arg variant.
+    ok_p(p1, mk_pat(PVariant(name, []), t.line, t.col))
+  } else {
+    ok_p(p1, mk_pat(PBind(name), t.line, t.col))
+  }
+}
+
+fn parse_variant_sub_patterns(p: Parser, acc: [Pattern], name: String, t: Token) : PPat {
+  let r = parse_pattern(p)
+  match r.r {
+    None -> err_p(r.p)
+    Some(sub) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_variant_sub_patterns(p_skip_newlines(p_advance(p1)), [sub, ...acc], name, t)
+      } else if p_at(p1, TkRparen) {
+        ok_p(p_advance(p1), mk_pat(PVariant(name, list_reverse([sub, ...acc])), t.line, t.col))
+      } else {
+        err_p(p_error_here(p1, "expected `,` or `)` in variant pattern"))
+      }
+    }
+  }
+}
+
+fn parse_record_pattern_fields(p: Parser, acc: [PField], ctor: Option[String], t: Token) : PPat {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    let p1 = p_advance(p0)
+    match ctor {
+      None -> ok_p(p1, mk_pat(PRecord(list_reverse(acc)), t.line, t.col))
+      Some(name) -> ok_p(p1, mk_pat(PVariantRecord(name, list_reverse(acc)), t.line, t.col))
+    }
+  } else {
+    let fn_t = p_peek(p0)
+    if not tk_is(fn_t.kind, TkIdent) {
+      err_p(p_error(p0, fn_t, "expected field name in record pattern"))
+    } else {
+      let fname = tok_source(p0.src, fn_t)
+      let p1 = p_advance(p0)
+      let sub_r =
+        if p_at(p1, TkColon) {
+          let r = parse_pattern(p_advance(p1))
+          match r.r {
+            None -> PPat { p: r.p, r: None }
+            Some(sp) -> PPat { p: r.p, r: Some(sp) }
+          }
+        } else {
+          PPat { p: p1, r: Some(mk_pat(PBind(fname), fn_t.line, fn_t.col)) }
+        }
+      match sub_r.r {
+        None -> err_p(sub_r.p)
+        Some(sub) -> {
+          let is_short = not p_at(p1, TkColon)
+          let pf = PField(fname, sub, is_short)
+          let p2 = p_skip_newlines(sub_r.p)
+          if p_at(p2, TkComma) {
+            parse_record_pattern_fields(p_skip_newlines(p_advance(p2)), [pf, ...acc], ctor, t)
+          } else if p_at(p2, TkRbrace) {
+            parse_record_pattern_fields(p2, [pf, ...acc], ctor, t)
+          } else {
+            err_p(p_error_here(p2, "expected `,` or `}` in record pattern"))
+          }
+        }
+      }
+    }
+  }
+}
+
+# ====================================================================
+# type expressions
+# ====================================================================
+
+fn parse_type(p: Parser) : PTy {
+  let t = p_peek(p)
+  if tk_is(t.kind, TkLbracket) {
+    let p1 = p_advance(p)
+    let r = parse_type(p1)
+    match r.r {
+      None -> err_t(r.p)
+      Some(inner) -> {
+        if p_at(r.p, TkRbracket) {
+          ok_t(p_advance(r.p), mk_ty(TyList(inner), t.line, t.col))
+        } else {
+          err_t(p_error_here(r.p, "expected `]` in list type"))
+        }
+      }
+    }
+  } else if tk_is(t.kind, TkLparen) {
+    parse_fn_type(p, t)
+  } else if tk_is(t.kind, TkIdent) {
+    parse_named_type(p, t)
+  } else {
+    err_t(p_error_here(p, "expected type"))
+  }
+}
+
+fn parse_named_type(p: Parser, t: Token) : PTy {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  if p_at(p1, TkLbracket) {
+    # Generic type: Name[T1, T2, ...]
+    let p2 = p_skip_newlines(p_advance(p1))
+    parse_type_args_loop(p2, [], name, t)
+  } else {
+    ok_t(p1, mk_ty(TyName(name, []), t.line, t.col))
+  }
+}
+
+fn parse_type_args_loop(p: Parser, acc: [TypeExpr], name: String, t: Token) : PTy {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_type_args_loop(p_skip_newlines(p_advance(p1)), [arg, ...acc], name, t)
+      } else if p_at(p1, TkRbracket) {
+        ok_t(p_advance(p1), mk_ty(TyName(name, list_reverse([arg, ...acc])), t.line, t.col))
+      } else {
+        err_t(p_error_here(p1, "expected `,` or `]` after type arguments"))
+      }
+    }
+  }
+}
+
+fn parse_fn_type(p: Parser, t: Token) : PTy {
+  let p1 = p_skip_newlines(p_advance(p))
+  if p_at(p1, TkRparen) {
+    let p2 = p_advance(p1)
+    if not p_at(p2, TkArrow) {
+      err_t(p_error_here(p2, "expected `->` in function type"))
+    } else {
+      let r = parse_type(p_advance(p2))
+      match r.r {
+        None -> err_t(r.p)
+        Some(ret) -> ok_t(r.p, mk_ty(TyFn([], ret), t.line, t.col))
+      }
+    }
+  } else {
+    parse_fn_type_args(p1, [], t)
+  }
+}
+
+fn parse_fn_type_args(p: Parser, acc: [TypeExpr], t: Token) : PTy {
+  let r = parse_type(p)
+  match r.r {
+    None -> err_t(r.p)
+    Some(arg) -> {
+      let p1 = p_skip_newlines(r.p)
+      if p_at(p1, TkComma) {
+        parse_fn_type_args(p_skip_newlines(p_advance(p1)), [arg, ...acc], t)
+      } else if p_at(p1, TkRparen) {
+        let p2 = p_advance(p1)
+        if not p_at(p2, TkArrow) {
+          err_t(p_error_here(p2, "expected `->` in function type"))
+        } else {
+          let rr = parse_type(p_advance(p2))
+          match rr.r {
+            None -> err_t(rr.p)
+            Some(ret) -> ok_t(rr.p, mk_ty(TyFn(list_reverse([arg, ...acc]), ret), t.line, t.col))
+          }
+        }
+      } else {
+        err_t(p_error_here(p1, "expected `,` or `)` in function type args"))
+      }
+    }
+  }
+}
+
+# ====================================================================
+# declarations
+# ====================================================================
+
+fn parse_decl(p: Parser) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let t = p_peek(p0)
+  let is_pub_r =
+    if tk_is(t.kind, TkPub) { PTy { p: p_advance(p0), r: Some(mk_ty(TyName("", []), 0, 0)) } }
+    else { PTy { p: p0, r: None } }
+  let is_pub =
+    match is_pub_r.r { Some(_) -> true None -> false }
+  let p1 = is_pub_r.p
+  let hd = p_peek(p1)
+  if tk_is(hd.kind, TkFn) {
+    parse_fn_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkType) {
+    parse_type_decl(p_advance(p1), is_pub, hd)
+  } else if tk_is(hd.kind, TkTest) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on a test")) }
+    else { parse_test_decl(p_advance(p1), hd) }
+  } else if tk_is(hd.kind, TkImport) {
+    if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
+    else { parse_import_decl(p_advance(p1), hd) }
+  } else {
+    err_d(p_error(p1, hd, "expected `fn`, `type`, `test`, or `import`"))
+  }
+}
+
+fn parse_fn_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p, id, "expected function name"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    if not p_at(p1, TkLparen) {
+      err_d(p_error_here(p1, "expected `(` after function name"))
+    } else {
+      let p2 = p_skip_newlines(p_advance(p1))
+      let params_r = parse_fn_params(p2, [])
+      match params_r.r {
+        None -> err_d(params_r.p)
+        Some(params) -> {
+          let p3 = p_skip_newlines(params_r.p)
+          # Optional `: ReturnType`
+          let ret_r =
+            if p_at(p3, TkColon) {
+              let rt = parse_type(p_advance(p3))
+              match rt.r {
+                None -> PTy { p: rt.p, r: None }
+                Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+              }
+            } else {
+              PTy { p: p3, r: None }
+            }
+          if ret_r.p.had_error and not p3.had_error { err_d(ret_r.p) }
+          else {
+            let p4 = p_skip_newlines(ret_r.p)
+            # Body: `= expr` or `{ block }`.
+            if p_at(p4, TkEq) {
+              let p5 = p_skip_newlines(p_advance(p4))
+              let rb = parse_expr(p5)
+              match rb.r {
+                None -> err_d(rb.p)
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+              }
+            } else if p_at(p4, TkLbrace) {
+              let tb = p_peek(p4)
+              let rb = parse_block(p4, tb)
+              match rb.r {
+                None -> err_d(rb.p)
+                Some(body) -> ok_d(rb.p, DFn(is_pub, name, params, ret_r.r, body, t.line, t.col))
+              }
+            } else {
+              err_d(p_error_here(p4, "expected `=` or `{` to start function body"))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+type PParams = { p: Parser, r: Option[[Param]] }
+
+fn parse_fn_params(p: Parser, acc: [Param]) : PParams {
+  if p_at(p, TkRparen) { PParams { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let t = p_peek(p)
+    if not tk_is(t.kind, TkIdent) {
+      PParams { p: p_error(p, t, "expected parameter name"), r: None }
+    } else {
+      let name = tok_source(p.src, t)
+      let p1 = p_advance(p)
+      if not p_at(p1, TkColon) {
+        PParams { p: p_error_here(p1, "expected `:` after parameter name"), r: None }
+      } else {
+        let rt = parse_type(p_advance(p1))
+        match rt.r {
+          None -> PParams { p: rt.p, r: None }
+          Some(ty) -> {
+            let param = Param { pname: name, ptype: Some(ty), pline: t.line, pcol: t.col }
+            let p2 = p_skip_newlines(rt.p)
+            if p_at(p2, TkComma) {
+              parse_fn_params(p_skip_newlines(p_advance(p2)), [param, ...acc])
+            } else if p_at(p2, TkRparen) {
+              PParams { p: p_advance(p2), r: Some(list_reverse([param, ...acc])) }
+            } else {
+              PParams { p: p_error_here(p2, "expected `,` or `)` in parameter list"), r: None }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_type_decl(p: Parser, is_pub: Bool, t: Token) : PDecl {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) or not is_upper_ident(p.src, id) {
+    err_d(p_error(p, id, "expected an uppercase type name after `type`"))
+  } else {
+    let name = tok_source(p.src, id)
+    let p1 = p_advance(p)
+    let p1n = p_skip_newlines(p1)
+    # Optional type params `[a, b, c]`.
+    let tparams_r =
+      if p_at(p1n, TkLbracket) {
+        parse_type_params_loop(p_skip_newlines(p_advance(p1n)), [])
+      } else {
+        PTParams { p: p1n, r: Some([]) }
+      }
+    match tparams_r.r {
+      None -> err_d(tparams_r.p)
+      Some(tparams) -> {
+        let p2 = p_skip_newlines(tparams_r.p)
+        if not p_at(p2, TkEq) {
+          err_d(p_error_here(p2, "expected `=` in type declaration"))
+        } else {
+          let p3 = p_skip_newlines(p_advance(p2))
+          parse_type_body(p3, is_pub, name, tparams, t)
+        }
+      }
+    }
+  }
+}
+
+type PTParams = { p: Parser, r: Option[[String]] }
+
+fn parse_type_params_loop(p: Parser, acc: [String]) : PTParams {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) {
+    PTParams { p: p_error(p, t, "expected type parameter name"), r: None }
+  } else {
+    let name = tok_source(p.src, t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if p_at(p1, TkComma) {
+      parse_type_params_loop(p_skip_newlines(p_advance(p1)), [name, ...acc])
+    } else if p_at(p1, TkRbracket) {
+      PTParams { p: p_advance(p1), r: Some(list_reverse([name, ...acc])) }
+    } else {
+      PTParams { p: p_error_here(p1, "expected `,` or `]` after type parameter"), r: None }
+    }
+  }
+}
+
+fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  if p_at(p, TkLbrace) {
+    let p1 = p_skip_newlines(p_advance(p))
+    parse_record_body(p1, [], is_pub, name, tparams, t)
+  } else {
+    # Sum or alias: check for an uppercase ident followed by `(` OR
+    # followed eventually by `|` to decide. Simpler approach: try to
+    # parse as sum; if the first variant is followed by `|`, continue
+    # as sum; otherwise, fall back to alias. But stage 1 mirrors stage
+    # 0: use the same heuristic — if the first token is Uppercase and
+    # the next is `(` OR further along we see `|`, treat as sum.
+    let hd = p_peek(p)
+    if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
+      # Decide by lookahead.
+      let is_sum = looks_like_sum(p)
+      if is_sum {
+        parse_sum_body(p, [], is_pub, name, tparams, t)
+      } else {
+        let rt = parse_type(p)
+        match rt.r {
+          None -> err_d(rt.p)
+          Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+        }
+      }
+    } else {
+      let rt = parse_type(p)
+      match rt.r {
+        None -> err_d(rt.p)
+        Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+      }
+    }
+  }
+}
+
+# Mirror of stage 0's looks_like_sum heuristic: scan ahead for `|` or
+# for `Uppercase(` indicating a variant with payload.
+fn looks_like_sum(p: Parser) : Bool {
+  let hd = p_peek(p)
+  let nxt = p_peek1(p)
+  if is_upper_ident(p.src, hd) and tk_is(nxt.kind, TkLparen) { true }
+  else { looks_like_sum_scan(p.rest, 0) }
+}
+
+fn looks_like_sum_scan(toks: [Token], depth: Int) : Bool {
+  match toks {
+    [] -> false
+    [t, ...rs] -> {
+      match t.kind {
+        TkEof -> false
+        TkLparen -> looks_like_sum_scan(rs, depth + 1)
+        TkLbracket -> looks_like_sum_scan(rs, depth + 1)
+        TkLbrace -> looks_like_sum_scan(rs, depth + 1)
+        TkRparen -> looks_like_sum_scan(rs, depth - 1)
+        TkRbracket -> looks_like_sum_scan(rs, depth - 1)
+        TkRbrace -> looks_like_sum_scan(rs, depth - 1)
+        TkPipe -> if depth == 0 { true } else { looks_like_sum_scan(rs, depth) }
+        TkNewline -> if depth == 0 { looks_like_sum_after_nl(rs) }
+                     else { looks_like_sum_scan(rs, depth) }
+        _ -> looks_like_sum_scan(rs, depth)
+      }
+    }
+  }
+}
+
+fn looks_like_sum_after_nl(toks: [Token]) : Bool {
+  match toks {
+    [] -> false
+    [t, ...rs] -> {
+      match t.kind {
+        TkNewline -> looks_like_sum_after_nl(rs)
+        TkPipe -> true
+        _ -> false
+      }
+    }
+  }
+}
+
+fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkRbrace) {
+    ok_d(p_advance(p0), DType(is_pub, name, tparams, TBRecord(list_reverse(acc)), t.line, t.col))
+  } else {
+    let ft = p_peek(p0)
+    if not tk_is(ft.kind, TkIdent) {
+      err_d(p_error(p0, ft, "expected field name in record type"))
+    } else {
+      let fname = tok_source(p0.src, ft)
+      let p1 = p_advance(p0)
+      if not p_at(p1, TkColon) {
+        err_d(p_error_here(p1, "expected `:` after field name"))
+      } else {
+        let rt = parse_type(p_advance(p1))
+        match rt.r {
+          None -> err_d(rt.p)
+          Some(ty) -> {
+            let fd = FD(fname, ty)
+            let p2 = p_skip_newlines(rt.p)
+            if p_at(p2, TkComma) {
+              parse_record_body(p_skip_newlines(p_advance(p2)), [fd, ...acc], is_pub, name, tparams, t)
+            } else if p_at(p2, TkRbrace) {
+              ok_d(p_advance(p2), DType(is_pub, name, tparams, TBRecord(list_reverse([fd, ...acc])), t.line, t.col))
+            } else {
+              err_d(p_error_here(p2, "expected `,` or `}` in record type"))
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn parse_sum_body(p: Parser, acc: [Variant], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let vt = p_peek(p0)
+  if not tk_is(vt.kind, TkIdent) or not is_upper_ident(p0.src, vt) {
+    err_d(p_error(p0, vt, "expected variant constructor name"))
+  } else {
+    let vname = tok_source(p0.src, vt)
+    let p1 = p_advance(p0)
+    let args_r =
+      if p_at(p1, TkLparen) {
+        parse_variant_args(p_skip_newlines(p_advance(p1)), [])
+      } else {
+        PVariantArgs { p: p1, r: Some([]) }
+      }
+    match args_r.r {
+      None -> err_d(args_r.p)
+      Some(vargs) -> {
+        let vnode = Var(vname, vargs)
+        let p2 = p_skip_newlines(args_r.p)
+        if p_at(p2, TkPipe) {
+          parse_sum_body(p_skip_newlines(p_advance(p2)), [vnode, ...acc], is_pub, name, tparams, t)
+        } else {
+          ok_d(p2, DType(is_pub, name, tparams, TBSum(list_reverse([vnode, ...acc])), t.line, t.col))
+        }
+      }
+    }
+  }
+}
+
+type PVariantArgs = { p: Parser, r: Option[[TypeExpr]] }
+
+fn parse_variant_args(p: Parser, acc: [TypeExpr]) : PVariantArgs {
+  if p_at(p, TkRparen) { PVariantArgs { p: p_advance(p), r: Some(list_reverse(acc)) } }
+  else {
+    let r = parse_type(p)
+    match r.r {
+      None -> PVariantArgs { p: r.p, r: None }
+      Some(ty) -> {
+        let p1 = p_skip_newlines(r.p)
+        if p_at(p1, TkComma) {
+          parse_variant_args(p_skip_newlines(p_advance(p1)), [ty, ...acc])
+        } else if p_at(p1, TkRparen) {
+          PVariantArgs { p: p_advance(p1), r: Some(list_reverse([ty, ...acc])) }
+        } else {
+          PVariantArgs { p: p_error_here(p1, "expected `,` or `)` in variant payload"), r: None }
+        }
+      }
+    }
+  }
+}
+
+fn parse_test_decl(p: Parser, t: Token) : PDecl {
+  let desc_t = p_peek(p)
+  if not tk_is(desc_t.kind, TkString) {
+    err_d(p_error(p, desc_t, "expected string description after `test`"))
+  } else {
+    let desc_span = tok_source(p.src, desc_t)
+    let p1 = p_skip_newlines(p_advance(p))
+    if not p_at(p1, TkLbrace) {
+      err_d(p_error_here(p1, "expected `{` for test body"))
+    } else {
+      let tb = p_peek(p1)
+      let rb = parse_block(p1, tb)
+      match rb.r {
+        None -> err_d(rb.p)
+        Some(body) -> ok_d(rb.p, DTest(desc_span, body, t.line, t.col))
+      }
+    }
+  }
+}
+
+fn parse_import_decl(p: Parser, t: Token) : PDecl {
+  # For stage 1 MVP, imports are structurally parsed but not resolved.
+  # Accept: `import a.b.c`, `import a.b.c as X`, `import a.b.c.{f, g}`.
+  let first = p_peek(p)
+  if not tk_is(first.kind, TkIdent) {
+    err_d(p_error(p, first, "expected module name after `import`"))
+  } else {
+    parse_import_path(p_advance(p), tok_source(p.src, first), t)
+  }
+}
+
+fn parse_import_path(p: Parser, acc_path: String, t: Token) : PDecl {
+  if p_at(p, TkDot) {
+    let p1 = p_advance(p)
+    let nxt = p_peek(p1)
+    if tk_is(nxt.kind, TkIdent) {
+      let seg = tok_source(p1.src, nxt)
+      parse_import_path(p_advance(p1), string_concat(string_concat(acc_path, "."), seg), t)
+    } else if tk_is(nxt.kind, TkLbrace) {
+      # Selective: `.{a, b}`
+      parse_import_selectives(p_skip_newlines(p_advance(p1)), [], acc_path, t)
+    } else {
+      err_d(p_error_here(p1, "expected identifier or `{` after `.`"))
+    }
+  } else if p_at(p, TkAs) {
+    let p1 = p_advance(p)
+    let nxt = p_peek(p1)
+    if not tk_is(nxt.kind, TkIdent) {
+      err_d(p_error(p1, nxt, "expected alias name after `as`"))
+    } else {
+      let alias = tok_source(p1.src, nxt)
+      ok_d(p_advance(p1), DImport(IkAlias(acc_path, alias), t.line, t.col))
+    }
+  } else {
+    ok_d(p, DImport(IkPath(acc_path), t.line, t.col))
+  }
+}
+
+fn parse_import_selectives(p: Parser, acc: [String], path: String, t: Token) : PDecl {
+  let p0 = p_skip_newlines(p)
+  let nxt = p_peek(p0)
+  if not tk_is(nxt.kind, TkIdent) {
+    err_d(p_error(p0, nxt, "expected identifier in selective import"))
+  } else {
+    let name = tok_source(p0.src, nxt)
+    let p1 = p_skip_newlines(p_advance(p0))
+    if p_at(p1, TkComma) {
+      parse_import_selectives(p_skip_newlines(p_advance(p1)), [name, ...acc], path, t)
+    } else if p_at(p1, TkRbrace) {
+      ok_d(p_advance(p1), DImport(IkSelective(path, list_reverse([name, ...acc])), t.line, t.col))
+    } else {
+      err_d(p_error_here(p1, "expected `,` or `}` in selective import"))
+    }
+  }
+}
+
+# ====================================================================
+# program
+# ====================================================================
+
+fn parse_program_loop(p: Parser, acc: [Decl]) : PParser {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkEof) { PParser { p: p0, decls: Some(list_reverse(acc)) } }
+  else {
+    let r = parse_decl(p0)
+    match r.r {
+      None -> PParser { p: r.p, decls: None }
+      Some(d) -> parse_program_loop(r.p, [d, ...acc])
+    }
+  }
+}
+
+type PParser = { p: Parser, decls: Option[[Decl]] }
+
+fn parse_program(file: String, src: String, toks: [Token]) : PParser {
+  parse_program_loop(parser_new(file, src, toks), [])
+}
+
+# ====================================================================
+# AST dumper (for --ast)
+# ====================================================================
+#
+# The format is indented nesting, one node per line. It does not try
+# to match stage 0's kai_dump_ast byte-for-byte; the value here is to
+# help visually inspect stage 1's parser while the emitter is being
+# written.
+
+fn indent_of(depth: Int) : String {
+  if depth == 0 { "" } else { string_concat("  ", indent_of(depth - 1)) }
+}
+
+fn emit_line(depth: Int, s: String) : Unit = print("#{indent_of(depth)}#{s}")
+
+fn dump_expr(e: Expr, depth: Int) : Unit {
+  match e.kind {
+    EInt(n) -> emit_line(depth, "int #{int_to_string(n)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EReal(r) -> emit_line(depth, "real #{real_to_string(r)} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EBool(b) -> {
+      let s = if b { "true" } else { "false" }
+      emit_line(depth, "bool #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    }
+    EChar(c) -> emit_line(depth, "char '#{c}' @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EStr(s, _) -> emit_line(depth, "string #{s} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnit -> emit_line(depth, "unit @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EVar(name) -> emit_line(depth, "ident #{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EUnder -> emit_line(depth, "_ @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    EPlaceholder -> emit_line(depth, ". @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    ECall(callee, xs) -> {
+      emit_line(depth, "call @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(callee, depth + 1)
+      xs |> each((a) => dump_expr(a, depth + 1))
+    }
+    EField(base, name) -> {
+      emit_line(depth, "field .#{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(base, depth + 1)
+    }
+    EIndex(base, idx) -> {
+      emit_line(depth, "index @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(base, depth + 1)
+      dump_expr(idx, depth + 1)
+    }
+    EBinop(op, a, b) -> {
+      emit_line(depth, "binop #{op} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
+    EUnop(op, x) -> {
+      emit_line(depth, "unop #{op} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(x, depth + 1)
+    }
+    EIf(c, a, opt_b) -> {
+      emit_line(depth, "if @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(c, depth + 1)
+      dump_expr(a, depth + 1)
+      match opt_b { Some(b) -> dump_expr(b, depth + 1) None -> () }
+    }
+    EMatch(scrut, arms) -> {
+      emit_line(depth, "match @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(scrut, depth + 1)
+      arms |> each((a) => dump_arm(a, depth + 1))
+    }
+    ELambda(params, body) -> {
+      emit_line(depth, "lambda @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      params |> each((pm) => emit_line(depth + 1, "param #{pm.pname}"))
+      dump_expr(body, depth + 1)
+    }
+    ERecordLit(name, fields) -> {
+      emit_line(depth, "record #{name} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      fields |> each((fi) => dump_field_init(fi, depth + 1))
+    }
+    EList(elems) -> {
+      emit_line(depth, "list @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      elems |> each((el) => dump_list_elem(el, depth + 1))
+    }
+    ERange(a, b, opt_step) -> {
+      emit_line(depth, "range @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+      match opt_step { Some(s) -> dump_expr(s, depth + 1) None -> () }
+    }
+    EBlock(stmts, opt_final) -> {
+      emit_line(depth, "block @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      stmts |> each((s) => dump_stmt(s, depth + 1))
+      match opt_final { Some(fe) -> dump_expr(fe, depth + 1) None -> () }
+    }
+    EPipe(a, b) -> {
+      emit_line(depth, "pipe @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+      dump_expr(a, depth + 1)
+      dump_expr(b, depth + 1)
+    }
+  }
+}
+
+fn dump_arm(a: Arm, depth: Int) : Unit {
+  emit_line(depth, "arm")
+  match a {
+    Arm(pat, guard, body) -> {
+      dump_pat(pat, depth + 1)
+      match guard { Some(g) -> { emit_line(depth + 1, "guard"); dump_expr(g, depth + 2) } None -> () }
+      dump_expr(body, depth + 1)
+    }
+  }
+}
+
+fn dump_field_init(fi: FieldInit, depth: Int) : Unit {
+  match fi {
+    FI(name, val) -> {
+      emit_line(depth, "field_init #{name}")
+      dump_expr(val, depth + 1)
+    }
+  }
+}
+
+fn dump_list_elem(el: ListElem, depth: Int) : Unit {
+  match el {
+    ElPlain(e) -> dump_expr(e, depth)
+    ElSpread(e) -> {
+      emit_line(depth, "spread")
+      dump_expr(e, depth + 1)
+    }
+  }
+}
+
+fn dump_stmt(s: Stmt, depth: Int) : Unit {
+  match s {
+    SLet(pat, opt_ty, rhs) -> {
+      emit_line(depth, "let")
+      dump_pat(pat, depth + 1)
+      match opt_ty { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_expr(rhs, depth + 1)
+    }
+    SAssert(cond, opt_msg) -> {
+      emit_line(depth, "assert")
+      dump_expr(cond, depth + 1)
+      match opt_msg { Some(m) -> dump_expr(m, depth + 1) None -> () }
+    }
+    SExprStmt(e) -> dump_expr(e, depth)
+  }
+}
+
+fn dump_pat(pat: Pattern, depth: Int) : Unit {
+  match pat.pkind {
+    PWild -> emit_line(depth, "pat _ @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PLit(e) -> {
+      emit_line(depth, "pat_lit @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      dump_expr(e, depth + 1)
+    }
+    PBind(name) -> emit_line(depth, "pat_bind #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+    PList(pats, opt_rest) -> {
+      emit_line(depth, "pat_list @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      pats |> each((pp) => dump_pat(pp, depth + 1))
+      match opt_rest { Some(r) -> emit_line(depth + 1, "...#{r}") None -> () }
+    }
+    PVariant(name, subs) -> {
+      emit_line(depth, "pat_variant #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      subs |> each((pp) => dump_pat(pp, depth + 1))
+    }
+    PVariantRecord(name, fields) -> {
+      emit_line(depth, "pat_variant_record #{name} @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(pf, depth + 1))
+    }
+    PRecord(fields) -> {
+      emit_line(depth, "pat_record @#{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
+      fields |> each((pf) => dump_pfield(pf, depth + 1))
+    }
+  }
+}
+
+fn dump_pfield(pf: PField, depth: Int) : Unit {
+  match pf {
+    PField(name, sub, short) -> {
+      let suffix = if short { " (shorthand)" } else { "" }
+      emit_line(depth, "pat_field #{name}#{suffix}")
+      dump_pat(sub, depth + 1)
+    }
+  }
+}
+
+fn dump_type(ty: TypeExpr, depth: Int) : Unit {
+  match ty.tkind {
+    TyName(name, targs) -> {
+      emit_line(depth, "ty_name #{name} @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(a, depth + 1))
+    }
+    TyList(inner) -> {
+      emit_line(depth, "ty_list @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      dump_type(inner, depth + 1)
+    }
+    TyFn(targs, ret) -> {
+      emit_line(depth, "ty_fn @#{int_to_string(ty.line)}:#{int_to_string(ty.col)}")
+      targs |> each((a) => dump_type(a, depth + 1))
+      dump_type(ret, depth + 1)
+    }
+  }
+}
+
+fn dump_decl(d: Decl, depth: Int) : Unit {
+  match d {
+    DFn(is_pub, name, params, opt_ret, body, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "fn #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      params |> each((pm) => dump_param(pm, depth + 1))
+      match opt_ret { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_expr(body, depth + 1)
+    }
+    DType(is_pub, name, tparams, body, line, col) -> {
+      let pub_s = if is_pub { "pub " } else { "" }
+      emit_line(depth, "type #{pub_s}\"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      tparams |> each((tp) => emit_line(depth + 1, "tparam #{tp}"))
+      dump_type_body(body, depth + 1)
+    }
+    DTest(desc, body, line, col) -> {
+      emit_line(depth, "test #{desc} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_expr(body, depth + 1)
+    }
+    DImport(ik, line, col) -> {
+      match ik {
+        IkPath(path) -> emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkAlias(path, a) -> emit_line(depth, "import #{path} as #{a} @#{int_to_string(line)}:#{int_to_string(col)}")
+        IkSelective(path, names) -> {
+          emit_line(depth, "import #{path} @#{int_to_string(line)}:#{int_to_string(col)}")
+          names |> each((n) => emit_line(depth + 1, "sel #{n}"))
+        }
+      }
+    }
+  }
+}
+
+fn dump_param(pm: Param, depth: Int) : Unit {
+  emit_line(depth, "param #{pm.pname} @#{int_to_string(pm.pline)}:#{int_to_string(pm.pcol)}")
+  match pm.ptype { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+}
+
+fn dump_type_body(tb: TypeBody, depth: Int) : Unit {
+  match tb {
+    TBAlias(ty) -> {
+      emit_line(depth, "ty_alias")
+      dump_type(ty, depth + 1)
+    }
+    TBRecord(fields) -> {
+      emit_line(depth, "ty_record")
+      fields |> each((fd) => dump_field_decl(fd, depth + 1))
+    }
+    TBSum(variants) -> {
+      emit_line(depth, "ty_sum")
+      variants |> each((v) => dump_variant(v, depth + 1))
+    }
+  }
+}
+
+fn dump_field_decl(fd: FieldDecl, depth: Int) : Unit {
+  match fd {
+    FD(name, ty) -> {
+      emit_line(depth, "field_decl #{name}")
+      dump_type(ty, depth + 1)
+    }
+  }
+}
+
+fn dump_variant(v: Variant, depth: Int) : Unit {
+  match v {
+    Var(name, vargs) -> {
+      emit_line(depth, "variant #{name}")
+      vargs |> each((a) => dump_type(a, depth + 1))
+    }
+  }
+}
+
+fn dump_program(decls: [Decl]) : Unit {
+  print("program")
+  decls |> each((d) => dump_decl(d, 1))
+}
+
+# ====================================================================
+# checker: name resolution
+# ====================================================================
+#
+# Mirrors stage 0's `check.c`. No type inference, no exhaustiveness —
+# just "every identifier is bound somewhere in scope." Top-level names
+# (fns, type constructors, imported names) are pre-registered so
+# forward references work. Each scope introduced by a block, match
+# arm, lambda, or function body is pushed and popped as the walker
+# enters and leaves. Errors accumulate into `had_error`; the driver
+# returns 1 when that flag is set.
+
+type Env = { scopes: [[String]], had_error: Bool, file: String }
+
+fn env_new(file: String) : Env = Env { scopes: [[]], had_error: false, file: file }
+
+fn env_push(e: Env) : Env =
+  Env { scopes: [[], ...e.scopes], had_error: e.had_error, file: e.file }
+
+fn env_pop(e: Env) : Env {
+  match e.scopes {
+    [_, ...rest] -> Env { scopes: rest, had_error: e.had_error, file: e.file }
+    _ -> e
+  }
+}
+
+fn env_add(e: Env, name: String) : Env {
+  match e.scopes {
+    [top, ...rest] ->
+      Env { scopes: [[name, ...top], ...rest], had_error: e.had_error, file: e.file }
+    _ -> e
+  }
+}
+
+fn list_has(names: [String], target: String) : Bool {
+  match names {
+    [] -> false
+    [n, ...rest] -> if n == target { true } else { list_has(rest, target) }
+  }
+}
+
+fn scopes_has(scopes: [[String]], target: String) : Bool {
+  match scopes {
+    [] -> false
+    [top, ...rest] -> if list_has(top, target) { true } else { scopes_has(rest, target) }
+  }
+}
+
+fn env_has(e: Env, name: String) : Bool = scopes_has(e.scopes, name)
+
+fn env_mark_err(e: Env) : Env =
+  Env { scopes: e.scopes, had_error: true, file: e.file }
+
+fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
+  eprint("#{e.file}:#{int_to_string(line)}:#{int_to_string(col)}: error: #{msg}")
+  env_mark_err(e)
+}
+
+# ---- prelude seeding (kept in sync with stage 0's PRELUDE) ----
+
+fn prelude_names() : [String] {
+  [
+    "print", "eprint", "read_file", "write_file", "read_line", "args",
+    "exit", "panic",
+    "int_to_string", "real_to_string", "string_to_int", "string_to_real",
+    "string_length", "string_concat", "string_split", "string_contains", "char_at",
+    "string_slice", "char_to_int", "int_to_char",
+    "list_length", "list_append", "list_reverse",
+    "map", "filter", "reduce", "each",
+    "Some", "None", "Ok", "Err"
+  ]
+}
+
+fn add_all(e: Env, names: [String]) : Env =
+  reduce(names, e, (acc, n) => env_add(acc, n))
+
+# ---- pattern bindings: walk a pattern and add its bound names ----
+
+fn bind_pat(e: Env, pat: Pattern) : Env {
+  match pat.pkind {
+    PWild -> e
+    PLit(_) -> e
+    PBind(name) -> env_add(e, name)
+    PList(pats, opt_rest) -> {
+      let e1 = bind_pats_loop(e, pats)
+      match opt_rest {
+        Some(rname) -> env_add(e1, rname)
+        None -> e1
+      }
+    }
+    PVariant(_, subs) -> bind_pats_loop(e, subs)
+    PVariantRecord(_, fields) -> bind_pfields_loop(e, fields)
+    PRecord(fields) -> bind_pfields_loop(e, fields)
+  }
+}
+
+fn bind_pats_loop(e: Env, ps: [Pattern]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> bind_pats_loop(bind_pat(e, p), rest)
+  }
+}
+
+fn bind_pfields_loop(e: Env, fs: [PField]) : Env {
+  match fs {
+    [] -> e
+    [pf, ...rest] -> bind_pfields_loop(bind_pfield(e, pf), rest)
+  }
+}
+
+fn bind_pfield(e: Env, pf: PField) : Env {
+  match pf {
+    # Shorthand `{ x }` binds `x` directly; the parser already builds the
+    # equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
+    PField(_, sub, _) -> bind_pat(e, sub)
+  }
+}
+
+# ---- expression walker ----
+
+fn chk_expr(e: Env, x: Expr) : Env {
+  match x.kind {
+    EInt(_)    -> e
+    EReal(_)   -> e
+    EBool(_)   -> e
+    EChar(_)   -> e
+    EStr(_, _) -> e
+    EUnit      -> e
+    EUnder     -> e
+    EPlaceholder -> e
+    EVar(name) -> {
+      if env_has(e, name) { e }
+      else { chk_error(e, x.line, x.col, "undefined name `#{name}`") }
+    }
+    ECall(f, xs) -> {
+      let e1 = chk_expr(e, f)
+      chk_exprs(e1, xs)
+    }
+    EField(base, _) -> chk_expr(e, base)
+    EIndex(base, idx) -> chk_expr(chk_expr(e, base), idx)
+    EBinop(_, a, b) -> chk_expr(chk_expr(e, a), b)
+    EUnop(_, inner) -> chk_expr(e, inner)
+    EIf(c, a, opt_b) -> {
+      let e1 = chk_expr(chk_expr(e, c), a)
+      match opt_b {
+        Some(b) -> chk_expr(e1, b)
+        None -> e1
+      }
+    }
+    EMatch(scrut, arms) -> {
+      let e1 = chk_expr(e, scrut)
+      chk_arms(e1, arms)
+    }
+    ELambda(params, body) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    ERecordLit(_, fields) -> chk_field_inits(e, fields)
+    EList(elems) -> chk_list_elems(e, elems)
+    ERange(a, b, opt_step) -> {
+      let e1 = chk_expr(chk_expr(e, a), b)
+      match opt_step { Some(s) -> chk_expr(e1, s) None -> e1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let e1 = env_push(e)
+      let e2 = chk_stmts(e1, stmts)
+      let e3 = match opt_final { Some(f) -> chk_expr(e2, f) None -> e2 }
+      env_pop(e3)
+    }
+    EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+  }
+}
+
+fn chk_exprs(e: Env, xs: [Expr]) : Env {
+  match xs {
+    [] -> e
+    [h, ...rest] -> chk_exprs(chk_expr(e, h), rest)
+  }
+}
+
+fn chk_field_inits(e: Env, fs: [FieldInit]) : Env {
+  match fs {
+    [] -> e
+    [f, ...rest] -> match f {
+      FI(_, val) -> chk_field_inits(chk_expr(e, val), rest)
+    }
+  }
+}
+
+fn chk_list_elems(e: Env, es: [ListElem]) : Env {
+  match es {
+    [] -> e
+    [el, ...rest] -> match el {
+      ElPlain(x)  -> chk_list_elems(chk_expr(e, x), rest)
+      ElSpread(x) -> chk_list_elems(chk_expr(e, x), rest)
+    }
+  }
+}
+
+fn chk_arms(e: Env, arms: [Arm]) : Env {
+  match arms {
+    [] -> e
+    [a, ...rest] -> chk_arms(chk_arm(e, a), rest)
+  }
+}
+
+fn chk_arm(e: Env, a: Arm) : Env {
+  match a {
+    Arm(pat, guard, body) -> {
+      let e1 = env_push(e)
+      let e2 = bind_pat(e1, pat)
+      let e3 = match guard { Some(g) -> chk_expr(e2, g) None -> e2 }
+      let e4 = chk_expr(e3, body)
+      env_pop(e4)
+    }
+  }
+}
+
+fn chk_stmts(e: Env, ss: [Stmt]) : Env {
+  match ss {
+    [] -> e
+    [s, ...rest] -> chk_stmts(chk_stmt(e, s), rest)
+  }
+}
+
+fn chk_stmt(e: Env, s: Stmt) : Env {
+  match s {
+    SLet(pat, _, rhs) -> {
+      let e1 = chk_expr(e, rhs)
+      bind_pat(e1, pat)
+    }
+    SAssert(cond, opt_msg) -> {
+      let e1 = chk_expr(e, cond)
+      match opt_msg { Some(m) -> chk_expr(e1, m) None -> e1 }
+    }
+    SExprStmt(x) -> chk_expr(e, x)
+  }
+}
+
+fn add_params(e: Env, ps: [Param]) : Env {
+  match ps {
+    [] -> e
+    [p, ...rest] -> add_params(env_add(e, p.pname), rest)
+  }
+}
+
+# ---- declaration walkers ----
+
+fn chk_decl(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, _, params, _, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = add_params(e1, params)
+      let e3 = chk_expr(e2, body)
+      env_pop(e3)
+    }
+    DType(_, _, _, _, _, _) -> e
+    DTest(_, body, _, _) -> {
+      let e1 = env_push(e)
+      let e2 = chk_expr(e1, body)
+      env_pop(e2)
+    }
+    DImport(_, _, _) -> e
+  }
+}
+
+fn chk_decls(e: Env, ds: [Decl]) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> chk_decls(chk_decl(e, d), rest)
+  }
+}
+
+# ---- top-level pre-registration ----
+
+fn register_decls(e: Env, ds: [Decl]) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> register_decls(register_one(e, d), rest)
+  }
+}
+
+fn register_one(e: Env, d: Decl) : Env {
+  match d {
+    DFn(_, name, _, _, _, _, _) -> env_add(e, name)
+    DType(_, name, _, body, _, _) -> {
+      let e1 = env_add(e, name)
+      match body {
+        TBSum(variants) -> register_variants_env(e1, variants)
+        _ -> e1
+      }
+    }
+    DTest(_, _, _, _) -> e
+    DImport(ik, _, _) -> register_import(e, ik)
+  }
+}
+
+fn register_variants_env(e: Env, vs: [Variant]) : Env {
+  match vs {
+    [] -> e
+    [v, ...rest] -> match v {
+      Var(name, _) -> register_variants_env(env_add(e, name), rest)
+    }
+  }
+}
+
+# For imports we add just the surface name: the last segment of the
+# dotted path, the alias, or each selected name. Stage 0 does the
+# same; deeper module resolution is a stage 2 concern.
+fn last_segment(path: String) : String {
+  last_segment_loop(path, string_length(path) - 1, string_length(path))
+}
+
+fn last_segment_loop(s: String, i: Int, end: Int) : String {
+  if i < 0 { string_slice(s, 0, end) }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, i + 1, end - i - 1) }
+                 else { last_segment_loop(s, i - 1, end) }
+      None -> string_slice(s, 0, end)
+    }
+  }
+}
+
+fn register_import(e: Env, ik: ImportKind) : Env {
+  match ik {
+    IkPath(path) -> env_add(e, last_segment(path))
+    IkAlias(_, alias) -> env_add(e, alias)
+    IkSelective(_, names) -> add_all(e, names)
+  }
+}
+
+# ---- entry point ----
+
+fn check_program(file: String, decls: [Decl]) : Int {
+  let e0 = env_new(file)
+  let e1 = add_all(e0, prelude_names())
+  let e2 = register_decls(e1, decls)
+  let e3 = chk_decls(e2, decls)
+  if e3.had_error { 1 } else { 0 }
+}
+
+# ====================================================================
+# emitter
+# ====================================================================
+#
+# Produces C source that links against stage 0's runtime.h. This
+# milestone (6) only covers what hello.kai needs — enough of expressions
+# to emit a call, a string literal, a block body, and the top-level
+# scaffolding (forward decls, thunks, int main). Subsequent milestones
+# extend emit_expr to cover the rest of ExprKind.
+
+# ---- small string helpers ----
+
+fn cat2(a: String, b: String) : String = string_concat(a, b)
+fn cat3(a: String, b: String, c: String) : String =
+  string_concat(a, string_concat(b, c))
+fn cat4(a: String, b: String, c: String, d: String) : String =
+  string_concat(a, string_concat(b, string_concat(c, d)))
+fn cat5(a: String, b: String, c: String, d: String, ee: String) : String =
+  string_concat(a, string_concat(b, string_concat(c, string_concat(d, ee))))
+
+fn concat_all(xs: [String]) : String =
+  reduce(xs, "", (acc, s) => string_concat(acc, s))
+
+fn join_with(xs: [String], sep: String) : String {
+  match xs {
+    [] -> ""
+    [x] -> x
+    [x, ...rest] -> string_concat(x, string_concat(sep, join_with(rest, sep)))
+  }
+}
+
+# ---- tables: user function arities, variant arities ----
+#
+# Stage 0 emit keeps parallel tables of user-defined function names and
+# variant constructors; the ident dispatcher looks into both before
+# falling back to a local. Stage 1 does the same; both tables are
+# lists of sum-variant pairs.
+
+type EFn  = EFn(String, Int)
+type EVar = EV(String, Int)
+
+fn efn_find(fns: [EFn], target: String) : Option[Int] {
+  match fns {
+    [] -> None
+    [h, ...rest] -> match h {
+      EFn(n, ar) -> if n == target { Some(ar) } else { efn_find(rest, target) }
+    }
+  }
+}
+
+fn evar_find(vs: [EVar], target: String) : Option[Int] {
+  match vs {
+    [] -> None
+    [h, ...rest] -> match h {
+      EV(n, ar) -> if n == target { Some(ar) } else { evar_find(rest, target) }
+    }
+  }
+}
+
+fn fn_of_decl(d: Decl) : Option[EFn] {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> Some(EFn(name, list_length(params)))
+    _ -> None
+  }
+}
+
+fn register_fn_decls(decls: [Decl]) : [EFn] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match fn_of_decl(d) {
+      Some(fs) -> [fs, ...register_fn_decls(rest)]
+      None -> register_fn_decls(rest)
+    }
+  }
+}
+
+fn builtin_variants() : [EVar] =
+  [EV("Some", 1), EV("None", 0), EV("Ok", 1), EV("Err", 1)]
+
+fn collect_user_variants_loop(ds: [Decl], acc: [EVar]) : [EVar] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DType(_, _, _, body, _, _) -> match body {
+        TBSum(vs) -> collect_user_variants_loop(rest, vs_to_evars(vs, acc))
+        _ -> collect_user_variants_loop(rest, acc)
+      }
+      _ -> collect_user_variants_loop(rest, acc)
+    }
+  }
+}
+
+fn vs_to_evars(vs: [Variant], acc: [EVar]) : [EVar] {
+  match vs {
+    [] -> acc
+    [v, ...rest] -> match v {
+      Var(n, tys) -> vs_to_evars(rest, [EV(n, list_length(tys)), ...acc])
+    }
+  }
+}
+
+fn register_variants(decls: [Decl]) : [EVar] =
+  collect_user_variants_loop(decls, builtin_variants())
+
+# ---- prelude mapping for emission ----
+#
+# For user-facing builtins, we map to their runtime C symbol and arity.
+# Stage 1 mirrors stage 0's table 1:1.
+
+type EPrelude = EP(String, String, Int)     # kai name, c name, arity
+
+fn prelude_table() : [EPrelude] {
+  [
+    EP("print",            "kai_prelude_print",            1),
+    EP("eprint",           "kai_prelude_eprint",           1),
+    EP("panic",            "kai_prelude_panic",            1),
+    EP("exit",             "kai_prelude_exit",             1),
+    EP("int_to_string",    "kai_prelude_int_to_string",    1),
+    EP("real_to_string",   "kai_prelude_real_to_string",   1),
+    EP("string_length",    "kai_prelude_string_length",    1),
+    EP("string_concat",    "kai_prelude_string_concat",    2),
+    EP("list_length",      "kai_prelude_list_length",      1),
+    EP("list_append",      "kai_prelude_list_append",      2),
+    EP("list_reverse",     "kai_prelude_list_reverse",     1),
+    EP("map",              "kai_prelude_map",              2),
+    EP("filter",           "kai_prelude_filter",           2),
+    EP("reduce",           "kai_prelude_reduce",           3),
+    EP("each",             "kai_prelude_each",             2),
+    EP("args",             "kai_prelude_args",             0),
+    EP("read_file",        "kai_prelude_read_file",        1),
+    EP("write_file",       "kai_prelude_write_file",       2),
+    EP("read_line",        "kai_prelude_read_line",        0),
+    EP("string_to_int",    "kai_prelude_string_to_int",    1),
+    EP("string_to_real",   "kai_prelude_string_to_real",   1),
+    EP("char_at",          "kai_prelude_char_at",          2),
+    EP("string_split",     "kai_prelude_string_split",     2),
+    EP("string_contains",  "kai_prelude_string_contains",  2),
+    EP("string_slice",     "kai_prelude_string_slice",     3),
+    EP("char_to_int",      "kai_prelude_char_to_int",      1),
+    EP("int_to_char",      "kai_prelude_int_to_char",      1)
+  ]
+}
+
+fn prelude_find(target: String) : Option[EPrelude] {
+  prelude_find_loop(prelude_table(), target)
+}
+
+fn prelude_find_loop(table: [EPrelude], target: String) : Option[EPrelude] {
+  match table {
+    [] -> None
+    [ep, ...rest] -> match ep {
+      EP(name, _, _) -> if name == target { Some(ep) } else { prelude_find_loop(rest, target) }
+    }
+  }
+}
+
+# ---- expression emission ----
+
+fn emit_ident_callee(name: String) : String {
+  match prelude_find(name) {
+    Some(ep) -> match ep { EP(_, cname, _) -> cname }
+    None -> cat2("kai_", name)
+  }
+}
+
+# Emit an ident used as a value (not a call target).
+fn emit_ident_value(name: String, fns: [EFn], variants: [EVar]) : String {
+  match evar_find(variants, name) {
+    Some(_) -> cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+    None -> match prelude_find(name) {
+      Some(ep) -> match ep {
+        EP(_, cname, ar) ->
+          cat5("kai_closure(&_", cname, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+      }
+      None -> match efn_find(fns, name) {
+        Some(ar) ->
+          cat5("kai_closure(&_kai_", name, "_thunk, ", int_to_string(ar), ", 0, NULL)")
+        None -> cat2("kai_", name)
+      }
+    }
+  }
+}
+
+# Emit a raw string literal's *body* as a C string literal. For now this
+# only handles hello-style cases: no #{...} interpolation, no \u{HHHH},
+# the escapes that kaikai and C share are passed through unchanged.
+# Later milestones extend this to full interpolation.
+fn emit_string_lit_body(span: String) : String {
+  # span includes opening and closing quotes; C literal syntax matches.
+  span
+}
+
+fn binop_cname(op: String) : Option[String] {
+  if op == "+" { Some("kai_add") }
+  else if op == "-" { Some("kai_sub") }
+  else if op == "*" { Some("kai_mul") }
+  else if op == "/" { Some("kai_div") }
+  else if op == "//" { Some("kai_idiv") }
+  else if op == "%" { Some("kai_mod") }
+  else if op == "<" { Some("kai_lt") }
+  else if op == ">" { Some("kai_gt") }
+  else if op == "<=" { Some("kai_le") }
+  else if op == ">=" { Some("kai_ge") }
+  else if op == "==" { Some("kai_eq_v") }
+  else if op == "!=" { Some("kai_ne_v") }
+  else { None }
+}
+
+fn unop_cname(op: String) : Option[String] {
+  if op == "-" { Some("kai_neg") }
+  else if op == "not" { Some("kai_boolnot") }
+  else { None }
+}
+
+fn emit_call_args(src: String, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  join_with(map(args_e, (a) => emit_expr(src, a, fns, variants, lams)), ", ")
+
+fn emit_variant_call(name: String, n_args: Int, arg_out: String) : String {
+  if n_args == 0 {
+    cat3("kai_variant(0, \"", name, "\", 0, NULL)")
+  } else {
+    concat_all([
+      "kai_variant(0, \"", name, "\", ", int_to_string(n_args),
+      ", (KaiValue *[]){", arg_out, "})"
+    ])
+  }
+}
+
+fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let call_args = emit_call_args(src, args_e, fns, variants, lams)
+  match f.kind {
+    EVar(callee) -> {
+      match evar_find(variants, callee) {
+        Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
+        None -> match prelude_find(callee) {
+          Some(ep) -> match ep {
+            EP(_, cname, _) -> cat4(cname, "(", call_args, ")")
+          }
+          None -> match efn_find(fns, callee) {
+            Some(_) -> cat5("kai_", callee, "(", call_args, ")")
+            None -> concat_all([
+              "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e)),
+              ", (KaiValue *[]){", call_args, "})"
+            ])
+          }
+        }
+      }
+    }
+    _ -> {
+      let fc = emit_expr(src, f, fns, variants, lams)
+      concat_all([
+        "kai_apply(", fc, ", ", int_to_string(list_length(args_e)),
+        ", (KaiValue *[]){", call_args, "})"
+      ])
+    }
+  }
+}
+
+fn emit_pipe_expr(src: String, lhs: Expr, rhs: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let lhs_c = emit_expr(src, lhs, fns, variants, lams)
+  match rhs.kind {
+    ECall(f, args_e) -> match f.kind {
+      EVar(callee) -> {
+        let rest_args = emit_call_args(src, args_e, fns, variants, lams)
+        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+        match evar_find(variants, callee) {
+          Some(_) -> emit_variant_call(callee, list_length(args_e) + 1, args_all)
+          None -> match prelude_find(callee) {
+            Some(ep) -> match ep {
+              EP(_, cname, _) -> cat4(cname, "(", args_all, ")")
+            }
+            None -> match efn_find(fns, callee) {
+              Some(_) -> cat5("kai_", callee, "(", args_all, ")")
+              None -> concat_all([
+                "kai_apply(kai_", callee, ", ", int_to_string(list_length(args_e) + 1),
+                ", (KaiValue *[]){", args_all, "})"
+              ])
+            }
+          }
+        }
+      }
+      _ -> {
+        let fc = emit_expr(src, f, fns, variants, lams)
+        let rest_args = emit_call_args(src, args_e, fns, variants, lams)
+        let args_all = if list_length(args_e) == 0 { lhs_c } else { cat3(lhs_c, ", ", rest_args) }
+        concat_all([
+          "kai_apply(", fc, ", ", int_to_string(list_length(args_e) + 1),
+          ", (KaiValue *[]){", args_all, "})"
+        ])
+      }
+    }
+    EVar(callee) -> {
+      match evar_find(variants, callee) {
+        Some(_) -> emit_variant_call(callee, 1, lhs_c)
+        None -> match prelude_find(callee) {
+          Some(ep) -> match ep { EP(_, cname, _) -> cat4(cname, "(", lhs_c, ")") }
+          None -> match efn_find(fns, callee) {
+            Some(_) -> cat5("kai_", callee, "(", lhs_c, ")")
+            None -> concat_all([
+              "kai_apply(kai_", callee,
+              ", 1, (KaiValue *[]){", lhs_c, "})"
+            ])
+          }
+        }
+      }
+    }
+    _ -> concat_all([
+      "kai_apply(", emit_expr(src, rhs, fns, variants, lams),
+      ", 1, (KaiValue *[]){", lhs_c, "})"
+    ])
+  }
+}
+
+fn emit_range_expr(src: String, from: Expr, to: Expr, opt_step: Option[Expr],
+                   fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let a = emit_expr(src, from, fns, variants, lams)
+  let b = emit_expr(src, to, fns, variants, lams)
+  match opt_step {
+    None -> cat5("kai_range(", a, ", ", b, ")")
+    Some(s) -> {
+      let sc = emit_expr(src, s, fns, variants, lams)
+      concat_all(["kai_range_step(", a, ", ", b, ", ", sc, ")"])
+    }
+  }
+}
+
+# ---- list literal emission ----
+
+fn emit_list_tail(src: String, elems: [ListElem], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match elems {
+    [] -> "kai_nil()"
+    [el, ...rest] -> match el {
+      ElPlain(x) -> concat_all([
+        "kai_cons(", emit_expr(src,x, fns, variants, lams), ", ",
+        emit_list_tail(src, rest, fns, variants, lams), ")"
+      ])
+      ElSpread(x) -> concat_all([
+        "kai_prelude_list_append(", emit_expr(src,x, fns, variants, lams), ", ",
+        emit_list_tail(src, rest, fns, variants, lams), ")"
+      ])
+    }
+  }
+}
+
+fn emit_list_expr(src: String, elems: [ListElem], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  emit_list_tail(src, elems, fns, variants, lams)
+
+# ---- record literal emission ----
+
+fn emit_field_init_val(src: String, fi: FieldInit, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fi { FI(_, val) -> emit_expr(src,val, fns, variants, lams) }
+}
+
+fn emit_field_init_name(fi: FieldInit) : String {
+  match fi { FI(name, _) -> cat3("\"", name, "\"") }
+}
+
+fn emit_record_lit(src: String, fields: [FieldInit], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n = list_length(fields)
+  let vals = join_with(map(fields, (fi) => emit_field_init_val(src, fi, fns, variants, lams)), ", ")
+  let names = join_with(map(fields, emit_field_init_name), ", ")
+  concat_all([
+    "kai_record(", int_to_string(n),
+    ", (KaiValue *[]){", vals, "}, (const char *[]){", names, "})"
+  ])
+}
+
+# ---- match: pattern test + bind emission ----
+
+fn emit_pat_test(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pat.pkind {
+    PWild -> "1"
+    PBind(_) -> "1"
+    PLit(e) -> concat_all(["kai_eq(", scr, ", ", emit_expr(src,e, fns, variants, lams), ")"])
+    PList(pats, opt_rest) -> emit_pat_test_list(src, pats, opt_rest, scr, fns, variants, lams)
+    PVariant(name, subs) -> emit_pat_test_variant(src, name, subs, scr, fns, variants, lams)
+    PVariantRecord(name, fields) -> emit_pat_test_variant_record(src, name, fields, scr, fns, variants, lams)
+    PRecord(fields) -> emit_pat_test_record(src, fields, scr, fns, variants, lams)
+  }
+}
+
+fn emit_pat_test_list(src: String, pats: [Pattern], opt_rest: Option[String],
+                      scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n_fixed = list_length(pats)
+  let has_rest = match opt_rest { Some(_) -> true None -> false }
+  if n_fixed == 0 and not has_rest {
+    concat_all(["(", scr, " && ", scr, "->tag == KAI_NIL)"])
+  } else {
+    cat3("(", emit_pat_test_list_loop(src, pats, has_rest, scr, 0, n_fixed, fns, variants, lams), ")")
+  }
+}
+
+fn emit_pat_test_list_loop(src: String, pats: [Pattern], has_rest: Bool,
+                            cur: String, i: Int, n_fixed: Int,
+                            fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  if i >= n_fixed {
+    if has_rest { "1" }
+    else { concat_all([cur, " && ", cur, "->tag == KAI_NIL"]) }
+  } else {
+    let head = cat2(cur, "->as.cons.head")
+    let tail = cat2(cur, "->as.cons.tail")
+    let pi = list_nth(pats, i)
+    let head_test = emit_pat_test(src, pi, head, fns, variants, lams)
+    let cons_guard = concat_all([cur, " && ", cur, "->tag == KAI_CONS"])
+    concat_all([
+      cons_guard, " && ", head_test, " && ",
+      emit_pat_test_list_loop(src, pats, has_rest, tail, i + 1, n_fixed, fns, variants, lams)
+    ])
+  }
+}
+
+fn list_nth(xs: [Pattern], i: Int) : Pattern {
+  match xs {
+    [] -> mk_pat(PWild, 0, 0)
+    [h, ...rest] -> if i == 0 { h } else { list_nth(rest, i - 1) }
+  }
+}
+
+fn emit_pat_test_variant(src: String, name: String, subs: [Pattern],
+                         scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let base = concat_all([
+    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
+    scr, "->as.var.variant_name, \"", name, "\") == 0"
+  ])
+  cat3(base, emit_pat_test_variant_subs(src, subs, scr, 0, fns, variants, lams), ")")
+}
+
+fn emit_pat_test_variant_subs(src: String, subs: [Pattern], scr: String, i: Int,
+                              fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
+      let t = emit_pat_test(src, sp, sub_scr, fns, variants, lams)
+      concat_all([" && ", t, emit_pat_test_variant_subs(src, rest, scr, i + 1, fns, variants, lams)])
+    }
+  }
+}
+
+fn emit_pat_test_record(src: String, fields: [PField], scr: String,
+                        fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let base = concat_all(["(", scr, " && ", scr, "->tag == KAI_RECORD"])
+  cat3(base, emit_pat_test_record_fields(src, fields, scr, fns, variants, lams), ")")
+}
+
+fn emit_pat_test_record_fields(src: String, fields: [PField], scr: String,
+                               fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fields {
+    [] -> ""
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let tmp = concat_all(["kai_field(", scr, ", \"", name, "\")"])
+        let t = emit_pat_test(src, sub, tmp, fns, variants, lams)
+        concat_all([" && (", t, ")", emit_pat_test_record_fields(src, rest, scr, fns, variants, lams)])
+      }
+    }
+  }
+}
+
+fn emit_pat_test_variant_record(src: String, name: String, fields: [PField], scr: String,
+                                 fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # Variant with record destructuring: first check variant tag, then
+  # record fields are accessed via kai_field on the scrutinee itself
+  # because the emit side stores records directly in variants.
+  let base = concat_all([
+    "(", scr, " && ", scr, "->tag == KAI_VARIANT && strcmp(",
+    scr, "->as.var.variant_name, \"", name, "\") == 0"
+  ])
+  cat3(base, emit_pat_test_record_fields(src, fields, scr, fns, variants, lams), ")")
+}
+
+fn emit_pat_binds(src: String, pat: Pattern, scr: String, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pat.pkind {
+    PWild -> ""
+    PLit(_) -> ""
+    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", scr, "; "])
+    PList(pats, opt_rest) -> emit_pat_binds_list(src, pats, opt_rest, scr, 0, fns, variants, lams)
+    PVariant(_, subs) -> emit_pat_binds_variant(src, subs, scr, 0, fns, variants, lams)
+    PVariantRecord(_, fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
+    PRecord(fields) -> emit_pat_binds_record(src, fields, scr, fns, variants, lams)
+  }
+}
+
+fn emit_pat_binds_list(src: String, pats: [Pattern], opt_rest: Option[String],
+                       cur: String, i: Int, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match pats {
+    [] -> match opt_rest {
+      Some(name) -> concat_all(["KaiValue *kai_", name, " = ", cur, "; "])
+      None -> ""
+    }
+    [p, ...rest] -> {
+      let head = cat2(cur, "->as.cons.head")
+      let tail = cat2(cur, "->as.cons.tail")
+      cat2(emit_pat_binds(src, p, head, fns, variants, lams),
+           emit_pat_binds_list(src, rest, opt_rest, tail, i + 1, fns, variants, lams))
+    }
+  }
+}
+
+fn emit_pat_binds_variant(src: String, subs: [Pattern], scr: String, i: Int,
+                          fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match subs {
+    [] -> ""
+    [sp, ...rest] -> {
+      let sub_scr = concat_all([scr, "->as.var.args[", int_to_string(i), "]"])
+      cat2(emit_pat_binds(src, sp, sub_scr, fns, variants, lams),
+           emit_pat_binds_variant(src, rest, scr, i + 1, fns, variants, lams))
+    }
+  }
+}
+
+fn emit_pat_binds_record(src: String, fields: [PField], scr: String,
+                          fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match fields {
+    [] -> ""
+    [pf, ...rest] -> match pf {
+      PField(name, sub, _) -> {
+        let tmp = concat_all(["kai_field(", scr, ", \"", name, "\")"])
+        cat2(emit_pat_binds(src, sub, tmp, fns, variants, lams),
+             emit_pat_binds_record(src, rest, scr, fns, variants, lams))
+      }
+    }
+  }
+}
+
+fn emit_match_arms(src: String, arms: [Arm], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  concat_all(map(arms, (a) => emit_match_arm(src, a, fns, variants, lams)))
+
+fn emit_match_arm(src: String, a: Arm, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match a {
+    Arm(pat, opt_guard, body) -> {
+      let pt = emit_pat_test(src, pat, "_scr", fns, variants, lams)
+      let binds = emit_pat_binds(src, pat, "_scr", fns, variants, lams)
+      let body_c = emit_expr(src,body, fns, variants, lams)
+      match opt_guard {
+        Some(g) -> {
+          let gc = emit_expr(src,g, fns, variants, lams)
+          concat_all([
+            "    if (", pt, ") { ", binds,
+            "if (kai_truthy(", gc, ")) { _r = ", body_c, "; break; } }\n"
+          ])
+        }
+        None -> concat_all([
+          "    if (", pt, ") { ", binds, "_r = ", body_c, "; break; }\n"
+        ])
+      }
+    }
+  }
+}
+
+fn emit_match_expr(src: String, scrut: Expr, arms: [Arm], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let sc = emit_expr(src,scrut, fns, variants, lams)
+  concat_all([
+    "({ KaiValue *_scr = ", sc, "; KaiValue *_r = kai_unit(); do {\n",
+    emit_match_arms(src, arms, fns, variants, lams),
+    "    kai_prelude_panic(kai_str(\"non-exhaustive match\"));\n",
+    "} while (0); _r; })"
+  ])
+}
+
+# ---- string interpolation ----
+#
+# The raw span includes quotes: either 1 quote on each side for single-
+# or 3 quotes for triple. We walk the body (between the quotes) and
+# split into literal / expression parts at each `#{...}` boundary, then
+# chain them via kai_string_concat wrapping each expression in
+# kai_to_string.
+
+type IPart = IpLit(String, String) | IpExp(String)   # lit: body_slice, raw_literal; exp: body_slice
+
+fn interp_is_triple(span: String) : Bool {
+  let n = string_length(span)
+  if n < 6 { false }
+  else {
+    match char_at(span, 0) {
+      Some(c) -> c == '"' and match char_at(span, 1) {
+        Some(c2) -> c2 == '"' and match char_at(span, 2) {
+          Some(c3) -> c3 == '"'
+          None -> false
+        }
+        None -> false
+      }
+      None -> false
+    }
+  }
+}
+
+# Walk the inner body of a string span between (start, end), accumulating
+# parts. At `#{`, open a new IpExp until the balanced `}`; otherwise
+# grow the current literal span.
+type IScan = { parts: [IPart], lit_start: Int, i: Int }
+
+fn iscan_collect(span: String, end: Int, st: IScan) : [IPart] {
+  if st.i >= end { finish_iscan(span, end, st) }
+  else {
+    match char_at(span, st.i) {
+      None -> finish_iscan(span, end, st)
+      Some(c) -> {
+        let nxt = match char_at(span, st.i + 1) { Some(c2) -> c2 None -> ' ' }
+        if c == '#' and nxt == '{' and st.i + 1 < end {
+          let lit_part =
+            if st.i > st.lit_start {
+              let piece = string_slice(span, st.lit_start, st.i - st.lit_start)
+              [IpLit(piece, cat3("\"", piece, "\""))]
+            } else { [] }
+          let expr_start = st.i + 2
+          let expr_end = iscan_expr_end(span, expr_start, end, 1)
+          let expr_src = string_slice(span, expr_start, expr_end - expr_start)
+          let new_parts = list_append(st.parts, list_append(lit_part, [IpExp(expr_src)]))
+          let next_i = if expr_end < end { expr_end + 1 } else { expr_end }
+          iscan_collect(span, end, IScan { parts: new_parts, lit_start: next_i, i: next_i })
+        } else {
+          iscan_collect(span, end, IScan { parts: st.parts, lit_start: st.lit_start, i: st.i + 1 })
+        }
+      }
+    }
+  }
+}
+
+fn iscan_expr_end(span: String, i: Int, end: Int, depth: Int) : Int {
+  if depth == 0 or i >= end { i }
+  else {
+    match char_at(span, i) {
+      None -> i
+      Some(c) -> {
+        if c == '{' { iscan_expr_end(span, i + 1, end, depth + 1) }
+        else if c == '}' {
+          if depth == 1 { i }
+          else { iscan_expr_end(span, i + 1, end, depth - 1) }
+        }
+        else { iscan_expr_end(span, i + 1, end, depth) }
+      }
+    }
+  }
+}
+
+fn finish_iscan(span: String, end: Int, st: IScan) : [IPart] {
+  if st.lit_start < end {
+    let piece = string_slice(span, st.lit_start, end - st.lit_start)
+    list_append(st.parts, [IpLit(piece, cat3("\"", piece, "\""))])
+  } else {
+    st.parts
+  }
+}
+
+fn emit_interp_parts(src: String, parts: [IPart], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match parts {
+    [] -> "kai_str(\"\")"
+    [p] -> emit_interp_part(src, p, fns, variants, lams)
+    [p, ...rest] -> concat_all([
+      "kai_string_concat(",
+      emit_interp_part(src, p, fns, variants, lams),
+      ", ",
+      emit_interp_parts(src, rest, fns, variants, lams),
+      ")"
+    ])
+  }
+}
+
+fn emit_interp_part(src: String, p: IPart, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match p {
+    IpLit(_, raw) -> cat3("kai_str(", raw, ")")
+    IpExp(expr_src) -> {
+      let toks = tokenize(expr_src)
+      let prs = parser_new("<interp>", expr_src, toks)
+      let r = parse_expr(prs)
+      match r.r {
+        Some(e) -> cat3("kai_to_string(", emit_expr(src,e, fns, variants, lams), ")")
+        None -> "kai_str(\"\")"
+      }
+    }
+  }
+}
+
+fn emit_string_expr(src: String, span: String, is_triple: Bool, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  # Fast path: if no `#{` appears, emit as a plain C literal.
+  if not has_interp(span, body_start, body_end) {
+    cat3("kai_str(", span, ")")
+  } else {
+    let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+    emit_interp_parts(src, parts, fns, variants, lams)
+  }
+}
+
+fn has_interp(span: String, i: Int, end: Int) : Bool {
+  if i + 1 >= end { false }
+  else {
+    match char_at(span, i) {
+      Some(c) -> {
+        if c == '#' {
+          match char_at(span, i + 1) {
+            Some(c2) -> if c2 == '{' { true } else { has_interp(span, i + 1, end) }
+            None -> false
+          }
+        } else { has_interp(span, i + 1, end) }
+      }
+      None -> false
+    }
+  }
+}
+
+# ---- lambda collection + emission ----
+#
+# We pre-walk the program building a list of LamInfo entries; each entry
+# gets a unique id and records the lambda's params, its free variables
+# (its closure captures), and its body. At emit time the lambda
+# expression is replaced with `kai_closure(&_kai_lam_<id>, arity,
+# n_caps, captures)`; the body is emitted as a separate function later.
+
+type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
+
+fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
+  match lams {
+    [] -> None
+    [l, ...rest] -> match l {
+      LamInfo(_, ln, cl, _, _, _) ->
+        if ln == line and cl == col { Some(l) }
+        else { find_lam(rest, line, col) }
+    }
+  }
+}
+
+# Free variables of an expression, given the lambda's own params and the
+# program's globals. We skip descent into nested ELambdas (each gets its
+# own capture set), and re-parse string interpolations so identifiers
+# hidden inside #{...} get captured too.
+fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] {
+  match x.kind {
+    EInt(_)  -> acc
+    EReal(_) -> acc
+    EBool(_) -> acc
+    EChar(_) -> acc
+    EStr(span, is_triple) -> fv_interp(span, is_triple, own, globals, acc)
+    EUnit -> acc
+    EVar(name) -> {
+      if list_has(own, name) { acc }
+      else if list_has(globals, name) { acc }
+      else if list_has(acc, name) { acc }
+      else { [name, ...acc] }
+    }
+    EUnder -> acc
+    EPlaceholder -> acc
+    ECall(f, xs) -> fv_exprs(xs, own, globals, fv_expr(f, own, globals, acc))
+    EField(base, _) -> fv_expr(base, own, globals, acc)
+    EIndex(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EBinop(_, a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EUnop(_, inner) -> fv_expr(inner, own, globals, acc)
+    EIf(c, a, opt_b) -> {
+      let acc1 = fv_expr(a, own, globals, fv_expr(c, own, globals, acc))
+      match opt_b { Some(b) -> fv_expr(b, own, globals, acc1) None -> acc1 }
+    }
+    EMatch(scr, arms) -> fv_arms(arms, own, globals, fv_expr(scr, own, globals, acc))
+    ELambda(_, _) -> acc                      # nested lambdas collect their own
+    ERecordLit(_, fields) -> fv_field_inits(fields, own, globals, acc)
+    EList(elems) -> fv_list_elems(elems, own, globals, acc)
+    ERange(a, b, opt_step) -> {
+      let acc1 = fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+      match opt_step { Some(s) -> fv_expr(s, own, globals, acc1) None -> acc1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let acc1 = fv_stmts(stmts, own, globals, acc)
+      match opt_final { Some(f) -> fv_expr(f, own, globals, acc1) None -> acc1 }
+    }
+    EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+  }
+}
+
+fn fv_exprs(xs: [Expr], own: [String], globals: [String], acc: [String]) : [String] {
+  match xs {
+    [] -> acc
+    [h, ...rest] -> fv_exprs(rest, own, globals, fv_expr(h, own, globals, acc))
+  }
+}
+
+fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [String] {
+  match arms {
+    [] -> acc
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own, globals, acc) None -> acc }
+        fv_arms(rest, own, globals, fv_expr(body, own, globals, acc1))
+      }
+    }
+  }
+}
+
+fn fv_field_inits(fs: [FieldInit], own: [String], globals: [String], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      FI(_, val) -> fv_field_inits(rest, own, globals, fv_expr(val, own, globals, acc))
+    }
+  }
+}
+
+fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]) : [String] {
+  match es {
+    [] -> acc
+    [el, ...rest] -> match el {
+      ElPlain(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+      ElSpread(x) -> fv_list_elems(rest, own, globals, fv_expr(x, own, globals, acc))
+    }
+  }
+}
+
+fn fv_stmts(ss: [Stmt], own: [String], globals: [String], acc: [String]) : [String] {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> fv_stmts(rest, own, globals, fv_stmt(s, own, globals, acc))
+  }
+}
+
+fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] {
+  match s {
+    SLet(_, _, rhs) -> fv_expr(rhs, own, globals, acc)
+    SAssert(c, opt_m) -> {
+      let acc1 = fv_expr(c, own, globals, acc)
+      match opt_m { Some(m) -> fv_expr(m, own, globals, acc1) None -> acc1 }
+    }
+    SExprStmt(x) -> fv_expr(x, own, globals, acc)
+  }
+}
+
+fn fv_interp(span: String, is_triple: Bool, own: [String], globals: [String], acc: [String]) : [String] {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  fv_interp_parts(parts, own, globals, acc)
+}
+
+fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [String]) : [String] {
+  match parts {
+    [] -> acc
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> fv_interp_parts(rest, own, globals, acc)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let acc1 = match r.r {
+          Some(e) -> fv_expr(e, own, globals, acc)
+          None -> acc
+        }
+        fv_interp_parts(rest, own, globals, acc1)
+      }
+    }
+  }
+}
+
+# ---- lambda collection pass ----
+
+type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String] }
+
+fn lc_new(globals: [String]) : LamCollect = LamCollect { next_id: 0, lams: [], globals: globals }
+
+fn params_to_names(ps: [Param]) : [String] =
+  map(ps, (pm) => pm.pname)
+
+fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
+  match x.kind {
+    EInt(_)  -> st
+    EReal(_) -> st
+    EBool(_) -> st
+    EChar(_) -> st
+    EStr(span, is_triple) -> collect_interp(span, is_triple, st)
+    EUnit -> st
+    EVar(_) -> st
+    EUnder -> st
+    EPlaceholder -> st
+    ECall(f, xs) -> collect_exprs(xs, collect_expr(f, st))
+    EField(base, _) -> collect_expr(base, st)
+    EIndex(a, b) -> collect_expr(b, collect_expr(a, st))
+    EBinop(_, a, b) -> collect_expr(b, collect_expr(a, st))
+    EUnop(_, inner) -> collect_expr(inner, st)
+    EIf(c, a, opt_b) -> {
+      let s1 = collect_expr(a, collect_expr(c, st))
+      match opt_b { Some(b) -> collect_expr(b, s1) None -> s1 }
+    }
+    EMatch(scr, arms) -> collect_arms(arms, collect_expr(scr, st))
+    ELambda(params, body) -> {
+      let id = st.next_id
+      let own = params_to_names(params)
+      let caps = fv_expr(body, own, st.globals, [])
+      let info = LamInfo(id, x.line, x.col, params, caps, body)
+      let st1 = LamCollect { next_id: id + 1, lams: list_append(st.lams, [info]), globals: st.globals }
+      collect_expr(body, st1)
+    }
+    ERecordLit(_, fields) -> collect_field_inits(fields, st)
+    EList(elems) -> collect_list_elems(elems, st)
+    ERange(a, b, opt_step) -> {
+      let s1 = collect_expr(b, collect_expr(a, st))
+      match opt_step { Some(s) -> collect_expr(s, s1) None -> s1 }
+    }
+    EBlock(stmts, opt_final) -> {
+      let s1 = collect_stmts(stmts, st)
+      match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
+    }
+    EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+  }
+}
+
+fn collect_exprs(xs: [Expr], st: LamCollect) : LamCollect {
+  match xs {
+    [] -> st
+    [h, ...rest] -> collect_exprs(rest, collect_expr(h, st))
+  }
+}
+
+fn collect_arms(arms: [Arm], st: LamCollect) : LamCollect {
+  match arms {
+    [] -> st
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, body) -> {
+        let s1 = match opt_g { Some(g) -> collect_expr(g, st) None -> st }
+        collect_arms(rest, collect_expr(body, s1))
+      }
+    }
+  }
+}
+
+fn collect_field_inits(fs: [FieldInit], st: LamCollect) : LamCollect {
+  match fs {
+    [] -> st
+    [f, ...rest] -> match f {
+      FI(_, val) -> collect_field_inits(rest, collect_expr(val, st))
+    }
+  }
+}
+
+fn collect_list_elems(es: [ListElem], st: LamCollect) : LamCollect {
+  match es {
+    [] -> st
+    [el, ...rest] -> match el {
+      ElPlain(x) -> collect_list_elems(rest, collect_expr(x, st))
+      ElSpread(x) -> collect_list_elems(rest, collect_expr(x, st))
+    }
+  }
+}
+
+fn collect_stmts(ss: [Stmt], st: LamCollect) : LamCollect {
+  match ss {
+    [] -> st
+    [s, ...rest] -> collect_stmts(rest, collect_stmt(s, st))
+  }
+}
+
+fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
+  match s {
+    SLet(_, _, rhs) -> collect_expr(rhs, st)
+    SAssert(c, opt_m) -> {
+      let s1 = collect_expr(c, st)
+      match opt_m { Some(m) -> collect_expr(m, s1) None -> s1 }
+    }
+    SExprStmt(x) -> collect_expr(x, st)
+  }
+}
+
+fn collect_interp(span: String, is_triple: Bool, st: LamCollect) : LamCollect {
+  let n = string_length(span)
+  let body_start = if is_triple { 3 } else { 1 }
+  let body_end = if is_triple { n - 3 } else { n - 1 }
+  let parts = iscan_collect(span, body_end, IScan { parts: [], lit_start: body_start, i: body_start })
+  collect_interp_parts(parts, st)
+}
+
+fn collect_interp_parts(parts: [IPart], st: LamCollect) : LamCollect {
+  match parts {
+    [] -> st
+    [p, ...rest] -> match p {
+      IpLit(_, _) -> collect_interp_parts(rest, st)
+      IpExp(esrc) -> {
+        let toks = tokenize(esrc)
+        let prs = parser_new("<interp>", esrc, toks)
+        let r = parse_expr(prs)
+        let st1 = match r.r { Some(e) -> collect_expr(e, st) None -> st }
+        collect_interp_parts(rest, st1)
+      }
+    }
+  }
+}
+
+fn collect_decl(d: Decl, st: LamCollect) : LamCollect {
+  match d {
+    DFn(_, _, _, _, body, _, _) -> collect_expr(body, st)
+    DType(_, _, _, _, _, _) -> st
+    DTest(_, body, _, _) -> collect_expr(body, st)
+    DImport(_, _, _) -> st
+  }
+}
+
+fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
+  match ds {
+    [] -> st
+    [d, ...rest] -> collect_decls(rest, collect_decl(d, st))
+  }
+}
+
+# Globals: prelude names + user fn names + variant ctor names. Used as a
+# cheap "this ident does not need to be captured" test.
+fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
+fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
+
+fn build_globals(fns: [EFn], variants: [EVar]) : [String] {
+  let p = prelude_names()
+  let f = map(fns, efn_name)
+  let v = map(variants, evar_name)
+  list_append(p, list_append(f, v))
+}
+
+# ---- lambda helper emission ----
+
+fn emit_lam_arg_reads(params: [Param], i: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] -> concat_all([
+      "    KaiValue *kai_", p.pname, " = args[", int_to_string(i), "];\n",
+      emit_lam_arg_reads(rest, i + 1)
+    ])
+  }
+}
+
+fn emit_lam_cap_reads(caps: [String], i: Int) : String {
+  match caps {
+    [] -> ""
+    [c, ...rest] -> concat_all([
+      "    KaiValue *kai_", c, " = self->as.clo.captures[", int_to_string(i), "];\n",
+      emit_lam_cap_reads(rest, i + 1)
+    ])
+  }
+}
+
+fn emit_lam_helper(src: String, l: LamInfo, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match l {
+    LamInfo(id, _, _, params, caps, body) -> {
+      let arg_reads = emit_lam_arg_reads(params, 0)
+      let cap_reads = emit_lam_cap_reads(caps, 0)
+      let body_c = emit_expr(src,body, fns, variants, lams)
+      concat_all([
+        "static KaiValue *_kai_lam_", int_to_string(id),
+        "(KaiValue *self, KaiValue **args, int n) {\n",
+        "    (void) self; (void) n;\n",
+        arg_reads, cap_reads,
+        "    return ", body_c, ";\n}\n\n"
+      ])
+    }
+  }
+}
+
+fn emit_lam_helpers(src: String, lams: [LamInfo], fns: [EFn], variants: [EVar]) : String =
+  concat_all(map(lams, (l) => emit_lam_helper(src, l, fns, variants, lams)))
+
+fn emit_one_lam_forward(l: LamInfo) : String =
+  match l {
+    LamInfo(id, _, _, _, _, _) ->
+      concat_all(["static KaiValue *_kai_lam_", int_to_string(id), "(KaiValue *, KaiValue **, int);\n"])
+  }
+
+fn emit_lam_forward_decls(lams: [LamInfo]) : String =
+  concat_all(map(lams, emit_one_lam_forward))
+
+fn emit_closure_caps(caps: [String]) : String =
+  join_with(map(caps, (c) => cat2("kai_", c)), ", ")
+
+fn emit_lambda_ref(x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match find_lam(lams, x.line, x.col) {
+    None -> "kai_unit() /* lambda: missing info */"
+    Some(l) -> match l {
+      LamInfo(id, _, _, params, caps, _) -> {
+        let arity = list_length(params)
+        let n_caps = list_length(caps)
+        if n_caps == 0 {
+          concat_all([
+            "kai_closure(&_kai_lam_", int_to_string(id),
+            ", ", int_to_string(arity), ", 0, NULL)"
+          ])
+        } else {
+          concat_all([
+            "kai_closure(&_kai_lam_", int_to_string(id),
+            ", ", int_to_string(arity), ", ", int_to_string(n_caps),
+            ", (KaiValue *[]){", emit_closure_caps(caps), "})"
+          ])
+        }
+      }
+    }
+  }
+}
+
+# ---- full emit_expr (with lambda support) ----
+
+fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match x.kind {
+    EInt(n)      -> cat3("kai_int(", int_to_string(n), "LL)")
+    EReal(r)     -> cat3("kai_real(", real_to_string(r), ")")
+    EBool(b)     -> if b { "kai_bool(1)" } else { "kai_bool(0)" }
+    EChar(c)     -> cat3("kai_char(", int_to_string(char_to_int(c)), ")")
+    EStr(span, is_triple) -> emit_string_expr(src, span, is_triple, fns, variants, lams)
+    EUnit        -> "kai_unit()"
+    EVar(name)   -> emit_ident_value(name, fns, variants)
+    EUnder       -> "kai_unit() /* _ */"
+    EPlaceholder -> "kai_unit() /* placeholder */"
+    ECall(f, args_e) -> emit_call_expr(src, f, args_e, fns, variants, lams)
+    EField(base, fname) -> {
+      let b = emit_expr(src, base, fns, variants, lams)
+      cat5("kai_field(", b, ", \"", fname, "\")")
+    }
+    EIndex(_, _) -> "kai_unit() /* index: not used by bootstrap examples */"
+    EBinop(op, a, b) -> {
+      if op == "and" {
+        concat_all([
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams),
+          "; kai_truthy(_a) ? ", emit_expr(src, b, fns, variants, lams),
+          " : kai_bool(0); })"
+        ])
+      } else if op == "or" {
+        concat_all([
+          "({ KaiValue *_a = ", emit_expr(src, a, fns, variants, lams),
+          "; kai_truthy(_a) ? kai_bool(1) : ", emit_expr(src, b, fns, variants, lams), "; })"
+        ])
+      } else {
+        match binop_cname(op) {
+          Some(cn) -> concat_all([
+            cn, "(",
+            emit_expr(src, a, fns, variants, lams), ", ",
+            emit_expr(src, b, fns, variants, lams), ")"
+          ])
+          None -> cat3("kai_unit() /* unknown binop: ", op, " */")
+        }
+      }
+    }
+    EUnop(op, inner) -> {
+      match unop_cname(op) {
+        Some(cn) -> concat_all([cn, "(", emit_expr(src, inner, fns, variants, lams), ")"])
+        None -> cat3("kai_unit() /* unknown unop: ", op, " */")
+      }
+    }
+    EIf(c, a, opt_b) -> {
+      let cc = emit_expr(src, c, fns, variants, lams)
+      let tc = emit_expr(src, a, fns, variants, lams)
+      let ec = match opt_b {
+        Some(eb) -> emit_expr(src, eb, fns, variants, lams)
+        None -> "kai_unit()"
+      }
+      concat_all(["(kai_truthy(", cc, ") ? ", tc, " : ", ec, ")"])
+    }
+    EMatch(scr, arms) -> emit_match_expr(src, scr, arms, fns, variants, lams)
+    ELambda(_, _) -> emit_lambda_ref(x, fns, variants, lams)
+    ERecordLit(_, fields) -> emit_record_lit(src, fields, fns, variants, lams)
+    EList(elems) -> emit_list_expr(src, elems, fns, variants, lams)
+    ERange(a, b, opt_step) -> emit_range_expr(src, a, b, opt_step, fns, variants, lams)
+    EBlock(stmts, opt_final) -> {
+      match stmts {
+        [] -> match opt_final {
+          Some(fe) -> emit_expr(src, fe, fns, variants, lams)
+          None -> "kai_unit()"
+        }
+        _ -> {
+          let stmt_out = concat_all(map(stmts, (s) => emit_stmt(src, s, fns, variants, lams)))
+          let final_out = match opt_final {
+            Some(fe) -> cat2(emit_expr(src, fe, fns, variants, lams), "; ")
+            None -> "kai_unit(); "
+          }
+          cat4("({ ", stmt_out, final_out, "})")
+        }
+      }
+    }
+    EPipe(a, b) -> emit_pipe_expr(src, a, b, fns, variants, lams)
+  }
+}
+
+fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match s {
+    SLet(pat, _, rhs) -> emit_let_stmt(src, pat, rhs, fns, variants, lams)
+    SAssert(cond, opt_msg) -> emit_assert_stmt(src, cond, opt_msg, fns, variants, lams)
+    SExprStmt(x) -> cat3("{ KaiValue *_ = ", emit_expr(src, x, fns, variants, lams), "; (void) _; } ")
+  }
+}
+
+fn emit_let_stmt(src: String, pat: Pattern, rhs: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let rhs_c = emit_expr(src, rhs, fns, variants, lams)
+  match pat.pkind {
+    PBind(name) -> concat_all(["KaiValue *kai_", name, " = ", rhs_c, "; "])
+    PWild -> cat3("{ KaiValue *_w = ", rhs_c, "; (void) _w; } ")
+    _ -> {
+      # Destructuring let: bind a temp, then run pattern binds.
+      let binds = emit_pat_binds(src, pat, "_letv", fns, variants, lams)
+      concat_all(["{ KaiValue *_letv = ", rhs_c, "; ", binds, "} "])
+    }
+  }
+}
+
+fn emit_assert_stmt(src: String, cond: Expr, opt_msg: Option[Expr],
+                    fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # kai_assert_check consults kai_test_in_progress at runtime and either
+  # aborts (outside a test) or longjmps to the test harness (inside one),
+  # so the emitter doesn't need to know whether it's in test mode.
+  # `opt_msg` is ignored for now — we always pass the generic string,
+  # matching stage 0's out-of-test panic path.
+  let cc = emit_expr(src, cond, fns, variants, lams)
+  concat_all(["kai_assert_check(", cc, ", \"assertion failed\"); "])
+}
+
+# ---- declaration emission ----
+
+fn emit_param_list(params: [Param]) : String {
+  match params {
+    [] -> "void"
+    _ -> join_with(map(params, (pm) => cat2("KaiValue *kai_", pm.pname)), ", ")
+  }
+}
+
+fn emit_fn_signature(name: String, params: [Param]) : String =
+  cat5("static KaiValue *kai_", name, "(", emit_param_list(params), ")")
+
+fn emit_fn_forward(d: Decl) : String {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> cat2(emit_fn_signature(name, params), ";\n")
+    _ -> ""
+  }
+}
+
+fn emit_thunk_forward(d: Decl) : String {
+  match d {
+    DFn(_, name, _, _, _, _, _) ->
+      cat3("static KaiValue *_kai_", name, "_thunk(KaiValue *, KaiValue **, int);\n")
+    _ -> ""
+  }
+}
+
+fn emit_fn_body(src: String, d: Decl, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  match d {
+    DFn(_, name, params, _, body, _, _) -> {
+      let sig = emit_fn_signature(name, params)
+      let body_c = emit_expr(src, body, fns, variants, lams)
+      cat5(sig, " {\n    return ", body_c, ";\n", "}\n\n")
+    }
+    _ -> ""
+  }
+}
+
+fn emit_param_args(params: [Param]) : String =
+  join_with(map(params, (pm) => cat2("kai_", pm.pname)), ", ")
+
+fn emit_param_reads(params: [Param], start: Int) : String {
+  match params {
+    [] -> ""
+    [p, ...rest] ->
+      cat2(
+        concat_all(["    KaiValue *kai_", p.pname, " = args[", int_to_string(start), "];\n"]),
+        emit_param_reads(rest, start + 1))
+  }
+}
+
+fn emit_fn_thunk(d: Decl) : String {
+  match d {
+    DFn(_, name, params, _, _, _, _) -> {
+      let param_reads = emit_param_reads(params, 0)
+      let named_args = emit_param_args(params)
+      let hdr = concat_all([
+        "static KaiValue *_kai_", name,
+        "_thunk(KaiValue *self, KaiValue **args, int n) {\n    (void) self; (void) n;\n"
+      ])
+      let call = concat_all(["    return kai_", name, "(", named_args, ");\n}\n\n"])
+      concat_all([hdr, param_reads, call])
+    }
+    _ -> ""
+  }
+}
+
+# ---- top-level passes ----
+
+fn fn_forward_decls(decls: [Decl]) : String =
+  concat_all(map(decls, emit_fn_forward))
+
+fn thunk_forward_decls(decls: [Decl]) : String =
+  concat_all(map(decls, emit_thunk_forward))
+
+fn fn_bodies(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String =
+  concat_all(map(decls, (d) => {
+    match d {
+      DFn(_, _, _, _, _, _, _) -> cat2(emit_fn_body(src, d, fns, variants, lams), emit_fn_thunk(d))
+      _ -> ""
+    }
+  }))
+
+# ---- test function emission (always emitted; only called from int main
+#      when test_mode is on) ----
+
+fn emit_test_fn(src: String, id: Int, desc_span: String, body: Expr,
+                fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  # desc_span is the raw source of the description including its quotes,
+  # so it's already a valid C string literal. We wrap the body in
+  # setjmp/longjmp: kai_assert_check inside the body can longjmp us out
+  # on failure, and the test still counts as a tried test.
+  let body_c = emit_expr(src, body, fns, variants, lams)
+  concat_all([
+    "static void _kai_test_", int_to_string(id), "(void) {\n",
+    "    kai_test_begin(", desc_span, ");\n",
+    "    if (setjmp(kai_test_jmp) == 0) {\n",
+    "        kai_test_in_progress = 1;\n",
+    "        KaiValue *_body = ", body_c, ";\n",
+    "        kai_decref(_body);\n",
+    "        kai_test_in_progress = 0;\n",
+    "        kai_test_pass();\n",
+    "    } else {\n",
+    "        kai_test_in_progress = 0;\n",
+    "    }\n",
+    "}\n\n"
+  ])
+}
+
+fn test_decls(decls: [Decl]) : [Decl] =
+  filter(decls, (d) => match d { DTest(_, _, _, _) -> true _ -> false })
+
+fn emit_one_test(src: String, fns: [EFn], variants: [EVar], lams: [LamInfo],
+                 id_d: DeclWithId) : String {
+  match id_d {
+    DWI(id, d) -> match d {
+      DTest(desc_span, body, _, _) -> emit_test_fn(src, id, desc_span, body, fns, variants, lams)
+      _ -> ""
+    }
+  }
+}
+
+# Helper pair to zip index with decl for clean iteration.
+type DeclWithId = DWI(Int, Decl)
+
+fn number_tests_loop(decls: [Decl], id: Int, acc: [DeclWithId]) : [DeclWithId] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DTest(_, _, _, _) -> number_tests_loop(rest, id + 1, [DWI(id, d), ...acc])
+      _ -> number_tests_loop(rest, id, acc)
+    }
+  }
+}
+
+fn number_tests(decls: [Decl]) : [DeclWithId] =
+  number_tests_loop(decls, 0, [])
+
+fn emit_all_tests(src: String, decls: [Decl], fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
+  let numbered = number_tests(decls)
+  concat_all(map(numbered, (dwi) => emit_one_test(src, fns, variants, lams, dwi)))
+}
+
+fn test_count(decls: [Decl]) : Int = list_length(test_decls(decls))
+
+fn test_call_list(n: Int, i: Int) : String {
+  if i >= n { "" }
+  else {
+    concat_all(["    _kai_test_", int_to_string(i), "();\n", test_call_list(n, i + 1)])
+  }
+}
+
+fn has_main_decl(decls: [Decl]) : Bool {
+  match decls {
+    [] -> false
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, _, _, _) -> if n == "main" { true } else { has_main_decl(rest) }
+      _ -> has_main_decl(rest)
+    }
+  }
+}
+
+fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
+  if test_mode {
+    let n = test_count(decls)
+    concat_all([
+      "int main(int argc, char **argv) {\n",
+      "    kai_set_args(argc, argv);\n",
+      test_call_list(n, 0),
+      "    return kai_test_summary();\n",
+      "}\n"
+    ])
+  } else if has_main_decl(decls) {
+    "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    KaiValue *_result = kai_main();\n    kai_decref(_result);\n    return 0;\n}\n"
+  } else {
+    ""
+  }
+}
+
+fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : String {
+  let fns = register_fn_decls(decls)
+  let variants = register_variants(decls)
+  let globals = build_globals(fns, variants)
+  let st0 = lc_new(globals)
+  let st = collect_decls(decls, st0)
+  let lams = st.lams
+  let header = "/* generated by kaikai stage 2 */\n#include \"runtime.h\"\n\n"
+  let fwd = fn_forward_decls(decls)
+  let thunk_fwd = thunk_forward_decls(decls)
+  let lam_fwd = emit_lam_forward_decls(lams)
+  let bodies = fn_bodies(src, decls, fns, variants, lams)
+  let lam_bodies = emit_lam_helpers(src, lams, fns, variants)
+  let tests = emit_all_tests(src, decls, fns, variants, lams)
+  let main_wr = emit_main_wrapper(decls, test_mode)
+  concat_all([header, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, tests, main_wr])
+}
+
+# ====================================================================
+# cli + driver
+# ====================================================================
+
+type Mode
+  = MDefault
+  | MTokens
+  | MAst
+  | MTest
+  | MHelp
+
+type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String] }
+
+fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
+  CliOptions { mode: m, path: opts.path, prelude: opts.prelude }
+
+fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude }
+
+fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p) }
+
+fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
+  match rest {
+    [] -> opts
+    [a, ...more] -> {
+      if a == "--tokens" {
+        parse_cli_loop(more, cli_with_mode(opts, MTokens))
+      } else if a == "--ast" {
+        parse_cli_loop(more, cli_with_mode(opts, MAst))
+      } else if a == "--test" {
+        parse_cli_loop(more, cli_with_mode(opts, MTest))
+      } else if a == "-h" or a == "--help" {
+        parse_cli_loop(more, cli_with_mode(opts, MHelp))
+      } else if a == "--prelude" {
+        match more {
+          [p, ...rest2] -> parse_cli_loop(rest2, cli_with_prelude(opts, p))
+          [] -> {
+            eprint("kaic1: --prelude requires a file argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
+      } else {
+        parse_cli_loop(more, cli_with_path(opts, a))
+      }
+    }
+  }
+}
+
+fn parse_cli(argv: [String]) : CliOptions {
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None })
+}
+
+fn usage() : Unit {
+  eprint("usage: kaic2 [options] <file.kai>")
+  eprint("  --prelude <file>   include <file>'s decls before the input")
+  eprint("  --tokens           print the token stream and exit")
+  eprint("  --ast              parse and print the AST and exit")
+  eprint("  --test             emit C wired to a test runner (runs test blocks)")
+  eprint("  -h, --help         this help")
+}
+
+# Parse a prelude file and return its decl list. On any error report
+# to stderr and return None.
+fn load_prelude(path: String) : Option[[Decl]] {
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic1: #{path}: #{msg}"); None }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(path, src, tokens)
+      if errs != 0 { None }
+      else {
+        let parsed = parse_program(path, src, tokens)
+        parsed.decls
+      }
+    }
+  }
+}
+
+fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) : Int {
+  let tokens = tokenize(src)
+  let lex_errs = report_errors(path, src, tokens)
+  match mode {
+    MTokens -> {
+      dump_tokens(src, tokens)
+      lex_errs
+    }
+    MHelp -> { usage(); 0 }
+    _ -> {
+      if lex_errs != 0 { lex_errs }
+      else {
+        let parsed = parse_program(path, src, tokens)
+        match parsed.decls {
+          None -> 1
+          Some(own_decls) -> {
+            let all_decls = list_append(prelude_decls, own_decls)
+            match mode {
+              MAst -> { dump_program(all_decls); 0 }
+              _ -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk }
+                else {
+                  let test_mode = match mode { MTest -> true _ -> false }
+                  let out = emit_program(path, src, all_decls, test_mode)
+                  print(out)
+                  0
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn run(opts: CliOptions) : Int {
+  match opts.mode {
+    MHelp -> { usage(); 0 }
+    _ -> match opts.path {
+      None -> { usage(); 2 }
+      Some(p) -> {
+        let prelude_decls =
+          match opts.prelude {
+            None -> Some([])
+            Some(pp) -> load_prelude(pp)
+          }
+        match prelude_decls {
+          None -> 1
+          Some(pds) -> match read_file(p) {
+            Ok(src) -> compile_source(p, opts.mode, src, pds)
+            Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn main() {
+  let code = run(parse_cli(args()))
+  exit(code)
+}

@@ -1,0 +1,100 @@
+CC      ?= cc
+CFLAGS  ?= -std=c99 -Wall -Wno-unused-function -Wno-unused-variable -g -O0
+KAIC1   := ../stage1/kaic1
+TARGET  := kaic2
+SRC     := compiler.kai
+
+.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks selfhost
+
+all: $(TARGET)
+
+$(KAIC1):
+	$(MAKE) -C ../stage1 kaic1
+
+build:
+	@mkdir -p build
+
+build/stage2.c: $(SRC) $(KAIC1) | build
+	$(KAIC1) $(SRC) > $@
+
+$(TARGET): build/stage2.c
+	$(CC) $(CFLAGS) -I ../stage0 $< -o $@
+
+# Token stream must match stage 1 (which already matches stage 0).
+test-tokens: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai ../stage1/compiler.kai $(SRC); do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
+	  ../stage1/kaic1 --tokens $$f | awk '{$$1=$$1; print}' > build/s1-$$name.tok; \
+	  diff -q build/s1-$$name.tok build/s2-$$name.tok > /dev/null \
+	    && echo "tokens OK $$name" \
+	    || { echo "tokens DIFF $$name"; diff build/s1-$$name.tok build/s2-$$name.tok | head; exit 1; }; \
+	done
+
+# --ast smoke test (format is indented, readable, not byte-compared).
+test-ast: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai $(SRC); do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
+	    || { echo "ast FAIL $$name"; exit 1; }; \
+	done
+
+# Checker: undefined-name resolution runs clean on every example.
+test-check: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai $(SRC); do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > /dev/null \
+	    && echo "check OK $$name" \
+	    || { echo "check FAIL $$name"; exit 1; }; \
+	done
+
+# End-to-end: emitted C from kaic2 matches stage 1's stdout byte for byte.
+test-run: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name; \
+	  ./build/$$name > build/$$name.out; \
+	  ../stage1/kaic1 $$f > build/$$name-s1.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-s1.c -o build/$$name-s1; \
+	  ./build/$$name-s1 > build/$$name-s1.out; \
+	  diff -q build/$$name.out build/$$name-s1.out > /dev/null \
+	    && echo "run OK $$name" \
+	    || { echo "run DIFF $$name"; exit 1; }; \
+	done
+
+# --test binaries produce the same stderr as stage 1's.
+test-blocks: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --test $$f > build/$$name-t.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t.c -o build/$$name-t; \
+	  ./build/$$name-t 2> build/$$name-t.err || true; \
+	  ../stage1/kaic1 --test $$f > build/$$name-t-s1.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-t-s1.c -o build/$$name-t-s1; \
+	  ./build/$$name-t-s1 2> build/$$name-t-s1.err || true; \
+	  diff -q build/$$name-t.err build/$$name-t-s1.err > /dev/null \
+	    && echo "tests OK $$name" \
+	    || { echo "tests DIFF $$name"; exit 1; }; \
+	done
+
+# Self-hosting: kaic2 compiles its own source, and the round-trip reaches
+# a fixed point.
+selfhost: $(TARGET) build
+	@set -e; \
+	./$(TARGET) $(SRC) > build/kaic2b.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/kaic2b.c -o build/kaic2b; \
+	./build/kaic2b $(SRC) > build/kaic2c.c; \
+	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
+	  && echo "self-hosting fixed point: OK" \
+	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
+
+test: test-tokens test-ast test-check test-run test-blocks
+
+clean:
+	rm -rf build $(TARGET)
