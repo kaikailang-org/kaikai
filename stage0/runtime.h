@@ -653,6 +653,212 @@ static KaiValue *kai_range_step(KaiValue *from, KaiValue *to, KaiValue *step) {
     return acc;
 }
 
+/* ---------- prelude: args (set by generated `int main`) ---------- */
+
+static int          kai_g_argc = 0;
+static char       **kai_g_argv = NULL;
+
+static void kai_set_args(int argc, char **argv) {
+    kai_g_argc = argc;
+    kai_g_argv = argv;
+}
+
+static KaiValue *kai_prelude_args(void) {
+    KaiValue *acc = kai_nil();
+    for (int i = kai_g_argc - 1; i >= 1; --i) {
+        acc = kai_cons(kai_str(kai_g_argv[i]), acc);
+    }
+    return acc;
+}
+
+/* ---------- prelude: file io ---------- */
+
+static KaiValue *kai_prelude_read_file(KaiValue *path) {
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("read_file: argument is not a String");
+        KaiValue *err = kai_variant(0, "Err", 1, &msg);
+        return err;
+    }
+    char pbuf[4096];
+    size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+    memcpy(pbuf, path->as.s.bytes, plen);
+    pbuf[plen] = '\0';
+    FILE *fp = fopen(pbuf, "rb");
+    if (!fp) {
+        KaiValue *msg = kai_str("read_file: cannot open file");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp);
+        KaiValue *msg = kai_str("read_file: seek failed");
+        return kai_variant(0, "Err", 1, &msg); }
+    long n = ftell(fp);
+    if (n < 0) { fclose(fp);
+        KaiValue *msg = kai_str("read_file: tell failed");
+        return kai_variant(0, "Err", 1, &msg); }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp);
+        KaiValue *msg = kai_str("read_file: rewind failed");
+        return kai_variant(0, "Err", 1, &msg); }
+    KaiValue *v = kai_alloc(KAI_STR);
+    v->as.s.len = (size_t) n;
+    v->as.s.bytes = (char *) malloc((size_t) n + 1);
+    if (!v->as.s.bytes) { fclose(fp); fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    size_t got = fread(v->as.s.bytes, 1, (size_t) n, fp);
+    fclose(fp);
+    v->as.s.bytes[got] = '\0';
+    v->as.s.len = got;
+    return kai_variant(0, "Ok", 1, &v);
+}
+
+static KaiValue *kai_prelude_write_file(KaiValue *path, KaiValue *content) {
+    if (!path || path->tag != KAI_STR) {
+        KaiValue *msg = kai_str("write_file: path is not a String");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    if (!content || content->tag != KAI_STR) {
+        KaiValue *msg = kai_str("write_file: content is not a String");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    char pbuf[4096];
+    size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+    memcpy(pbuf, path->as.s.bytes, plen);
+    pbuf[plen] = '\0';
+    FILE *fp = fopen(pbuf, "wb");
+    if (!fp) {
+        KaiValue *msg = kai_str("write_file: cannot open file");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    size_t wrote = fwrite(content->as.s.bytes, 1, content->as.s.len, fp);
+    fclose(fp);
+    if (wrote != content->as.s.len) {
+        KaiValue *msg = kai_str("write_file: short write");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    KaiValue *u = kai_unit();
+    return kai_variant(0, "Ok", 1, &u);
+}
+
+static KaiValue *kai_prelude_read_line(void) {
+    size_t cap = 128, n = 0;
+    char *buf = (char *) malloc(cap);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
+        buf[n++] = (char) ch;
+    }
+    if (ch == EOF && n == 0) {
+        free(buf);
+        KaiValue *msg = kai_str("read_line: end of input");
+        return kai_variant(0, "Err", 1, &msg);
+    }
+    KaiValue *s = kai_str_from_bytes(buf, n);
+    free(buf);
+    return kai_variant(0, "Ok", 1, &s);
+}
+
+/* ---------- prelude: parsing and string helpers ---------- */
+
+static KaiValue *kai_prelude_string_to_int(KaiValue *s) {
+    if (!s || s->tag != KAI_STR || s->as.s.len == 0) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    char buf[64];
+    if (s->as.s.len >= sizeof(buf)) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    memcpy(buf, s->as.s.bytes, s->as.s.len);
+    buf[s->as.s.len] = '\0';
+    char *end = NULL;
+    long long v = strtoll(buf, &end, 10);
+    if (!end || *end != '\0' || end == buf) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    KaiValue *iv = kai_int((int64_t) v);
+    return kai_variant(0, "Some", 1, &iv);
+}
+
+static KaiValue *kai_prelude_string_to_real(KaiValue *s) {
+    if (!s || s->tag != KAI_STR || s->as.s.len == 0) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    char buf[64];
+    if (s->as.s.len >= sizeof(buf)) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    memcpy(buf, s->as.s.bytes, s->as.s.len);
+    buf[s->as.s.len] = '\0';
+    char *end = NULL;
+    double v = strtod(buf, &end);
+    if (!end || *end != '\0' || end == buf) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    KaiValue *rv = kai_real(v);
+    return kai_variant(0, "Some", 1, &rv);
+}
+
+static KaiValue *kai_prelude_char_at(KaiValue *s, KaiValue *i) {
+    if (!s || s->tag != KAI_STR || !i || i->tag != KAI_INT) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    int64_t idx = i->as.i;
+    if (idx < 0 || (size_t) idx >= s->as.s.len) {
+        return kai_variant(0, "None", 0, NULL);
+    }
+    /* Byte-at semantics for now; multi-byte UTF-8 can return surrogate-like
+       codepoints once we need them. Stage 0 keeps it simple. */
+    KaiValue *cv = kai_char((uint32_t)(unsigned char) s->as.s.bytes[idx]);
+    return kai_variant(0, "Some", 1, &cv);
+}
+
+static KaiValue *kai_prelude_string_split(KaiValue *s, KaiValue *sep) {
+    if (!s || s->tag != KAI_STR) return kai_nil();
+    if (!sep || sep->tag != KAI_STR || sep->as.s.len == 0) {
+        return kai_cons(kai_incref(s), kai_nil());
+    }
+    const char *p = s->as.s.bytes;
+    size_t slen = s->as.s.len;
+    const char *sp = sep->as.s.bytes;
+    size_t seplen = sep->as.s.len;
+    /* Collect pieces into a temp array then fold right into a cons list. */
+    size_t cap = 8, n = 0;
+    struct { const char *b; size_t l; } *pieces = malloc(cap * sizeof(*pieces));
+    size_t i = 0;
+    size_t last = 0;
+    while (i + seplen <= slen) {
+        if (memcmp(p + i, sp, seplen) == 0) {
+            if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
+            pieces[n].b = p + last;
+            pieces[n].l = i - last;
+            n++;
+            i += seplen;
+            last = i;
+        } else {
+            i++;
+        }
+    }
+    if (n == cap) { cap *= 2; pieces = realloc(pieces, cap * sizeof(*pieces)); }
+    pieces[n].b = p + last;
+    pieces[n].l = slen - last;
+    n++;
+    KaiValue *acc = kai_nil();
+    for (size_t k = n; k > 0;) {
+        --k;
+        acc = kai_cons(kai_str_from_bytes(pieces[k].b, pieces[k].l), acc);
+    }
+    free(pieces);
+    return acc;
+}
+
+static KaiValue *kai_prelude_string_contains(KaiValue *s, KaiValue *sub) {
+    if (!s || s->tag != KAI_STR || !sub || sub->tag != KAI_STR) return kai_bool(0);
+    if (sub->as.s.len == 0) return kai_bool(1);
+    if (sub->as.s.len > s->as.s.len) return kai_bool(0);
+    for (size_t i = 0; i + sub->as.s.len <= s->as.s.len; ++i) {
+        if (memcmp(s->as.s.bytes + i, sub->as.s.bytes, sub->as.s.len) == 0) return kai_bool(1);
+    }
+    return kai_bool(0);
+}
+
 /* ---------- prelude thunks for first-class function refs ---------- */
 
 static KaiValue *_kai_prelude_print_thunk(KaiValue *s, KaiValue **a, int n)          { (void) s; (void) n; return kai_prelude_print(a[0]); }
@@ -670,6 +876,15 @@ static KaiValue *_kai_prelude_map_thunk(KaiValue *s, KaiValue **a, int n)       
 static KaiValue *_kai_prelude_filter_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_filter(a[0], a[1]); }
 static KaiValue *_kai_prelude_reduce_thunk(KaiValue *s, KaiValue **a, int n)         { (void) s; (void) n; return kai_prelude_reduce(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_each_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) n; return kai_prelude_each(a[0], a[1]); }
+static KaiValue *_kai_prelude_args_thunk(KaiValue *s, KaiValue **a, int n)           { (void) s; (void) a; (void) n; return kai_prelude_args(); }
+static KaiValue *_kai_prelude_read_file_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_prelude_read_file(a[0]); }
+static KaiValue *_kai_prelude_write_file_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_prelude_write_file(a[0], a[1]); }
+static KaiValue *_kai_prelude_read_line_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) a; (void) n; return kai_prelude_read_line(); }
+static KaiValue *_kai_prelude_string_to_int_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_prelude_string_to_int(a[0]); }
+static KaiValue *_kai_prelude_string_to_real_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_prelude_string_to_real(a[0]); }
+static KaiValue *_kai_prelude_char_at_thunk(KaiValue *s, KaiValue **a, int n)        { (void) s; (void) n; return kai_prelude_char_at(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_split_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_split(a[0], a[1]); }
+static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, int n){ (void) s; (void) n; return kai_prelude_string_contains(a[0], a[1]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 

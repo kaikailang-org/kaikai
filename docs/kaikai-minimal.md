@@ -379,6 +379,7 @@ eprint(s: String) -> Unit             # write to stderr with a newline
 read_file(path: String) -> Result[String, String]
 write_file(path: String, content: String) -> Result[Unit, String]
 read_line() -> Result[String, String]
+args() -> [String]                     # command-line arguments (excludes program name)
 
 # Numeric conversions
 int_to_string(n: Int) -> String

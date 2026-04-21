@@ -97,7 +97,16 @@ static const struct {
     { "map",            "kai_prelude_map",            2 },
     { "filter",         "kai_prelude_filter",         2 },
     { "reduce",         "kai_prelude_reduce",         3 },
-    { "each",           "kai_prelude_each",           2 }
+    { "each",           "kai_prelude_each",           2 },
+    { "args",           "kai_prelude_args",           0 },
+    { "read_file",      "kai_prelude_read_file",      1 },
+    { "write_file",     "kai_prelude_write_file",     2 },
+    { "read_line",      "kai_prelude_read_line",      0 },
+    { "string_to_int",  "kai_prelude_string_to_int",  1 },
+    { "string_to_real", "kai_prelude_string_to_real", 1 },
+    { "char_at",        "kai_prelude_char_at",        2 },
+    { "string_split",   "kai_prelude_string_split",   2 },
+    { "string_contains","kai_prelude_string_contains",2 }
 };
 static const size_t N_PRELUDE = sizeof(PRELUDE) / sizeof(PRELUDE[0]);
 
@@ -1132,14 +1141,16 @@ int kai_emit(Node *program, FILE *out, int test_mode) {
     }
 
     if (test_mode) {
-        fputs("int main(void) {\n", out);
+        fputs("int main(int argc, char **argv) {\n"
+              "    kai_set_args(argc, argv);\n", out);
         for (int i = 0; i < n_tests; ++i) {
             fprintf(out, "    _kai_test_%d();\n", i);
         }
         fputs("    return kai_test_summary();\n"
               "}\n", out);
     } else if (has_main(program)) {
-        fputs("int main(void) {\n"
+        fputs("int main(int argc, char **argv) {\n"
+              "    kai_set_args(argc, argv);\n"
               "    KaiValue *_result = kai_main();\n"
               "    kai_decref(_result);\n"
               "    return 0;\n"
