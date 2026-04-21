@@ -1,0 +1,99 @@
+# stage 1: kaikai compiler, written in kaikai-minimal.
+#
+# This file is compiled by stage 0 (the C bootstrap) into a native binary
+# (`kaic1`). kaic1 then compiles kaikai source to portable C, the same way
+# kaic0 does today, with the feature set growing in subsequent milestones
+# until it can compile stage 1 itself (the self-hosting checkpoint).
+#
+# Layout: one file for now. See docs/stage1-design.md.
+
+# ---- cli + driver ----
+
+type Mode
+  = MDefault
+  | MTokens
+  | MAst
+  | MTest
+  | MHelp
+
+type CliOptions = { mode: Mode, path: Option[String] }
+
+fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
+  match rest {
+    [] -> opts
+    [a, ...more] -> {
+      if a == "--tokens" {
+        parse_cli_loop(more, CliOptions { mode: MTokens, path: opts.path })
+      } else if a == "--ast" {
+        parse_cli_loop(more, CliOptions { mode: MAst, path: opts.path })
+      } else if a == "--test" {
+        parse_cli_loop(more, CliOptions { mode: MTest, path: opts.path })
+      } else if a == "-h" {
+        parse_cli_loop(more, CliOptions { mode: MHelp, path: opts.path })
+      } else if a == "--help" {
+        parse_cli_loop(more, CliOptions { mode: MHelp, path: opts.path })
+      } else {
+        parse_cli_loop(more, CliOptions { mode: opts.mode, path: Some(a) })
+      }
+    }
+  }
+}
+
+fn parse_cli(argv: [String]) : CliOptions {
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None })
+}
+
+fn usage() : Unit {
+  eprint("usage: kaic1 [--tokens|--ast|--test] <file.kai>")
+  eprint("  default     lex, parse, check, and emit C to stdout")
+  eprint("  --tokens    print the token stream and exit")
+  eprint("  --ast       parse and print the AST and exit")
+  eprint("  --test      emit C wired to a test runner (runs test blocks)")
+  eprint("  -h, --help  this help")
+}
+
+fn compile_source(path: String, mode: Mode, src: String) : Int {
+  # Milestone 2 stub: acknowledge that we received the source.
+  # Subsequent milestones replace this body with lex/parse/check/emit.
+  eprint("stage1 skeleton: #{path} (#{int_to_string(string_length(src))} bytes)")
+  match mode {
+    MDefault -> {
+      print("/* stage1 placeholder: pipeline not yet wired */")
+      0
+    }
+    MTokens -> {
+      eprint("stage1: --tokens not yet implemented")
+      1
+    }
+    MAst -> {
+      eprint("stage1: --ast not yet implemented")
+      1
+    }
+    MTest -> {
+      eprint("stage1: --test not yet implemented")
+      1
+    }
+    MHelp -> {
+      usage()
+      0
+    }
+  }
+}
+
+fn run(opts: CliOptions) : Int {
+  match opts.mode {
+    MHelp -> { usage(); 0 }
+    _ -> match opts.path {
+      None -> { usage(); 2 }
+      Some(p) -> match read_file(p) {
+        Ok(src) -> compile_source(p, opts.mode, src)
+        Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
+      }
+    }
+  }
+}
+
+fn main() {
+  let code = run(parse_cli(args()))
+  exit(code)
+}
