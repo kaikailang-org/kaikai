@@ -6399,6 +6399,21 @@ fn resolve_holes(hs: [HoleSite], sub: Subst) : [ResolvedHole] {
 # instantiations, and the resolved hole reports.
 type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS], holes: [ResolvedHole] }
 
+# Walk to the expression whose type is what the function body
+# "produces". For block bodies that's the tail expression (or the
+# block's closing brace if tail is absent). This lets return-type
+# mismatches point at the offending expression instead of the `fn`
+# header.
+fn return_site_of(e: Expr) : Expr {
+  match e.kind {
+    EBlock(_, opt_tail) -> match opt_tail {
+      Some(tail) -> return_site_of(tail)
+      None       -> e
+    }
+    _ -> e
+  }
+}
+
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, ps, opt_ret, body, line, col) -> {
@@ -6410,7 +6425,8 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
         None      -> TyUnit
       }
       let what = string_concat("return type of ", nm)
-      let st1 = st_unify(rb.st, declared_ret, rb.ty, what, line, col)
+      let ret_site = return_site_of(body)
+      let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
       } else { () }
