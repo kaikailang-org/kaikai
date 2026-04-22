@@ -4,7 +4,7 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
-.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks selfhost
+.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks test-holes selfhost
 
 all: $(TARGET)
 
@@ -214,6 +214,33 @@ test-modules: $(TARGET) build
 	  && echo "modules OK" \
 	  || { echo "modules DIFF"; diff build/modules-c.out build/modules-llvm.out; exit 1; }
 
+# Typed holes (M10): every example under examples/holes/ must
+# (a) produce a --holes report with at least one "type hole" entry,
+# (b) compile clean through both backends, and
+# (c) panic at runtime with "unfilled hole:" when the hole is reached.
+test-holes: $(TARGET) build
+	@set -e; \
+	for f in ../examples/holes/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --holes $$f > build/s2-$$name.holes; \
+	  if ! grep -q "type hole" build/s2-$$name.holes; then \
+	    echo "holes FAIL $$name (no report)"; cat build/s2-$$name.holes; exit 1; \
+	  fi; \
+	  ./$(TARGET) $$f > build/$$name-holes.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name-holes.c -o build/$$name-holes-c; \
+	  ./build/$$name-holes-c > build/$$name-holes-c.out 2>&1 || true; \
+	  if ! grep -q "unfilled hole:" build/$$name-holes-c.out; then \
+	    echo "holes FAIL $$name (C backend did not panic)"; cat build/$$name-holes-c.out; exit 1; \
+	  fi; \
+	  ./$(TARGET) --emit=llvm $$f > build/$$name-holes.ll; \
+	  clang -w -I ../stage0 build/$$name-holes.ll ../stage0/runtime_llvm.c -o build/$$name-holes-llvm; \
+	  ./build/$$name-holes-llvm > build/$$name-holes-llvm.out 2>&1 || true; \
+	  if ! grep -q "unfilled hole:" build/$$name-holes-llvm.out; then \
+	    echo "holes FAIL $$name (LLVM backend did not panic)"; cat build/$$name-holes-llvm.out; exit 1; \
+	  fi; \
+	  echo "holes OK $$name"; \
+	done
+
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 selfhost: $(TARGET) build
@@ -239,7 +266,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-holes
 
 clean:
 	rm -rf build $(TARGET)

@@ -52,6 +52,10 @@ type TokKind
   | TkPlus | TkMinus | TkStar | TkSlash | TkSlashSlash | TkPercent
   | TkEqEq | TkNeq | TkLt | TkGt | TkLe | TkGe
   | TkBang
+  # typed holes (M10): TkHole is a bare `?`; TkHoleName carries the
+  # identifier for `?foo`. The lexer recognises `?ident` as one token
+  # so the parser does not have to re-synthesise the form.
+  | TkHole | TkHoleName(String)
   # error token carries a human-readable message
   | TkError(String)
 
@@ -83,6 +87,7 @@ fn tk_name(k: TokKind) : String {
     TkSlashSlash -> "//" TkPercent -> "%"
     TkEqEq -> "==" TkNeq -> "!=" TkLt -> "<" TkGt -> ">"
     TkLe -> "<=" TkGe -> ">=" TkBang -> "!"
+    TkHole -> "?" TkHoleName(_) -> "?NAME"
     TkError(_) -> "ERROR"
   }
 }
@@ -509,6 +514,23 @@ fn lex_punct(l: Lexer) : LexStep {
           Step(l1, tok(TkBang, sl, sc, start, l1.pos))
         }
       }
+      else if c == '?' {
+        # `?ident` is one TkHoleName token; `?` alone is TkHole.
+        # Peek at the next char: if it's alpha (or `_`), read an
+        # identifier.
+        match lex_peek(l1) {
+          Some(nc) -> {
+            if ch_is_alpha(nc) {
+              let l_end = lex_scan_ident_rest(lex_advance(l1))
+              let name = string_slice(l.src, start + 1, l_end.pos - (start + 1))
+              Step(l_end, tok(TkHoleName(name), sl, sc, start, l_end.pos))
+            } else {
+              Step(l1, tok(TkHole, sl, sc, start, l1.pos))
+            }
+          }
+          None -> Step(l1, tok(TkHole, sl, sc, start, l1.pos))
+        }
+      }
       else if c == '|' {
         if lex_peek_is(l1, '>') {
           let l2 = lex_advance(l1)
@@ -661,6 +683,10 @@ type ExprKind
   | ERange(Expr, Expr, Option[Expr])
   | EBlock([Stmt], Option[Expr])
   | EPipe(Expr, Expr)
+  # Typed hole (M10). `None` payload → anonymous `?`. `Some(name)` →
+  # `?name`. Checker reports at each hole site; emitter falls back
+  # to a runtime panic so unfilled holes in a binary are loud.
+  | EHole(Option[String])
 
 type ListElem = ElPlain(Expr) | ElSpread(Expr)
 
@@ -847,6 +873,8 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkLe         -> match b { TkLe -> true _ -> false }
     TkGe         -> match b { TkGe -> true _ -> false }
     TkBang       -> match b { TkBang -> true _ -> false }
+    TkHole       -> match b { TkHole -> true _ -> false }
+    TkHoleName(_) -> match b { TkHoleName(_) -> true _ -> false }
     TkError(_)   -> false
   }
 }
@@ -1335,6 +1363,8 @@ fn parse_primary(p: Parser) : PExpr {
     }
     TkUnderscore -> ok_e(p_advance(p), mk_expr(EUnder, t.line, t.col))
     TkDot -> ok_e(p_advance(p), mk_expr(EPlaceholder, t.line, t.col))
+    TkHole -> ok_e(p_advance(p), mk_expr(EHole(None), t.line, t.col))
+    TkHoleName(nm) -> ok_e(p_advance(p), mk_expr(EHole(Some(nm)), t.line, t.col))
     TkIdent -> parse_ident_primary(p, t)
     TkLparen -> parse_paren_or_lambda(p, t)
     TkLbracket -> parse_list_or_range(p, t)
@@ -2603,6 +2633,10 @@ fn dump_expr(e: Expr, depth: Int) : Unit {
       dump_expr(a, depth + 1)
       dump_expr(b, depth + 1)
     }
+    EHole(nm_opt) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      emit_line(depth, "hole #{label} @#{int_to_string(e.line)}:#{int_to_string(e.col)}")
+    }
   }
 }
 
@@ -2958,6 +2992,7 @@ fn chk_expr(e: Env, x: Expr) : Env {
       env_pop(e3)
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
+    EHole(_) -> e          # holes bind no names; checker lets them pass silently
   }
 }
 
@@ -3897,6 +3932,7 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       match opt_final { Some(f) -> fv_expr(f, own, globals, acc1) None -> acc1 }
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
+    EHole(_) -> acc
   }
 }
 
@@ -4032,6 +4068,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       match opt_final { Some(f) -> collect_expr(f, s1) None -> s1 }
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
+    EHole(_) -> st
   }
 }
 
@@ -4300,6 +4337,15 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       }
     }
     EPipe(a, b) -> emit_pipe_expr(src, a, b, fns, variants, lams)
+    EHole(nm_opt) -> {
+      # Unfilled holes are runtime-panicky but syntactically valid:
+      # the checker reports them and emission leaves a panic stub,
+      # so a binary with holes is runnable — it just aborts loudly
+      # on first reach.
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      let msg = cat2("unfilled hole: ", label)
+      concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
+    }
   }
 }
 
@@ -4904,11 +4950,13 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
   }
 }
 
-fn build_ty_env(decls: [Decl]) : TyEnv {
+type BuiltEnv = { env: TyEnv, prelude_len: Int }
+
+fn build_ty_env(decls: [Decl]) : BuiltEnv {
   let e0 = ty_env_empty()
   let e1 = add_prelude_sigs(e0)
   let e2 = add_builtin_variant_sigs(e1)
-  add_decls_loop(e2, decls)
+  BuiltEnv { env: add_decls_loop(e2, decls), prelude_len: list_length(e2.entries) }
 }
 
 # ---- env dump (debugging) ----
@@ -5207,8 +5255,15 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 # through the final sub recovers the concrete type arguments.
 type CallSite = CS(String, Int, Int, [Int])        # name, line, col, fresh ids
 
-type InferState = { file: String, env: TyEnv, sub: Subst, recs: [RecInfo], errs: Int,
-                    insts: [CallSite] }
+# A typed hole site: the name (if named), source position, the
+# fresh TyVarT id that stands in for it during inference, and the
+# env entries visible at that point (snapshot of the locals stack).
+# After inference the fresh id runs through the final sub to
+# recover the expected type.
+type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry])
+
+type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
+                    insts: [CallSite], holes: [HoleSite] }
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -5226,21 +5281,29 @@ type InferredArms  = { st: InferState, arms: [Arm] }
 type InferredElems = { st: InferState, elems: [ListElem] }
 type InferredFInits = { st: InferState, fis: [FieldInit] }
 
-fn infer_state_new(file: String, env: TyEnv, recs: [RecInfo]) : InferState =
-  InferState { file: file, env: env, sub: subst_empty(), recs: recs, errs: 0, insts: [] }
+fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
+  InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
+               recs: recs, errs: 0, insts: [], holes: [] }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
-  InferState { file: st.file, env: new_env, sub: st.sub, recs: st.recs, errs: st.errs, insts: st.insts }
+  InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
-  InferState { file: st.file, env: st.env, sub: new_sub, recs: st.recs, errs: st.errs, insts: st.insts }
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes }
 
 fn st_bump_err(st: InferState) : InferState =
-  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs + 1, insts: st.insts }
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes }
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
-  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs,
-               insts: [cs, ...st.insts] }
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes }
+
+fn st_push_hole(st: InferState, h: HoleSite) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes] }
 
 # Half-open range [lo, hi) as a list of ints. Used to name the fresh
 # TyVarT ids minted by one call-site's instantiation.
@@ -5311,10 +5374,12 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
   InferState {
     file: outer.file,
     env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh },
+    prelude_len: outer.prelude_len,
     sub: inner.sub,
     recs: inner.recs,
     errs: inner.errs,
-    insts: inner.insts
+    insts: inner.insts,
+    holes: inner.holes
   }
 
 # ---- parameter typing ----
@@ -5439,6 +5504,41 @@ fn synth(st: InferState, e: Expr) : Inferred {
     ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
     EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
     EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
+    EHole(nm_opt)              -> synth_hole(st, nm_opt, e)
+  }
+}
+
+# A hole gets a fresh TyVarT and records its source position and the
+# current scope snapshot. Named holes with the same name within the
+# same decl share a TyVarT so both instances unify to the same type
+# (matches the `if ... { ?x } else { ?x }` example in the doc).
+fn synth_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
+  match nm_opt {
+    Some(nm) -> match find_hole_by_name(st.holes, nm) {
+      Some(prior_fresh) -> inferred_leaf(st, TyVarT(prior_fresh), e)
+      None -> register_fresh_hole(st, nm_opt, e)
+    }
+    None -> register_fresh_hole(st, nm_opt, e)
+  }
+}
+
+fn register_fresh_hole(st: InferState, nm_opt: Option[String], e: Expr) : Inferred {
+  let fresh_id = st.env.fresh
+  let st1 = st_set_env(st, fresh_var(st.env))
+  let site = HS(nm_opt, e.line, e.col, fresh_id, st1.env.entries)
+  let st2 = st_push_hole(st1, site)
+  inferred_leaf(st2, TyVarT(fresh_id), e)
+}
+
+fn find_hole_by_name(holes: [HoleSite], target: String) : Option[Int] {
+  match holes {
+    [] -> None
+    [h, ...rest] -> match h {
+      HS(nm_opt, _, _, fresh, _) -> match nm_opt {
+        Some(nm) -> if nm == target { Some(fresh) } else { find_hole_by_name(rest, target) }
+        None -> find_hole_by_name(rest, target)
+      }
+    }
   }
 }
 
@@ -5978,15 +6078,48 @@ fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
   }
 }
 
-# Decls after inference: type-annotated body (or original decl for
-# non-DFn). Also carries the error count and the resolved call-site
-# instantiations so the caller can aggregate without re-walking.
-type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS] }
+# A hole resolved against the final substitution: the expected type
+# is the TyVarT ran through sub, which usually pins to a concrete
+# type from context but can remain a TyVarT if the hole sits in a
+# position that doesn't constrain (e.g. the whole body of a fn with
+# no declared return).
+type ResolvedHole = RH(Option[String], Int, Int, Ty, [TyEntry])
+#                       name            line col expected scope
 
-fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
+fn drop_last_entries(es: [TyEntry], n: Int) : [TyEntry] {
+  let total = list_length(es)
+  let keep = total - n
+  if keep <= 0 { [] } else { take_entries(es, keep, []) }
+}
+
+fn take_entries(es: [TyEntry], n: Int, acc: [TyEntry]) : [TyEntry] {
+  if n <= 0 { list_reverse(acc) }
+  else { match es {
+    [] -> list_reverse(acc)
+    [h, ...rest] -> take_entries(rest, n - 1, [h, ...acc])
+  } }
+}
+
+fn resolve_holes(hs: [HoleSite], sub: Subst, prelude_len: Int) : [ResolvedHole] {
+  match hs {
+    [] -> []
+    [h, ...rest] -> match h {
+      HS(nm_opt, line, col, fresh, scope) ->
+        [RH(nm_opt, line, col, apply_ty(sub, TyVarT(fresh)), drop_last_entries(scope, prelude_len)),
+         ...resolve_holes(rest, sub, prelude_len)]
+    }
+  }
+}
+
+# Decls after inference: type-annotated body (or original decl for
+# non-DFn). Also carries the error count, the resolved call-site
+# instantiations, and the resolved hole reports.
+type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS], holes: [ResolvedHole] }
+
+fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, ps, opt_ret, body, line, col) -> {
-      let st0 = infer_state_new(file, env, recs)
+      let st0 = infer_state_new(file, env, prelude_len, recs)
       let added = add_infer_params(st0, ps)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
@@ -5999,30 +6132,35 @@ fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool)
         print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
       } else { () }
       let resolved = resolve_callsites(list_reverse(st1.insts), st1.sub)
+      let hole_reports = resolve_holes(list_reverse(st1.holes), st1.sub, prelude_len)
       TypedDecl {
         decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col),
         errs: st1.errs,
-        insts: resolved
+        insts: resolved,
+        holes: hole_reports
       }
     }
-    _ -> TypedDecl { decl: d, errs: 0, insts: [] }
+    _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
   }
 }
 
-type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS] }
+type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS], holes: [ResolvedHole] }
 
-fn infer_all_loop(file: String, env: TyEnv, recs: [RecInfo], ds: [Decl], verbose: Bool,
-                   acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS]) : TypedProgram {
+fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], ds: [Decl], verbose: Bool,
+                   acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
+                   acc_holes: [ResolvedHole]) : TypedProgram {
   match ds {
     [] -> TypedProgram {
-      decls: list_reverse(acc_decls), errs: acc_errs, insts: list_reverse(acc_insts)
+      decls: list_reverse(acc_decls), errs: acc_errs,
+      insts: list_reverse(acc_insts), holes: list_reverse(acc_holes)
     }
     [d, ...rest] -> {
-      let r = infer_decl(file, env, recs, d, verbose)
-      infer_all_loop(file, env, recs, rest, verbose,
+      let r = infer_decl(file, env, prelude_len, recs, d, verbose)
+      infer_all_loop(file, env, prelude_len, recs, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
-                     llvm_prepend_reverse(r.insts, acc_insts))
+                     llvm_prepend_reverse(r.insts, acc_insts),
+                     prepend_reverse_holes(r.holes, acc_holes))
     }
   }
 }
@@ -6036,10 +6174,17 @@ fn llvm_prepend_reverse(xs: [ResolvedCS], acc: [ResolvedCS]) : [ResolvedCS] {
   }
 }
 
+fn prepend_reverse_holes(xs: [ResolvedHole], acc: [ResolvedHole]) : [ResolvedHole] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> prepend_reverse_holes(rest, [x, ...acc])
+  }
+}
+
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
-  let env = build_ty_env(decls)
+  let built = build_ty_env(decls)
   let recs = collect_records(decls)
-  infer_all_loop(file, env, recs, decls, verbose, [], 0, [])
+  infer_all_loop(file, built.env, built.prelude_len, recs, decls, verbose, [], 0, [], [])
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
@@ -6091,6 +6236,10 @@ fn tag_of_kind(k: ExprKind) : String {
     ERange(_, _, _) -> "range"
     EBlock(_, _)   -> "block"
     EPipe(_, _)    -> "pipe"
+    EHole(nm_opt)  -> match nm_opt {
+      Some(nm) -> concat_all(["hole ?", nm])
+      None     -> "hole ?"
+    }
   }
 }
 
@@ -6249,6 +6398,54 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
   let r = infer_program(file, decls, false)
   r.insts |> each(dump_mono_line)
   r.errs
+}
+
+# ---- `--holes`: typed-hole reports ----
+#
+# For each `?` / `?name` in the program, print the expected type
+# (recovered from the final substitution) and the bindings visible
+# at that point. Candidate synthesis — what the doc calls "a bounded
+# enumeration of fillable expressions" — lands in a later milestone;
+# this pass covers the "stop, record, keep going" half.
+#
+# Output mirrors the example in docs/typed-holes.md closely.
+
+fn dump_scope_entry(te: TyEntry) : Unit =
+  print("    #{te.name} : #{scheme_to_string(te.scheme)}")
+
+fn dump_hole_report(file: String, rh: ResolvedHole) : Unit {
+  match rh {
+    RH(nm_opt, line, col, ty, scope) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      print("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: type hole #{label}")
+      print("")
+      print("  expected: #{ty_to_string(ty)}")
+      print("")
+      match scope {
+        [] -> { print("  in scope: (empty)") print("") }
+        _  -> {
+          print("  in scope:")
+          scope |> each(dump_scope_entry)
+          print("")
+        }
+      }
+    }
+  }
+}
+
+fn dump_holes_loop(file: String, hs: [ResolvedHole]) : Unit {
+  match hs {
+    [] -> ()
+    [h, ...rest] -> { dump_hole_report(file, h) dump_holes_loop(file, rest) }
+  }
+}
+
+fn dump_holes(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  match r.holes {
+    [] -> { print("(no typed holes)") r.errs }
+    _  -> { dump_holes_loop(file, r.holes) r.errs }
+  }
 }
 
 # ====================================================================
@@ -6688,6 +6885,21 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
     EList(elems) -> llvm_emit_list(e, elems)
     ELambda(_, _) -> llvm_emit_lambda_ref(e, x)
     EField(obj, fnm) -> llvm_emit_field(e, obj, fnm)
+    EHole(nm_opt) -> {
+      let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
+      let msg = cat2("unfilled hole: ", label)
+      let name_res = llvm_emit_name_constant(e, msg, "hole.msg.")
+      let sreg = llvm_fresh_reg(name_res.e)
+      let s_instr = concat_all([
+        "  ", sreg.reg, " = call %KaiValue* @kaix_str(i8* ", name_res.gep, ")\n"
+      ])
+      let e_s = llvm_append_body(sreg.e, s_instr)
+      let r = llvm_fresh_reg(e_s)
+      let p_instr = concat_all([
+        "  ", r.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n"
+      ])
+      llvm_set_last(llvm_append_body(r.e, p_instr), r.reg)
+    }
     _ -> {
       eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -7983,6 +8195,7 @@ type Mode
   | MCheck
   | MDumpTyped
   | MDumpMono
+  | MHoles
   | MEmitLlvm
   | MTest
   | MHelp
@@ -8018,6 +8231,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MDumpTyped))
       } else if a == "--dump-mono" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
+      } else if a == "--holes" {
+        parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--test" {
@@ -8054,6 +8269,7 @@ fn usage() : Unit {
   eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
+  eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
@@ -8097,7 +8313,7 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
             match mode {
               MAst -> { dump_program(all_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }
-              MEnv -> { dump_env(build_ty_env(all_decls)); 0 }
+              MEnv -> { dump_env(build_ty_env(all_decls).env); 0 }
               MInfer -> dump_infer(path, all_decls)
               MCheck -> {
                 let chk = check_program(path, all_decls)
@@ -8110,6 +8326,10 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
               MDumpMono -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_mono(path, all_decls) }
+              }
+              MHoles -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_holes(path, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
