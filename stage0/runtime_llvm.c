@@ -45,6 +45,7 @@ int kaix_truthy(KaiValue *v)                   { return kai_truthy(v); }
 
 /* ---------- prelude subset used by M3b ---------- */
 KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
+KaiValue *kaix_prelude_eprint(KaiValue *v)         { return kai_prelude_eprint(v); }
 KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_string(v); }
 
 /* ---------- M3c: strings, ranges, higher-order prelude ---------- */
@@ -96,8 +97,12 @@ KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b));
 
 /* Panic with a message. The LLVM match lowering calls this in the
    fall-through block of the last arm when no pattern matches, so the
-   generated IR then drops into `unreachable`. */
-KaiValue *kaix_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
+   generated IR then drops into `unreachable`. Named distinctly from
+   `kaix_prelude_panic` below to keep the prelude-dispatch symbol
+   free for user calls to the `panic` prelude fn. */
+KaiValue *kaix_match_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
+
+KaiValue *kaix_prelude_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
 
 /* ---------- M3e: lists + closures-with-captures ---------- */
 KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
@@ -114,6 +119,40 @@ KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(se
 KaiValue *kaix_prelude_list_length(KaiValue *xs)          { return kai_prelude_list_length(xs); }
 KaiValue *kaix_prelude_list_append(KaiValue *a, KaiValue *b) { return kai_prelude_list_append(a, b); }
 KaiValue *kaix_prelude_list_reverse(KaiValue *xs)         { return kai_prelude_list_reverse(xs); }
+
+/* ---------- M12: chars, reals, records, fields ---------- */
+KaiValue *kaix_char(uint32_t c)                           { return kai_char(c); }
+KaiValue *kaix_real(double r)                             { return kai_real(r); }
+KaiValue *kaix_unit(void)                                 { return kai_unit(); }
+
+/* Record construction: fields[i] carries the value for names[i].
+   `names` must point to string literals with program lifetime —
+   the runtime stores them by reference and does not free them. */
+KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
+    return kai_record(n, fields, names);
+}
+
+KaiValue *kaix_field(KaiValue *rec, const char *name)     { return kai_field(rec, name); }
+
+/* Full prelude set — anything the compiler (stage 2's own source)
+   calls directly when compiled through the LLVM backend. */
+KaiValue *kaix_prelude_args(void)                           { return kai_prelude_args(); }
+KaiValue *kaix_prelude_exit(KaiValue *v)                    { return kai_prelude_exit(v); }
+/* kaix_prelude_panic is defined above near kaix_match_panic. */
+KaiValue *kaix_prelude_read_file(KaiValue *p)               { return kai_prelude_read_file(p); }
+KaiValue *kaix_prelude_write_file(KaiValue *p, KaiValue *c) { return kai_prelude_write_file(p, c); }
+KaiValue *kaix_prelude_read_line(void)                      { return kai_prelude_read_line(); }
+KaiValue *kaix_prelude_real_to_string(KaiValue *v)          { return kai_prelude_real_to_string(v); }
+KaiValue *kaix_prelude_string_to_int(KaiValue *s)           { return kai_prelude_string_to_int(s); }
+KaiValue *kaix_prelude_string_to_real(KaiValue *s)          { return kai_prelude_string_to_real(s); }
+KaiValue *kaix_prelude_string_length(KaiValue *s)           { return kai_prelude_string_length(s); }
+KaiValue *kaix_prelude_string_concat(KaiValue *a, KaiValue *b) { return kai_prelude_string_concat(a, b); }
+KaiValue *kaix_prelude_string_slice(KaiValue *s, KaiValue *i, KaiValue *n) { return kai_prelude_string_slice(s, i, n); }
+KaiValue *kaix_prelude_string_split(KaiValue *s, KaiValue *d)  { return kai_prelude_string_split(s, d); }
+KaiValue *kaix_prelude_string_contains(KaiValue *s, KaiValue *sub) { return kai_prelude_string_contains(s, sub); }
+KaiValue *kaix_prelude_char_at(KaiValue *s, KaiValue *i)       { return kai_prelude_char_at(s, i); }
+KaiValue *kaix_prelude_char_to_int(KaiValue *c)                { return kai_prelude_char_to_int(c); }
+KaiValue *kaix_prelude_int_to_char(KaiValue *i)                { return kai_prelude_int_to_char(i); }
 
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */

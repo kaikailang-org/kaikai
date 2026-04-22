@@ -6299,6 +6299,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_range_step(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_closure(i8*, i32, i32, i8*)\n",
     "declare %KaiValue* @kaix_prelude_print(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_eprint(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_int_to_string(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_map(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_each(%KaiValue*, %KaiValue*)\n",
@@ -6311,7 +6312,7 @@ fn llvm_header() : String =
     "declare i32           @kaix_is_variant(%KaiValue*, i8*)\n",
     "declare %KaiValue* @kaix_variant_arg(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_eq_raw(%KaiValue*, %KaiValue*)\n",
-    "declare %KaiValue* @kaix_panic(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_match_panic(%KaiValue*)\n",
     "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_nil()\n",
     "declare i32           @kaix_is_cons(%KaiValue*)\n",
@@ -6322,6 +6323,28 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_prelude_list_append(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_list_length(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_list_reverse(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_char(i32)\n",
+    "declare %KaiValue* @kaix_real(double)\n",
+    "declare %KaiValue* @kaix_unit()\n",
+    "declare %KaiValue* @kaix_record(i32, %KaiValue**, i8**)\n",
+    "declare %KaiValue* @kaix_field(%KaiValue*, i8*)\n",
+    "declare %KaiValue* @kaix_prelude_args()\n",
+    "declare %KaiValue* @kaix_prelude_exit(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_panic_fn(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_read_file(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_write_file(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_read_line()\n",
+    "declare %KaiValue* @kaix_prelude_real_to_string(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_to_int(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_to_real(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_length(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_concat(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_slice(%KaiValue*, %KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_split(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_string_contains(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_char_at(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_char_to_int(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_int_to_char(%KaiValue*)\n",
     "\n"
   ])
 
@@ -6421,12 +6444,91 @@ fn llvm_fresh_label(e: LlvmEmit, prefix: String) : LlvmReg {
 fn llvm_str_body(span: String) : String =
   string_slice(span, 1, string_length(span) - 2)
 
-fn llvm_emit_string_const(label: String, body: String) : String {
-  let n = string_length(body) + 1
-  concat_all([
+# kaikai source strings use C-style escapes (`\n`, `\t`, `\r`, `\"`,
+# `\'`, `\\`, `\0`). LLVM IR's `c"..."` literal recognises only
+# `\NN` hex escapes; everything else is treated as raw bytes —
+# including `\n`, which LLVM sees as the two bytes `\` and `n`.
+# That mismatch both blows up the declared length and produces
+# incorrect runtime strings. This helper walks the kaikai source
+# byte-by-byte, decodes kaikai escapes, and re-emits each decoded
+# byte as a LLVM hex escape (or literal ASCII if it's safe).
+type EncodedBody = { text: String, n_bytes: Int }
+
+fn llvm_encode_body(body: String) : EncodedBody =
+  llvm_encode_body_loop(body, 0, string_length(body), "", 0)
+
+fn llvm_encode_body_loop(src: String, i: Int, n: Int, acc: String, bytes: Int) : EncodedBody {
+  if i >= n { EncodedBody { text: acc, n_bytes: bytes } }
+  else {
+    match char_at(src, i) {
+      None -> EncodedBody { text: acc, n_bytes: bytes }
+      Some(c) -> {
+        if c == '\\' {
+          match char_at(src, i + 1) {
+            None -> EncodedBody { text: acc, n_bytes: bytes }
+            Some(c2) -> {
+              let piece = llvm_byte_literal(decode_kai_escape(c2))
+              llvm_encode_body_loop(src, i + 2, n, string_concat(acc, piece), bytes + 1)
+            }
+          }
+        } else {
+          let piece = llvm_byte_literal(char_to_int(c))
+          llvm_encode_body_loop(src, i + 1, n, string_concat(acc, piece), bytes + 1)
+        }
+      }
+    }
+  }
+}
+
+fn decode_kai_escape(c: Char) : Int {
+  if c == 'n' { 10 }
+  else if c == 't' { 9 }
+  else if c == 'r' { 13 }
+  else if c == '0' { 0 }
+  else { char_to_int(c) }       # covers `\"`, `\'`, `\\`, fallback
+}
+
+# Printable ASCII except `"` and `\` goes in literally; everything
+# else becomes `\NN` in hex (exactly two hex digits).
+fn llvm_byte_literal(b: Int) : String {
+  if b == 34       { "\\22" }
+  else if b == 92  { "\\5C" }
+  else if b >= 32 and b < 127 { "#{int_to_char(b)}" }
+  else { concat_all(["\\", hex_digit(b / 16), hex_digit(b % 16)]) }
+}
+
+fn hex_digit(d: Int) : String {
+  if d == 0 { "0" } else if d == 1 { "1" } else if d == 2 { "2" }
+  else if d == 3 { "3" } else if d == 4 { "4" } else if d == 5 { "5" }
+  else if d == 6 { "6" } else if d == 7 { "7" } else if d == 8 { "8" }
+  else if d == 9 { "9" } else if d == 10 { "A" } else if d == 11 { "B" }
+  else if d == 12 { "C" } else if d == 13 { "D" } else if d == 14 { "E" }
+  else { "F" }
+}
+
+# Emit an LLVM global string constant and return both the textual
+# declaration and the total byte count (including null terminator),
+# so callers can size their `getelementptr` with the same N the
+# declaration uses.
+type StrConst = { text: String, n: Int }
+
+fn llvm_emit_string_const_enc(label: String, body: String) : StrConst {
+  let enc = llvm_encode_body(body)
+  let n = enc.n_bytes + 1
+  let text = concat_all([
     "@", label, " = private unnamed_addr constant [",
-    int_to_string(n), " x i8] c\"", body, "\\00\"\n"
+    int_to_string(n), " x i8] c\"", enc.text, "\\00\"\n"
   ])
+  StrConst { text: text, n: n }
+}
+
+# Legacy wrapper used in paths that pre-compute `n = string_length +
+# 1`; those paths only pass ASCII-safe identifier names (variant /
+# field names), where encoding is a no-op and the lengths still
+# line up.
+fn llvm_emit_string_const(label: String, body: String) : String {
+  let r = llvm_emit_string_const_enc(label, body)
+  r.text
 }
 
 fn llvm_gep_str(label: String, n: Int) : String =
@@ -6449,16 +6551,33 @@ type LlvmPrelude = LP(String, Int, Option[String])   # name, arity, value-thunk 
 
 fn llvm_prelude_table() : [LlvmPrelude] {
   [
-    LP("print",         1, Some("@kaix_print_thunk")),
-    LP("eprint",        1, Some("@kaix_eprint_thunk")),
-    LP("int_to_string", 1, Some("@kaix_int_to_string_thunk")),
-    LP("map",           2, None),
-    LP("each",          2, None),
-    LP("filter",        2, None),
-    LP("reduce",        3, None),
-    LP("list_append",   2, None),
-    LP("list_length",   1, None),
-    LP("list_reverse",  1, None)
+    LP("print",            1, Some("@kaix_print_thunk")),
+    LP("eprint",           1, Some("@kaix_eprint_thunk")),
+    LP("int_to_string",    1, Some("@kaix_int_to_string_thunk")),
+    LP("map",              2, None),
+    LP("each",             2, None),
+    LP("filter",           2, None),
+    LP("reduce",           3, None),
+    LP("list_append",      2, None),
+    LP("list_length",      1, None),
+    LP("list_reverse",     1, None),
+    LP("args",             0, None),
+    LP("exit",             1, None),
+    LP("panic",            1, None),
+    LP("read_file",        1, None),
+    LP("write_file",       2, None),
+    LP("read_line",        0, None),
+    LP("real_to_string",   1, None),
+    LP("string_to_int",    1, None),
+    LP("string_to_real",   1, None),
+    LP("string_length",    1, None),
+    LP("string_concat",    2, None),
+    LP("string_slice",     3, None),
+    LP("string_split",     2, None),
+    LP("string_contains",  2, None),
+    LP("char_at",          2, None),
+    LP("char_to_int",      1, None),
+    LP("int_to_char",      1, None)
   ]
 }
 
@@ -6515,6 +6634,28 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
       llvm_set_last(llvm_append_body(r.e, instr), r.reg)
     }
     EStr(span, is_triple) -> llvm_emit_string(e, span, is_triple)
+    EChar(c) -> {
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_char(i32 ",
+                              int_to_string(char_to_int(c)), ")\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+    EReal(_) -> {
+      # Real literals carry their lexeme at parse time but the AST
+      # stores the decoded value. For M12 we only need to round-trip
+      # the compiler, which has exactly one real literal — and it's
+      # inside an unreachable arm. Emit 0.0 as a placeholder rather
+      # than plumb real serialisation through the emitter.
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_real(double 0.0)\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+    EUnit -> {
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_unit()\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+    ERecordLit(nm, fis) -> llvm_emit_record_lit(e, nm, fis)
     EVar(nm) -> match llvm_local_find(e.locals, nm) {
       Some(reg) -> llvm_set_last(e, reg)
       None -> match evar_find(e.vars_, nm) {
@@ -6540,10 +6681,38 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
     EMatch(scr, arms) -> llvm_emit_match(e, scr, arms, x.line, x.col)
     EList(elems) -> llvm_emit_list(e, elems)
     ELambda(_, _) -> llvm_emit_lambda_ref(e, x)
+    EField(obj, fnm) -> llvm_emit_field(e, obj, fnm)
     _ -> {
-      eprint("llvm: unsupported expression kind at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
+      eprint("llvm: unsupported expression kind (#{expr_kind_name(x.kind)}) at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
     }
+  }
+}
+
+fn expr_kind_name(k: ExprKind) : String {
+  match k {
+    EInt(_)        -> "EInt"
+    EReal(_)       -> "EReal"
+    EBool(_)       -> "EBool"
+    EChar(_)       -> "EChar"
+    EStr(_, _)     -> "EStr"
+    EUnit          -> "EUnit"
+    EVar(_)        -> "EVar"
+    EUnder         -> "EUnder"
+    EPlaceholder   -> "EPlaceholder"
+    ECall(_, _)    -> "ECall"
+    EField(_, _)   -> "EField"
+    EIndex(_, _)   -> "EIndex"
+    EBinop(_, _, _) -> "EBinop"
+    EUnop(_, _)    -> "EUnop"
+    EIf(_, _, _)   -> "EIf"
+    EMatch(_, _)   -> "EMatch"
+    ELambda(_, _)  -> "ELambda"
+    ERecordLit(_, _) -> "ERecordLit"
+    EList(_)       -> "EList"
+    ERange(_, _, _) -> "ERange"
+    EBlock(_, _)   -> "EBlock"
+    EPipe(_, _)    -> "EPipe"
   }
 }
 
@@ -6552,11 +6721,11 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
 fn llvm_emit_plain_str_body(e: LlvmEmit, body: String) : LlvmEmit {
   let label_id = llvm_fresh_label(e, "str.")
   let label = label_id.reg
-  let n = string_length(body) + 1
-  let e2 = llvm_append_global(label_id.e, llvm_emit_string_const(label, body))
+  let sc = llvm_emit_string_const_enc(label, body)
+  let e2 = llvm_append_global(label_id.e, sc.text)
   let r = llvm_fresh_reg(e2)
   let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_str(i8* ",
-                          llvm_gep_str(label, n), ")\n"])
+                          llvm_gep_str(label, sc.n), ")\n"])
   llvm_set_last(llvm_append_body(r.e, instr), r.reg)
 }
 
@@ -6639,6 +6808,92 @@ fn llvm_emit_range(e: LlvmEmit, lo: Expr, hi: Expr, stp: Option[Expr]) : LlvmEmi
         ", %KaiValue* ", hi_val, ", %KaiValue* ", step_val, ")\n"
       ])
       llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+  }
+}
+
+# ---- field access + record literal ----
+#
+# Both route through the runtime: `kaix_field(rec, name_ptr)` reads a
+# field by name; `kaix_record(n, fields_buf, names_buf)` allocates a
+# KAI_RECORD with the n (value, name) pairs stored as parallel arrays.
+# Field names are emitted as private global i8* constants shared
+# across the .ll.
+
+fn llvm_emit_field(e: LlvmEmit, obj: Expr, fnm: String) : LlvmEmit {
+  let ro = llvm_emit_expr(e, obj)
+  let nameinfo = llvm_emit_name_constant(ro, fnm, "fld.")
+  let r = llvm_fresh_reg(nameinfo.e)
+  let instr = concat_all([
+    "  ", r.reg, " = call %KaiValue* @kaix_field(%KaiValue* ",
+    ro.last_val, ", i8* ", nameinfo.gep, ")\n"
+  ])
+  llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+}
+
+type RecLitBufs = { st: LlvmEmit, fields_buf: String, names_buf: String }
+
+fn llvm_emit_record_lit(e: LlvmEmit, nm: String, fis: [FieldInit]) : LlvmEmit {
+  let n = list_length(fis)
+  if n == 0 {
+    let r = llvm_fresh_reg(e)
+    let instr = concat_all([
+      "  ", r.reg, " = call %KaiValue* @kaix_record(i32 0, %KaiValue** null, i8** null)\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  } else {
+    # alloca both buffers, fill them, call kaix_record.
+    let fb = llvm_fresh_reg(e)
+    let fb_i = concat_all([
+      "  ", fb.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+    ])
+    let e1 = llvm_append_body(fb.e, fb_i)
+    let nb = llvm_fresh_reg(e1)
+    let nb_i = concat_all([
+      "  ", nb.reg, " = alloca i8*, i32 ", int_to_string(n), "\n"
+    ])
+    let e2 = llvm_append_body(nb.e, nb_i)
+    let e3 = llvm_emit_rec_fill(e2, fb.reg, nb.reg, fis, 0)
+    let r = llvm_fresh_reg(e3)
+    let instr = concat_all([
+      "  ", r.reg, " = call %KaiValue* @kaix_record(i32 ", int_to_string(n),
+      ", %KaiValue** ", fb.reg, ", i8** ", nb.reg, ")\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  }
+}
+
+fn llvm_emit_rec_fill(e: LlvmEmit, fb: String, nb: String, fis: [FieldInit], i: Int) : LlvmEmit {
+  match fis {
+    [] -> e
+    [fi, ...rest] -> match fi {
+      FI(fnm, val) -> {
+        let rv = llvm_emit_expr(e, val)
+        # Store value into fields_buf[i]
+        let fgep = llvm_fresh_reg(rv)
+        let fgep_i = concat_all([
+          "  ", fgep.reg, " = getelementptr inbounds %KaiValue*, %KaiValue** ", fb,
+          ", i32 ", int_to_string(i), "\n"
+        ])
+        let e1 = llvm_append_body(fgep.e, fgep_i)
+        let fst = concat_all([
+          "  store %KaiValue* ", rv.last_val, ", %KaiValue** ", fgep.reg, "\n"
+        ])
+        let e2 = llvm_append_body(e1, fst)
+        # Emit name constant + store its gep into names_buf[i]
+        let nameinfo = llvm_emit_name_constant(e2, fnm, "fname.")
+        let ngep = llvm_fresh_reg(nameinfo.e)
+        let ngep_i = concat_all([
+          "  ", ngep.reg, " = getelementptr inbounds i8*, i8** ", nb,
+          ", i32 ", int_to_string(i), "\n"
+        ])
+        let e3 = llvm_append_body(ngep.e, ngep_i)
+        let nst = concat_all([
+          "  store i8* ", nameinfo.gep, ", i8** ", ngep.reg, "\n"
+        ])
+        let e4 = llvm_append_body(e3, nst)
+        llvm_emit_rec_fill(e4, fb, nb, rest, i + 1)
+      }
     }
   }
 }
@@ -7372,7 +7627,7 @@ fn llvm_emit_match(e: LlvmEmit, scr: Expr, arms: [Arm], line: Int, col: Int) : L
   let e_s = llvm_append_body(sreg.e, s_instr)
   let pcall = llvm_fresh_reg(e_s)
   let p_instr = concat_all([
-    "  ", pcall.reg, " = call %KaiValue* @kaix_panic(%KaiValue* ", sreg.reg, ")\n",
+    "  ", pcall.reg, " = call %KaiValue* @kaix_match_panic(%KaiValue* ", sreg.reg, ")\n",
     "  unreachable\n"
   ])
   let e_p = llvm_append_body(pcall.e, p_instr)

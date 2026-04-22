@@ -207,6 +207,20 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
+# LLVM self-hosting: same idea but via the LLVM backend.
+# kaic2 (C) emits its own source as .ll, which is compiled to a
+# binary. That binary then re-emits the same .ll. We require a
+# byte-identical fixed point — the LLVM emitter must be a pure
+# function of the typed AST.
+selfhost-llvm: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
+	clang -w -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1; \
+	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
+	diff -q build/kaic2-s1.ll build/kaic2-s2.ll > /dev/null \
+	  && echo "llvm self-hosting fixed point: OK" \
+	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
+
 test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm
 
 clean:
