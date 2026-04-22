@@ -72,6 +72,23 @@ test-infer: $(TARGET) build
 	    || { echo "infer FAIL $$name"; cat build/s2-$$name.infer.err; exit 1; }; \
 	done
 
+# --dump-typed: smoke test that the walker populates every Expr node.
+# A clean run produces stdout with no `?` type markers — every node
+# must be annotated.
+test-dump-typed: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --dump-typed $$f > build/s2-$$name.typed 2> build/s2-$$name.typed.err; \
+	  if grep -q ' : ?$$' build/s2-$$name.typed; then \
+	    echo "dump-typed FAIL $$name (found un-annotated nodes)"; \
+	    grep ' : ?$$' build/s2-$$name.typed | head; \
+	    exit 1; \
+	  else \
+	    echo "dump-typed OK $$name"; \
+	  fi; \
+	done
+
 # --check: name resolution + HM inference, with no --infer noise on stdout.
 # A clean run must leave both stdout and stderr empty.
 test-infer-check: $(TARGET) build
@@ -172,7 +189,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-check test-run test-blocks test-llvm
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-check test-run test-blocks test-llvm
 
 clean:
 	rm -rf build $(TARGET)

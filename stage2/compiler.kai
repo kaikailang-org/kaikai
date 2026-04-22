@@ -5183,9 +5183,21 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 
 type InferState = { file: String, env: TyEnv, sub: Subst, recs: [RecInfo], errs: Int }
 
-type Inferred = { st: InferState, ty: Ty }
+# `TyRes` is the narrow result returned by pure type operations that
+# don't consume or produce an expression (fresh var, instantiate a
+# scheme, compute a param type). `Inferred` adds the re-built Expr
+# tree with every sub-node carrying its inferred `Ty`, which M4+
+# passes consume without re-running inference.
+type TyRes = { st: InferState, ty: Ty }
 
-type InferredList = { st: InferState, tys: [Ty] }
+type Inferred = { st: InferState, ty: Ty, expr: Expr }
+
+type InferredList = { st: InferState, tys: [Ty], exprs: [Expr] }
+
+type InferredStmts = { st: InferState, stmts: [Stmt] }
+type InferredArms  = { st: InferState, arms: [Arm] }
+type InferredElems = { st: InferState, elems: [ListElem] }
+type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, recs: [RecInfo]) : InferState =
   InferState { file: file, env: env, sub: subst_empty(), recs: recs, errs: 0 }
@@ -5199,11 +5211,19 @@ fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs + 1 }
 
-fn mk_inferred(st: InferState, t: Ty) : Inferred = Inferred { st: st, ty: t }
+fn ty_res(st: InferState, t: Ty) : TyRes = TyRes { st: st, ty: t }
 
-fn st_fresh_ty(st: InferState) : Inferred {
+fn mk_inferred(st: InferState, t: Ty, e: Expr) : Inferred =
+  Inferred { st: st, ty: t, expr: e }
+
+# Leaf expressions (literals, EVar, EUnder, EPlaceholder) have no
+# sub-nodes to rebuild, so they annotate themselves in place.
+fn inferred_leaf(st: InferState, t: Ty, e: Expr) : Inferred =
+  mk_inferred(st, t, with_ty(e, t))
+
+fn st_fresh_ty(st: InferState) : TyRes {
   let n = st.env.fresh
-  mk_inferred(st_set_env(st, fresh_var(st.env)), TyVarT(n))
+  ty_res(st_set_env(st, fresh_var(st.env)), TyVarT(n))
 }
 
 fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState {
@@ -5220,9 +5240,9 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
   }
 }
 
-fn st_instantiate(st: InferState, sc: TyScheme) : Inferred {
+fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
   let inst = instantiate(st.env, sc)
-  mk_inferred(st_set_env(st, inst.env), inst.ty)
+  ty_res(st_set_env(st, inst.env), inst.ty)
 }
 
 # Lexically scope a sub-walk: entries added during `inner` are dropped,
@@ -5239,16 +5259,21 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
 
 # ---- parameter typing ----
 
-fn param_ty_or_fresh(st: InferState, pm: Param) : Inferred {
+fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   match pm.ptype {
-    Some(te) -> mk_inferred(st, resolve_ty(te))
+    Some(te) -> ty_res(st, resolve_ty(te))
     None     -> st_fresh_ty(st)
   }
 }
 
-fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredList {
+# Add fn parameters to the type environment. Doesn't produce an Expr
+# list (params aren't expressions), just the param types for later
+# function-type construction.
+type InferredParams = { st: InferState, tys: [Ty] }
+
+fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredParams {
   match ps {
-    [] -> InferredList { st: st, tys: list_reverse(acc) }
+    [] -> InferredParams { st: st, tys: list_reverse(acc) }
     [pm, ...rest] -> {
       let pr = param_ty_or_fresh(st, pm)
       let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
@@ -5258,7 +5283,7 @@ fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredList 
   }
 }
 
-fn add_infer_params(st: InferState, ps: [Param]) : InferredList = add_infer_params_loop(st, ps, [])
+fn add_infer_params(st: InferState, ps: [Param]) : InferredParams = add_infer_params_loop(st, ps, [])
 
 # ---- record instantiation ----
 
@@ -5322,17 +5347,20 @@ fn fty_find(fs: [FTy], target: String) : Option[Ty] = fty_find_loop(fs, target)
 
 fn synth(st: InferState, e: Expr) : Inferred {
   match e.kind {
-    EInt(_)        -> mk_inferred(st, TyInt)
-    EReal(_)       -> mk_inferred(st, TyReal)
-    EBool(_)       -> mk_inferred(st, TyBool)
-    EChar(_)       -> mk_inferred(st, TyChar)
-    EStr(_, _)     -> mk_inferred(st, TyString)
-    EUnit          -> mk_inferred(st, TyUnit)
-    EUnder         -> mk_inferred(st, TyAny)
-    EPlaceholder   -> mk_inferred(st, TyAny)
+    EInt(_)        -> inferred_leaf(st, TyInt, e)
+    EReal(_)       -> inferred_leaf(st, TyReal, e)
+    EBool(_)       -> inferred_leaf(st, TyBool, e)
+    EChar(_)       -> inferred_leaf(st, TyChar, e)
+    EStr(_, _)     -> inferred_leaf(st, TyString, e)
+    EUnit          -> inferred_leaf(st, TyUnit, e)
+    EUnder         -> inferred_leaf(st, TyAny, e)
+    EPlaceholder   -> inferred_leaf(st, TyAny, e)
     EVar(nm)       -> match ty_env_lookup(st.env, nm) {
-      Some(sc) -> st_instantiate(st, sc)
-      None     -> mk_inferred(st, TyAny)
+      Some(sc) -> {
+        let r = st_instantiate(st, sc)
+        inferred_leaf(r.st, r.ty, e)
+      }
+      None     -> inferred_leaf(st, TyAny, e)
     }
     ECall(callee, args_)       -> synth_call(st, callee, args_, e.line, e.col)
     EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
@@ -5352,11 +5380,11 @@ fn synth(st: InferState, e: Expr) : Inferred {
 
 fn synth_many(st: InferState, es: [Expr]) : InferredList {
   match es {
-    [] -> InferredList { st: st, tys: [] }
+    [] -> InferredList { st: st, tys: [], exprs: [] }
     [x, ...rest] -> {
       let r = synth(st, x)
       let rr = synth_many(r.st, rest)
-      InferredList { st: rr.st, tys: [r.ty, ...rr.tys] }
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys], exprs: [r.expr, ...rr.exprs] }
     }
   }
 }
@@ -5367,28 +5395,36 @@ fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) 
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, rc.ty, expected, "function call", line, col)
-  mk_inferred(st2, apply_ty(st2.sub, rv.ty))
+  let ty = apply_ty(st2.sub, rv.ty)
+  let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
+  mk_inferred(st2, ty, root)
 }
+
+fn field_root(obj_expr: Expr, fnm: String, line: Int, col: Int, ty: Ty) : Expr =
+  with_ty(mk_expr(EField(obj_expr, fnm), line, col), ty)
 
 fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : Inferred {
   let r = synth(st, obj)
   let applied = apply_ty(r.st.sub, r.ty)
   match applied {
     TyCon(cname, _) -> match rec_find(r.st.recs, cname) {
-      None -> mk_inferred(r.st, TyAny)
+      None -> mk_inferred(r.st, TyAny, field_root(r.expr, fnm, line, col, TyAny))
       Some(ri) -> {
         let inst = rec_instantiate(r.st, ri)
         let st1 = st_unify(inst.st, inst.result_ty, r.ty, "record field access", line, col)
         match fty_find(inst.fields, fnm) {
-          Some(t) -> mk_inferred(st1, apply_ty(st1.sub, t))
+          Some(t) -> {
+            let ty = apply_ty(st1.sub, t)
+            mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
+          }
           None -> {
             eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: no field '#{fnm}' on #{cname}")
-            mk_inferred(st_bump_err(st1), TyAny)
+            mk_inferred(st_bump_err(st1), TyAny, field_root(r.expr, fnm, line, col, TyAny))
           }
         }
       }
     }
-    _ -> mk_inferred(r.st, TyAny)
+    _ -> mk_inferred(r.st, TyAny, field_root(r.expr, fnm, line, col, TyAny))
   }
 }
 
@@ -5398,34 +5434,40 @@ fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Infe
   let st1 = st_unify(ri.st, ri.ty, TyInt, "list index", line, col)
   let rv = st_fresh_ty(st1)
   let st2 = st_unify(rv.st, rc.ty, TyListT(rv.ty), "list indexing", line, col)
-  mk_inferred(st2, apply_ty(st2.sub, rv.ty))
+  let ty = apply_ty(st2.sub, rv.ty)
+  let root = with_ty(mk_expr(EIndex(rc.expr, ri.expr), line, col), ty)
+  mk_inferred(st2, ty, root)
 }
 
 # Binop typing is deliberately coarse: numeric operators unify their
 # two operands and return the shared type (usually `Int`); comparison
 # operators unify operands and return `Bool`; logical `and`/`or` pin
 # both sides to `Bool`; `//` and `%` pin operands to `Int`.
+fn binop_root(op: String, l_expr: Expr, r_expr: Expr, line: Int, col: Int, ty: Ty) : Expr =
+  with_ty(mk_expr(EBinop(op, l_expr, r_expr), line, col), ty)
+
 fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int) : Inferred {
   let rl = synth(st, l)
   let rr = synth(rl.st, r)
   if op == "and" or op == "or" {
     let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
     let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
-    mk_inferred(s2, TyBool)
+    mk_inferred(s2, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
   } else if op == "==" or op == "!=" {
     let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
-    mk_inferred(s1, TyBool)
+    mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
   } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
     let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
-    mk_inferred(s1, TyBool)
+    mk_inferred(s1, TyBool, binop_root(op, rl.expr, rr.expr, line, col, TyBool))
   } else if op == "//" or op == "%" {
     let s1 = st_unify(rr.st, rl.ty, TyInt, "integer arithmetic", line, col)
     let s2 = st_unify(s1, rr.ty, TyInt, "integer arithmetic", line, col)
-    mk_inferred(s2, TyInt)
+    mk_inferred(s2, TyInt, binop_root(op, rl.expr, rr.expr, line, col, TyInt))
   } else {
     let what = string_concat("arithmetic operator '", string_concat(op, "'"))
     let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
-    mk_inferred(s1, apply_ty(s1.sub, rl.ty))
+    let ty = apply_ty(s1.sub, rl.ty)
+    mk_inferred(s1, ty, binop_root(op, rl.expr, rr.expr, line, col, ty))
   }
 }
 
@@ -5433,9 +5475,11 @@ fn synth_unop(st: InferState, op: String, x: Expr, line: Int, col: Int) : Inferr
   let r = synth(st, x)
   if op == "not" {
     let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
-    mk_inferred(s1, TyBool)
+    let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), TyBool)
+    mk_inferred(s1, TyBool, root)
   } else {
-    mk_inferred(r.st, r.ty)
+    let root = with_ty(mk_expr(EUnop(op, r.expr), line, col), r.ty)
+    mk_inferred(r.st, r.ty, root)
   }
 }
 
@@ -5444,11 +5488,16 @@ fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, col:
   let s1 = st_unify(rc.st, rc.ty, TyBool, "if condition", line, col)
   let rt = synth(s1, t_)
   match eo {
-    None -> mk_inferred(rt.st, TyUnit)
+    None -> {
+      let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, None), line, col), TyUnit)
+      mk_inferred(rt.st, TyUnit, root)
+    }
     Some(ee) -> {
       let re = synth(rt.st, ee)
       let s2 = st_unify(re.st, rt.ty, re.ty, "if/else branches", line, col)
-      mk_inferred(s2, apply_ty(s2.sub, rt.ty))
+      let ty = apply_ty(s2.sub, rt.ty)
+      let root = with_ty(mk_expr(EIf(rc.expr, rt.expr, Some(re.expr)), line, col), ty)
+      mk_inferred(s2, ty, root)
     }
   }
 }
@@ -5458,28 +5507,34 @@ fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : 
   let added = add_infer_params(st, ps)
   let rb = synth(added.st, body)
   let st2 = st_restore_entries(outer, rb.st)
-  mk_inferred(st2, fn_ty(apply_tys(st2.sub, added.tys), apply_ty(st2.sub, rb.ty)))
+  let lam_ty = fn_ty(apply_tys(st2.sub, added.tys), apply_ty(st2.sub, rb.ty))
+  let root = with_ty(mk_expr(ELambda(ps, rb.expr), line, col), lam_ty)
+  mk_inferred(st2, lam_ty, root)
 }
 
 fn synth_list_expr(st: InferState, els: [ListElem], line: Int, col: Int) : Inferred {
   let rv = st_fresh_ty(st)
-  let s1 = synth_list_elems(rv.st, els, rv.ty, line, col)
-  mk_inferred(s1, TyListT(apply_ty(s1.sub, rv.ty)))
+  let elems = synth_list_elems(rv.st, els, rv.ty, line, col)
+  let ty = TyListT(apply_ty(elems.st.sub, rv.ty))
+  let root = with_ty(mk_expr(EList(elems.elems), line, col), ty)
+  mk_inferred(elems.st, ty, root)
 }
 
-fn synth_list_elems(st: InferState, els: [ListElem], elem: Ty, line: Int, col: Int) : InferState {
+fn synth_list_elems(st: InferState, els: [ListElem], elem: Ty, line: Int, col: Int) : InferredElems {
   match els {
-    [] -> st
+    [] -> InferredElems { st: st, elems: [] }
     [el, ...rest] -> match el {
       ElPlain(ex) -> {
         let r = synth(st, ex)
         let s1 = st_unify(r.st, elem, r.ty, "list element", line, col)
-        synth_list_elems(s1, rest, elem, line, col)
+        let rr = synth_list_elems(s1, rest, elem, line, col)
+        InferredElems { st: rr.st, elems: [ElPlain(r.expr), ...rr.elems] }
       }
       ElSpread(ex) -> {
         let r = synth(st, ex)
         let s1 = st_unify(r.st, TyListT(elem), r.ty, "list spread", line, col)
-        synth_list_elems(s1, rest, elem, line, col)
+        let rr = synth_list_elems(s1, rest, elem, line, col)
+        InferredElems { st: rr.st, elems: [ElSpread(r.expr), ...rr.elems] }
       }
     }
   }
@@ -5490,42 +5545,74 @@ fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int,
   let s1 = st_unify(rl.st, rl.ty, TyInt, "range start", line, col)
   let rh = synth(s1, hi)
   let s2 = st_unify(rh.st, rh.ty, TyInt, "range end", line, col)
-  let s3 = match stp {
-    None -> s2
+  match stp {
+    None -> {
+      let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, None), line, col), TyListT(TyInt))
+      mk_inferred(s2, TyListT(TyInt), root)
+    }
     Some(se) -> {
       let rs_ = synth(s2, se)
-      st_unify(rs_.st, rs_.ty, TyInt, "range step", line, col)
+      let s3 = st_unify(rs_.st, rs_.ty, TyInt, "range step", line, col)
+      let root = with_ty(mk_expr(ERange(rl.expr, rh.expr, Some(rs_.expr)), line, col), TyListT(TyInt))
+      mk_inferred(s3, TyListT(TyInt), root)
     }
   }
-  mk_inferred(s3, TyListT(TyInt))
 }
 
-# `x |> f(y, z)` desugars to `f(x, y, z)`; a non-call rhs is treated
-# as a unary function applied to lhs.
+# `x |> f(y, z)` pipes `x` into `f` as its first argument. Rather
+# than desugar and re-infer, we manually emit the same unify chain
+# that an ECall would run, and rebuild EPipe around it so the emitter
+# still sees the original shape (stage 2's emitter has its own
+# desugaring of EPipe).
+type PipeRes = { st: InferState, ty: Ty, rhs: Expr }
+
 fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred {
-  match rhs.kind {
-    ECall(f, pa) -> synth_call(st, f, [lhs, ...pa], line, col)
-    _ -> synth_call(st, rhs, [lhs], line, col)
+  let rl = synth(st, lhs)
+  let res = match rhs.kind {
+    ECall(f, pa) -> {
+      let rf = synth(rl.st, f)
+      let ra = synth_many(rf.st, pa)
+      let rv = st_fresh_ty(ra.st)
+      let expected = fn_ty([rl.ty, ...ra.tys], rv.ty)
+      let st2 = st_unify(rv.st, rf.ty, expected, "pipe call", line, col)
+      let ty = apply_ty(st2.sub, rv.ty)
+      let typed_rhs = with_ty(mk_expr(ECall(rf.expr, ra.exprs), rhs.line, rhs.col), ty)
+      PipeRes { st: st2, ty: ty, rhs: typed_rhs }
+    }
+    _ -> {
+      let rf = synth(rl.st, rhs)
+      let rv = st_fresh_ty(rf.st)
+      let expected = fn_ty([rl.ty], rv.ty)
+      let st2 = st_unify(rv.st, rf.ty, expected, "pipe call", line, col)
+      let ty = apply_ty(st2.sub, rv.ty)
+      PipeRes { st: st2, ty: ty, rhs: rf.expr }
+    }
   }
+  let root = with_ty(mk_expr(EPipe(rl.expr, res.rhs), line, col), res.ty)
+  mk_inferred(res.st, res.ty, root)
 }
 
 fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred {
   match rec_find(st.recs, nm) {
     None -> {
-      let s1 = synth_field_inits(st, fis, [], line, col)
-      mk_inferred(s1, TyCon(nm, []))
+      let r = synth_field_inits(st, fis, [], line, col)
+      let ty = TyCon(nm, [])
+      let root = with_ty(mk_expr(ERecordLit(nm, r.fis), line, col), ty)
+      mk_inferred(r.st, ty, root)
     }
     Some(ri) -> {
       let inst = rec_instantiate(st, ri)
-      let s2 = synth_field_inits(inst.st, fis, inst.fields, line, col)
-      mk_inferred(s2, apply_ty(s2.sub, inst.result_ty))
+      let r = synth_field_inits(inst.st, fis, inst.fields, line, col)
+      let ty = apply_ty(r.st.sub, inst.result_ty)
+      let root = with_ty(mk_expr(ERecordLit(nm, r.fis), line, col), ty)
+      mk_inferred(r.st, ty, root)
     }
   }
 }
 
-fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferState {
+fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferredFInits {
   match fis {
-    [] -> st
+    [] -> InferredFInits { st: st, fis: [] }
     [fi, ...rest] -> match fi {
       FI(fnm, ex) -> {
         let r = synth(st, ex)
@@ -5536,7 +5623,8 @@ fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int,
             st_unify(r.st, ft, r.ty, what, line, col)
           }
         }
-        synth_field_inits(s1, rest, fields, line, col)
+        let rr = synth_field_inits(s1, rest, fields, line, col)
+        InferredFInits { st: rr.st, fis: [FI(fnm, r.expr), ...rr.fis] }
       }
     }
   }
@@ -5544,43 +5632,71 @@ fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int,
 
 fn synth_block(st: InferState, stmts: [Stmt], tail: Option[Expr], line: Int, col: Int) : Inferred {
   let outer = st
-  let after = synth_stmts(st, stmts)
-  let rt = match tail {
-    None     -> mk_inferred(after, TyUnit)
-    Some(te) -> synth(after, te)
+  let is = synth_stmts(st, stmts)
+  let rt_kind = match tail {
+    None     -> BlockTail { st: is.st, ty: TyUnit, expr_opt: None }
+    Some(te) -> {
+      let r = synth(is.st, te)
+      BlockTail { st: r.st, ty: r.ty, expr_opt: Some(r.expr) }
+    }
   }
-  let st2 = st_restore_entries(outer, rt.st)
-  mk_inferred(st2, apply_ty(st2.sub, rt.ty))
+  let st2 = st_restore_entries(outer, rt_kind.st)
+  let ty = apply_ty(st2.sub, rt_kind.ty)
+  let root = with_ty(mk_expr(EBlock(is.stmts, rt_kind.expr_opt), line, col), ty)
+  mk_inferred(st2, ty, root)
 }
 
-fn synth_stmts(st: InferState, stmts: [Stmt]) : InferState {
+# Local record so the two `match tail` branches return the same
+# shape; kaikai-minimal has no tuples.
+type BlockTail = { st: InferState, ty: Ty, expr_opt: Option[Expr] }
+
+type OneStmt = { st: InferState, stmt: Stmt }
+type InferredOptExpr = { st: InferState, expr: Option[Expr] }
+
+fn synth_stmts(st: InferState, stmts: [Stmt]) : InferredStmts {
   match stmts {
-    [] -> st
-    [one, ...rest] -> synth_stmts(synth_stmt(st, one), rest)
+    [] -> InferredStmts { st: st, stmts: [] }
+    [one, ...rest] -> {
+      let r = synth_stmt(st, one)
+      let rr = synth_stmts(r.st, rest)
+      InferredStmts { st: rr.st, stmts: [r.stmt, ...rr.stmts] }
+    }
   }
 }
 
-fn synth_stmt(st: InferState, stmt: Stmt) : InferState {
+fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
   match stmt {
     SLet(pat, ann, rhs) -> {
       let rr = synth(st, rhs)
-      let binding = match ann {
-        None -> mk_inferred(rr.st, rr.ty)
+      let binding_st = match ann {
+        None -> rr.st
         Some(te) -> {
           let declared = resolve_ty(te)
-          let s1 = st_unify(rr.st, declared, rr.ty, "let annotation", pat.line, pat.col)
-          mk_inferred(s1, declared)
+          st_unify(rr.st, declared, rr.ty, "let annotation", pat.line, pat.col)
         }
       }
-      check_pattern(binding.st, pat, binding.ty)
+      let binding_ty = match ann {
+        None -> rr.ty
+        Some(te) -> resolve_ty(te)
+      }
+      let after = check_pattern(binding_st, pat, binding_ty)
+      OneStmt { st: after, stmt: SLet(pat, ann, rr.expr) }
     }
-    SAssert(cond, _) -> {
+    SAssert(cond, msg) -> {
       let rc = synth(st, cond)
-      st_unify(rc.st, rc.ty, TyBool, "assert condition", cond.line, cond.col)
+      let s1 = st_unify(rc.st, rc.ty, TyBool, "assert condition", cond.line, cond.col)
+      let rm = match msg {
+        None -> InferredOptExpr { st: s1, expr: None }
+        Some(mx) -> {
+          let r = synth(s1, mx)
+          InferredOptExpr { st: r.st, expr: Some(r.expr) }
+        }
+      }
+      OneStmt { st: rm.st, stmt: SAssert(rc.expr, rm.expr) }
     }
     SExprStmt(ex) -> {
       let r = synth(st, ex)
-      r.st
+      OneStmt { st: r.st, stmt: SExprStmt(r.expr) }
     }
   }
 }
@@ -5738,28 +5854,32 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
 fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : Inferred {
   let rs_ = synth(st, scr)
   let rv = st_fresh_ty(rs_.st)
-  let s1 = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
-  mk_inferred(s1, apply_ty(s1.sub, rv.ty))
+  let ra = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
+  let ty = apply_ty(ra.st.sub, rv.ty)
+  let root = with_ty(mk_expr(EMatch(rs_.expr, ra.arms), line, col), ty)
+  mk_inferred(ra.st, ty, root)
 }
 
-fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int, col: Int) : InferState {
+fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int, col: Int) : InferredArms {
   match arms {
-    [] -> st
+    [] -> InferredArms { st: st, arms: [] }
     [a, ...rest] -> match a {
       Arm(pat, guard, body) -> {
         let outer = st
         let s_p = check_pattern(st, pat, scrut_ty)
-        let s_g = match guard {
-          None -> s_p
+        let guard_res = match guard {
+          None -> InferredOptExpr { st: s_p, expr: None }
           Some(gx) -> {
             let rg = synth(s_p, gx)
-            st_unify(rg.st, rg.ty, TyBool, "match guard", gx.line, gx.col)
+            let s_g = st_unify(rg.st, rg.ty, TyBool, "match guard", gx.line, gx.col)
+            InferredOptExpr { st: s_g, expr: Some(rg.expr) }
           }
         }
-        let rb = synth(s_g, body)
+        let rb = synth(guard_res.st, body)
         let s_b = st_unify(rb.st, body_ty, rb.ty, "match arm", body.line, body.col)
         let s_scoped = st_restore_entries(outer, s_b)
-        synth_arms(s_scoped, rest, scrut_ty, body_ty, line, col)
+        let rr = synth_arms(s_scoped, rest, scrut_ty, body_ty, line, col)
+        InferredArms { st: rr.st, arms: [Arm(pat, guard_res.expr, rb.expr), ...rr.arms] }
       }
     }
   }
@@ -5772,9 +5892,14 @@ fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col:
   print("fn #{nm} : #{ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
 }
 
-fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool) : Int {
+# Decls after inference: type-annotated body (or original decl for
+# non-DFn). Also carries the error count so the caller can aggregate
+# without re-walking.
+type TypedDecl = { decl: Decl, errs: Int }
+
+fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
-    DFn(_, nm, ps, opt_ret, body, line, col) -> {
+    DFn(is_pub, nm, ps, opt_ret, body, line, col) -> {
       let st0 = infer_state_new(file, env, recs)
       let added = add_infer_params(st0, ps)
       let rb = synth(added.st, body)
@@ -5787,30 +5912,213 @@ fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
       } else { () }
-      st1.errs
+      TypedDecl { decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col), errs: st1.errs }
     }
-    _ -> 0
+    _ -> TypedDecl { decl: d, errs: 0 }
   }
 }
 
-fn infer_all_loop(file: String, env: TyEnv, recs: [RecInfo], ds: [Decl], verbose: Bool, acc: Int) : Int {
+type TypedProgram = { decls: [Decl], errs: Int }
+
+fn infer_all_loop(file: String, env: TyEnv, recs: [RecInfo], ds: [Decl], verbose: Bool,
+                   acc_decls: [Decl], acc_errs: Int) : TypedProgram {
   match ds {
-    [] -> acc
-    [d, ...rest] -> infer_all_loop(file, env, recs, rest, verbose,
-                                   acc + infer_decl(file, env, recs, d, verbose))
+    [] -> TypedProgram { decls: list_reverse(acc_decls), errs: acc_errs }
+    [d, ...rest] -> {
+      let r = infer_decl(file, env, recs, d, verbose)
+      infer_all_loop(file, env, recs, rest, verbose,
+                     [r.decl, ...acc_decls], acc_errs + r.errs)
+    }
   }
+}
+
+fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
+  let env = build_ty_env(decls)
+  let recs = collect_records(decls)
+  infer_all_loop(file, env, recs, decls, verbose, [], 0)
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
-  let env = build_ty_env(decls)
-  let recs = collect_records(decls)
-  infer_all_loop(file, env, recs, decls, true, 0)
+  let r = infer_program(file, decls, true)
+  r.errs
 }
 
 fn check_infer(file: String, decls: [Decl]) : Int {
-  let env = build_ty_env(decls)
-  let recs = collect_records(decls)
-  infer_all_loop(file, env, recs, decls, false, 0)
+  let r = infer_program(file, decls, false)
+  r.errs
+}
+
+# ---- `--dump-typed`: typed AST pretty-printer ----
+#
+# Runs inference and walks the resulting annotated tree, printing a
+# compact `<kind> : <ty>` line per Expr node. The point of the flag
+# is diagnostic — every Expr node the walker returned is expected to
+# carry a `Some(ty)`, so a `?` in the output indicates a missed
+# rebuild path.
+
+fn ty_tag(e: Expr) : String {
+  match e.ty {
+    Some(t) -> string_concat(" : ", ty_to_string(t))
+    None    -> " : ?"
+  }
+}
+
+fn tag_of_kind(k: ExprKind) : String {
+  match k {
+    EInt(n)        -> concat_all(["int ", int_to_string(n)])
+    EReal(_)       -> "real"
+    EBool(b)       -> if b { "bool true" } else { "bool false" }
+    EChar(_)       -> "char"
+    EStr(_, _)     -> "string"
+    EUnit          -> "unit"
+    EVar(nm)       -> concat_all(["ident ", nm])
+    EUnder         -> "_"
+    EPlaceholder   -> "."
+    ECall(_, _)    -> "call"
+    EField(_, nm)  -> concat_all(["field .", nm])
+    EIndex(_, _)   -> "index"
+    EBinop(op, _, _) -> concat_all(["binop ", op])
+    EUnop(op, _)   -> concat_all(["unop ", op])
+    EIf(_, _, _)   -> "if"
+    EMatch(_, _)   -> "match"
+    ELambda(_, _)  -> "lambda"
+    ERecordLit(nm, _) -> concat_all(["record ", nm])
+    EList(_)       -> "list"
+    ERange(_, _, _) -> "range"
+    EBlock(_, _)   -> "block"
+    EPipe(_, _)    -> "pipe"
+  }
+}
+
+fn dump_typed_expr(e: Expr, depth: Int) : Unit {
+  emit_line(depth, concat_all([tag_of_kind(e.kind), ty_tag(e)]))
+  dump_typed_subexprs(e.kind, depth + 1)
+}
+
+# Note: stage 1's capture analyser doesn't recognise pattern bindings
+# inside a lambda body as locals, which turns a seemingly-innocent
+# `each((a) => match a { Arm(_, g, body) -> ... })` into "capture
+# g, body from outer scope" and fails to compile. Every iteration in
+# this dumper therefore uses explicit recursive helpers with pattern
+# matching at top level rather than inline lambdas.
+
+fn dump_typed_exprs(xs: [Expr], depth: Int) : Unit {
+  match xs {
+    [] -> ()
+    [x, ...rest] -> { dump_typed_expr(x, depth) dump_typed_exprs(rest, depth) }
+  }
+}
+
+fn dump_typed_arms(arms: [Arm], depth: Int) : Unit {
+  match arms {
+    [] -> ()
+    [a, ...rest] -> {
+      match a {
+        Arm(_, g, body) -> {
+          match g {
+            Some(gx) -> dump_typed_expr(gx, depth)
+            None -> ()
+          }
+          dump_typed_expr(body, depth)
+        }
+      }
+      dump_typed_arms(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_fis(fis: [FieldInit], depth: Int) : Unit {
+  match fis {
+    [] -> ()
+    [fi, ...rest] -> {
+      match fi { FI(_, v) -> dump_typed_expr(v, depth) }
+      dump_typed_fis(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_elems(els: [ListElem], depth: Int) : Unit {
+  match els {
+    [] -> ()
+    [el, ...rest] -> {
+      match el {
+        ElPlain(x)  -> dump_typed_expr(x, depth)
+        ElSpread(x) -> dump_typed_expr(x, depth)
+      }
+      dump_typed_elems(rest, depth)
+    }
+  }
+}
+
+fn dump_typed_stmts(ss: [Stmt], depth: Int) : Unit {
+  match ss {
+    [] -> ()
+    [s, ...rest] -> { dump_typed_stmt(s, depth) dump_typed_stmts(rest, depth) }
+  }
+}
+
+fn dump_typed_subexprs(k: ExprKind, depth: Int) : Unit {
+  match k {
+    ECall(callee, xs) -> {
+      dump_typed_expr(callee, depth)
+      dump_typed_exprs(xs, depth)
+    }
+    EField(base, _)   -> dump_typed_expr(base, depth)
+    EIndex(a, b)      -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EBinop(_, a, b)   -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    EUnop(_, x)       -> dump_typed_expr(x, depth)
+    EIf(c, a, eo)     -> {
+      dump_typed_expr(c, depth)
+      dump_typed_expr(a, depth)
+      match eo { Some(b) -> dump_typed_expr(b, depth) None -> () }
+    }
+    EMatch(scr, arms) -> {
+      dump_typed_expr(scr, depth)
+      dump_typed_arms(arms, depth)
+    }
+    ELambda(_, body)  -> dump_typed_expr(body, depth)
+    ERecordLit(_, fis) -> dump_typed_fis(fis, depth)
+    EList(els) -> dump_typed_elems(els, depth)
+    ERange(a, b, so) -> {
+      dump_typed_expr(a, depth)
+      dump_typed_expr(b, depth)
+      match so { Some(s) -> dump_typed_expr(s, depth) None -> () }
+    }
+    EBlock(ss, tail) -> {
+      dump_typed_stmts(ss, depth)
+      match tail { Some(t) -> dump_typed_expr(t, depth) None -> () }
+    }
+    EPipe(a, b) -> { dump_typed_expr(a, depth) dump_typed_expr(b, depth) }
+    _ -> ()
+  }
+}
+
+fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
+  match s {
+    SLet(_, _, rhs)  -> { emit_line(depth, "let") dump_typed_expr(rhs, depth + 1) }
+    SAssert(c, mo)   -> {
+      emit_line(depth, "assert")
+      dump_typed_expr(c, depth + 1)
+      match mo { Some(m) -> dump_typed_expr(m, depth + 1) None -> () }
+    }
+    SExprStmt(ex)    -> dump_typed_expr(ex, depth)
+  }
+}
+
+fn dump_typed_decl(d: Decl) : Unit {
+  match d {
+    DFn(_, nm, _, _, body, line, col) -> {
+      print("fn #{nm} @#{int_to_string(line)}:#{int_to_string(col)}")
+      dump_typed_expr(body, 1)
+    }
+    _ -> ()
+  }
+}
+
+fn dump_typed(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.decls |> each(dump_typed_decl)
+  r.errs
 }
 
 # ====================================================================
@@ -7145,6 +7453,7 @@ type Mode
   | MEnv
   | MInfer
   | MCheck
+  | MDumpTyped
   | MEmitLlvm
   | MTest
   | MHelp
@@ -7176,6 +7485,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MInfer))
       } else if a == "--check" {
         parse_cli_loop(more, cli_with_mode(opts, MCheck))
+      } else if a == "--dump-typed" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpTyped))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--test" {
@@ -7210,6 +7521,7 @@ fn usage() : Unit {
   eprint("  --env              print the full type environment (prelude + variants + decls)")
   eprint("  --infer            run HM inference over each fn body and dump the inferred type")
   eprint("  --check            run name resolution and HM inference; report errors and exit")
+  eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
@@ -7257,6 +7569,10 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
               MCheck -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { check_infer(path, all_decls) }
+              }
+              MDumpTyped -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_typed(path, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
