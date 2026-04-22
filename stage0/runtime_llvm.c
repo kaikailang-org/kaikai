@@ -19,9 +19,33 @@
 
 #include "runtime.h"
 
-/* String construction and printing. Enough to round-trip hello.kai. */
+/* ---------- value constructors ---------- */
 KaiValue *kaix_str(const char *s)              { return kai_str(s); }
-KaiValue *kaix_prelude_print(KaiValue *v)      { return kai_prelude_print(v); }
+KaiValue *kaix_int(int64_t i)                  { return kai_int(i); }
+KaiValue *kaix_bool(int b)                     { return kai_bool(b); }
+
+/* ---------- binops ---------- */
+KaiValue *kaix_add(KaiValue *a, KaiValue *b)   { return kai_add(a, b); }
+KaiValue *kaix_sub(KaiValue *a, KaiValue *b)   { return kai_sub(a, b); }
+KaiValue *kaix_mul(KaiValue *a, KaiValue *b)   { return kai_mul(a, b); }
+KaiValue *kaix_div(KaiValue *a, KaiValue *b)   { return kai_div(a, b); }
+KaiValue *kaix_idiv(KaiValue *a, KaiValue *b)  { return kai_idiv(a, b); }
+KaiValue *kaix_mod(KaiValue *a, KaiValue *b)   { return kai_mod(a, b); }
+KaiValue *kaix_eq(KaiValue *a, KaiValue *b)    { return kai_eq_v(a, b); }
+KaiValue *kaix_ne(KaiValue *a, KaiValue *b)    { return kai_ne_v(a, b); }
+KaiValue *kaix_lt(KaiValue *a, KaiValue *b)    { return kai_lt(a, b); }
+KaiValue *kaix_gt(KaiValue *a, KaiValue *b)    { return kai_gt(a, b); }
+KaiValue *kaix_le(KaiValue *a, KaiValue *b)    { return kai_le(a, b); }
+KaiValue *kaix_ge(KaiValue *a, KaiValue *b)    { return kai_ge(a, b); }
+KaiValue *kaix_neg(KaiValue *a)                { return kai_neg(a); }
+KaiValue *kaix_not(KaiValue *a)                { return kai_bool(!kai_truthy(a)); }
+
+/* ---------- control helpers ---------- */
+int kaix_truthy(KaiValue *v)                   { return kai_truthy(v); }
+
+/* ---------- prelude subset used by M3b ---------- */
+KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
+KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_string(v); }
 
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */

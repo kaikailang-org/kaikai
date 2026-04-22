@@ -97,13 +97,27 @@ test-check: $(TARGET) build
 
 # LLVM backend round-trip: emitted .ll is compiled with clang against
 # the runtime shim, and the resulting binary's output must match the
-# C backend's. Scoped to hello.kai for M3a — extended as more language
-# features land in the LLVM emitter.
-LLVM_EXAMPLES := hello
+# C backend's. `minimal/hello.kai` exercises the M3a skeleton; files
+# under `examples/llvm/` cover the incremental milestones with just
+# the constructs each one targets.
+LLVM_MIN_EXAMPLES := hello
+LLVM_EXAMPLES     := m3b
 test-llvm: $(TARGET) build
 	@set -e; \
-	for name in $(LLVM_EXAMPLES); do \
+	for name in $(LLVM_MIN_EXAMPLES); do \
 	  f=../examples/minimal/$$name.kai; \
+	  ./$(TARGET) --emit=llvm $$f > build/$$name.ll; \
+	  clang -w -I ../stage0 build/$$name.ll ../stage0/runtime_llvm.c -o build/$$name-llvm; \
+	  ./build/$$name-llvm > build/$$name-llvm.out; \
+	  ./$(TARGET) $$f > build/$$name.c; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name-c; \
+	  ./build/$$name-c > build/$$name-c.out; \
+	  diff -q build/$$name-llvm.out build/$$name-c.out > /dev/null \
+	    && echo "llvm OK $$name" \
+	    || { echo "llvm DIFF $$name"; diff build/$$name-llvm.out build/$$name-c.out | head; exit 1; }; \
+	done; \
+	for name in $(LLVM_EXAMPLES); do \
+	  f=../examples/llvm/$$name.kai; \
 	  ./$(TARGET) --emit=llvm $$f > build/$$name.ll; \
 	  clang -w -I ../stage0 build/$$name.ll ../stage0/runtime_llvm.c -o build/$$name-llvm; \
 	  ./build/$$name-llvm > build/$$name-llvm.out; \
