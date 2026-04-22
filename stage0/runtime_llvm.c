@@ -47,6 +47,31 @@ int kaix_truthy(KaiValue *v)                   { return kai_truthy(v); }
 KaiValue *kaix_prelude_print(KaiValue *v)          { return kai_prelude_print(v); }
 KaiValue *kaix_prelude_int_to_string(KaiValue *v)  { return kai_prelude_int_to_string(v); }
 
+/* ---------- M3c: strings, ranges, higher-order prelude ---------- */
+KaiValue *kaix_string_concat(KaiValue *a, KaiValue *b)         { return kai_string_concat(a, b); }
+KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_string(v); }
+
+KaiValue *kaix_range(KaiValue *from, KaiValue *to)              { return kai_range(from, to); }
+KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s){ return kai_range_step(f, t, s); }
+
+KaiValue *kaix_prelude_map(KaiValue *xs, KaiValue *f)          { return kai_prelude_map(xs, f); }
+KaiValue *kaix_prelude_each(KaiValue *xs, KaiValue *f)         { return kai_prelude_each(xs, f); }
+KaiValue *kaix_prelude_filter(KaiValue *xs, KaiValue *p)       { return kai_prelude_filter(xs, p); }
+KaiValue *kaix_prelude_reduce(KaiValue *xs, KaiValue *i, KaiValue *f) { return kai_prelude_reduce(xs, i, f); }
+
+/* Closure construction. Accepts a KaiFn-compatible function pointer
+   (passed as a void* from the LLVM IR for opaque-pointer mode). */
+KaiValue *kaix_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures) {
+    return kai_closure(fn, arity, n_captures, captures);
+}
+
+/* Prelude thunks exported as regular symbols so LLVM IR can take
+   their address to build closures passed into higher-order prelude
+   calls. One per prelude entry we may reference as a value. */
+KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n)            { (void)s; (void)n; return kai_prelude_print(a[0]); }
+KaiValue *kaix_eprint_thunk(KaiValue *s, KaiValue **a, int n)           { (void)s; (void)n; return kai_prelude_eprint(a[0]); }
+KaiValue *kaix_int_to_string_thunk(KaiValue *s, KaiValue **a, int n)    { (void)s; (void)n; return kai_prelude_int_to_string(a[0]); }
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);
