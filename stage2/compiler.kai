@@ -705,6 +705,9 @@ fn diag_error(file: String, line: Int, col: Int, msg: String) : Unit {
   emit_source_caret(file, line, col)
 }
 
+fn diag_note(msg: String) : Unit = eprint("  = note: #{msg}")
+fn diag_help(msg: String) : Unit = eprint("  = help: #{msg}")
+
 # Levenshtein edit distance for "did you mean?" suggestions. Plain
 # DP over rows, immutable — each row is a freshly-built list. Small
 # strings + small scope means cost is negligible in practice; we
@@ -5555,13 +5558,46 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
     None -> {
       let a1 = apply_ty(st.sub, a)
       let b1 = apply_ty(st.sub, b)
-      diag_error(st.file, line, col, concat_all([
-        "type mismatch in ", what,
-        "\n  expected: ", ty_to_string(a1),
-        "\n  found:    ", ty_to_string(b1)
-      ]))
+      diag_error(st.file, line, col, "type mismatch in #{what}")
+      diag_note("expected: #{ty_to_string(a1)}")
+      diag_note("found:    #{ty_to_string(b1)}")
+      emit_type_hint(a1, b1)
       st_bump_err(st)
     }
+  }
+}
+
+# Known conversion pairs. `emit_type_hint(expected, found)` suggests
+# a prelude helper that lifts `found` into `expected` (or vice versa)
+# when the pair is one we already have a built-in for. Kept narrow
+# on purpose: hints that nearly-always apply are the helpful ones.
+fn emit_type_hint(expected: Ty, found: Ty) : Unit {
+  match expected {
+    TyString -> match found {
+      TyInt    -> diag_help("wrap the Int with `int_to_string(n)`")
+      TyReal   -> diag_help("wrap the Real with `real_to_string(r)`")
+      TyChar   -> diag_help("interpolate the Char into a String literal")
+      _        -> ()
+    }
+    TyInt -> match found {
+      TyString -> diag_help("parse with `string_to_int(s)` (returns Option[Int])")
+      TyChar   -> diag_help("convert with `char_to_int(c)`")
+      _        -> ()
+    }
+    TyReal -> match found {
+      TyString -> diag_help("parse with `string_to_real(s)` (returns Option[Real])")
+      _        -> ()
+    }
+    TyChar -> match found {
+      TyInt -> diag_help("convert with `int_to_char(n)`")
+      _     -> ()
+    }
+    TyCon(nm, _) -> {
+      if nm == "Option" {
+        diag_help("wrap the value with `Some(...)`, or use `None` if absent")
+      } else { () }
+    }
+    _ -> ()
   }
 }
 
