@@ -630,7 +630,7 @@ fn report_errors(path: String, src: String, tokens: [Token]) : Int {
 # stay compact. Pattern matching on expressions therefore destructures
 # the record to reach `.kind`, then matches the sum.
 
-type Expr = { kind: ExprKind, line: Int, col: Int }
+type Expr = { kind: ExprKind, line: Int, col: Int, ty: Option[Ty] }
 
 type ExprKind
   = EInt(Int)
@@ -705,7 +705,14 @@ type ImportKind
   | IkSelective(String, [String])
 
 # ---- small constructors ----
-fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col }
+fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr = Expr { kind: k, line: line, col: col, ty: None }
+
+# Return a copy of `e` with its inferred type set. Used by `synth` to
+# hand back a typed expression tree alongside its Ty. Downstream passes
+# (emitter today ignores it; M3/M4 will consume) can traverse the tree
+# and read `.ty` at each node without re-running inference.
+fn with_ty(e: Expr, t: Ty) : Expr =
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t) }
 fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
 fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
 
