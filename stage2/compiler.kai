@@ -625,29 +625,115 @@ fn dump_tokens(src: String, tokens: [Token]) : Unit {
 }
 
 # ====================================================================
+# diagnostics
+# ====================================================================
+#
+# Rust-style source snippets for error reporting. A diagnostic site
+# (file, line, col) renders as:
+#
+#     error: <msg>
+#       --> foo.kai:5:12
+#        |
+#      5 | let x = bar(42)
+#        |         ^
+#
+# Caret is placed by byte column, which matches the (line, col) kept
+# on tokens and AST nodes. Multi-byte characters in source therefore
+# shift the caret rightwards of the logical glyph — acceptable for
+# the ASCII-heavy code we compile, and easy to replace later with
+# a codepoint-aware locator.
+
+fn spaces(n: Int) : String = spaces_loop(n, "")
+
+fn spaces_loop(n: Int, acc: String) : String =
+  if n <= 0 { acc } else { spaces_loop(n - 1, string_concat(acc, " ")) }
+
+# Extract the `n`-th (1-indexed) line from `src`, without the trailing
+# newline. Returns None if `n` is out of range or `n <= 0`.
+fn nth_line(src: String, n: Int) : Option[String] =
+  if n <= 0 { None } else { nth_line_loop(src, 0, string_length(src), 1, n, "") }
+
+fn nth_line_loop(src: String, i: Int, total: Int, cur: Int, target: Int, acc: String) : Option[String] {
+  if i >= total { if cur == target { Some(acc) } else { None } }
+  else {
+    match char_at(src, i) {
+      None -> if cur == target { Some(acc) } else { None }
+      Some(c) -> {
+        if c == '\n' {
+          if cur == target { Some(acc) }
+          else { nth_line_loop(src, i + 1, total, cur + 1, target, "") }
+        } else {
+          if cur == target { nth_line_loop(src, i + 1, total, cur, target, string_concat(acc, "#{c}")) }
+          else { nth_line_loop(src, i + 1, total, cur, target, acc) }
+        }
+      }
+    }
+  }
+}
+
+# Render a snippet to stderr. `src` is the source of the entry file;
+# for imported modules we re-read on the fly (see emit_source_caret).
+fn emit_src_snippet(line: Int, col: Int, src_line: String) : Unit {
+  let num = int_to_string(line)
+  let margin = spaces(string_length(num))
+  eprint("  #{margin} |")
+  eprint("  #{num} | #{src_line}")
+  let caret_gap = if col > 1 { spaces(col - 1) } else { "" }
+  eprint("  #{margin} | #{caret_gap}^")
+}
+
+fn emit_source_caret_from_src(src: String, line: Int, col: Int) : Unit {
+  match nth_line(src, line) {
+    None       -> ()
+    Some(text) -> emit_src_snippet(line, col, text)
+  }
+}
+
+# Self-contained variant: takes a path, reads it, and emits the
+# snippet. Used by diagnostics that don't already have the source
+# threaded through (most checker/infer sites).
+fn emit_source_caret(file: String, line: Int, col: Int) : Unit {
+  match read_file(file) {
+    Err(_)  -> ()
+    Ok(src) -> emit_source_caret_from_src(src, line, col)
+  }
+}
+
+fn diag_error(file: String, line: Int, col: Int, msg: String) : Unit {
+  eprint("error: #{msg}")
+  eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
+  emit_source_caret(file, line, col)
+}
+
+fn diag_error_from_src(file: String, src: String, line: Int, col: Int, msg: String) : Unit {
+  eprint("error: #{msg}")
+  eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
+  emit_source_caret_from_src(src, line, col)
+}
+
+# ====================================================================
 # error scanning
 # ====================================================================
 
-fn report_one_error(path: String, t: Token, msg: String) : Unit {
-  eprint("#{path}:#{tok_line_str(t)}:#{tok_col_str(t)}: error: #{msg}")
-}
+fn report_one_error(path: String, src: String, t: Token, msg: String) : Unit =
+  diag_error_from_src(path, src, t.line, t.col, msg)
 
-fn report_errors_loop(path: String, ts: [Token], count: Int) : Int {
+fn report_errors_loop(path: String, src: String, ts: [Token], count: Int) : Int {
   match ts {
     [] -> count
     [t, ...rest] -> match t.kind {
       TkError(msg) -> {
-        report_one_error(path, t, msg)
-        report_errors_loop(path, rest, count + 1)
+        report_one_error(path, src, t, msg)
+        report_errors_loop(path, src, rest, count + 1)
       }
-      _ -> report_errors_loop(path, rest, count)
+      _ -> report_errors_loop(path, src, rest, count)
     }
   }
 }
 
 # Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).
 fn report_errors(path: String, src: String, tokens: [Token]) : Int {
-  if report_errors_loop(path, tokens, 0) > 0 { 1 } else { 0 }
+  if report_errors_loop(path, src, tokens, 0) > 0 { 1 } else { 0 }
 }
 
 # ====================================================================
@@ -898,7 +984,7 @@ fn p_skip_newlines_and_semis(p: Parser) : Parser {
 fn p_error(p: Parser, t: Token, msg: String) : Parser {
   if p.had_error { p }
   else {
-    eprint("#{p.file}:#{int_to_string(t.line)}:#{int_to_string(t.col)}: error: #{msg}")
+    diag_error_from_src(p.file, p.src, t.line, t.col, msg)
     p_mark_err(p)
   }
 }
@@ -2887,7 +2973,7 @@ fn env_mark_err(e: Env) : Env =
   Env { scopes: e.scopes, had_error: true, file: e.file }
 
 fn chk_error(e: Env, line: Int, col: Int, msg: String) : Env {
-  eprint("#{e.file}:#{int_to_string(line)}:#{int_to_string(col)}: error: #{msg}")
+  diag_error(e.file, line, col, msg)
   env_mark_err(e)
 }
 
@@ -5352,9 +5438,11 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
     None -> {
       let a1 = apply_ty(st.sub, a)
       let b1 = apply_ty(st.sub, b)
-      eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: type mismatch in #{what}")
-      eprint("  expected: #{ty_to_string(a1)}")
-      eprint("  found:    #{ty_to_string(b1)}")
+      diag_error(st.file, line, col, concat_all([
+        "type mismatch in ", what,
+        "\n  expected: ", ty_to_string(a1),
+        "\n  found:    ", ty_to_string(b1)
+      ]))
       st_bump_err(st)
     }
   }
@@ -5599,7 +5687,7 @@ fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : In
             mk_inferred(st1, ty, field_root(r.expr, fnm, line, col, ty))
           }
           None -> {
-            eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: no field '#{fnm}' on #{cname}")
+            diag_error(st.file, line, col, "no field '#{fnm}' on #{cname}")
             mk_inferred(st_bump_err(st1), TyAny, field_root(r.expr, fnm, line, col, TyAny))
           }
         }
@@ -5965,7 +6053,7 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
           match subpats {
             [] -> s1
             _  -> {
-              eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}")
+              diag_error(st.file, line, col, "variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}")
               st_bump_err(s1)
             }
           }
@@ -5987,13 +6075,13 @@ fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: I
     [] -> match tys {
       [] -> st
       _  -> {
-        eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant pattern arity mismatch")
+        diag_error(st.file, line, col, "variant pattern arity mismatch")
         st_bump_err(st)
       }
     }
     [p, ...pr] -> match tys {
       [] -> {
-        eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant pattern arity mismatch")
+        diag_error(st.file, line, col, "variant pattern arity mismatch")
         st_bump_err(st)
       }
       [t, ...tr] -> check_subpat_list(check_pattern(st, p, t), pr, tr, line, col)
@@ -6045,7 +6133,7 @@ fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, co
         let s1 = match fty_find(fields, fnm) {
           Some(ft) -> check_pattern(st, sub, ft)
           None -> {
-            eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: no field '#{fnm}' in record pattern")
+            diag_error(st.file, line, col, "no field '#{fnm}' in record pattern")
             check_pattern(st_bump_err(st), sub, TyAny)
           }
         }
@@ -6729,7 +6817,7 @@ fn strict_holes_report_loop(file: String, hs: [ResolvedHole]) : Unit {
       match h {
         RH(nm_opt, line, col, ty, _, _) -> {
           let label = match nm_opt { Some(nm) -> cat2("?", nm) None -> "?" }
-          eprint("#{file}:#{int_to_string(line)}:#{int_to_string(col)}: error: unfilled hole #{label} : #{ty_to_string(ty)}")
+          diag_error(file, line, col, "unfilled hole #{label} : #{ty_to_string(ty)}")
         }
       }
       strict_holes_report_loop(file, rest)
