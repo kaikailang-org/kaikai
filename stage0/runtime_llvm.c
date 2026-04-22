@@ -99,6 +99,22 @@ KaiValue *kaix_eq_raw(KaiValue *a, KaiValue *b) { return kai_bool(kai_eq(a, b));
    generated IR then drops into `unreachable`. */
 KaiValue *kaix_panic(KaiValue *msg) { return kai_prelude_panic(msg); }
 
+/* ---------- M3e: lists + closures-with-captures ---------- */
+KaiValue *kaix_cons(KaiValue *h, KaiValue *t)            { return kai_cons(h, t); }
+KaiValue *kaix_nil(void)                                  { return kai_nil(); }
+int       kaix_is_cons(KaiValue *v)                       { return v && v->tag == KAI_CONS; }
+int       kaix_is_nil(KaiValue *v)                        { return !v || v->tag == KAI_NIL; }
+KaiValue *kaix_cons_head(KaiValue *v)                     { return kai_incref(v->as.cons.head); }
+KaiValue *kaix_cons_tail(KaiValue *v)                     { return kai_incref(v->as.cons.tail); }
+
+/* Used by lambda thunks to read their captured values from the
+   closure's self parameter. i is the capture's index. */
+KaiValue *kaix_capture(KaiValue *self, int i)             { return kai_incref(self->as.clo.captures[i]); }
+
+KaiValue *kaix_prelude_list_length(KaiValue *xs)          { return kai_prelude_list_length(xs); }
+KaiValue *kaix_prelude_list_append(KaiValue *a, KaiValue *b) { return kai_prelude_list_append(a, b); }
+KaiValue *kaix_prelude_list_reverse(KaiValue *xs)         { return kai_prelude_list_reverse(xs); }
+
 /* Entry point: the LLVM output defines kai_main. Match what the C
    backend's emit_main_wrapper does. */
 extern KaiValue *kai_main(void);

@@ -5880,6 +5880,16 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_variant_arg(%KaiValue*, i32)\n",
     "declare %KaiValue* @kaix_eq_raw(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_panic(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_cons(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_nil()\n",
+    "declare i32           @kaix_is_cons(%KaiValue*)\n",
+    "declare i32           @kaix_is_nil(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_cons_head(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_cons_tail(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_capture(%KaiValue*, i32)\n",
+    "declare %KaiValue* @kaix_prelude_list_append(%KaiValue*, %KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_list_length(%KaiValue*)\n",
+    "declare %KaiValue* @kaix_prelude_list_reverse(%KaiValue*)\n",
     "\n"
   ])
 
@@ -5917,42 +5927,43 @@ type LlvmEmit = {
   cur_label: String,
   locals: [LlvmLocal],
   fns: [EFn],
-  vars_: [EVar]
+  vars_: [EVar],
+  lams: [LamInfo]
 }
 
 fn llvm_emit_new() : LlvmEmit =
   LlvmEmit { ids: llvm_id_new(), globals: "", body: "", last_val: "",
-             cur_label: "entry", locals: [], fns: [], vars_: [] }
+             cur_label: "entry", locals: [], fns: [], vars_: [], lams: [] }
 
 fn llvm_append_body(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: string_concat(e.body, s),
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_ }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 fn llvm_set_last(e: LlvmEmit, v: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: v, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_ }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 fn llvm_set_label(e: LlvmEmit, lbl: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: lbl,
-             locals: e.locals, fns: e.fns, vars_: e.vars_ }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 fn llvm_append_global(e: LlvmEmit, s: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: string_concat(e.globals, s), body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_ }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 fn llvm_fresh_id(e: LlvmEmit) : LlvmEmit =
   LlvmEmit { ids: llvm_id_bump(e.ids), globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: e.locals, fns: e.fns, vars_: e.vars_ }
+             locals: e.locals, fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 fn llvm_push_local(e: LlvmEmit, nm: String, reg: String) : LlvmEmit =
   LlvmEmit { ids: e.ids, globals: e.globals, body: e.body,
              last_val: e.last_val, cur_label: e.cur_label,
-             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_ }
+             locals: [LL(nm, reg), ...e.locals], fns: e.fns, vars_: e.vars_, lams: e.lams }
 
 # Open a new LLVM basic block: emit the `<label>:` header and
 # record `label` as the active one so downstream phi nodes can
@@ -6012,7 +6023,10 @@ fn llvm_prelude_table() : [LlvmPrelude] {
     LP("map",           2, None),
     LP("each",          2, None),
     LP("filter",        2, None),
-    LP("reduce",        3, None)
+    LP("reduce",        3, None),
+    LP("list_append",   2, None),
+    LP("list_length",   1, None),
+    LP("list_reverse",  1, None)
   ]
 }
 
@@ -6092,6 +6106,8 @@ fn llvm_emit_expr(e: LlvmEmit, x: Expr) : LlvmEmit {
     ERange(lo, hi, stp) -> llvm_emit_range(e, lo, hi, stp)
     EPipe(lhs, rhs) -> llvm_emit_pipe(e, lhs, rhs)
     EMatch(scr, arms) -> llvm_emit_match(e, scr, arms, x.line, x.col)
+    EList(elems) -> llvm_emit_list(e, elems)
+    ELambda(_, _) -> llvm_emit_lambda_ref(e, x)
     _ -> {
       eprint("llvm: unsupported expression kind at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
       llvm_set_last(e, "undef")
@@ -6502,7 +6518,7 @@ fn llvm_emit_block(e: LlvmEmit, stmts: [Stmt], tail: Option[Expr]) : LlvmEmit {
   # Restore outer scope, keep id counter / body / globals / last_val.
   LlvmEmit { ids: tailed.ids, globals: tailed.globals, body: tailed.body,
              last_val: tailed.last_val, cur_label: tailed.cur_label,
-             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_ }
+             locals: outer_locals, fns: tailed.fns, vars_: tailed.vars_, lams: tailed.lams }
 }
 
 fn llvm_emit_stmts(e: LlvmEmit, stmts: [Stmt]) : LlvmEmit {
@@ -6552,6 +6568,120 @@ fn llvm_init_locals_from_params(ps: [Param]) : [LlvmLocal] {
   match ps {
     [] -> []
     [p, ...rest] -> [LL(p.pname, string_concat("%p_", p.pname)), ...llvm_init_locals_from_params(rest)]
+  }
+}
+
+# ---- list literals ----
+
+fn llvm_emit_list(e: LlvmEmit, elems: [ListElem]) : LlvmEmit = llvm_emit_list_tail(e, elems)
+
+fn llvm_emit_list_tail(e: LlvmEmit, elems: [ListElem]) : LlvmEmit {
+  match elems {
+    [] -> {
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all(["  ", r.reg, " = call %KaiValue* @kaix_nil()\n"])
+      llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+    }
+    [el, ...rest] -> match el {
+      ElPlain(x) -> {
+        let eh = llvm_emit_expr(e, x)
+        let head_val = eh.last_val
+        let et = llvm_emit_list_tail(eh, rest)
+        let tail_val = et.last_val
+        let r = llvm_fresh_reg(et)
+        let instr = concat_all([
+          "  ", r.reg, " = call %KaiValue* @kaix_cons(%KaiValue* ", head_val,
+          ", %KaiValue* ", tail_val, ")\n"
+        ])
+        llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      }
+      ElSpread(x) -> {
+        let eh = llvm_emit_expr(e, x)
+        let head_val = eh.last_val
+        let et = llvm_emit_list_tail(eh, rest)
+        let tail_val = et.last_val
+        let r = llvm_fresh_reg(et)
+        let instr = concat_all([
+          "  ", r.reg, " = call %KaiValue* @kaix_prelude_list_append(%KaiValue* ",
+          head_val, ", %KaiValue* ", tail_val, ")\n"
+        ])
+        llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      }
+    }
+  }
+}
+
+# ---- lambda expressions ----
+#
+# At the ELambda site we look up the LamInfo by (line, col) and emit
+# a call to `kaix_closure` with the thunk's address, arity, and the
+# captured values currently in scope.
+fn llvm_emit_lambda_ref(e: LlvmEmit, x: Expr) : LlvmEmit {
+  match find_lam(e.lams, x.line, x.col) {
+    None -> {
+      eprint("llvm: lambda info missing at #{int_to_string(x.line)}:#{int_to_string(x.col)}")
+      llvm_set_last(e, "undef")
+    }
+    Some(l) -> match l {
+      LamInfo(id, _, _, params, caps, _) -> {
+        let arity = list_length(params)
+        let n_caps = list_length(caps)
+        let thunk_sym = concat_all(["@_kai_lam_", int_to_string(id)])
+        if n_caps == 0 {
+          llvm_build_closure(e, thunk_sym, arity)
+        } else {
+          let buf = llvm_fresh_reg(e)
+          let alloc_i = concat_all([
+            "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n_caps), "\n"
+          ])
+          let e1 = llvm_append_body(buf.e, alloc_i)
+          let e2 = llvm_emit_capture_stores(e1, buf.reg, caps, 0)
+          # Bitcast the buffer to i8* as a separate instruction; inline
+          # constant-expr bitcast is not allowed on function-local
+          # SSA values like the `alloca` result.
+          let cast = llvm_fresh_reg(e2)
+          let cast_i = concat_all([
+            "  ", cast.reg, " = bitcast %KaiValue** ", buf.reg, " to i8*\n"
+          ])
+          let e3 = llvm_append_body(cast.e, cast_i)
+          let r = llvm_fresh_reg(e3)
+          let call_i = concat_all([
+            "  ", r.reg, " = call %KaiValue* @kaix_closure(",
+            "i8* bitcast (%KaiValue* (%KaiValue*, %KaiValue**, i32)* ", thunk_sym, " to i8*), ",
+            "i32 ", int_to_string(arity), ", ",
+            "i32 ", int_to_string(n_caps), ", ",
+            "i8* ", cast.reg, ")\n"
+          ])
+          llvm_set_last(llvm_append_body(r.e, call_i), r.reg)
+        }
+      }
+    }
+  }
+}
+
+# Fill the captures buffer with the current register binding for each
+# captured name. If a capture isn't in scope (shouldn't happen after
+# `fv_expr`), store a null to keep the IR well-formed.
+fn llvm_emit_capture_stores(e: LlvmEmit, buf_reg: String, caps: [String], i: Int) : LlvmEmit {
+  match caps {
+    [] -> e
+    [c, ...rest] -> {
+      let val = match llvm_local_find(e.locals, c) {
+        Some(r) -> r
+        None -> "null"
+      }
+      let gep = llvm_fresh_reg(e)
+      let gep_i = concat_all([
+        "  ", gep.reg, " = getelementptr inbounds %KaiValue*, %KaiValue** ", buf_reg,
+        ", i32 ", int_to_string(i), "\n"
+      ])
+      let e1 = llvm_append_body(gep.e, gep_i)
+      let store_i = concat_all([
+        "  store %KaiValue* ", val, ", %KaiValue** ", gep.reg, "\n"
+      ])
+      let e2 = llvm_append_body(e1, store_i)
+      llvm_emit_capture_stores(e2, buf_reg, rest, i + 1)
+    }
   }
 }
 
@@ -6651,9 +6781,91 @@ fn llvm_emit_pattern_test(e: LlvmEmit, pat: Pattern, scr: String, fail_lbl: Stri
       let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.var.ok.")
       llvm_emit_pat_subpats(e3, subpats, scr, fail_lbl, 0)
     }
+    PList(sub_pats, opt_rest) -> llvm_emit_pat_list(e, sub_pats, opt_rest, scr, fail_lbl)
     _ -> {
       eprint("llvm: pattern kind not supported at #{int_to_string(pat.line)}:#{int_to_string(pat.col)}")
       e
+    }
+  }
+}
+
+# List-pattern test. `[]` checks `is_nil`. `[p1, ..., pn]` without a
+# rest binder requires exactly n elements (cons * n, then nil). With
+# a rest binder (`...rest`) only the prefix is required; `rest` is
+# bound to the tail at position n.
+fn llvm_emit_pat_list(e: LlvmEmit, sub_pats: [Pattern], opt_rest: Option[String],
+                       scr: String, fail_lbl: String) : LlvmEmit {
+  let n_fixed = list_length(sub_pats)
+  let has_rest = match opt_rest { Some(_) -> true None -> false }
+  if n_fixed == 0 {
+    if has_rest {
+      # [..rest] — any list; bind rest = scr.
+      match opt_rest {
+        Some(nm) -> llvm_push_local(e, nm, scr)
+        None     -> e
+      }
+    } else {
+      # [] — require is_nil.
+      let chk = llvm_fresh_reg(e)
+      let chk_i = concat_all([
+        "  ", chk.reg, " = call i32 @kaix_is_nil(%KaiValue* ", scr, ")\n"
+      ])
+      let e1 = llvm_append_body(chk.e, chk_i)
+      let cond = llvm_fresh_reg(e1)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      let e2 = llvm_append_body(cond.e, cond_i)
+      llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.nil.ok.")
+    }
+  } else {
+    llvm_emit_pat_list_loop(e, sub_pats, has_rest, opt_rest, scr, fail_lbl)
+  }
+}
+
+fn llvm_emit_pat_list_loop(e: LlvmEmit, sub_pats: [Pattern], has_rest: Bool,
+                            opt_rest: Option[String], scr: String, fail_lbl: String) : LlvmEmit {
+  match sub_pats {
+    [] -> {
+      # End of fixed prefix: either rest-binder gets the tail, or we
+      # require the tail to be nil.
+      if has_rest {
+        match opt_rest {
+          Some(nm) -> llvm_push_local(e, nm, scr)
+          None     -> e
+        }
+      } else {
+        let chk = llvm_fresh_reg(e)
+        let chk_i = concat_all([
+          "  ", chk.reg, " = call i32 @kaix_is_nil(%KaiValue* ", scr, ")\n"
+        ])
+        let e1 = llvm_append_body(chk.e, chk_i)
+        let cond = llvm_fresh_reg(e1)
+        let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+        let e2 = llvm_append_body(cond.e, cond_i)
+        llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.nil_end.ok.")
+      }
+    }
+    [p, ...rest] -> {
+      let chk = llvm_fresh_reg(e)
+      let chk_i = concat_all([
+        "  ", chk.reg, " = call i32 @kaix_is_cons(%KaiValue* ", scr, ")\n"
+      ])
+      let e1 = llvm_append_body(chk.e, chk_i)
+      let cond = llvm_fresh_reg(e1)
+      let cond_i = concat_all(["  ", cond.reg, " = icmp ne i32 ", chk.reg, ", 0\n"])
+      let e2 = llvm_append_body(cond.e, cond_i)
+      let e3 = llvm_emit_cond_br_fail(e2, cond.reg, fail_lbl, "pat.cons.ok.")
+      let head = llvm_fresh_reg(e3)
+      let head_i = concat_all([
+        "  ", head.reg, " = call %KaiValue* @kaix_cons_head(%KaiValue* ", scr, ")\n"
+      ])
+      let e4 = llvm_append_body(head.e, head_i)
+      let tail = llvm_fresh_reg(e4)
+      let tail_i = concat_all([
+        "  ", tail.reg, " = call %KaiValue* @kaix_cons_tail(%KaiValue* ", scr, ")\n"
+      ])
+      let e5 = llvm_append_body(tail.e, tail_i)
+      let e6 = llvm_emit_pattern_test(e5, p, head.reg, fail_lbl)
+      llvm_emit_pat_list_loop(e6, rest, has_rest, opt_rest, tail.reg, fail_lbl)
     }
   }
 }
@@ -6700,7 +6912,8 @@ fn llvm_emit_match_arms(e: LlvmEmit, arms: [Arm], scr_reg: String, end_lbl: Stri
         let e_scoped = LlvmEmit {
           ids: e_br.ids, globals: e_br.globals, body: e_br.body,
           last_val: e_br.last_val, cur_label: e_br.cur_label,
-          locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_
+          locals: outer_locals, fns: e_br.fns, vars_: e_br.vars_,
+          lams: e_br.lams
         }
         let e_next = llvm_open_block(e_scoped, next_try.reg)
         llvm_emit_match_arms(e_next, rest, scr_reg, end_lbl,
@@ -6793,14 +7006,14 @@ fn llvm_thunk_call_args(i: Int, arity: Int, acc: String) : String {
 # through all decls.
 type LlvmDeclOut = { text: String, next_id: Int }
 
-fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], start_id: Int) : LlvmDeclOut {
+fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
   match d {
     DFn(_, nm, ps, _, body, _, _) -> {
       let locals0 = llvm_init_locals_from_params(ps)
       let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
                           globals: "", body: "",
                           last_val: "", cur_label: "entry",
-                          locals: locals0, fns: fns, vars_: vs }
+                          locals: locals0, fns: fns, vars_: vs, lams: lams }
       let e1 = llvm_emit_expr(e0, body)
       let sym = if nm == "main" { "@kai_main" } else { string_concat("@kai_", nm) }
       let arity = list_length(ps)
@@ -6820,24 +7033,105 @@ fn llvm_emit_fn(d: Decl, fns: [EFn], vs: [EVar], start_id: Int) : LlvmDeclOut {
   }
 }
 
-fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], start_id: Int, acc: String) : String {
+fn llvm_emit_decls_loop(ds: [Decl], fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int, acc: String) : LlvmDeclOut {
   match ds {
-    [] -> acc
+    [] -> LlvmDeclOut { text: acc, next_id: start_id }
     [d, ...rest] -> {
-      let out = llvm_emit_fn(d, fns, vs, start_id)
-      llvm_emit_decls_loop(rest, fns, vs, out.next_id, string_concat(acc, out.text))
+      let out = llvm_emit_fn(d, fns, vs, lams, start_id)
+      llvm_emit_decls_loop(rest, fns, vs, lams, out.next_id, string_concat(acc, out.text))
     }
   }
 }
 
-fn llvm_emit_decls(ds: [Decl]) : String {
-  let fns = register_fn_decls(ds)
-  let vs = register_variants(ds)
-  llvm_emit_decls_loop(ds, fns, vs, 0, "")
+# Emit a single lambda body as a top-level fn. Each lambda lives in
+# `lams` with its params + captured-variable names. The generated fn
+# has thunk signature `(self, args, n)` — args[i] reads the i-th
+# param, `kaix_capture(self, i)` reads the i-th captured local. The
+# body is then emitted under an env that pushes both as named regs.
+fn llvm_emit_lambda_body(l: LamInfo, fns: [EFn], vs: [EVar], lams: [LamInfo], start_id: Int) : LlvmDeclOut {
+  match l {
+    LamInfo(id, _, _, params, caps, body) -> {
+      let e0 = LlvmEmit { ids: LlvmIdGen { next: start_id },
+                          globals: "", body: "",
+                          last_val: "", cur_label: "entry",
+                          locals: [], fns: fns, vars_: vs, lams: lams }
+      let e1 = llvm_emit_lambda_param_loads(e0, params, 0)
+      let e2 = llvm_emit_lambda_capture_loads(e1, caps, 0)
+      let e3 = llvm_emit_expr(e2, body)
+      let sym = concat_all(["@_kai_lam_", int_to_string(id)])
+      let text = concat_all([
+        e3.globals,
+        "\n",
+        "define %KaiValue* ", sym, "(%KaiValue* %self, %KaiValue** %args, i32 %n) {\n",
+        e3.body,
+        "  ret %KaiValue* ", e3.last_val, "\n",
+        "}\n"
+      ])
+      LlvmDeclOut { text: text, next_id: e3.ids.next }
+    }
+  }
 }
 
-fn emit_program_llvm(path: String, src: String, decls: [Decl], test_mode: Bool) : String =
-  concat_all([llvm_header(), llvm_emit_decls(decls)])
+fn llvm_emit_lambda_param_loads(e: LlvmEmit, params: [Param], i: Int) : LlvmEmit {
+  match params {
+    [] -> e
+    [p, ...rest] -> {
+      let gep = llvm_fresh_reg(e)
+      let gep_i = concat_all([
+        "  ", gep.reg, " = getelementptr inbounds %KaiValue*, %KaiValue** %args, i32 ",
+        int_to_string(i), "\n"
+      ])
+      let e1 = llvm_append_body(gep.e, gep_i)
+      let ld = llvm_fresh_reg(e1)
+      let ld_i = concat_all([
+        "  ", ld.reg, " = load %KaiValue*, %KaiValue** ", gep.reg, "\n"
+      ])
+      let e2 = llvm_append_body(ld.e, ld_i)
+      let e3 = llvm_push_local(e2, p.pname, ld.reg)
+      llvm_emit_lambda_param_loads(e3, rest, i + 1)
+    }
+  }
+}
+
+fn llvm_emit_lambda_capture_loads(e: LlvmEmit, caps: [String], i: Int) : LlvmEmit {
+  match caps {
+    [] -> e
+    [c, ...rest] -> {
+      let r = llvm_fresh_reg(e)
+      let instr = concat_all([
+        "  ", r.reg, " = call %KaiValue* @kaix_capture(%KaiValue* %self, i32 ",
+        int_to_string(i), ")\n"
+      ])
+      let e1 = llvm_append_body(r.e, instr)
+      let e2 = llvm_push_local(e1, c, r.reg)
+      llvm_emit_lambda_capture_loads(e2, rest, i + 1)
+    }
+  }
+}
+
+fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], start_id: Int, acc: String) : String {
+  match lams {
+    [] -> acc
+    [l, ...rest] -> {
+      let out = llvm_emit_lambda_body(l, fns, vs, lams, start_id)
+      llvm_emit_lambda_bodies(rest, fns, vs, out.next_id, string_concat(acc, out.text))
+    }
+  }
+}
+
+fn llvm_build_globals_names(fns: [EFn], vs: [EVar]) : [String] = build_globals(fns, vs)
+
+fn emit_program_llvm(path: String, src: String, decls: [Decl], test_mode: Bool) : String {
+  let fns = register_fn_decls(decls)
+  let vs = register_variants(decls)
+  let globals = llvm_build_globals_names(fns, vs)
+  let st0 = lc_new(globals)
+  let lc = collect_decls(decls, st0)
+  let lams = lc.lams
+  let decls_out = llvm_emit_decls_loop(decls, fns, vs, lams, 0, "")
+  let lam_bodies = llvm_emit_lambda_bodies(lams, fns, vs, decls_out.next_id, "")
+  concat_all([llvm_header(), decls_out.text, lam_bodies])
+}
 
 # ====================================================================
 # cli + driver
