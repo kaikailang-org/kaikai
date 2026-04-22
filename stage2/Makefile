@@ -196,6 +196,24 @@ test-blocks: $(TARGET) build
 	    || { echo "tests DIFF $$name"; exit 1; }; \
 	done
 
+# M6.1 modules smoke test: the `examples/modules/` tree has a
+# diamond `main → {arith, shapes}` where `shapes` also imports
+# `arith`. A clean compile through each backend must produce the
+# expected output `42 / 42 / 12` byte-for-byte. Verifies that
+# import resolution produces a single flat decl list that
+# downstream passes (check + HM + emit) accept without change.
+test-modules: $(TARGET) build
+	@set -e; \
+	./$(TARGET) ../examples/modules/main.kai > build/modules.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/modules.c -o build/modules-c; \
+	./build/modules-c > build/modules-c.out; \
+	./$(TARGET) --emit=llvm ../examples/modules/main.kai > build/modules.ll; \
+	clang -w -I ../stage0 build/modules.ll ../stage0/runtime_llvm.c -o build/modules-llvm; \
+	./build/modules-llvm > build/modules-llvm.out; \
+	diff -q build/modules-c.out build/modules-llvm.out > /dev/null \
+	  && echo "modules OK" \
+	  || { echo "modules DIFF"; diff build/modules-c.out build/modules-llvm.out; exit 1; }
+
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 selfhost: $(TARGET) build
@@ -221,7 +239,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules
 
 clean:
 	rm -rf build $(TARGET)
