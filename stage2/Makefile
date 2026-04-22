@@ -72,6 +72,24 @@ test-infer: $(TARGET) build
 	    || { echo "infer FAIL $$name"; cat build/s2-$$name.infer.err; exit 1; }; \
 	done
 
+# --dump-mono: smoke test that call-site instantiations resolve to
+# concrete types. Any `?t<N>` in the output means a fresh var wasn't
+# pinned by the final substitution, which for our minimal examples
+# would indicate an incomplete rewrite.
+test-dump-mono: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --dump-mono $$f > build/s2-$$name.mono 2> build/s2-$$name.mono.err; \
+	  if grep -Eq '\?t[0-9]+' build/s2-$$name.mono; then \
+	    echo "dump-mono FAIL $$name (unresolved type vars)"; \
+	    grep -E '\?t[0-9]+' build/s2-$$name.mono | head; \
+	    exit 1; \
+	  else \
+	    echo "dump-mono OK $$name"; \
+	  fi; \
+	done
+
 # --dump-typed: smoke test that the walker populates every Expr node.
 # A clean run produces stdout with no `?` type markers — every node
 # must be annotated.
@@ -189,7 +207,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-check test-run test-blocks test-llvm
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm
 
 clean:
 	rm -rf build $(TARGET)

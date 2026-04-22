@@ -5181,7 +5181,13 @@ fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
 
 # ---- inference state ----
 
-type InferState = { file: String, env: TyEnv, sub: Subst, recs: [RecInfo], errs: Int }
+# A single call-site that instantiated a polymorphic scheme. `fresh`
+# lists the TyVarT ids minted for that instantiation; running each
+# through the final sub recovers the concrete type arguments.
+type CallSite = CS(String, Int, Int, [Int])        # name, line, col, fresh ids
+
+type InferState = { file: String, env: TyEnv, sub: Subst, recs: [RecInfo], errs: Int,
+                    insts: [CallSite] }
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -5200,16 +5206,29 @@ type InferredElems = { st: InferState, elems: [ListElem] }
 type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, recs: [RecInfo]) : InferState =
-  InferState { file: file, env: env, sub: subst_empty(), recs: recs, errs: 0 }
+  InferState { file: file, env: env, sub: subst_empty(), recs: recs, errs: 0, insts: [] }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
-  InferState { file: st.file, env: new_env, sub: st.sub, recs: st.recs, errs: st.errs }
+  InferState { file: st.file, env: new_env, sub: st.sub, recs: st.recs, errs: st.errs, insts: st.insts }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
-  InferState { file: st.file, env: st.env, sub: new_sub, recs: st.recs, errs: st.errs }
+  InferState { file: st.file, env: st.env, sub: new_sub, recs: st.recs, errs: st.errs, insts: st.insts }
 
 fn st_bump_err(st: InferState) : InferState =
-  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs + 1 }
+  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs + 1, insts: st.insts }
+
+fn st_push_inst(st: InferState, cs: CallSite) : InferState =
+  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs,
+               insts: [cs, ...st.insts] }
+
+# Half-open range [lo, hi) as a list of ints. Used to name the fresh
+# TyVarT ids minted by one call-site's instantiation.
+fn range_ids_loop(i: Int, hi: Int, acc: [Int]) : [Int] {
+  if i >= hi { list_reverse(acc) }
+  else { range_ids_loop(i + 1, hi, [i, ...acc]) }
+}
+
+fn range_ids(lo: Int, hi: Int) : [Int] = range_ids_loop(lo, hi, [])
 
 fn ty_res(st: InferState, t: Ty) : TyRes = TyRes { st: st, ty: t }
 
@@ -5240,9 +5259,28 @@ fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : I
   }
 }
 
+# Wider instantiate result: also reports the fresh TyVarT ids that
+# were minted to replace the scheme's bound vars. Those ids, run
+# through the final substitution, give the call-site's concrete
+# type arguments (M4b) and feed monomorphisation (M4c).
+type TyInstRes = { st: InferState, ty: Ty, fresh: [Int] }
+
 fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
-  let inst = instantiate(st.env, sc)
-  ty_res(st_set_env(st, inst.env), inst.ty)
+  let r = st_instantiate_report(st, sc)
+  ty_res(r.st, r.ty)
+}
+
+fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
+  match sc {
+    Scheme(vars, _) -> {
+      let n = list_length(vars)
+      let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
+      let start = if st.env.fresh >= need { st.env.fresh } else { need }
+      let inst = instantiate(st.env, sc)
+      let fresh = range_ids(start, start + n)
+      TyInstRes { st: st_set_env(st, inst.env), ty: inst.ty, fresh: fresh }
+    }
+  }
 }
 
 # Lexically scope a sub-walk: entries added during `inner` are dropped,
@@ -5254,7 +5292,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh },
     sub: inner.sub,
     recs: inner.recs,
-    errs: inner.errs
+    errs: inner.errs,
+    insts: inner.insts
   }
 
 # ---- parameter typing ----
@@ -5357,8 +5396,12 @@ fn synth(st: InferState, e: Expr) : Inferred {
     EPlaceholder   -> inferred_leaf(st, TyAny, e)
     EVar(nm)       -> match ty_env_lookup(st.env, nm) {
       Some(sc) -> {
-        let r = st_instantiate(st, sc)
-        inferred_leaf(r.st, r.ty, e)
+        let r = st_instantiate_report(st, sc)
+        let st2 = match r.fresh {
+          [] -> r.st
+          _  -> st_push_inst(r.st, CS(nm, e.line, e.col, r.fresh))
+        }
+        inferred_leaf(st2, r.ty, e)
       }
       None     -> inferred_leaf(st, TyAny, e)
     }
@@ -5892,10 +5935,32 @@ fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col:
   print("fn #{nm} : #{ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
 }
 
+# A CallSite whose fresh var ids have been resolved via the final
+# substitution to concrete types. Consumed by monomorphisation later
+# and surfaced as-is by `--dump-mono`.
+type ResolvedCS = RCS(String, Int, Int, [Ty])       # name, line, col, concrete tys
+
+fn resolve_callsite_tys(ids: [Int], sub: Subst) : [Ty] {
+  match ids {
+    [] -> []
+    [i, ...rest] -> [apply_ty(sub, TyVarT(i)), ...resolve_callsite_tys(rest, sub)]
+  }
+}
+
+fn resolve_callsites(css: [CallSite], sub: Subst) : [ResolvedCS] {
+  match css {
+    [] -> []
+    [cs, ...rest] -> match cs {
+      CS(nm, line, col, ids) ->
+        [RCS(nm, line, col, resolve_callsite_tys(ids, sub)), ...resolve_callsites(rest, sub)]
+    }
+  }
+}
+
 # Decls after inference: type-annotated body (or original decl for
-# non-DFn). Also carries the error count so the caller can aggregate
-# without re-walking.
-type TypedDecl = { decl: Decl, errs: Int }
+# non-DFn). Also carries the error count and the resolved call-site
+# instantiations so the caller can aggregate without re-walking.
+type TypedDecl = { decl: Decl, errs: Int, insts: [ResolvedCS] }
 
 fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
@@ -5912,30 +5977,48 @@ fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
       } else { () }
-      TypedDecl { decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col), errs: st1.errs }
+      let resolved = resolve_callsites(list_reverse(st1.insts), st1.sub)
+      TypedDecl {
+        decl: DFn(is_pub, nm, ps, opt_ret, rb.expr, line, col),
+        errs: st1.errs,
+        insts: resolved
+      }
     }
-    _ -> TypedDecl { decl: d, errs: 0 }
+    _ -> TypedDecl { decl: d, errs: 0, insts: [] }
   }
 }
 
-type TypedProgram = { decls: [Decl], errs: Int }
+type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS] }
 
 fn infer_all_loop(file: String, env: TyEnv, recs: [RecInfo], ds: [Decl], verbose: Bool,
-                   acc_decls: [Decl], acc_errs: Int) : TypedProgram {
+                   acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS]) : TypedProgram {
   match ds {
-    [] -> TypedProgram { decls: list_reverse(acc_decls), errs: acc_errs }
+    [] -> TypedProgram {
+      decls: list_reverse(acc_decls), errs: acc_errs, insts: list_reverse(acc_insts)
+    }
     [d, ...rest] -> {
       let r = infer_decl(file, env, recs, d, verbose)
       infer_all_loop(file, env, recs, rest, verbose,
-                     [r.decl, ...acc_decls], acc_errs + r.errs)
+                     [r.decl, ...acc_decls],
+                     acc_errs + r.errs,
+                     llvm_prepend_reverse(r.insts, acc_insts))
     }
+  }
+}
+
+# Prepend `xs` onto `acc` in reverse order so `list_reverse(acc)` at
+# the end restores document order. Saves a full list_append per decl.
+fn llvm_prepend_reverse(xs: [ResolvedCS], acc: [ResolvedCS]) : [ResolvedCS] {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> llvm_prepend_reverse(rest, [x, ...acc])
   }
 }
 
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
   let env = build_ty_env(decls)
   let recs = collect_records(decls)
-  infer_all_loop(file, env, recs, decls, verbose, [], 0)
+  infer_all_loop(file, env, recs, decls, verbose, [], 0, [])
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
@@ -6118,6 +6201,32 @@ fn dump_typed_decl(d: Decl) : Unit {
 fn dump_typed(file: String, decls: [Decl]) : Int {
   let r = infer_program(file, decls, false)
   r.decls |> each(dump_typed_decl)
+  r.errs
+}
+
+# ---- `--dump-mono`: call-site instantiations ----
+#
+# Every EVar reference that instantiates a polymorphic scheme
+# registers a CallSite; inference then resolves each CallSite's
+# fresh TyVarT ids through the final substitution to get concrete
+# type arguments. This flag prints one line per call-site showing
+# the name, location, and the resolved type tuple.
+#
+# Monomorphisation (M4c) will de-duplicate these tuples per callee
+# and emit one specialised function body per unique instantiation.
+
+fn dump_mono_line(cs: ResolvedCS) : Unit {
+  match cs {
+    RCS(nm, line, col, tys) -> {
+      let tys_str = join_with(ty_string_list(tys), ", ")
+      print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]")
+    }
+  }
+}
+
+fn dump_mono(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.insts |> each(dump_mono_line)
   r.errs
 }
 
@@ -7454,6 +7563,7 @@ type Mode
   | MInfer
   | MCheck
   | MDumpTyped
+  | MDumpMono
   | MEmitLlvm
   | MTest
   | MHelp
@@ -7487,6 +7597,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MCheck))
       } else if a == "--dump-typed" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpTyped))
+      } else if a == "--dump-mono" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
       } else if a == "--emit=llvm" {
         parse_cli_loop(more, cli_with_mode(opts, MEmitLlvm))
       } else if a == "--test" {
@@ -7522,6 +7634,7 @@ fn usage() : Unit {
   eprint("  --infer            run HM inference over each fn body and dump the inferred type")
   eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
+  eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
   eprint("  --emit=llvm        emit LLVM IR (.ll) instead of C; link with stage0/runtime_llvm.c")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
@@ -7573,6 +7686,10 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
               MDumpTyped -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_typed(path, all_decls) }
+              }
+              MDumpMono -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_mono(path, all_decls) }
               }
               _ -> {
                 let chk = check_program(path, all_decls)
