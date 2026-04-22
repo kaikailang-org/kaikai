@@ -4959,11 +4959,16 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
     }
     TyListT(inner) -> TyListT(apply_ty(s, inner))
     TyFnT(params, ret) -> TyFnT(apply_tys(s, params), apply_ty(s, ret))
-    TyCon(name, args) -> TyCon(name, apply_tys(s, args))
+    TyCon(name, atys) -> TyCon(name, apply_tys(s, atys))
   }
 }
 
-fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = map(ts, (t) => apply_ty(s, t))
+fn apply_tys(s: Subst, ts: [Ty]) : [Ty] {
+  match ts {
+    [] -> []
+    [t, ...rest] -> [apply_ty(s, t), ...apply_tys(s, rest)]
+  }
+}
 
 # Does TyVarT(v) appear inside `ty` after applying the substitution?
 # Used as the occurs check in unify.
@@ -4980,7 +4985,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
     TyVarT(n) -> n == v
     TyListT(inner) -> occurs(v, inner, s)
     TyFnT(params, ret) -> occurs_any(v, [ret, ...params], s)
-    TyCon(_, args) -> occurs_any(v, args, s)
+    TyCon(_, atys) -> occurs_any(v, atys, s)
     _ -> false
   }
 }
@@ -5075,15 +5080,717 @@ fn mk_fresh_subst(vars: [Int], start: Int) : Subst =
 # drawn from the counter.
 type Instantiated = { env: TyEnv, ty: Ty }
 
+fn max_id_loop(vs: [Int], acc: Int) : Int {
+  match vs {
+    [] -> acc
+    [v, ...rest] -> max_id_loop(rest, if v > acc { v } else { acc })
+  }
+}
+
+# `start` must exceed every bound-var id in `vars`, otherwise the
+# substitution would map a bound id to itself (e.g. `SB(0, TyVarT(0))`
+# when env.fresh=0 and vars=[0]) and apply_ty would loop forever. By
+# clamping up to `max(vars) + 1`, fresh vars never alias any bound id.
 fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
   match sc {
     Scheme(vars, body) -> {
-      let start = env.fresh
-      let env1 = advance_fresh(env, list_length(vars))
+      let n = list_length(vars)
+      let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
+      let start = if env.fresh >= need { env.fresh } else { need }
+      let env1 = TyEnv { entries: env.entries, fresh: start + n }
       let sub = mk_fresh_subst(vars, start)
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
   }
+}
+
+# ====================================================================
+# bidirectional inference (M2d)
+# ====================================================================
+#
+# `synth` traverses an expression, returning the inferred `Ty` plus an
+# updated InferState (environment, substitution, error counter, record
+# registry). Type mismatches print a diagnostic at the offending source
+# position and bump the error counter; the walker keeps going with the
+# old substitution so a single failure doesn't cascade into a wall of
+# noise.
+#
+# Local `let` bindings are treated monomorphically (no generalisation);
+# user-level polymorphism continues to live in prelude and variant
+# schemes. TyAny acts as the unknown-fallback for AST shapes we cannot
+# yet resolve (unknown record names, records referenced without a
+# registry entry) and unifies with anything, so it never blocks
+# inference from making progress elsewhere.
+#
+# Output surfaced via the `--infer` flag: one line per `DFn` decl
+# giving its inferred function type. Unresolved type variables survive
+# as `?tN` (see `ty_to_string`).
+
+# ---- record registry ----
+#
+# Collected once per program. Lookup is linear in the number of record
+# declarations, which is tiny in practice.
+
+type RecInfo = RI(String, [String], [FieldDecl])
+
+fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] {
+  match rs {
+    [] -> None
+    [r, ...rest] -> match r {
+      RI(nm, _, _) -> if nm == target { Some(r) } else { rec_find_loop(rest, target) }
+    }
+  }
+}
+
+fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
+
+fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DType(_, nm, tps, body, _, _) -> match body {
+        TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs), ...acc])
+        _ -> collect_records_loop(rest, acc)
+      }
+      _ -> collect_records_loop(rest, acc)
+    }
+  }
+}
+
+fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
+
+# ---- inference state ----
+
+type InferState = { file: String, env: TyEnv, sub: Subst, recs: [RecInfo], errs: Int }
+
+type Inferred = { st: InferState, ty: Ty }
+
+type InferredList = { st: InferState, tys: [Ty] }
+
+fn infer_state_new(file: String, env: TyEnv, recs: [RecInfo]) : InferState =
+  InferState { file: file, env: env, sub: subst_empty(), recs: recs, errs: 0 }
+
+fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
+  InferState { file: st.file, env: new_env, sub: st.sub, recs: st.recs, errs: st.errs }
+
+fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
+  InferState { file: st.file, env: st.env, sub: new_sub, recs: st.recs, errs: st.errs }
+
+fn st_bump_err(st: InferState) : InferState =
+  InferState { file: st.file, env: st.env, sub: st.sub, recs: st.recs, errs: st.errs + 1 }
+
+fn mk_inferred(st: InferState, t: Ty) : Inferred = Inferred { st: st, ty: t }
+
+fn st_fresh_ty(st: InferState) : Inferred {
+  let n = st.env.fresh
+  mk_inferred(st_set_env(st, fresh_var(st.env)), TyVarT(n))
+}
+
+fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState {
+  match unify(a, b, st.sub) {
+    Some(s2) -> st_set_sub(st, s2)
+    None -> {
+      let a1 = apply_ty(st.sub, a)
+      let b1 = apply_ty(st.sub, b)
+      eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: type mismatch in #{what}")
+      eprint("  expected: #{ty_to_string(a1)}")
+      eprint("  found:    #{ty_to_string(b1)}")
+      st_bump_err(st)
+    }
+  }
+}
+
+fn st_instantiate(st: InferState, sc: TyScheme) : Inferred {
+  let inst = instantiate(st.env, sc)
+  mk_inferred(st_set_env(st, inst.env), inst.ty)
+}
+
+# Lexically scope a sub-walk: entries added during `inner` are dropped,
+# but the fresh counter, substitution, record registry, and error
+# counter propagate back to the caller.
+fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
+  InferState {
+    file: outer.file,
+    env: TyEnv { entries: outer.env.entries, fresh: inner.env.fresh },
+    sub: inner.sub,
+    recs: inner.recs,
+    errs: inner.errs
+  }
+
+# ---- parameter typing ----
+
+fn param_ty_or_fresh(st: InferState, pm: Param) : Inferred {
+  match pm.ptype {
+    Some(te) -> mk_inferred(st, resolve_ty(te))
+    None     -> st_fresh_ty(st)
+  }
+}
+
+fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredList {
+  match ps {
+    [] -> InferredList { st: st, tys: list_reverse(acc) }
+    [pm, ...rest] -> {
+      let pr = param_ty_or_fresh(st, pm)
+      let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
+      let st2 = st_set_env(pr.st, env2)
+      add_infer_params_loop(st2, rest, [pr.ty, ...acc])
+    }
+  }
+}
+
+fn add_infer_params(st: InferState, ps: [Param]) : InferredList = add_infer_params_loop(st, ps, [])
+
+# ---- record instantiation ----
+
+type FTy = FT(String, Ty)
+
+type RecInst = { st: InferState, result_ty: Ty, fields: [FTy] }
+
+fn rec_tpbinds_loop(tps: [String], start: Int, i: Int, acc: [TPBind]) : [TPBind] {
+  match tps {
+    [] -> list_reverse(acc)
+    [n, ...rest] -> rec_tpbinds_loop(rest, start, i + 1, [TPB(n, start + i), ...acc])
+  }
+}
+
+fn rec_field_tys(fs: [FieldDecl], binds: [TPBind]) : [FTy] {
+  match fs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FD(nm, te) -> [FT(nm, resolve_ty_with_tparams(te, binds)), ...rec_field_tys(rest, binds)]
+    }
+  }
+}
+
+fn fresh_tv_range_loop(start: Int, n: Int, i: Int, acc: [Ty]) : [Ty] {
+  if i >= n { list_reverse(acc) }
+  else { fresh_tv_range_loop(start, n, i + 1, [TyVarT(start + i), ...acc]) }
+}
+
+fn fresh_tv_range(start: Int, n: Int) : [Ty] = fresh_tv_range_loop(start, n, 0, [])
+
+fn rec_instantiate(st: InferState, ri: RecInfo) : RecInst {
+  match ri {
+    RI(nm, tps, fs) -> {
+      let start = st.env.fresh
+      let n = list_length(tps)
+      let env2 = advance_fresh(st.env, n)
+      let binds = rec_tpbinds_loop(tps, start, 0, [])
+      let flds = rec_field_tys(fs, binds)
+      let atys = fresh_tv_range(start, n)
+      RecInst {
+        st: st_set_env(st, env2),
+        result_ty: TyCon(nm, atys),
+        fields: flds
+      }
+    }
+  }
+}
+
+fn fty_find_loop(fs: [FTy], target: String) : Option[Ty] {
+  match fs {
+    [] -> None
+    [f, ...rest] -> match f {
+      FT(nm, t) -> if nm == target { Some(t) } else { fty_find_loop(rest, target) }
+    }
+  }
+}
+
+fn fty_find(fs: [FTy], target: String) : Option[Ty] = fty_find_loop(fs, target)
+
+# ---- the walker ----
+
+fn synth(st: InferState, e: Expr) : Inferred {
+  match e.kind {
+    EInt(_)        -> mk_inferred(st, TyInt)
+    EReal(_)       -> mk_inferred(st, TyReal)
+    EBool(_)       -> mk_inferred(st, TyBool)
+    EChar(_)       -> mk_inferred(st, TyChar)
+    EStr(_, _)     -> mk_inferred(st, TyString)
+    EUnit          -> mk_inferred(st, TyUnit)
+    EUnder         -> mk_inferred(st, TyAny)
+    EPlaceholder   -> mk_inferred(st, TyAny)
+    EVar(nm)       -> match ty_env_lookup(st.env, nm) {
+      Some(sc) -> st_instantiate(st, sc)
+      None     -> mk_inferred(st, TyAny)
+    }
+    ECall(callee, args_)       -> synth_call(st, callee, args_, e.line, e.col)
+    EField(obj, fnm)           -> synth_field(st, obj, fnm, e.line, e.col)
+    EIndex(coll, ix)           -> synth_index(st, coll, ix, e.line, e.col)
+    EBinop(op, l, r)           -> synth_binop(st, op, l, r, e.line, e.col)
+    EUnop(op, x)               -> synth_unop(st, op, x, e.line, e.col)
+    EIf(c, t_, eo)             -> synth_if(st, c, t_, eo, e.line, e.col)
+    EMatch(scr, arms)          -> synth_match(st, scr, arms, e.line, e.col)
+    ELambda(ps, body)          -> synth_lambda(st, ps, body, e.line, e.col)
+    ERecordLit(nm, fis)        -> synth_record_lit(st, nm, fis, e.line, e.col)
+    EList(els)                 -> synth_list_expr(st, els, e.line, e.col)
+    ERange(lo, hi, stp)        -> synth_range(st, lo, hi, stp, e.line, e.col)
+    EBlock(stmts, tail)        -> synth_block(st, stmts, tail, e.line, e.col)
+    EPipe(lhs, rhs)            -> synth_pipe(st, lhs, rhs, e.line, e.col)
+  }
+}
+
+fn synth_many(st: InferState, es: [Expr]) : InferredList {
+  match es {
+    [] -> InferredList { st: st, tys: [] }
+    [x, ...rest] -> {
+      let r = synth(st, x)
+      let rr = synth_many(r.st, rest)
+      InferredList { st: rr.st, tys: [r.ty, ...rr.tys] }
+    }
+  }
+}
+
+fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred {
+  let rc = synth(st, callee)
+  let ra = synth_many(rc.st, args_)
+  let rv = st_fresh_ty(ra.st)
+  let expected = fn_ty(ra.tys, rv.ty)
+  let st2 = st_unify(rv.st, rc.ty, expected, "function call", line, col)
+  mk_inferred(st2, apply_ty(st2.sub, rv.ty))
+}
+
+fn synth_field(st: InferState, obj: Expr, fnm: String, line: Int, col: Int) : Inferred {
+  let r = synth(st, obj)
+  let applied = apply_ty(r.st.sub, r.ty)
+  match applied {
+    TyCon(cname, _) -> match rec_find(r.st.recs, cname) {
+      None -> mk_inferred(r.st, TyAny)
+      Some(ri) -> {
+        let inst = rec_instantiate(r.st, ri)
+        let st1 = st_unify(inst.st, inst.result_ty, r.ty, "record field access", line, col)
+        match fty_find(inst.fields, fnm) {
+          Some(t) -> mk_inferred(st1, apply_ty(st1.sub, t))
+          None -> {
+            eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: no field '#{fnm}' on #{cname}")
+            mk_inferred(st_bump_err(st1), TyAny)
+          }
+        }
+      }
+    }
+    _ -> mk_inferred(r.st, TyAny)
+  }
+}
+
+fn synth_index(st: InferState, coll: Expr, ix: Expr, line: Int, col: Int) : Inferred {
+  let rc = synth(st, coll)
+  let ri = synth(rc.st, ix)
+  let st1 = st_unify(ri.st, ri.ty, TyInt, "list index", line, col)
+  let rv = st_fresh_ty(st1)
+  let st2 = st_unify(rv.st, rc.ty, TyListT(rv.ty), "list indexing", line, col)
+  mk_inferred(st2, apply_ty(st2.sub, rv.ty))
+}
+
+# Binop typing is deliberately coarse: numeric operators unify their
+# two operands and return the shared type (usually `Int`); comparison
+# operators unify operands and return `Bool`; logical `and`/`or` pin
+# both sides to `Bool`; `//` and `%` pin operands to `Int`.
+fn synth_binop(st: InferState, op: String, l: Expr, r: Expr, line: Int, col: Int) : Inferred {
+  let rl = synth(st, l)
+  let rr = synth(rl.st, r)
+  if op == "and" or op == "or" {
+    let s1 = st_unify(rr.st, rl.ty, TyBool, "boolean operator", line, col)
+    let s2 = st_unify(s1, rr.ty, TyBool, "boolean operator", line, col)
+    mk_inferred(s2, TyBool)
+  } else if op == "==" or op == "!=" {
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
+    mk_inferred(s1, TyBool)
+  } else if op == "<" or op == ">" or op == "<=" or op == ">=" {
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, "comparison", line, col)
+    mk_inferred(s1, TyBool)
+  } else if op == "//" or op == "%" {
+    let s1 = st_unify(rr.st, rl.ty, TyInt, "integer arithmetic", line, col)
+    let s2 = st_unify(s1, rr.ty, TyInt, "integer arithmetic", line, col)
+    mk_inferred(s2, TyInt)
+  } else {
+    let what = string_concat("arithmetic operator '", string_concat(op, "'"))
+    let s1 = st_unify(rr.st, rl.ty, rr.ty, what, line, col)
+    mk_inferred(s1, apply_ty(s1.sub, rl.ty))
+  }
+}
+
+fn synth_unop(st: InferState, op: String, x: Expr, line: Int, col: Int) : Inferred {
+  let r = synth(st, x)
+  if op == "not" {
+    let s1 = st_unify(r.st, r.ty, TyBool, "logical 'not'", line, col)
+    mk_inferred(s1, TyBool)
+  } else {
+    mk_inferred(r.st, r.ty)
+  }
+}
+
+fn synth_if(st: InferState, c: Expr, t_: Expr, eo: Option[Expr], line: Int, col: Int) : Inferred {
+  let rc = synth(st, c)
+  let s1 = st_unify(rc.st, rc.ty, TyBool, "if condition", line, col)
+  let rt = synth(s1, t_)
+  match eo {
+    None -> mk_inferred(rt.st, TyUnit)
+    Some(ee) -> {
+      let re = synth(rt.st, ee)
+      let s2 = st_unify(re.st, rt.ty, re.ty, "if/else branches", line, col)
+      mk_inferred(s2, apply_ty(s2.sub, rt.ty))
+    }
+  }
+}
+
+fn synth_lambda(st: InferState, ps: [Param], body: Expr, line: Int, col: Int) : Inferred {
+  let outer = st
+  let added = add_infer_params(st, ps)
+  let rb = synth(added.st, body)
+  let st2 = st_restore_entries(outer, rb.st)
+  mk_inferred(st2, fn_ty(apply_tys(st2.sub, added.tys), apply_ty(st2.sub, rb.ty)))
+}
+
+fn synth_list_expr(st: InferState, els: [ListElem], line: Int, col: Int) : Inferred {
+  let rv = st_fresh_ty(st)
+  let s1 = synth_list_elems(rv.st, els, rv.ty, line, col)
+  mk_inferred(s1, TyListT(apply_ty(s1.sub, rv.ty)))
+}
+
+fn synth_list_elems(st: InferState, els: [ListElem], elem: Ty, line: Int, col: Int) : InferState {
+  match els {
+    [] -> st
+    [el, ...rest] -> match el {
+      ElPlain(ex) -> {
+        let r = synth(st, ex)
+        let s1 = st_unify(r.st, elem, r.ty, "list element", line, col)
+        synth_list_elems(s1, rest, elem, line, col)
+      }
+      ElSpread(ex) -> {
+        let r = synth(st, ex)
+        let s1 = st_unify(r.st, TyListT(elem), r.ty, "list spread", line, col)
+        synth_list_elems(s1, rest, elem, line, col)
+      }
+    }
+  }
+}
+
+fn synth_range(st: InferState, lo: Expr, hi: Expr, stp: Option[Expr], line: Int, col: Int) : Inferred {
+  let rl = synth(st, lo)
+  let s1 = st_unify(rl.st, rl.ty, TyInt, "range start", line, col)
+  let rh = synth(s1, hi)
+  let s2 = st_unify(rh.st, rh.ty, TyInt, "range end", line, col)
+  let s3 = match stp {
+    None -> s2
+    Some(se) -> {
+      let rs_ = synth(s2, se)
+      st_unify(rs_.st, rs_.ty, TyInt, "range step", line, col)
+    }
+  }
+  mk_inferred(s3, TyListT(TyInt))
+}
+
+# `x |> f(y, z)` desugars to `f(x, y, z)`; a non-call rhs is treated
+# as a unary function applied to lhs.
+fn synth_pipe(st: InferState, lhs: Expr, rhs: Expr, line: Int, col: Int) : Inferred {
+  match rhs.kind {
+    ECall(f, pa) -> synth_call(st, f, [lhs, ...pa], line, col)
+    _ -> synth_call(st, rhs, [lhs], line, col)
+  }
+}
+
+fn synth_record_lit(st: InferState, nm: String, fis: [FieldInit], line: Int, col: Int) : Inferred {
+  match rec_find(st.recs, nm) {
+    None -> {
+      let s1 = synth_field_inits(st, fis, [], line, col)
+      mk_inferred(s1, TyCon(nm, []))
+    }
+    Some(ri) -> {
+      let inst = rec_instantiate(st, ri)
+      let s2 = synth_field_inits(inst.st, fis, inst.fields, line, col)
+      mk_inferred(s2, apply_ty(s2.sub, inst.result_ty))
+    }
+  }
+}
+
+fn synth_field_inits(st: InferState, fis: [FieldInit], fields: [FTy], line: Int, col: Int) : InferState {
+  match fis {
+    [] -> st
+    [fi, ...rest] -> match fi {
+      FI(fnm, ex) -> {
+        let r = synth(st, ex)
+        let s1 = match fty_find(fields, fnm) {
+          None -> r.st
+          Some(ft) -> {
+            let what = string_concat("record field '", string_concat(fnm, "'"))
+            st_unify(r.st, ft, r.ty, what, line, col)
+          }
+        }
+        synth_field_inits(s1, rest, fields, line, col)
+      }
+    }
+  }
+}
+
+fn synth_block(st: InferState, stmts: [Stmt], tail: Option[Expr], line: Int, col: Int) : Inferred {
+  let outer = st
+  let after = synth_stmts(st, stmts)
+  let rt = match tail {
+    None     -> mk_inferred(after, TyUnit)
+    Some(te) -> synth(after, te)
+  }
+  let st2 = st_restore_entries(outer, rt.st)
+  mk_inferred(st2, apply_ty(st2.sub, rt.ty))
+}
+
+fn synth_stmts(st: InferState, stmts: [Stmt]) : InferState {
+  match stmts {
+    [] -> st
+    [one, ...rest] -> synth_stmts(synth_stmt(st, one), rest)
+  }
+}
+
+fn synth_stmt(st: InferState, stmt: Stmt) : InferState {
+  match stmt {
+    SLet(pat, ann, rhs) -> {
+      let rr = synth(st, rhs)
+      let binding = match ann {
+        None -> mk_inferred(rr.st, rr.ty)
+        Some(te) -> {
+          let declared = resolve_ty(te)
+          let s1 = st_unify(rr.st, declared, rr.ty, "let annotation", pat.line, pat.col)
+          mk_inferred(s1, declared)
+        }
+      }
+      check_pattern(binding.st, pat, binding.ty)
+    }
+    SAssert(cond, _) -> {
+      let rc = synth(st, cond)
+      st_unify(rc.st, rc.ty, TyBool, "assert condition", cond.line, cond.col)
+    }
+    SExprStmt(ex) -> {
+      let r = synth(st, ex)
+      r.st
+    }
+  }
+}
+
+# ---- patterns ----
+
+fn check_pattern(st: InferState, pat: Pattern, expected: Ty) : InferState {
+  match pat.pkind {
+    PWild      -> st
+    PBind(nm)  -> {
+      let env2 = ty_env_add(st.env, nm, mono(apply_ty(st.sub, expected)))
+      st_set_env(st, env2)
+    }
+    PLit(lit)  -> {
+      let r = synth(st, lit)
+      st_unify(r.st, expected, r.ty, "literal pattern", pat.line, pat.col)
+    }
+    PList(subpats, rest_opt) -> {
+      let rv = st_fresh_ty(st)
+      let s1 = st_unify(rv.st, expected, TyListT(rv.ty), "list pattern", pat.line, pat.col)
+      let s2 = check_list_subpats(s1, subpats, rv.ty)
+      match rest_opt {
+        None -> s2
+        Some(rnm) -> {
+          let env2 = ty_env_add(s2.env, rnm, mono(TyListT(apply_ty(s2.sub, rv.ty))))
+          st_set_env(s2, env2)
+        }
+      }
+    }
+    PVariant(cname, sub_pats) ->
+      check_variant_pattern(st, cname, sub_pats, expected, pat.line, pat.col)
+    PVariantRecord(cname, pfs) ->
+      check_variant_record_pattern(st, cname, pfs, expected, pat.line, pat.col)
+    PRecord(pfs) ->
+      check_record_pattern(st, pfs, expected, pat.line, pat.col)
+  }
+}
+
+fn check_list_subpats(st: InferState, ps: [Pattern], elem: Ty) : InferState {
+  match ps {
+    [] -> st
+    [p, ...rest] -> check_list_subpats(check_pattern(st, p, elem), rest, elem)
+  }
+}
+
+fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expected: Ty, line: Int, col: Int) : InferState {
+  match ty_env_lookup(st.env, cname) {
+    None -> check_unknown_subpats(st, subpats)
+    Some(sc) -> {
+      let inst = st_instantiate(st, sc)
+      match inst.ty {
+        TyFnT(aps, ret) -> {
+          let what = string_concat("variant pattern '", string_concat(cname, "'"))
+          let s1 = st_unify(inst.st, expected, ret, what, line, col)
+          check_subpat_list(s1, subpats, aps, line, col)
+        }
+        _ -> {
+          let what = string_concat("variant pattern '", string_concat(cname, "'"))
+          let s1 = st_unify(inst.st, expected, inst.ty, what, line, col)
+          match subpats {
+            [] -> s1
+            _  -> {
+              eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant '#{cname}' takes no args but pattern has #{int_to_string(list_length(subpats))}")
+              st_bump_err(s1)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn check_unknown_subpats(st: InferState, ps: [Pattern]) : InferState {
+  match ps {
+    [] -> st
+    [p, ...rest] -> check_unknown_subpats(check_pattern(st, p, TyAny), rest)
+  }
+}
+
+fn check_subpat_list(st: InferState, ps: [Pattern], tys: [Ty], line: Int, col: Int) : InferState {
+  match ps {
+    [] -> match tys {
+      [] -> st
+      _  -> {
+        eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant pattern arity mismatch")
+        st_bump_err(st)
+      }
+    }
+    [p, ...pr] -> match tys {
+      [] -> {
+        eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: variant pattern arity mismatch")
+        st_bump_err(st)
+      }
+      [t, ...tr] -> check_subpat_list(check_pattern(st, p, t), pr, tr, line, col)
+    }
+  }
+}
+
+fn check_variant_record_pattern(st: InferState, cname: String, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState {
+  match rec_find(st.recs, cname) {
+    None -> check_unknown_pfields(st, pfs)
+    Some(ri) -> {
+      let inst = rec_instantiate(st, ri)
+      let what = string_concat("record pattern '", string_concat(cname, "'"))
+      let s1 = st_unify(inst.st, expected, inst.result_ty, what, line, col)
+      check_pfield_list(s1, pfs, inst.fields, line, col)
+    }
+  }
+}
+
+fn check_record_pattern(st: InferState, pfs: [PField], expected: Ty, line: Int, col: Int) : InferState {
+  let applied = apply_ty(st.sub, expected)
+  match applied {
+    TyCon(nm, _) -> match rec_find(st.recs, nm) {
+      None -> check_unknown_pfields(st, pfs)
+      Some(ri) -> {
+        let inst = rec_instantiate(st, ri)
+        let s1 = st_unify(inst.st, expected, inst.result_ty, "record pattern", line, col)
+        check_pfield_list(s1, pfs, inst.fields, line, col)
+      }
+    }
+    _ -> check_unknown_pfields(st, pfs)
+  }
+}
+
+fn check_unknown_pfields(st: InferState, pfs: [PField]) : InferState {
+  match pfs {
+    [] -> st
+    [pf, ...rest] -> match pf {
+      PField(_, sub, _) -> check_unknown_pfields(check_pattern(st, sub, TyAny), rest)
+    }
+  }
+}
+
+fn check_pfield_list(st: InferState, pfs: [PField], fields: [FTy], line: Int, col: Int) : InferState {
+  match pfs {
+    [] -> st
+    [pf, ...rest] -> match pf {
+      PField(fnm, sub, _) -> {
+        let s1 = match fty_find(fields, fnm) {
+          Some(ft) -> check_pattern(st, sub, ft)
+          None -> {
+            eprint("#{st.file}:#{int_to_string(line)}:#{int_to_string(col)}: no field '#{fnm}' in record pattern")
+            check_pattern(st_bump_err(st), sub, TyAny)
+          }
+        }
+        check_pfield_list(s1, rest, fields, line, col)
+      }
+    }
+  }
+}
+
+# ---- match ----
+
+fn synth_match(st: InferState, scr: Expr, arms: [Arm], line: Int, col: Int) : Inferred {
+  let rs_ = synth(st, scr)
+  let rv = st_fresh_ty(rs_.st)
+  let s1 = synth_arms(rv.st, arms, rs_.ty, rv.ty, line, col)
+  mk_inferred(s1, apply_ty(s1.sub, rv.ty))
+}
+
+fn synth_arms(st: InferState, arms: [Arm], scrut_ty: Ty, body_ty: Ty, line: Int, col: Int) : InferState {
+  match arms {
+    [] -> st
+    [a, ...rest] -> match a {
+      Arm(pat, guard, body) -> {
+        let outer = st
+        let s_p = check_pattern(st, pat, scrut_ty)
+        let s_g = match guard {
+          None -> s_p
+          Some(gx) -> {
+            let rg = synth(s_p, gx)
+            st_unify(rg.st, rg.ty, TyBool, "match guard", gx.line, gx.col)
+          }
+        }
+        let rb = synth(s_g, body)
+        let s_b = st_unify(rb.st, body_ty, rb.ty, "match arm", body.line, body.col)
+        let s_scoped = st_restore_entries(outer, s_b)
+        synth_arms(s_scoped, rest, scrut_ty, body_ty, line, col)
+      }
+    }
+  }
+}
+
+# ---- per-decl entry + dumper ----
+
+fn print_inferred_fn(nm: String, final_ret: Ty, param_tys: [Ty], line: Int, col: Int) : Unit {
+  let fn_t = fn_ty(param_tys, final_ret)
+  print("fn #{nm} : #{ty_to_string(fn_t)} @#{int_to_string(line)}:#{int_to_string(col)}")
+}
+
+fn infer_decl(file: String, env: TyEnv, recs: [RecInfo], d: Decl, verbose: Bool) : Int {
+  match d {
+    DFn(_, nm, ps, opt_ret, body, line, col) -> {
+      let st0 = infer_state_new(file, env, recs)
+      let added = add_infer_params(st0, ps)
+      let rb = synth(added.st, body)
+      let declared_ret = match opt_ret {
+        Some(rty) -> resolve_ty(rty)
+        None      -> TyUnit
+      }
+      let what = string_concat("return type of ", nm)
+      let st1 = st_unify(rb.st, declared_ret, rb.ty, what, line, col)
+      let _ = if verbose {
+        print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
+      } else { () }
+      st1.errs
+    }
+    _ -> 0
+  }
+}
+
+fn infer_all_loop(file: String, env: TyEnv, recs: [RecInfo], ds: [Decl], verbose: Bool, acc: Int) : Int {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> infer_all_loop(file, env, recs, rest, verbose,
+                                   acc + infer_decl(file, env, recs, d, verbose))
+  }
+}
+
+fn dump_infer(file: String, decls: [Decl]) : Int {
+  let env = build_ty_env(decls)
+  let recs = collect_records(decls)
+  infer_all_loop(file, env, recs, decls, true, 0)
+}
+
+fn check_infer(file: String, decls: [Decl]) : Int {
+  let env = build_ty_env(decls)
+  let recs = collect_records(decls)
+  infer_all_loop(file, env, recs, decls, false, 0)
 }
 
 # ====================================================================
@@ -5096,6 +5803,8 @@ type Mode
   | MAst
   | MTypes
   | MEnv
+  | MInfer
+  | MCheck
   | MTest
   | MHelp
 
@@ -5122,6 +5831,10 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MTypes))
       } else if a == "--env" {
         parse_cli_loop(more, cli_with_mode(opts, MEnv))
+      } else if a == "--infer" {
+        parse_cli_loop(more, cli_with_mode(opts, MInfer))
+      } else if a == "--check" {
+        parse_cli_loop(more, cli_with_mode(opts, MCheck))
       } else if a == "--test" {
         parse_cli_loop(more, cli_with_mode(opts, MTest))
       } else if a == "-h" or a == "--help" {
@@ -5152,6 +5865,8 @@ fn usage() : Unit {
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --types            print declared top-level signatures and exit")
   eprint("  --env              print the full type environment (prelude + variants + decls)")
+  eprint("  --infer            run HM inference over each fn body and dump the inferred type")
+  eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --test             emit C wired to a test runner (runs test blocks)")
   eprint("  -h, --help         this help")
 }
@@ -5194,6 +5909,11 @@ fn compile_source(path: String, mode: Mode, src: String, prelude_decls: [Decl]) 
               MAst -> { dump_program(all_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }
               MEnv -> { dump_env(build_ty_env(all_decls)); 0 }
+              MInfer -> dump_infer(path, all_decls)
+              MCheck -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { check_infer(path, all_decls) }
+              }
               _ -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }

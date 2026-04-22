@@ -59,6 +59,32 @@ test-env: $(TARGET) build
 	    || { echo "env FAIL $$name"; exit 1; }; \
 	done
 
+# --infer smoke test: HM inference over every top-level fn body. Each
+# example is expected to pass without unification errors; stderr lines
+# other than routine diagnostics would indicate a regression.
+test-infer: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --infer $$f > build/s2-$$name.infer 2> build/s2-$$name.infer.err \
+	    && [ ! -s build/s2-$$name.infer.err ] \
+	    && echo "infer OK $$name" \
+	    || { echo "infer FAIL $$name"; cat build/s2-$$name.infer.err; exit 1; }; \
+	done
+
+# --check: name resolution + HM inference, with no --infer noise on stdout.
+# A clean run must leave both stdout and stderr empty.
+test-infer-check: $(TARGET) build
+	@set -e; \
+	for f in ../examples/minimal/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) --check $$f > build/s2-$$name.check 2> build/s2-$$name.check.err \
+	    && [ ! -s build/s2-$$name.check ] \
+	    && [ ! -s build/s2-$$name.check.err ] \
+	    && echo "check-types OK $$name" \
+	    || { echo "check-types FAIL $$name"; cat build/s2-$$name.check.err; exit 1; }; \
+	done
+
 # Checker: undefined-name resolution runs clean on every example.
 test-check: $(TARGET) build
 	@set -e; \
@@ -112,7 +138,7 @@ selfhost: $(TARGET) build
 	  && echo "self-hosting fixed point: OK" \
 	  || { echo "self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-check test-run test-blocks
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-check test-run test-blocks
 
 clean:
 	rm -rf build $(TARGET)
