@@ -4,7 +4,7 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
-.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks test-holes selfhost
+.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks test-holes test-modules test-modules-path selfhost
 
 all: $(TARGET)
 
@@ -214,6 +214,34 @@ test-modules: $(TARGET) build
 	  && echo "modules OK" \
 	  || { echo "modules DIFF"; diff build/modules-c.out build/modules-llvm.out; exit 1; }
 
+# M6.2 search-path smoke test: `examples/modules-path/main.kai`
+# imports `shared.helpers`, which lives under
+# `examples/modules-path-lib/`. Without `--path`, the compile must
+# fail with "cannot open module"; with `--path`, both backends must
+# produce identical output matching the golden "42\nKAI!\n".
+test-modules-path: $(TARGET) build
+	@set -e; \
+	MAIN=../examples/modules-path/main.kai; \
+	LIB=../examples/modules-path-lib; \
+	rc=0; ./$(TARGET) $$MAIN > /dev/null 2> build/modules-path.miss.err || rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+	  echo "modules-path FAIL (expected error without --path)"; exit 1; \
+	fi; \
+	grep -q "cannot open module" build/modules-path.miss.err \
+	  || { echo "modules-path FAIL (wrong error message)"; cat build/modules-path.miss.err; exit 1; }; \
+	./$(TARGET) --path $$LIB $$MAIN > build/modules-path.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/modules-path.c -o build/modules-path-c; \
+	./build/modules-path-c > build/modules-path-c.out; \
+	./$(TARGET) --path $$LIB --emit=llvm $$MAIN > build/modules-path.ll; \
+	clang -w -I ../stage0 build/modules-path.ll ../stage0/runtime_llvm.c -o build/modules-path-llvm; \
+	./build/modules-path-llvm > build/modules-path-llvm.out; \
+	diff -q build/modules-path-c.out build/modules-path-llvm.out > /dev/null \
+	  || { echo "modules-path DIFF"; diff build/modules-path-c.out build/modules-path-llvm.out; exit 1; }; \
+	printf '42\nKAI!\n' > build/modules-path.expected; \
+	diff -q build/modules-path-c.out build/modules-path.expected > /dev/null \
+	  && echo "modules-path OK" \
+	  || { echo "modules-path UNEXPECTED"; cat build/modules-path-c.out; exit 1; }
+
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
@@ -276,7 +304,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-holes
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes
 
 clean:
 	rm -rf build $(TARGET)

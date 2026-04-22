@@ -8420,33 +8420,68 @@ fn non_import_decls(ds: [Decl]) : [Decl] {
   }
 }
 
-# Dotted module paths (`math.arith`) are resolved relative to the
-# *project root*, which we approximate as the directory of the root
-# file passed on the command line. The same `base_dir` is threaded
-# through every recursive load — a module nested in `math/` that
-# writes `import math.arith` still means "relative to the root",
-# not "relative to my own directory".
-fn resolve_module(base_dir: String, mod_path: String, rs: ResolveState) : ResolveState {
-  let abs_path = module_to_path(base_dir, mod_path)
-  if rs_has(rs, abs_path) { rs }
-  else {
-    let rs1 = rs_mark(rs, abs_path)
-    match read_file(abs_path) {
-      Err(msg) -> {
-        eprint("kaic: cannot open module '#{mod_path}' (#{abs_path}): #{msg}")
-        rs1
+# Dotted module paths (`math.arith`) are resolved in order:
+#   1. relative to the root file's directory (`base_dir`), then
+#   2. each directory given via `--path`, in the order passed.
+# The first candidate that exists wins. If none do, the caller
+# reports the original `base_dir` path so the error message points
+# to the most obvious location.
+type CandidateFile = CF(String, Option[String])
+#                      path    source (if read succeeded)
+
+fn try_candidate(abs_path: String) : Option[String] {
+  match read_file(abs_path) {
+    Err(_)  -> None
+    Ok(src) -> Some(src)
+  }
+}
+
+fn try_candidates_loop(mod_path: String, dirs: [String], first_tried: String) : CandidateFile {
+  match dirs {
+    [] -> CF(first_tried, None)
+    [d, ...rest] -> {
+      let p = module_to_path(d, mod_path)
+      match try_candidate(p) {
+        Some(src) -> CF(p, Some(src))
+        None      -> try_candidates_loop(mod_path, rest, first_tried)
       }
-      Ok(src) -> {
-        let tokens = tokenize(src)
-        let lex_errs = report_errors(abs_path, src, tokens)
-        if lex_errs != 0 { rs1 }
-        else {
-          let parsed = parse_program(abs_path, src, tokens)
-          match parsed.decls {
-            None -> rs1
-            Some(decls) -> {
-              let rs2 = process_imports(base_dir, decls, rs1)
-              rs_append_decls(rs2, non_import_decls(decls))
+    }
+  }
+}
+
+fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) : CandidateFile {
+  let first_try = module_to_path(base_dir, mod_path)
+  match try_candidate(first_try) {
+    Some(src) -> CF(first_try, Some(src))
+    None      -> try_candidates_loop(mod_path, search_paths, first_try)
+  }
+}
+
+fn resolve_module(base_dir: String, mod_path: String, search_paths: [String], rs: ResolveState) : ResolveState {
+  let cf = find_module_file(base_dir, mod_path, search_paths)
+  match cf {
+    CF(abs_path, opt_src) -> {
+      if rs_has(rs, abs_path) { rs }
+      else {
+        let rs1 = rs_mark(rs, abs_path)
+        match opt_src {
+          None -> {
+            eprint("kaic: cannot open module '#{mod_path}' (tried #{abs_path}): no such file")
+            rs1
+          }
+          Some(src) -> {
+            let tokens = tokenize(src)
+            let lex_errs = report_errors(abs_path, src, tokens)
+            if lex_errs != 0 { rs1 }
+            else {
+              let parsed = parse_program(abs_path, src, tokens)
+              match parsed.decls {
+                None -> rs1
+                Some(decls) -> {
+                  let rs2 = process_imports(base_dir, decls, search_paths, rs1)
+                  rs_append_decls(rs2, non_import_decls(decls))
+                }
+              }
             }
           }
         }
@@ -8455,19 +8490,19 @@ fn resolve_module(base_dir: String, mod_path: String, rs: ResolveState) : Resolv
   }
 }
 
-fn process_imports(base_dir: String, decls: [Decl], rs: ResolveState) : ResolveState {
+fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], rs: ResolveState) : ResolveState {
   match decls {
     [] -> rs
     [d, ...rest] -> {
       let rs1 = match d {
         DImport(ik, _, _) -> match ik {
-          IkPath(p)         -> resolve_module(base_dir, p, rs)
-          IkAlias(p, _)     -> resolve_module(base_dir, p, rs)
-          IkSelective(p, _) -> resolve_module(base_dir, p, rs)
+          IkPath(p)         -> resolve_module(base_dir, p, search_paths, rs)
+          IkAlias(p, _)     -> resolve_module(base_dir, p, search_paths, rs)
+          IkSelective(p, _) -> resolve_module(base_dir, p, search_paths, rs)
         }
         _ -> rs
       }
-      process_imports(base_dir, rest, rs1)
+      process_imports(base_dir, rest, search_paths, rs1)
     }
   }
 }
@@ -8475,10 +8510,10 @@ fn process_imports(base_dir: String, decls: [Decl], rs: ResolveState) : ResolveS
 # Given a root file's path and its parsed decls, return the flat
 # decl list with every (transitively-)imported module's decls
 # prepended in topological order and with every DImport stripped.
-fn expand_imports(root_path: String, root_decls: [Decl]) : [Decl] {
+fn expand_imports(root_path: String, search_paths: [String], root_decls: [Decl]) : [Decl] {
   let base_dir = dir_of(root_path)
   let rs0 = ResolveState { visited: [root_path], decls: [] }
-  let rs1 = process_imports(base_dir, root_decls, rs0)
+  let rs1 = process_imports(base_dir, root_decls, search_paths, rs0)
   list_append(rs1.decls, non_import_decls(root_decls))
 }
 
@@ -8502,19 +8537,29 @@ type Mode
   | MTest
   | MHelp
 
-type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String], strict_holes: Bool }
+type CliOptions = { mode: Mode, path: Option[String], prelude: Option[String],
+                    strict_holes: Bool, search_paths: [String] }
 
 fn cli_with_mode(opts: CliOptions, m: Mode) : CliOptions =
-  CliOptions { mode: m, path: opts.path, prelude: opts.prelude, strict_holes: opts.strict_holes }
+  CliOptions { mode: m, path: opts.path, prelude: opts.prelude,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
 
 fn cli_with_path(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude, strict_holes: opts.strict_holes }
+  CliOptions { mode: opts.mode, path: Some(p), prelude: opts.prelude,
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
 
 fn cli_with_prelude(opts: CliOptions, p: String) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p), strict_holes: opts.strict_holes }
+  CliOptions { mode: opts.mode, path: opts.path, prelude: Some(p),
+               strict_holes: opts.strict_holes, search_paths: opts.search_paths }
 
 fn cli_with_strict_holes(opts: CliOptions) : CliOptions =
-  CliOptions { mode: opts.mode, path: opts.path, prelude: opts.prelude, strict_holes: true }
+  CliOptions { mode: opts.mode, path: opts.path, prelude: opts.prelude,
+               strict_holes: true, search_paths: opts.search_paths }
+
+fn cli_push_search_path(opts: CliOptions, sp: String) : CliOptions =
+  CliOptions { mode: opts.mode, path: opts.path, prelude: opts.prelude,
+               strict_holes: opts.strict_holes,
+               search_paths: list_append(opts.search_paths, [sp]) }
 
 fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
   match rest {
@@ -8556,6 +8601,14 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
             cli_with_mode(opts, MHelp)
           }
         }
+      } else if a == "--path" {
+        match more {
+          [p, ...rest2] -> parse_cli_loop(rest2, cli_push_search_path(opts, p))
+          [] -> {
+            eprint("kaic2: --path requires a directory argument")
+            cli_with_mode(opts, MHelp)
+          }
+        }
       } else {
         parse_cli_loop(more, cli_with_path(opts, a))
       }
@@ -8564,12 +8617,14 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
 }
 
 fn parse_cli(argv: [String]) : CliOptions {
-  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None, strict_holes: false })
+  parse_cli_loop(argv, CliOptions { mode: MDefault, path: None, prelude: None,
+                                    strict_holes: false, search_paths: [] })
 }
 
 fn usage() : Unit {
   eprint("usage: kaic2 [options] <file.kai>")
   eprint("  --prelude <file>   include <file>'s decls before the input")
+  eprint("  --path <dir>       add <dir> to the module search path (repeatable)")
   eprint("  --tokens           print the token stream and exit")
   eprint("  --ast              parse and print the AST and exit")
   eprint("  --types            print declared top-level signatures and exit")
@@ -8603,7 +8658,7 @@ fn load_prelude(path: String) : Option[[Decl]] {
   }
 }
 
-fn compile_source(path: String, mode: Mode, strict_holes: Bool, src: String, prelude_decls: [Decl]) : Int {
+fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
   match mode {
@@ -8619,7 +8674,7 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, src: String, pre
         match parsed.decls {
           None -> 1
           Some(own_decls) -> {
-            let expanded = expand_imports(path, own_decls)
+            let expanded = expand_imports(path, search_paths, own_decls)
             let all_decls = list_append(prelude_decls, expanded)
             match mode {
               MAst -> { dump_program(all_decls); 0 }
@@ -8691,7 +8746,7 @@ fn run(opts: CliOptions) : Int {
         match prelude_decls {
           None -> 1
           Some(pds) -> match read_file(p) {
-            Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, src, pds)
+            Ok(src) -> compile_source(p, opts.mode, opts.strict_holes, opts.search_paths, src, pds)
             Err(msg) -> { eprint("kaic1: #{p}: #{msg}"); 1 }
           }
         }
