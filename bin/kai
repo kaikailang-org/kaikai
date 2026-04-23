@@ -15,6 +15,12 @@
 
 set -eu
 
+# kaic1/kaic2 lex their input recursively (lex_loop is not TCO'd in
+# stage 0's C output). On ~10 k-line sources the default 8 MB thread
+# stack overflows. Bump to 32 MB; ignore failure on shells/systems
+# that reject it.
+ulimit -s 32768 2>/dev/null || true
+
 # Resolve script path portably (macOS lacks GNU readlink -f).
 SCRIPT="$0"
 case "$SCRIPT" in

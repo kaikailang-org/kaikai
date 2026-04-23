@@ -4,6 +4,12 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
+# kaic1/kaic2 run recursive passes (lex_loop and others) that stage 0's
+# emitter doesn't TCO. On stage 2's source (~9 k lines) those recurse
+# past the default 8 MB thread stack. Prepend this to any recipe that
+# feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
+STACK := ulimit -s 32768 2>/dev/null || true;
+
 .PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-modules test-modules-path selfhost
 
 all: $(TARGET)
@@ -15,14 +21,14 @@ build:
 	@mkdir -p build
 
 build/stage2.c: $(SRC) $(KAIC1) | build
-	$(KAIC1) $(SRC) > $@
+	$(STACK) $(KAIC1) $(SRC) > $@
 
 $(TARGET): build/stage2.c
 	$(CC) $(CFLAGS) -I ../stage0 $< -o $@
 
 # Token stream must match stage 1 (which already matches stage 0).
 test-tokens: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai ../stage1/compiler.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --tokens $$f | awk '{$$1=$$1; print}' > build/s2-$$name.tok; \
@@ -34,7 +40,7 @@ test-tokens: $(TARGET) build
 
 # --ast smoke test (format is indented, readable, not byte-compared).
 test-ast: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --ast $$f > build/s2-$$name.ast && echo "ast OK $$name" \
@@ -43,7 +49,7 @@ test-ast: $(TARGET) build
 
 # --types smoke test: every top-level decl gets a signature dumped.
 test-types: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --types $$f > build/s2-$$name.types && echo "types OK $$name" \
@@ -52,7 +58,7 @@ test-types: $(TARGET) build
 
 # --env smoke test: full type environment (prelude + variants + user decls).
 test-env: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) --env $$f > build/s2-$$name.env && echo "env OK $$name" \
@@ -122,7 +128,7 @@ test-infer-check: $(TARGET) build
 
 # Checker: undefined-name resolution runs clean on every example.
 test-check: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	for f in ../examples/minimal/*.kai $(SRC); do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > /dev/null \
@@ -282,7 +288,7 @@ test-holes: $(TARGET) build
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 selfhost: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	./$(TARGET) $(SRC) > build/kaic2b.c; \
 	$(CC) $(CFLAGS) -I ../stage0 build/kaic2b.c -o build/kaic2b; \
 	./build/kaic2b $(SRC) > build/kaic2c.c; \
@@ -296,7 +302,7 @@ selfhost: $(TARGET) build
 # byte-identical fixed point — the LLVM emitter must be a pure
 # function of the typed AST.
 selfhost-llvm: $(TARGET) build
-	@set -e; \
+	@$(STACK) set -e; \
 	./$(TARGET) --emit=llvm $(SRC) > build/kaic2-s1.ll; \
 	clang -w -I ../stage0 build/kaic2-s1.ll ../stage0/runtime_llvm.c -o build/kaic2-llvm-s1; \
 	./build/kaic2-llvm-s1 --emit=llvm $(SRC) > build/kaic2-s2.ll; \
