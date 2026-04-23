@@ -643,30 +643,56 @@ fn dump_tokens(src: String, tokens: [Token]) : Unit {
 # the ASCII-heavy code we compile, and easy to replace later with
 # a codepoint-aware locator.
 
-fn spaces(n: Int) : String = spaces_loop(n, "")
+# Build a string of `n` spaces in a single allocation via string_slice.
+# Sidesteps the O(n²) fold of string_concat(acc, " "). 128 is the
+# widest line-number gutter we plausibly print; grow on demand.
+fn spaces(n: Int) : String {
+  if n <= 0 { "" }
+  else if n <= 128 { string_slice(spaces_pool(), 0, n) }
+  else { string_concat(spaces_pool(), spaces(n - 128)) }
+}
 
-fn spaces_loop(n: Int, acc: String) : String =
-  if n <= 0 { acc } else { spaces_loop(n - 1, string_concat(acc, " ")) }
+fn spaces_pool() : String =
+  "                                                                                                                                "
 
 # Extract the `n`-th (1-indexed) line from `src`, without the trailing
-# newline. Returns None if `n` is out of range or `n <= 0`.
-fn nth_line(src: String, n: Int) : Option[String] =
-  if n <= 0 { None } else { nth_line_loop(src, 0, string_length(src), 1, n, "") }
+# newline. Two passes of char_at to locate [start, end) in the source,
+# then a single string_slice — avoids the O(m²) per-char acc build.
+fn nth_line(src: String, n: Int) : Option[String] {
+  if n <= 0 { None }
+  else {
+    let total = string_length(src)
+    let start = nth_line_start(src, 0, total, 1, n)
+    if start < 0 { None }
+    else {
+      let end = scan_to_newline(src, start, total)
+      Some(string_slice(src, start, end - start))
+    }
+  }
+}
 
-fn nth_line_loop(src: String, i: Int, total: Int, cur: Int, target: Int, acc: String) : Option[String] {
-  if i >= total { if cur == target { Some(acc) } else { None } }
+# Walk forward returning the byte offset where the target'th line
+# starts, or -1 if the source ends first.
+fn nth_line_start(src: String, i: Int, total: Int, cur: Int, target: Int) : Int {
+  if cur == target { i }
+  else if i >= total { -1 }
   else {
     match char_at(src, i) {
-      None -> if cur == target { Some(acc) } else { None }
+      None -> -1
       Some(c) -> {
-        if c == '\n' {
-          if cur == target { Some(acc) }
-          else { nth_line_loop(src, i + 1, total, cur + 1, target, "") }
-        } else {
-          if cur == target { nth_line_loop(src, i + 1, total, cur, target, string_concat(acc, "#{c}")) }
-          else { nth_line_loop(src, i + 1, total, cur, target, acc) }
-        }
+        if c == '\n' { nth_line_start(src, i + 1, total, cur + 1, target) }
+        else { nth_line_start(src, i + 1, total, cur, target) }
       }
+    }
+  }
+}
+
+fn scan_to_newline(src: String, i: Int, total: Int) : Int {
+  if i >= total { total }
+  else {
+    match char_at(src, i) {
+      None -> total
+      Some(c) -> if c == '\n' { i } else { scan_to_newline(src, i + 1, total) }
     }
   }
 }
