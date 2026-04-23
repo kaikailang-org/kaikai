@@ -2339,7 +2339,15 @@ fn parse_decl(p: Parser) : PDecl {
     if is_pub { err_d(p_error(p1, hd, "`pub` is not allowed on an import")) }
     else { parse_import_decl(p_advance(p1), hd) }
   } else {
-    err_d(p_error(p1, hd, "expected `fn`, `type`, `test`, or `import`"))
+    let base = "expected `fn`, `type`, `test`, or `import`"
+    let msg = if tk_is(hd.kind, TkIdent) {
+      let text = tok_source(p1.src, hd)
+      match closest_name(text, ["fn", "type", "test", "import", "pub"]) {
+        Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
+        None      -> base
+      }
+    } else { base }
+    err_d(p_error(p1, hd, msg))
   }
 }
 
