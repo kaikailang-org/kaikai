@@ -6492,8 +6492,80 @@ fn check_exhaustive(st: InferState, arms: [Arm], scr_ty: Ty, line: Int, col: Int
           }
         }
       }
+      TyListT(_) -> check_list_exhaustive(st, arms, line, col)
       _ -> st
     }
+  }
+}
+
+# A list match is exhaustive when (a) some unguarded arm matches the
+# empty list `[]` and (b) some unguarded arm matches at least one
+# non-empty shape. Any spread-bearing list pattern (`[_, ...rest]`,
+# `[a, b, ...rest]`, …) collectively covers every list of length ≥
+# its fixed portion; requiring one such arm is a pragmatic cover for
+# non-empty. Fixed-length arms alone leave gaps (e.g. `[a]` matches
+# size 1 only) — we flag that.
+
+fn arm_pat_empty_list(a: Arm) : Bool {
+  match a {
+    Arm(pat, guard, _) -> {
+      let unguarded = match guard { None -> true Some(_) -> false }
+      if not unguarded { false }
+      else { match pat.pkind {
+        PList(ps, rest_opt) -> match ps {
+          [] -> match rest_opt { None -> true Some(_) -> false }
+          _  -> false
+        }
+        _ -> false
+      } }
+    }
+  }
+}
+
+fn arm_pat_spread_list(a: Arm) : Bool {
+  match a {
+    Arm(pat, guard, _) -> {
+      let unguarded = match guard { None -> true Some(_) -> false }
+      if not unguarded { false }
+      else { match pat.pkind {
+        PList(_, rest_opt) -> match rest_opt {
+          Some(_) -> true
+          None    -> false
+        }
+        _ -> false
+      } }
+    }
+  }
+}
+
+# Direct loops rather than a higher-order `any_arm`; the LLVM
+# backend does not currently emit calls through fn-typed parameters,
+# and compiler.kai itself is part of the selfhost gate.
+fn arms_have_empty_list(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> if arm_pat_empty_list(a) { true } else { arms_have_empty_list(rest) }
+  }
+}
+
+fn arms_have_spread_list(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [a, ...rest] -> if arm_pat_spread_list(a) { true } else { arms_have_spread_list(rest) }
+  }
+}
+
+fn check_list_exhaustive(st: InferState, arms: [Arm], line: Int, col: Int) : InferState {
+  let has_empty  = arms_have_empty_list(arms)
+  let has_spread = arms_have_spread_list(arms)
+  if has_empty and has_spread { st }
+  else {
+    let missing = if has_empty { "non-empty lists (e.g. `[_, ...rest]`)" }
+                  else if has_spread { "the empty list `[]`" }
+                  else { "the empty list `[]` and non-empty lists (e.g. `[_, ...rest]`)" }
+    diag_error(st.file, line, col, "non-exhaustive match on list: missing #{missing}")
+    diag_help("cover both `[]` and a spread pattern, or add a wildcard `_` arm")
+    st_bump_err(st)
   }
 }
 
