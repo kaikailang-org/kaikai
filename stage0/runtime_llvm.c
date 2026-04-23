@@ -66,6 +66,15 @@ KaiValue *kaix_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures)
     return kai_closure(fn, arity, n_captures, captures);
 }
 
+/* Indirect call for a closure value held in a local binding. The LLVM
+   backend emits this when a ECall's head is a fn-typed parameter or
+   let binding — we can't lower it as a direct `call @kai_<name>`
+   because the name resolves to no global symbol. kai_apply checks the
+   tag and dispatches to clo->as.clo.fn(clo, args, n). */
+KaiValue *kaix_apply(KaiValue *clo, int32_t n, KaiValue **args) {
+    return kai_apply(clo, n, args);
+}
+
 /* Prelude thunks exported as regular symbols so LLVM IR can take
    their address to build closures passed into higher-order prelude
    calls. One per prelude entry we may reference as a value. */

@@ -6538,26 +6538,16 @@ fn arm_pat_spread_list(a: Arm) : Bool {
   }
 }
 
-# Direct loops rather than a higher-order `any_arm`; the LLVM
-# backend does not currently emit calls through fn-typed parameters,
-# and compiler.kai itself is part of the selfhost gate.
-fn arms_have_empty_list(arms: [Arm]) : Bool {
+fn any_arm(arms: [Arm], pred: (Arm) -> Bool) : Bool {
   match arms {
     [] -> false
-    [a, ...rest] -> if arm_pat_empty_list(a) { true } else { arms_have_empty_list(rest) }
-  }
-}
-
-fn arms_have_spread_list(arms: [Arm]) : Bool {
-  match arms {
-    [] -> false
-    [a, ...rest] -> if arm_pat_spread_list(a) { true } else { arms_have_spread_list(rest) }
+    [a, ...rest] -> if pred(a) { true } else { any_arm(rest, pred) }
   }
 }
 
 fn check_list_exhaustive(st: InferState, arms: [Arm], line: Int, col: Int) : InferState {
-  let has_empty  = arms_have_empty_list(arms)
-  let has_spread = arms_have_spread_list(arms)
+  let has_empty  = any_arm(arms, arm_pat_empty_list)
+  let has_spread = any_arm(arms, arm_pat_spread_list)
   if has_empty and has_spread { st }
   else {
     let missing = if has_empty { "non-empty lists (e.g. `[_, ...rest]`)" }
@@ -7320,6 +7310,7 @@ fn llvm_header() : String =
     "declare %KaiValue* @kaix_range(%KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_range_step(%KaiValue*, %KaiValue*, %KaiValue*)\n",
     "declare %KaiValue* @kaix_closure(i8*, i32, i32, i8*)\n",
+    "declare %KaiValue* @kaix_apply(%KaiValue*, i32, %KaiValue**)\n",
     "declare %KaiValue* @kaix_prelude_print(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_eprint(%KaiValue*)\n",
     "declare %KaiValue* @kaix_prelude_int_to_string(%KaiValue*)\n",
@@ -7991,19 +7982,52 @@ fn llvm_emit_call(e: LlvmEmit, callee: Expr, xs: [Expr]) : LlvmEmit {
   match callee.kind {
     EVar(nm) -> match evar_find(e.vars_, nm) {
       Some(_) -> llvm_emit_variant_ctor(e, nm, xs)
-      None -> {
-        let ra = llvm_emit_args(e, xs, [])
-        let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
-        let r = llvm_fresh_reg(ra.st)
-        let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
-                                llvm_format_args(ra.regs), ")\n"])
-        llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+      None -> match llvm_local_find_loop(e.locals, nm) {
+        Some(reg) -> llvm_emit_apply(e, reg, xs)
+        None      -> {
+          let ra = llvm_emit_args(e, xs, [])
+          let sym = if llvm_is_prelude_fn(nm) { llvm_prelude_symbol(nm) } else { string_concat("@kai_", nm) }
+          let r = llvm_fresh_reg(ra.st)
+          let instr = concat_all(["  ", r.reg, " = call %KaiValue* ", sym, "(",
+                                  llvm_format_args(ra.regs), ")\n"])
+          llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+        }
       }
     }
     _ -> {
-      eprint("llvm: indirect calls not supported yet")
-      llvm_set_last(e, "undef")
+      let ec = llvm_emit_expr(e, callee)
+      llvm_emit_apply(ec, ec.last_val, xs)
     }
+  }
+}
+
+# Invoke a closure value held in `clo_reg`. Args are evaluated in
+# order and laid out in an alloca'd KaiValue* buffer, then passed to
+# `kaix_apply` (thin wrapper over the runtime's kai_apply). Mirrors
+# the layout used for variant construction.
+fn llvm_emit_apply(e: LlvmEmit, clo_reg: String, xs: [Expr]) : LlvmEmit {
+  let n = list_length(xs)
+  let ra = llvm_emit_args(e, xs, [])
+  if n == 0 {
+    let r = llvm_fresh_reg(ra.st)
+    let instr = concat_all([
+      "  ", r.reg, " = call %KaiValue* @kaix_apply(%KaiValue* ", clo_reg,
+      ", i32 0, %KaiValue** null)\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, instr), r.reg)
+  } else {
+    let buf = llvm_fresh_reg(ra.st)
+    let alloc_instr = concat_all([
+      "  ", buf.reg, " = alloca %KaiValue*, i32 ", int_to_string(n), "\n"
+    ])
+    let e2 = llvm_append_body(buf.e, alloc_instr)
+    let e3 = llvm_emit_variant_stores(e2, buf.reg, ra.regs, 0)
+    let r = llvm_fresh_reg(e3)
+    let call_instr = concat_all([
+      "  ", r.reg, " = call %KaiValue* @kaix_apply(%KaiValue* ", clo_reg,
+      ", i32 ", int_to_string(n), ", %KaiValue** ", buf.reg, ")\n"
+    ])
+    llvm_set_last(llvm_append_body(r.e, call_instr), r.reg)
   }
 }
 
