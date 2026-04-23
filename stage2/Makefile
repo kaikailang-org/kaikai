@@ -4,7 +4,7 @@ KAIC1   := ../stage1/kaic1
 TARGET  := kaic2
 SRC     := compiler.kai
 
-.PHONY: all clean test test-tokens test-ast test-check test-run test-blocks test-holes test-modules test-modules-path selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-modules test-modules-path selfhost
 
 all: $(TARGET)
 
@@ -305,6 +305,15 @@ selfhost-llvm: $(TARGET) build
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
 test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes
+
+# Fast subset for iterative development: skips every subtarget that
+# runs kaic2 (or kaic1) against the compiler's own source. Each of
+# those takes ~80-90s per invocation and they dominate `make test`
+# (~8-9 min of its ~10-12 min runtime). `test-fast` leaves in the
+# smoke tests that actually catch regressions on minimal examples,
+# modules, and holes — covers the common feature-work cases.
+# Use `make test` for the end-of-block gate.
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes
 
 clean:
 	rm -rf build $(TARGET)
