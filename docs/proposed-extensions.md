@@ -44,6 +44,8 @@ on.
 | `@` as-pattern in `match`                  | proposed | parser                  |
 | `?.` optional chaining                     | proposed | parser + type checker   |
 | Bitwise operators (`&`, `~`, `^`, `<<`, `>>`) | deferred | demand-driven        |
+| `Map[K, V]` + `m["key"]` indexing          | proposed | collection design       |
+| Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -657,6 +659,122 @@ the language stays smaller.
 ship (lexer, parser, precedence rules, new AST node).
 **Depends on**: demonstrated need.
 
+## 17. `Map[K, V]` — hash-map / associative container
+
+```kai
+let scores: Map[String, Int] = Map.empty()
+    |> Map.insert("alice", 10)
+    |> Map.insert("bob",   7)
+
+# With indexing sugar (shipped with this proposal):
+let n = scores["alice"]                    # Option[Int]
+scores["charlie"] := 42                    # insert-or-update
+```
+
+kaikai has no general-purpose associative container in v1 —
+users compose with pairs and `list_*` helpers, or reach for
+`Array[T]` when keys are integer-shaped. A `Map[K, V]` type
+closes the gap.
+
+### What it buys
+
+- An idiomatic container for lookup-by-key, which is the second
+  most common shape after sequences. Today the workaround is
+  `[(K, V)]` with linear scans — fine for tiny maps, abysmal
+  at scale.
+- The natural place for the already-reserved `m["key"]` and
+  `m["key"] := v` indexing, which `docs/syntax-sugars.md` §4.3
+  notes but intentionally leaves undefined until `Map` lands.
+
+### What it costs
+
+- A new stdlib type plus its algorithms (insertion, lookup,
+  iteration, deletion). HAMT-style persistent or mutation-with-
+  `Mutable` — that decision is the hardest part of this
+  proposal.
+- A second indexing shape in the grammar (non-integer keys),
+  which the checker must disambiguate from `Array` indexing.
+  Only a problem if the decision is to make `Map` indexable
+  with the same `[]`; if the decision is a distinct operator
+  (`m#["key"]` or similar), the cost collapses.
+- Equality and hashing: the language needs a story for what
+  types can be map keys. `String` / `Int` are obvious; records
+  less so.
+
+### Decision axes
+
+Three coupled decisions to close this:
+
+1. **Persistent vs ephemeral.** `Map[K, V]` as a persistent
+   structure with structural sharing (no `Mutable` in the row)
+   vs a mutable hash table (paying `Mutable`). Persistent
+   matches the functional-first slant of kaikai; ephemeral is
+   typically faster.
+2. **Indexing syntax.** Same `a[i]` as `Array`, a distinct
+   operator, or method-only (no indexing sugar).
+3. **Key constraints.** Any type, types with derived `Eq` /
+   `Hash`, or a hand-curated set (`String`, `Int`, …).
+
+None is obviously right; each pushes the design in a different
+direction. This entry exists so the decisions can be made
+together rather than drifting independently.
+
+**Cost**: medium-to-high. A new type plus semantic design;
+several days of type-system and stdlib work.
+**Depends on**: a collection-design pass that also closes
+`Vector[T]` (see Doc B §`Mutable` *Known gap*).
+
+## 18. Slice syntax `a[i..j]`
+
+```kai
+let prefix = xs[0..5]        # first five elements
+let suffix = xs[10..]        # from index 10 to end
+let mid    = xs[i..j]        # half-open interval
+```
+
+A half-open-range indexing expression that returns a view into
+an existing container. The common form across Rust, Python, Go,
+Swift.
+
+### What it buys
+
+- The idiomatic way to take a sub-sequence: clearer and shorter
+  than `Mutable.array_slice(xs, i, j)` or `drop(i, xs) |>
+  take(j - i)`.
+- Composes with iteration: `for x in xs[i..j] { ... }` reads
+  the intent without manual index arithmetic.
+
+### What it costs
+
+- A new expression form. Parsing cost is small; `..` is unused
+  elsewhere and already reserved for range literals.
+- A semantic decision: **view** (no copy, shares memory) vs
+  **copy** (independent allocation). Views are faster but leak
+  lifetime constraints; copies are easy but can be wasteful on
+  large arrays.
+- Interaction with `Mutable`: a view into a mutable array is
+  itself mutable, which pushes into region-type territory
+  (same brand mechanism as `Fiber[T]` and `Pid[Msg]`).
+
+### Decision posture
+
+Slice syntax makes most sense alongside `Vector[T]` (post-MVP,
+see Doc B §*Out of scope for v1*). `Vector[T]` is persistent
+and has no mutation concerns, so "slice = view" is cheap and
+unambiguous. For `Array[T]`, a slice either copies (simplest)
+or carries the same lifetime brand the region machinery already
+supports.
+
+The recommended order is: (i) land `Vector[T]` with copying
+slice semantics for `Array[T]` as a first approximation, (ii)
+revisit view-style slices once region types have proven
+themselves elsewhere.
+
+**Cost**: low for a copying implementation; medium for
+view-based slices with region tracking.
+**Depends on**: `Vector[T]` landing; range-literal `..`
+confirmed in the grammar.
+
 ## Deliberately not on this list
 
 These were considered and rejected for the same reasons they are
@@ -716,7 +834,7 @@ Each extension lands only when:
 3. The feature fits in ≤500 lines on top of the stage-2 checker.
    Anything larger gets its own design doc first.
 
-### For language-surface features (sections 9–16)
+### For language-surface features (sections 9–18)
 
 These land only alongside the closing of *"Concrete syntax
 consolidation"* in `design.md`. Any decision on tuples or punning
@@ -753,6 +871,14 @@ should be made as part of that one conversation — not drip-fed.
   (`bit_and`, `bit_or`, …) until there is code that demonstrably
   suffers. This is the "wait for demand" case, not the "principle
   block" case.
+- **`Map[K, V]` + indexing**: land together with `Vector[T]`
+  (Doc B §*Out of scope for v1*) as a single collection-design
+  pass. The persistent-vs-ephemeral, indexing-syntax, and
+  key-constraint axes in §17 are coupled decisions.
+- **Slice syntax `a[i..j]`**: lands *after* `Vector[T]` ships.
+  Copying semantics over `Array[T]` is the first-approximation
+  implementation; view-based slices with region tracking wait
+  for region types to prove themselves elsewhere.
 
 The goal is to keep the surface small. A handful of orthogonal,
 well-integrated extensions is worth more than a pile of clever

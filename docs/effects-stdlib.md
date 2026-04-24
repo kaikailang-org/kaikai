@@ -728,6 +728,19 @@ This form — operations with their own `forall T. …` quantifier
 existing Hindley–Milner generalisation machinery at each call
 site. Row polymorphism at the call site remains out of scope.
 
+### Out-of-bounds behaviour
+
+`array_get`, `array_set`, and `array_grow` panic via the
+runtime's audited escape (`kai_prelude_panic`) when `i < 0` or
+`i >= array_length(a)`. None of the ops returns `Option[T]` or
+otherwise signals the condition as a value — the contract is
+"the caller is responsible for staying in bounds". This is the
+same discipline as C / Rust's unchecked indexing, with the
+difference that the panic is observable and produces a stack
+trace rather than being undefined behaviour. The array-indexing
+sugar (`a[i]`, `a[i] := v`; see
+`docs/syntax-sugars.md` §4) inherits this behaviour verbatim.
+
 ### Default handler
 
 The runtime's default `Mutable` handler is trivial: every clause
