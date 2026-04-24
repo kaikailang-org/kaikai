@@ -559,6 +559,46 @@ Style note: do not rely on `;` to cram statements; prefer one statement per line
 
 ---
 
+## Operator precedence
+
+Listed from tightest (binds first) to loosest (binds last). Each level
+resolves against the level above it. The grammar below describes the
+shape of expressions; this table resolves ambiguity within `Expr BinOp
+Expr`.
+
+| Level | Operators                                | Associativity        |
+|------:|------------------------------------------|----------------------|
+|     1 | call `f(args)`, field `.`, index `[i]`   | Postfix              |
+|     2 | unary `-`, `not`                         | Prefix               |
+|     3 | `*`, `/`, `//`, `%`                      | Left                 |
+|     4 | `+`, `-` (binary)                        | Left                 |
+|     5 | `==`, `!=`, `<`, `>`, `<=`, `>=`         | **Non-associative**  |
+|     6 | `and`                                    | Left (short-circuit) |
+|     7 | `or`                                     | Left (short-circuit) |
+|     8 | `\|>`                                    | Left                 |
+
+Notes:
+
+- **Comparison is non-associative.** `a < b < c` is a syntax error.
+  Write `a < b and b < c` for chained comparisons. This eliminates
+  the class of bugs where `1 == 1 == true` parses unexpectedly.
+- **Pipes are at the bottom.** `a + b |> f` parses as `f(a + b)`,
+  matching the usual reading of "compute, then pipe". Mixing pipes
+  with `and` / `or` needs explicit parentheses.
+- **Postfix chains associate left**: `a.b.c` = `(a.b).c`,
+  `f(x)(y)` = `(f(x))(y)`.
+- **Full kaikai (stage 1+) extends level 8** with `|` (map pipe) at
+  the same precedence as `|>`, left-associative. A chain like
+  `xs | f |> g` parses as `(xs | f) |> g`.
+
+The hand-written recursive-descent parser implements this with
+standard precedence climbing — each level is a function that parses
+one higher-precedence term followed by a loop of
+`(op, higher-precedence term)` pairs. The grammar in EBNF below
+states the *shape*; precedence climbing resolves the *grouping*.
+
+---
+
 ## Grammar (informal EBNF)
 
 ```
@@ -630,4 +670,8 @@ Pattern     ::= "_"
               | TypeName "{" (Ident (":" Pattern)?)* "}"
 ```
 
-The grammar is LL(1) with minor bookkeeping. Stage 0's parser is a hand-written recursive descent — no parser generator.
+The grammar is LL(1) with minor bookkeeping. Stage 0's parser is a
+hand-written recursive descent — no parser generator. Operator
+grouping (within `Expr BinOp Expr`) is not encoded in these rules
+directly; it is resolved by precedence climbing against the table
+above.
