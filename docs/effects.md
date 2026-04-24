@@ -271,6 +271,16 @@ handle { body } with Effect {
   return value of `body`.
 - Outside the `with` block, `Effect` is no longer in the row.
 
+The `{ body }` preceding `with` is the first occurrence of a
+general syntactic sugar: **trailing lambdas**. Any call whose
+last argument has type `() -> T` can write that argument as a
+block outside the parens. `try { body }`, `with_state(0) { body
+}`, and `nursery { n -> body }` (all stdlib helpers — see
+`docs/effects-stdlib.md`) use the same mechanism; `handle` is
+not a keyword. Trailing lambdas land in milestone **m7b**, so
+until then `handle` is a parser special case and every other
+helper is called with paren-and-lambda form.
+
 Example — supplying a value via an effect:
 
 ```kai
@@ -519,8 +529,14 @@ third slot for the effect row).
 - **Higher-rank row polymorphism** (a function value whose type
   quantifies over a row variable in its body). Complicates
   inference without buying much for the use cases at hand.
-- **Effect operations with generic type arguments at the use
-  site.** `State[T]` parameterises per-handler, not per-call.
+- **Row polymorphism at the call site of an effect operation.**
+  An operation cannot quantify over its own row variable.
+  *(Type generics at the call site — an operation with its own
+  `forall T. …` — are allowed, see `docs/effects-stdlib.md`
+  §`Mutable`; this is the narrowed version of what was
+  previously "effect operations with generic type arguments at
+  the use site". Row-level per-call polymorphism is what stays
+  out of scope.)*
 - **Multi-shot `resume` by default.** Always opt-in via
   `resume_multishot`.
 - **Ambient effects.** Every effect must be explicitly handled.
@@ -576,8 +592,17 @@ they first need to be acted on.
    whose row includes `Io`.
 
 5. **Do we allow effect aliases?** `type Net = Http + Dns`.
-   Useful for stdlib readability; adds a resolution pass.
-   *Open.* Defer to Doc B.
+   *Decided:* yes, with one restriction — aliases must be
+   **closed** (no row variable on the right-hand side). Legal:
+   `type Io = Console + Stdin + Env`. Illegal: `type WithIo[e] =
+   Io + e`. The restricted form covers every use case we have
+   (grouping stdlib effects, enabling future granulation of
+   coarse effects like `Io`) and avoids row-polymorphic aliases,
+   which would complicate unification beyond what §*Row
+   unification* specifies. Diagnostics keep the alias when a
+   row-position unifies successfully, and expand to the full
+   label set on mismatch so error messages are precise.
+   Resolution is a single lookup pass before inference.
 
 6. **Interaction with modules.** Can a user-declared effect be
    re-exported across modules? Is an operation addable after the
