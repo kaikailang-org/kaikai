@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop selfhost
 
 all: $(TARGET)
 
@@ -248,6 +248,18 @@ test-modules-path: $(TARGET) build
 	  && echo "modules-path OK" \
 	  || { echo "modules-path UNEXPECTED"; cat build/modules-path-c.out; exit 1; }
 
+# stdlib/loop.kai smoke test — exercises the row-polymorphic
+# helpers (`while`, `until`, `repeat`, `forever`) declared in
+# stdlib/loop.kai (m7b #12 unblocked them). Compiled with
+# `--path ../stdlib` so the resolver finds the module.
+test-loop: $(TARGET) build
+	@set -e; \
+	./$(TARGET) --path ../stdlib ../examples/loop/main.kai > build/loop.c; \
+	$(CC) $(CFLAGS) -I ../stage0 build/loop.c -o build/loop-c; \
+	./build/loop-c > build/loop.out; \
+	diff -q ../examples/loop/main.out.expected build/loop.out > /dev/null \
+	  && echo "loop OK" \
+	  || { echo "loop DIFF"; diff ../examples/loop/main.out.expected build/loop.out; exit 1; }
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
@@ -790,7 +802,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
