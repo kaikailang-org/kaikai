@@ -4112,20 +4112,24 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
   let call_args = emit_call_args(src, args_e, fns, variants, lams)
   match f.kind {
     EVar(callee) -> {
-      # m7a #6c: `resume(v)` is direct-style identity in this régime
-      # — the clause body returns `v` and the surrounding op-call
-      # site receives it as the op's result. m7a #6d will replace
-      # this with a reified-continuation call.
+      # m7a #6d: `resume(v)` lowers to a runtime call that performs
+      # the one-shot status check, flips the status, and tail-calls
+      # the continuation's `fn` (currently kai_cont_identity, until
+      # the full CPS transform reifies the rest of the caller's
+      # body). Doc C §*resume representation*.
       if callee == "resume" {
         match args_e {
-          [a] -> emit_expr(src, a, fns, variants, lams)
-          _   -> "kai_unit() /* resume: arity mismatch (m7a #6c expects 1 arg) */"
+          [a] -> concat_all([
+            "kai_cont_resume(k, ", emit_expr(src, a, fns, variants, lams), ")"
+          ])
+          _   -> "kai_unit() /* resume: arity mismatch (m7a #6d expects 1 arg) */"
         }
       } else if string_contains_dot(callee) {
-        # m7a #6c: op call `Eff.op(args)`. Look up the innermost EvEff
-        # in the fiber's evidence stack and indirect-call the op fn ptr
-        # (Doc C §*Calling a capability*). The trailing NULL is the
-        # KaiCont placeholder; m7a #6d threads the real continuation.
+        # m7a #6c/#6d: op call `Eff.op(args)`. Look up the innermost
+        # EvEff in the fiber's evidence stack, allocate a KaiCont on
+        # the stack initialised with the identity continuation, and
+        # indirect-call the op fn ptr. The clause body inspects the
+        # KaiCont via `resume(v)` (Doc C §*Calling a capability*).
         let eff_n = dotted_prefix(callee)
         let op_n  = dotted_suffix(callee)
         let arg_str = match args_e {
@@ -4135,7 +4139,8 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
         concat_all([
           "({ Ev", eff_n, " *_ev_op = (Ev", eff_n,
           " *) kai_evidence_lookup(\"", eff_n, "\"); ",
-          "_ev_op->", op_n, "(_ev_op", arg_str, ", (KaiCont *) 0); })"
+          "KaiCont _k; kai_cont_init_identity(&_k, _ev_op->handler_id); ",
+          "_ev_op->", op_n, "(_ev_op", arg_str, ", &_k); })"
         ])
       } else {
       match evar_find(variants, callee) {

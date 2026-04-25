@@ -1173,11 +1173,56 @@ static KaiHandlerId kai_fresh_handler_id(void) {
     return kai_next_handler_id++;
 }
 
-/* m7a #6a: forward declaration of the continuation closure. The
- * concrete layout (status byte + env ptr + fn ptr + handler_id)
- * lands in m7a #6d; until then, every EvE op fn ptr declares its
- * trailing parameter as KaiCont* without inspecting it. */
+/* m7a #6d: continuation closure, stack-allocated at every op call
+ * site (Doc C §*resume representation* one-shot path). `status` is
+ * the one-shot check: the first call to `resume` flips it from
+ * UNRESUMED to RESUMED, the second call aborts with a runtime
+ * diagnostic. `fn` + `env` together name the rest of the
+ * computation; m7a #6d ships only the identity continuation
+ * (kai_cont_identity), so resume is effectively a tail return of
+ * its argument. The full CPS reification (the rest of the caller's
+ * body as a separately emitted function) is a later milestone. */
+typedef enum {
+    KAI_CONT_UNRESUMED = 0,
+    KAI_CONT_RESUMED   = 1
+} KaiContStatus;
+
 typedef struct KaiCont KaiCont;
+struct KaiCont {
+    KaiContStatus  status;
+    void          *env;
+    KaiValue     *(*fn)(void *env, KaiValue *v);
+    KaiHandlerId   handler_id;
+};
+
+/* Identity continuation: returns its argument unchanged. Until the
+ * CPS transform reifies the rest of the caller's body, every op
+ * call site uses this as the resume target — so the one-shot check
+ * is observable but the continuation is functionally a no-op. */
+static KaiValue *kai_cont_identity(void *env, KaiValue *v) {
+    (void) env;
+    return v;
+}
+
+static void kai_cont_init_identity(KaiCont *k, KaiHandlerId hid) {
+    k->status     = KAI_CONT_UNRESUMED;
+    k->env        = NULL;
+    k->fn         = &kai_cont_identity;
+    k->handler_id = hid;
+}
+
+/* Surface `resume(v)` lowers to this. The check + flip + tail call
+ * all happen here; the clause body sees a single function call. */
+static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
+    if (k->status != KAI_CONT_UNRESUMED) {
+        fprintf(stderr,
+            "kai: continuation resumed twice (handler #%llu)\n",
+            (unsigned long long) k->handler_id);
+        exit(1);
+    }
+    k->status = KAI_CONT_RESUMED;
+    return k->fn(k->env, v);
+}
 
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
