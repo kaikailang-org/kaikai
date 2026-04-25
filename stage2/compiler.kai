@@ -947,15 +947,13 @@ type Stmt
   # field path). Lowered to a `Mutable.array_set`-style call by the
   # pre-resolve `desugar_index_assign` pass; never reaches the checker.
   | SIndexAssign(Expr, Expr, Expr, Int, Int)
-  # m7b #5: local mutable cell `var name [: T] = init`. NOT YET FULLY
-  # IMPLEMENTED — the parser produces this node, but the planned
-  # `desugar_var_decls` pass that rewrites it into a `handle ... with
-  # State[T](init)` form is unimplemented (blocked on EHandle lacking
-  # type-arg / init-expr slots, no generic effects, no state-threading
-  # resume — see m7b #5 final report). Until that lands, SVar reaches
-  # the resolver and inference, where it is rejected with an explicit
-  # "not yet implemented" diagnostic. The line/col point at the `var`
-  # keyword.
+  # m7b #5: local mutable cell `var name [: T] = init`. The parser
+  # produces this node; the pre-resolve `desugar_var_decls` pass
+  # rewrites every block containing an SVar into the canonical
+  # `handle { rest } with State[T](init) as name { canonical clauses }`
+  # form (Doc B §`State[T]` *Syntax note*, Doc C §m7b #5). SVar
+  # therefore never reaches the resolver. The line/col point at the
+  # `var` keyword.
   | SVar(String, Option[TypeExpr], Expr, Int, Int)
 
 type Pattern = { pkind: PatKind, line: Int, col: Int }
@@ -2465,12 +2463,12 @@ fn parse_let(p: Parser, t: Token) : PStmt {
 }
 
 # m7b #5: `var name (: T)? = init` — local mutable cell. The parser
-# produces an `SVar` node; the planned `desugar_var_decls` pass that
-# rewrites it into a `handle ... with State[T](init) as name { ... }`
-# is not yet implemented (see SVar's declaration comment), so any
-# program containing `var` is rejected at resolve time with an explicit
-# "not yet implemented" diagnostic. No `var name` (without `= init`)
-# form: rejected here with a syntax error.
+# produces an `SVar` node; the pre-resolve `desugar_var_decls` pass
+# rewrites every block containing an SVar into the canonical
+# `handle { rest } with State[T](init) as name { ... }` form. No
+# `var name` (without `= init`) form: rejected here with a syntax
+# error so the desugared `with State[T](init)` always has a state
+# value to thread.
 fn parse_var(p: Parser, t: Token) : PStmt {
   let p1 = p_advance(p)
   let nt = p_peek(p1)
@@ -4308,14 +4306,14 @@ fn chk_stmt(e: Env, s: Stmt) : Env {
       let e2 = chk_expr(e1, idx)
       chk_expr(e2, val)
     }
-    # m7b #5: `var name = init` — desugar pass not yet implemented.
-    # Reject explicitly so users do not silently get `let`-like behaviour
-    # while State[T] support is missing. Still resolves the init for
-    # follow-on diagnostics, but does not bind the name.
-    SVar(_, _, rhs, line, col) -> {
+    # m7b #5b: `var name = init` is desugared away pre-resolve by
+    # `desugar_var_decls`. This arm is dead code in normal compilation;
+    # if a future debug mode skips the desugar, treat the binding like
+    # `let` so the match stays exhaustive and follow-on resolution
+    # still produces useful diagnostics.
+    SVar(name, _, rhs, line, col) -> {
       let e1 = chk_expr(e, rhs)
-      chk_error(e1, line, col,
-        "`var` is not yet implemented (m7b #5: parser landed, desugar pending)")
+      env_add(e1, name)
     }
   }
 }
@@ -6525,6 +6523,174 @@ fn default_pops_for(main_row: [String]) : String =
     if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
   ])
 
+# m7b #5b/handle-as: rewrite alias-based callees `EField(EVar(alias),
+# op)` to `EField(EVar(eff_name), op)` so the subsequent
+# desugar_op_calls pass can fold them into `EVar("eff_name.op")`. The
+# inferencer's synth_op_call_with_scheme already does this rewrite on
+# the typed AST (via the alias table built from `with Eff as alias`),
+# but check_infer is a diagnostic-only pass — its rewrite does not
+# propagate into all_decls. This walker closes the gap. It is also
+# what makes the m7b #5b `var x = init` desugar end-to-end: the
+# desugar emits `with State[T](init) as x { ... x.get() ... }`, and
+# this pass converts the body's `x.get()` calls to `State.get()` so
+# desugar_op_calls + emit_call_expr can take it from there.
+#
+# Scope tracking: the alias map is pushed on entering an `EHandle`
+# body when `alias_opt = Some(name)` and dropped on the way out. The
+# init expression and the clause bodies are walked under the *outer*
+# alias map (matching the inferencer's `st_push_alias` placement at
+# synth_handle:9183-9186). Shadowing by an inner `let alias = ...` is
+# not tracked — the resolver's binding rules already make that
+# pattern resolve to the let, but for now this rewrite naively rewrites
+# any `alias.op` it finds inside the body. Pinned in Doc C §m7b #5
+# *Pre-resolve sugars*.
+type AliasMap = AM([AliasBinding])
+
+fn alias_map_empty() : AliasMap = AM([])
+
+fn alias_map_push(m: AliasMap, name: String, eff: String) : AliasMap {
+  match m { AM(xs) -> AM([AB(name, eff), ...xs]) }
+}
+
+fn alias_map_lookup(m: AliasMap, name: String) : Option[String] {
+  match m { AM(xs) -> lookup_alias(xs, name) }
+}
+
+fn rewrite_alias_decls(ds: [Decl]) : [Decl] = map(ds, rewrite_alias_decl)
+
+fn rewrite_alias_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, n, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, ps, ret, row, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    DTest(desc, body, l, c) ->
+      DTest(desc, rewrite_alias_expr(body, alias_map_empty()), l, c)
+    _ -> d
+  }
+}
+
+fn rewrite_alias_expr(e: Expr, m: AliasMap) : Expr =
+  Expr { kind: rewrite_alias_kind(e.kind, m, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn rewrite_alias_opt(opt: Option[Expr], m: AliasMap) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(rewrite_alias_expr(e, m))
+    None    -> None
+  }
+}
+
+fn rewrite_alias_exprs(es: [Expr], m: AliasMap) : [Expr] =
+  map(es, (e) => rewrite_alias_expr(e, m))
+
+fn rewrite_alias_stmts(ss: [Stmt], m: AliasMap) : [Stmt] =
+  map(ss, (s) => rewrite_alias_stmt(s, m))
+
+fn rewrite_alias_stmt(s: Stmt, m: AliasMap) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, rewrite_alias_expr(rhs, m))
+    SAssert(c, msg) -> SAssert(rewrite_alias_expr(c, m), rewrite_alias_opt(msg, m))
+    SExprStmt(x) -> SExprStmt(rewrite_alias_expr(x, m))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(rewrite_alias_expr(b, m), rewrite_alias_expr(i, m),
+                   rewrite_alias_expr(v, m), l, c)
+    SVar(n, ty, rhs, l, c) -> SVar(n, ty, rewrite_alias_expr(rhs, m), l, c)
+  }
+}
+
+fn rewrite_alias_arms(arms: [Arm], m: AliasMap) : [Arm] =
+  map(arms, (a) => rewrite_alias_arm(a, m))
+
+fn rewrite_alias_arm(a: Arm, m: AliasMap) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, rewrite_alias_opt(g, m), rewrite_alias_expr(b, m))
+  }
+}
+
+fn rewrite_alias_fields(fs: [FieldInit], m: AliasMap) : [FieldInit] =
+  map(fs, (f) => rewrite_alias_field(f, m))
+
+fn rewrite_alias_field(f: FieldInit, m: AliasMap) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, rewrite_alias_expr(v, m))
+  }
+}
+
+fn rewrite_alias_elems(els: [ListElem], m: AliasMap) : [ListElem] =
+  map(els, (el) => rewrite_alias_elem(el, m))
+
+fn rewrite_alias_elem(el: ListElem, m: AliasMap) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(rewrite_alias_expr(x, m))
+    ElSpread(x) -> ElSpread(rewrite_alias_expr(x, m))
+  }
+}
+
+fn rewrite_alias_clauses(cs: [HClause], m: AliasMap) : [HClause] =
+  map(cs, (c) => rewrite_alias_clause(c, m))
+
+fn rewrite_alias_clause(c: HClause, m: AliasMap) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, rewrite_alias_expr(b, m), l, co)
+  }
+}
+
+fn rewrite_alias_opt_return(opt: Option[HReturn], m: AliasMap) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(rewrite_alias_return(r, m))
+    None    -> None
+  }
+}
+
+fn rewrite_alias_return(r: HReturn, m: AliasMap) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, rewrite_alias_expr(b, m), l, c)
+  }
+}
+
+fn rewrite_alias_kind(k: ExprKind, m: AliasMap, line: Int, col: Int) : ExprKind {
+  match k {
+    EField(base, fname) -> match base.kind {
+      EVar(name) -> match alias_map_lookup(m, name) {
+        Some(eff_name) ->
+          EField(mk_expr(EVar(eff_name), base.line, base.col), fname)
+        None -> EField(rewrite_alias_expr(base, m), fname)
+      }
+      _ -> EField(rewrite_alias_expr(base, m), fname)
+    }
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let body_m = match alias_opt {
+        Some(a) -> alias_map_push(m, a, eff_name)
+        None    -> m
+      }
+      EHandle(rewrite_alias_expr(body, body_m), eff_name, eff_tyargs,
+              rewrite_alias_opt(init_opt, m), alias_opt,
+              rewrite_alias_clauses(clauses, m),
+              rewrite_alias_opt_return(ret_opt, m))
+    }
+    ECall(callee, args_) ->
+      ECall(rewrite_alias_expr(callee, m), rewrite_alias_exprs(args_, m))
+    EBlock(stmts, tail) ->
+      EBlock(rewrite_alias_stmts(stmts, m), rewrite_alias_opt(tail, m))
+    EIf(c, t_, eo) ->
+      EIf(rewrite_alias_expr(c, m), rewrite_alias_expr(t_, m),
+          rewrite_alias_opt(eo, m))
+    EBinop(op, a, b) ->
+      EBinop(op, rewrite_alias_expr(a, m), rewrite_alias_expr(b, m))
+    EUnop(op, x) -> EUnop(op, rewrite_alias_expr(x, m))
+    ELambda(ps, b) -> ELambda(ps, rewrite_alias_expr(b, m))
+    EMatch(scr, arms) -> EMatch(rewrite_alias_expr(scr, m),
+                                 rewrite_alias_arms(arms, m))
+    EPipe(a, b) -> EPipe(rewrite_alias_expr(a, m), rewrite_alias_expr(b, m))
+    EIndex(a, b) -> EIndex(rewrite_alias_expr(a, m), rewrite_alias_expr(b, m))
+    ERecordLit(name, fields) -> ERecordLit(name, rewrite_alias_fields(fields, m))
+    EList(elems) -> EList(rewrite_alias_elems(elems, m))
+    ERange(a, b, opt_step) ->
+      ERange(rewrite_alias_expr(a, m), rewrite_alias_expr(b, m),
+             rewrite_alias_opt(opt_step, m))
+    _ -> k
+  }
+}
+
 # m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
 # `EField(EVar(eff), op)` callee, where `eff` is a declared effect,
 # into `EVar("eff.op")`. emit_call_expr then dispatches it through
@@ -6833,6 +6999,213 @@ fn desugar_index_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
   }
 }
 
+# ====================================================================
+# m7b #5b: pre-resolve desugar of `var name [: T] = init`
+# ====================================================================
+#
+# Doc B §`State[T]` *Syntax note* and Doc C §m7b #5 mandate this
+# lowering: a block
+#
+#   { stmt0; ...; var name [: T] = init; rest_stmts; tail_expr }
+#
+# becomes
+#
+#   { stmt0; ...; handle { rest_stmts; tail_expr } with State[T](init) as name {
+#       get(resume)    -> resume(state)
+#       set(v, resume) -> resume((), v)
+#       return(x)      -> x
+#     } }
+#
+# Doc B locality: the `with` consumes `State[T]` inside the function,
+# so the function's effect row is unchanged (no `+ State[T]` leaking
+# out). When `T` is omitted, synth_handle infers it from the init's
+# inferred type — see the `eff_tyargs == []` fallback in synth_handle.
+#
+# Nested `var`s nest handlers, innermost first: the recursion finds
+# the head SVar in each block, wraps everything that follows it under
+# a fresh State[T] handler, and recurses into that wrapped block — so
+# a second `var` inside the rest produces a second handler nested
+# inside the first.
+
+fn desugar_var_decls(ds: [Decl]) : [Decl] = map(ds, desugar_var_decl)
+
+fn desugar_var_decl(d: Decl) : Decl {
+  match d {
+    DFn(pub_, n, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, ps, ret, row, desugar_var_expr(body), l, c)
+    DTest(desc, body, l, c) -> DTest(desc, desugar_var_expr(body), l, c)
+    _ -> d
+  }
+}
+
+fn desugar_var_expr(e: Expr) : Expr =
+  Expr { kind: desugar_var_kind(e.kind, e.line, e.col),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn desugar_var_opt(opt: Option[Expr]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(desugar_var_expr(e))
+    None    -> None
+  }
+}
+
+fn desugar_var_exprs(es: [Expr]) : [Expr] = map(es, desugar_var_expr)
+
+fn desugar_var_arms(arms: [Arm]) : [Arm] = map(arms, desugar_var_arm)
+
+fn desugar_var_arm(a: Arm) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, desugar_var_opt(g), desugar_var_expr(b))
+  }
+}
+
+fn desugar_var_fields(fs: [FieldInit]) : [FieldInit] =
+  map(fs, desugar_var_field)
+
+fn desugar_var_field(f: FieldInit) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, desugar_var_expr(v))
+  }
+}
+
+fn desugar_var_elems(els: [ListElem]) : [ListElem] =
+  map(els, desugar_var_elem)
+
+fn desugar_var_elem(el: ListElem) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(desugar_var_expr(x))
+    ElSpread(x) -> ElSpread(desugar_var_expr(x))
+  }
+}
+
+fn desugar_var_clauses(cs: [HClause]) : [HClause] =
+  map(cs, desugar_var_clause)
+
+fn desugar_var_clause(c: HClause) : HClause {
+  match c {
+    HC(n, ps, b, l, co) -> HC(n, ps, desugar_var_expr(b), l, co)
+  }
+}
+
+fn desugar_var_opt_return(opt: Option[HReturn]) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(desugar_var_return(r))
+    None    -> None
+  }
+}
+
+fn desugar_var_return(r: HReturn) : HReturn {
+  match r {
+    HR(p, b, l, c) -> HR(p, desugar_var_expr(b), l, c)
+  }
+}
+
+# Recurse into a non-block stmt's expressions. Used for stmts that
+# appear *before* the head SVar of a block — they cannot reference the
+# cell the var introduces, but their inner blocks (lambdas, ifs, match
+# arms, etc.) may declare their own `var`s.
+fn desugar_var_stmt(s: Stmt) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_var_expr(rhs))
+    SAssert(c, m) -> SAssert(desugar_var_expr(c), desugar_var_opt(m))
+    SExprStmt(x) -> SExprStmt(desugar_var_expr(x))
+    SIndexAssign(b, i, v, l, c) ->
+      SIndexAssign(desugar_var_expr(b), desugar_var_expr(i),
+                   desugar_var_expr(v), l, c)
+    # SVar at this site means it sits at non-head position relative to
+    # the wrapping pass. desugar_var_block consumes head-position SVars;
+    # any residual one here is rewritten to a `let` so the resolver does
+    # not see a stray SVar (defensive — should not occur in well-formed
+    # input).
+    SVar(n, _, rhs, _, _) -> SLet(mk_pat(PBind(n), 0, 0), None,
+                                   desugar_var_expr(rhs))
+  }
+}
+
+# Build the canonical `with State[?T](init) as name { ... }` clauses
+# Doc B §`State[T]` *Syntax note* prescribes for a `var` lowering.
+fn var_canonical_clauses(line: Int, col: Int) : [HClause] {
+  let p_resume = Param { pname: "resume", ptype: None, pline: line, pcol: col }
+  let p_v      = Param { pname: "v",      ptype: None, pline: line, pcol: col }
+  let resume_e = mk_expr(EVar("resume"), line, col)
+  let state_e  = mk_expr(EVar("state"),  line, col)
+  let unit_e   = mk_expr(EUnit,           line, col)
+  let v_e      = mk_expr(EVar("v"),       line, col)
+  let get_body = mk_expr(ECall(resume_e, [state_e]), line, col)
+  let set_body = mk_expr(ECall(resume_e, [unit_e, v_e]), line, col)
+  [
+    HC("get", [p_resume], get_body, line, col),
+    HC("set", [p_v, p_resume], set_body, line, col)
+  ]
+}
+
+fn var_canonical_return(line: Int, col: Int) : HReturn {
+  HR("x", mk_expr(EVar("x"), line, col), line, col)
+}
+
+# Walk a block's stmts looking for the first SVar. Returns the rewritten
+# (stmts, tail) pair: every stmt before the first SVar is structurally
+# desugared (so lambdas / inner blocks inside their expressions still
+# get their own `var`s rewritten), and from the SVar onward the rest
+# of the block becomes the body of a fresh `with State[T](init) as name`
+# handler. If no SVar is present, recursion proceeds structurally.
+fn desugar_var_block(stmts: [Stmt], tail: Option[Expr]) : ExprKind {
+  match stmts {
+    [] -> EBlock([], desugar_var_opt(tail))
+    [s, ...rest] -> match s {
+      SVar(name, ty, init, line, col) -> {
+        let init_d = desugar_var_expr(init)
+        let inner_kind = desugar_var_block(rest, tail)
+        let inner_expr = mk_expr(inner_kind, line, col)
+        let tyargs = match ty { Some(t) -> [t] None -> [] }
+        let clauses = var_canonical_clauses(line, col)
+        let ret = var_canonical_return(line, col)
+        let handle_kind = EHandle(inner_expr, "State", tyargs,
+                                   Some(init_d), Some(name),
+                                   clauses, Some(ret))
+        EBlock([], Some(mk_expr(handle_kind, line, col)))
+      }
+      _ -> {
+        let s_d = desugar_var_stmt(s)
+        let inner_kind = desugar_var_block(rest, tail)
+        match inner_kind {
+          EBlock(rest_stmts, rest_tail) ->
+            EBlock([s_d, ...rest_stmts], rest_tail)
+          _ -> EBlock([s_d], Some(mk_expr(inner_kind, 0, 0)))
+        }
+      }
+    }
+  }
+}
+
+fn desugar_var_kind(k: ExprKind, line: Int, col: Int) : ExprKind {
+  match k {
+    EBlock(stmts, tail) -> desugar_var_block(stmts, tail)
+    ECall(callee, args_) -> ECall(desugar_var_expr(callee),
+                                   desugar_var_exprs(args_))
+    EIf(c, t_, eo) -> EIf(desugar_var_expr(c), desugar_var_expr(t_),
+                          desugar_var_opt(eo))
+    EBinop(op, a, b) -> EBinop(op, desugar_var_expr(a), desugar_var_expr(b))
+    EUnop(op, x) -> EUnop(op, desugar_var_expr(x))
+    EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+      EHandle(desugar_var_expr(body), eff_name, eff_tyargs,
+              desugar_var_opt(init_opt), alias_opt,
+              desugar_var_clauses(clauses), desugar_var_opt_return(ret_opt))
+    ELambda(ps, b) -> ELambda(ps, desugar_var_expr(b))
+    EMatch(scr, arms) -> EMatch(desugar_var_expr(scr),
+                                 desugar_var_arms(arms))
+    EPipe(a, b) -> EPipe(desugar_var_expr(a), desugar_var_expr(b))
+    EField(base, fname) -> EField(desugar_var_expr(base), fname)
+    EIndex(a, b) -> EIndex(desugar_var_expr(a), desugar_var_expr(b))
+    ERecordLit(name, fields) -> ERecordLit(name, desugar_var_fields(fields))
+    EList(elems) -> EList(desugar_var_elems(elems))
+    ERange(a, b, opt_step) -> ERange(desugar_var_expr(a),
+                                      desugar_var_expr(b),
+                                      desugar_var_opt(opt_step))
+    _ -> k
+  }
+}
+
 fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
   # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
   # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
@@ -6841,8 +7214,9 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) :
   # This standalone walker closes the gap; the next pipeline iteration
   # (Doc C §*Pipeline order and desugaring*) will fold it into a proper
   # post-resolve desugar pass.
-  let eff_names = collect_effect_names(raw_decls)
-  let decls = desugar_op_calls_decls(raw_decls, eff_names)
+  let alias_resolved = rewrite_alias_decls(raw_decls)
+  let eff_names = collect_effect_names(alias_resolved)
+  let decls = desugar_op_calls_decls(alias_resolved, eff_names)
   let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
   let op_quals = collect_op_qualified_names(decls)
@@ -9184,7 +9558,21 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
         Some(a) -> st_push_alias(init_typed_st.st, a, eff_name)
         None    -> init_typed_st.st
       }
-      let resolved_eff_tyargs = resolve_ty_list(eff_tyargs)
+      # m7b #5b: when a stateful handler omits the explicit `[T]`
+      # instantiation but supplies an `(init)`, infer the single
+      # type argument from the init's type. This is the path Doc C
+      # §m7b #5 specifies for the unannotated `var x = init` desugar:
+      # `with State(init) as x { ... }` resolves to
+      # `State[type_of_init]`. The fallback only fires when no syntactic
+      # type args were written, so explicit `with State[Int](0)` still
+      # round-trips verbatim.
+      let resolved_eff_tyargs = match eff_tyargs {
+        [] -> match init_typed_st.state_ty {
+          Some(t) -> [t]
+          None    -> []
+        }
+        _ -> resolve_ty_list(eff_tyargs)
+      }
       let prev_row = st_aliased.row
       let st_in = st_set_row(st_aliased, [])
       let rb = synth(st_in, body)
@@ -12937,7 +13325,9 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], start_id: In
 
 fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
-fn emit_program_llvm(path: String, src: String, decls: [Decl], test_mode: Bool) : String {
+fn emit_program_llvm(path: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
+  let alias_resolved = rewrite_alias_decls(raw_decls)
+  let decls = alias_resolved
   let fns = register_fn_decls(decls)
   let vs = register_variants(decls)
   let eff_names = collect_effect_names(decls)
@@ -13459,7 +13849,13 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
             # name resolution so every downstream pass sees only the
             # core form. `--ast` keeps the raw decls so the dump shows
             # the sugar as written.
-            let all_decls = desugar_index_decls(raw_decls)
+            # m7b #5b: pre-resolve desugar of `var name = init` into
+            # `handle { rest } with State[T](init) as name { ... }`.
+            # Runs after the index desugar so any `a[i]` inside a
+            # `var`'s init or its rest-of-block has already been
+            # lowered to a call.
+            let indexed_decls = desugar_index_decls(raw_decls)
+            let all_decls = desugar_var_decls(indexed_decls)
             if alias_res.errs > 0 { alias_res.errs }
             else {
             match mode {
