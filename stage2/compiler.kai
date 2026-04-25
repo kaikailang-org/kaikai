@@ -7457,10 +7457,15 @@ fn ty_to_string(t: Ty) : String {
     TyChar   -> "Char"
     TyUnit   -> "Unit"
     TyListT(inner) -> cat3("[", ty_to_string(inner), "]")
-    TyFnT(ps, ret, _) ->
-      concat_all([
-        "(", join_with(ty_string_list(ps), ", "), ") -> ", ty_to_string(ret)
-      ])
+    # m7b #11k: render the function type's effect row alongside the
+    # arrow when non-empty, with each label printed as `Eff` or
+    # `Eff[T1, T2]` so parametric-effect mismatches (Reader[Int] vs
+    # Reader[String]) are visible in `expected/found` notes.
+    TyFnT(ps, ret, row) -> concat_all([
+      "(", join_with(ty_string_list(ps), ", "), ") -> ",
+      ty_to_string(ret),
+      row_to_string_suffix(row)
+    ])
     TyCon(cname, tas) -> {
       match tas {
         [] -> cname
@@ -7470,6 +7475,27 @@ fn ty_to_string(t: Ty) : String {
     TyVarT(n) -> cat2("?t", int_to_string(n))
     TyAny -> "?"
   }
+}
+
+# Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type
+# strings. Empty row → empty string. Open row tail → trailing
+# `+ ?eN`. Each label uses `label_to_string` so type args render.
+fn row_to_string_suffix(r: Row) : String {
+  let body =
+    if labels_empty(r.labels) and (match r.tail { None -> true Some(_) -> false }) {
+      ""
+    } else {
+      let lbs = join_with(map(r.labels, label_to_string), " + ")
+      let tail_s = match r.tail {
+        None -> ""
+        Some(v) -> {
+          let pre = if string_length(lbs) > 0 { " + " } else { "" }
+          concat_all([pre, "?e", int_to_string(v)])
+        }
+      }
+      concat_all([" / ", lbs, tail_s])
+    }
+  body
 }
 
 # Dump the declared signature (or shape) of every top-level decl. Used
