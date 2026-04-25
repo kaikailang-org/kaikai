@@ -407,7 +407,7 @@ fn supervisor(
   m:        ActorCap[SupervisorMsg],
   children: [ChildSpec]
 ) : Unit / Actor[SupervisorMsg] + Spawn + Monitor + Console + Cancel {
-  let pids = children |> map((spec) => start_child(spec))
+  let pids = children | (spec) => start_child(spec)
   pids |> each((p) => monitor(p))
   forever {
     match m.receive() {
@@ -526,7 +526,7 @@ fn pool(
   size: Int,
   work: (Task) -> Result / Cancel
 ) : Pid[Task] / Spawn + Monitor + Cancel {
-  let workers = [1..size] |> map((_) => start_worker(nur, work))
+  let workers = [1..size] | (_) => start_worker(nur, work)
   spawn_actor_default(nur) { m -> dispatcher_loop(m, workers) }
 }
 ```

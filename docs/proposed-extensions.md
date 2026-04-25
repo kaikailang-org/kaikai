@@ -46,6 +46,8 @@ on.
 | Bitwise operators (`&`, `~`, `^`, `<<`, `>>`) | deferred | demand-driven        |
 | `Map[K, V]` + `m["key"]` indexing          | proposed | collection design       |
 | Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
+| Method references as values (`obj.method`) | proposed | parser + brand machinery |
+| `Range[T]` as a first-class iterable       | proposed | collection design       |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -775,6 +777,124 @@ view-based slices with region tracking.
 **Depends on**: `Vector[T]` landing; range-literal `..`
 confirmed in the grammar.
 
+## 19. Method references as first-class values (point-free)
+
+```kai
+# Today (lambda required):
+options | (f) => n.spawn(f)
+xs      | (x) => x.label
+list    |> reduce(0, (acc, x) => acc + x.cost)
+
+# With point-free:
+options | n.spawn
+xs      | .label              # placeholder already covers this case
+list    |> reduce(0, (+).on(.cost))   # if `(+).on(...)` is also added
+```
+
+A method or operation reference, written as `obj.method` or
+`Type.method` without trailing parens, would denote the
+function value `(args...) => obj.method(args...)`. Same idea as
+Kotlin's `obj::method`, Scala's `obj.method _`, or Python's
+unbound-method syntax — applied to kaikai's effect ops and
+records.
+
+### What it buys
+
+- The map pipe (`|`) and other higher-order helpers
+  (`reduce`, `filter`, `each`) compose without lambda
+  ceremony when the function you want to apply is already a
+  named method or op.
+- Encourages reading code as a flow of operations rather than
+  an explicit lambda-per-step pipeline. Several functional
+  languages take this further with first-class composition;
+  kaikai already has `|>` and `|`, so first-class method refs
+  is the missing piece for clean pipelines.
+
+### What it costs
+
+- Parser ambiguity to resolve: `obj.method` in expression
+  position must be valid both as a value (the reference) and
+  as the start of a call (`obj.method(args)`). Solvable with
+  one-token lookahead — if the next token after `.method` is
+  `(`, parse as call; otherwise as reference.
+- The placeholder `.field` lambda (`xs | .label`) already
+  covers a subset of the use case — for record field access.
+  This proposal extends the same convenience to ops and
+  methods generally.
+- A method reference closes over the receiver — `n.spawn`
+  captures `n`. Lifetime / region implications need a small
+  amendment to the brand machinery (`n.spawn` cannot escape
+  the nursery any more than `Fiber[T]` can).
+
+### Decision posture
+
+Wanted in the language; deferred until after m7b. The current
+workaround is the explicit lambda `(f) => n.spawn(f)`, which
+adds 13 characters per call site but compiles unambiguously
+today. Once m7b lands and effect rows are stable, revisit
+this proposal as a clean ergonomic improvement.
+
+**Cost**: medium. Parser change (one extra production), brand
+extension for receiver-bound references, and a clear story
+about evaluation order (when does the receiver get
+evaluated — at the reference site, or at the call site?).
+**Depends on**: parser; effect-row stability from m7b.
+
+## 20. `Range[T]` as a first-class iterable
+
+```kai
+# Today (only as list literal):
+each([1..4]) { i -> ... }
+
+# With Range[T] as a value:
+each(1..4) { i -> ... }
+for i in 1..n { ... }                # if `for` lands too
+```
+
+Today kaikai-minimal allows `[1..n]` as syntax for *constructing
+a list* with a range fill. `1..n` on its own — without the
+brackets — is not a value. Adding `Range[T]` as a first-class
+type would let `1..4` evaluate to a value that `each`, `map`,
+`filter`, etc., can iterate over directly, without an
+intermediate list allocation.
+
+### What it buys
+
+- The common case `each(1..n) { ... }` reads cleanly without
+  bracket noise.
+- `Range[Int]` is iterable lazily — no allocation of the
+  underlying `[Int]`. Memory and start-up time matter for hot
+  paths and tight loops.
+- Foundation for a future `for ... in ...` form (proposal
+  is implicit if/when desired).
+
+### What it costs
+
+- A new built-in parametric type `Range[T]` (probably
+  `Range[Int]` and `Range[Char]` to start; full polymorphism
+  needs a `Stepable` capability or similar).
+- Higher-order helpers (`each`, `map`, `filter`, etc.) need to
+  accept either `[T]` or `Range[T]` — easiest with a common
+  `Iterable[T]` abstraction, which kaikai does not have today.
+  Without it, each helper grows two overloads (or `Range[T]` is
+  silently coerced to `[T]`, which loses the laziness benefit).
+- Parser distinction between `[1..n]` (list literal) and `1..n`
+  (range value). Both should remain legal; `[1..n]` keeps
+  meaning "list with these contents", `1..n` keeps meaning "the
+  range itself".
+
+### Decision posture
+
+Wanted alongside the collection-design pass that closes Doc B's
+`Vector[T]` Known gap (§*Out of scope for v1*). The trio
+`Vector[T]` + `Map[K, V]` + `Range[T]` is the natural set to
+design together — they share the question "what is the kaikai
+notion of an iterable?".
+
+**Cost**: medium. New built-in type, helper overloads,
+parser. Coupled with the iterable-abstraction question.
+**Depends on**: collection design (`Vector[T]`, `Map[K, V]`).
+
 ## Deliberately not on this list
 
 These were considered and rejected for the same reasons they are
@@ -834,7 +954,7 @@ Each extension lands only when:
 3. The feature fits in ≤500 lines on top of the stage-2 checker.
    Anything larger gets its own design doc first.
 
-### For language-surface features (sections 9–18)
+### For language-surface features (sections 9–20)
 
 These land only alongside the closing of *"Concrete syntax
 consolidation"* in `design.md`. Any decision on tuples or punning
@@ -879,6 +999,15 @@ should be made as part of that one conversation — not drip-fed.
   Copying semantics over `Array[T]` is the first-approximation
   implementation; view-based slices with region tracking wait
   for region types to prove themselves elsewhere.
+- **Method references as values**: wanted in the language for
+  cleaner pipelines (`options | n.spawn` over the explicit
+  lambda). Deferred until after m7b so effect rows are stable
+  and the brand machinery can be extended cleanly to
+  receiver-bound references.
+- **`Range[T]` as a first-class iterable**: lands together
+  with the collection design pass (`Vector[T]`, `Map[K, V]`).
+  Designing iterability across these three types in one go
+  avoids retrofitting helpers later.
 
 The goal is to keep the surface small. A handful of orthogonal,
 well-integrated extensions is worth more than a pile of clever
