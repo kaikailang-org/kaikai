@@ -989,7 +989,12 @@ type Decl
 # name(params) : ret_ty — no body, no `fn` keyword.
 type EffectOp = EOp(String, [Param], TypeExpr, Int, Int)
 
-type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant])
+# TBEffectAlias holds a closed sum of effect labels, e.g.
+# `type Io = Console + Stdin + Env + File` (m7b #1). The body is a
+# list of label names; non-effect labels and cycles are rejected at
+# resolve time. Single-effect aliases (`type Foo = Console`) parse as
+# TBAlias(TyName(name, [])) and are recognised at resolve time.
+type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant]) | TBEffectAlias([String])
 type FieldDecl = FD(String, TypeExpr)
 type Variant = Var(String, [TypeExpr])
 
@@ -3086,15 +3091,25 @@ fn parse_type_body(p: Parser, is_pub: Bool, name: String, tparams: [String], t: 
     # the next is `(` OR further along we see `|`, treat as sum.
     let hd = p_peek(p)
     if tk_is(hd.kind, TkIdent) and is_upper_ident(p.src, hd) {
-      # Decide by lookahead.
-      let is_sum = looks_like_sum(p)
-      if is_sum {
-        parse_sum_body(p, [], is_pub, name, tparams, t)
+      # Effect alias body has the form `Eff1 + Eff2 + ...`. The `+`
+      # immediately after the first uppercase ident is the unambiguous
+      # signal: type aliases never use `+`, sums use `|`. Single-effect
+      # aliases (`type Foo = Console`) parse as TBAlias and are
+      # recognised at resolve time. (m7b #1a)
+      let nxt = p_peek1(p)
+      if tk_is(nxt.kind, TkPlus) {
+        let nm = tok_source(p.src, hd)
+        parse_effect_alias_body(p_advance(p_advance(p)), [nm], is_pub, name, tparams, t)
       } else {
-        let rt = parse_type(p)
-        match rt.r {
-          None -> err_d(rt.p)
-          Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+        let is_sum = looks_like_sum(p)
+        if is_sum {
+          parse_sum_body(p, [], is_pub, name, tparams, t)
+        } else {
+          let rt = parse_type(p)
+          match rt.r {
+            None -> err_d(rt.p)
+            Some(aliased) -> ok_d(rt.p, DType(is_pub, name, tparams, TBAlias(aliased), t.line, t.col))
+          }
         }
       }
     } else {
@@ -3180,6 +3195,27 @@ fn parse_record_body(p: Parser, acc: [FieldDecl], is_pub: Bool, name: String, tp
           }
         }
       }
+    }
+  }
+}
+
+# m7b #1a — closed effect-alias body. Caller has consumed the first
+# label and the `+` separator; `acc` holds the labels parsed so far in
+# reverse order. Subsequent labels must be uppercase idents separated
+# by `+`. Validation that each label refers to a declared effect, plus
+# cycle detection, is m7b #1c at resolve time.
+fn parse_effect_alias_body(p: Parser, acc: [String], is_pub: Bool, name: String, tparams: [String], t: Token) : PDecl {
+  let hd = p_peek(p)
+  if not tk_is(hd.kind, TkIdent) or not is_upper_ident(p.src, hd) {
+    err_d(p_error(p, hd, "expected uppercase effect name in effect alias"))
+  } else {
+    let nm = tok_source(p.src, hd)
+    let p1 = p_advance(p)
+    let acc1 = [nm, ...acc]
+    if p_at(p1, TkPlus) {
+      parse_effect_alias_body(p_advance(p1), acc1, is_pub, name, tparams, t)
+    } else {
+      ok_d(p1, DType(is_pub, name, tparams, TBEffectAlias(list_reverse(acc1)), t.line, t.col))
     }
   }
 }
@@ -3650,6 +3686,11 @@ fn dump_type_body(tb: TypeBody, depth: Int) : Unit {
     TBSum(variants) -> {
       emit_line(depth, "ty_sum")
       variants |> each((v) => dump_variant(v, depth + 1))
+    }
+    TBEffectAlias(labels) -> {
+      let s = if labels == [] { "ty_effect_alias (empty)" }
+              else { string_concat("ty_effect_alias ", join_with(labels, " + ")) }
+      emit_line(depth, s)
     }
   }
 }
