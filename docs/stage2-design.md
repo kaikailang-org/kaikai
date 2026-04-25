@@ -316,6 +316,21 @@ in.
      `cap := v` capability sugar, local mutable cells (`var x
      = init`), array indexing (`a[i]` / `a[i] := v`),
      `Reader[T]` / `Writer[W]` as their own effects.
+   - **m7c — LLVM effects port**: replicate the m7a/m7b
+     effects codegen in the LLVM backend. Today
+     `llvm_emit_expr` falls through to "unsupported expression
+     kind" on `EHandle` — every effect-bearing program is
+     C-only. Port `emit_effect_struct`, `emit_handle`,
+     `emit_call_expr`'s op-dispatch branch, `emit_clause_*`,
+     and the default-handler wrapper to LLVM IR. End state:
+     `m7a_*.kai` and `m7b_*.kai` demos round-trip identically
+     between `--emit=c` and `--emit=llvm`, and
+     `bench-effects` runs against the LLVM-emitted binary as
+     well as the C one. Re-measure Doc C OQ #6 — hypothesis:
+     ratio drops from m7a's ~4× (vs C-direct on `gcc -O2`)
+     toward ~2× because the LLVM optimiser can see through
+     the lookup + indirect call when the trivial-clause shape
+     is statically visible.
 8. **m8 — Fibers + structured concurrency + actors**: CPS
    scheduler, `Spawn` / `Cancel` effects with default
    handlers, `nursery { n -> ... }` helper, region-branded
@@ -356,7 +371,7 @@ exists as a usable language as soon as possible" and treats
 performance work as a follow-up:
 
 ```
-m7a → m7b → m8 → m12 → m5 → full Perceus → m11/m13/m14/m15-17
+m7a → m7b → m7c → m8 → m12 → m5 → full Perceus → m11/m13/m14/m15-17
 ```
 
 Rationale:
@@ -368,23 +383,29 @@ Rationale:
    lambdas, `@cap`/`:=`, `var`, `a[i]`, aliases). The code in
    `effects-stdlib.md` and `actors.md` reads as written only
    after m7b lands.
-3. **m8 (fibers + structured concurrency + actors)** — closes
+3. **m7c (LLVM effects port)** — closes the asymmetry the C
+   backend opened. Without it, every effect-bearing demo is
+   C-only and the bench in m7a #9 cannot speak about the LLVM
+   path. Lands before m8 because m8's CPS-reified
+   continuations are simpler to add on top of an LLVM backend
+   that already handles the m7a/m7b shape.
+4. **m8 (fibers + structured concurrency + actors)** — closes
    the concurrency surface. The language is "complete" in the
    sense that every promise of the design docs (effects +
    handlers + nurseries + actors + cancellation) compiles and
    runs.
-4. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
+5. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
    produces a byte-identical output. Stage 1 retires from the
    dev loop. This is the natural moment to evaluate stage 2's
    performance, because once stage 1 is gone, stage 2's speed
    is the development speed.
-5. **m5 (basic Perceus in the typed IR)** — reuse analysis +
+6. **m5 (basic Perceus in the typed IR)** — reuse analysis +
    drop insertion. Lands now because it directly improves the
    self-compile speed and validates the IR design under load.
-6. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
+7. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
    unboxing, opt-in regions) — the heavy memory work, scheduled
    after the basic pass has stabilised.
-7. **m11 (diagnostics quality)**, **m13 (property/bench)**,
+8. **m11 (diagnostics quality)**, **m13 (property/bench)**,
    **m14 (stdlib expansion)**, **m15–m17 (tooling)** — these
    are mostly independent and can land in parallel once the
    above is done. m11 in particular benefits from being able
@@ -392,8 +413,8 @@ Rationale:
 
 Why this order and not "Perceus first":
 
-- m7a/m7b/m8 deliver the **language**. Without them, stage 2 is
-  a self-hosted kaikai-minimal with extras — not the language
+- m7a/m7b/m7c/m8 deliver the **language**. Without them, stage 2
+  is a self-hosted kaikai-minimal with extras — not the language
   the design docs describe. Performance is a constant-factor
   improvement on top of an existing language, not the language
   itself.
@@ -404,7 +425,7 @@ Why this order and not "Perceus first":
   means doing the work twice (once on a partial language, once
   after fibers/actors land).
 - Items beyond m12 (m5, full Perceus, m11/m13/m14, tooling) can
-  be parallelised much more freely than the m7a→m7b→m8 chain,
+  be parallelised much more freely than the m7a→m7b→m7c→m8 chain,
   which is sequential by nature (each depends on the previous).
 
 This ordering is recorded in `docs/stage1-design.md` §Features
