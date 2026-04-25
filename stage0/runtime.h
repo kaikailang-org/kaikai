@@ -1250,6 +1250,24 @@ static KaiValue *kai_default_console_eprint(void *self, KaiValue *s, KaiCont *k)
     return kai_cont_resume(k, kai_unit());
 }
 
+/* m7a #7: default Fail handler. Doc B §`Fail` declares the op as
+ * returning Nothing, so the handler must short-circuit — no resume,
+ * no return value. The runtime writes a banner to stderr and exits
+ * with status 1. Long-term Doc B prefers an unhandled-Fail compile
+ * error (catalog says "no (unhandled = compile error)"); until the
+ * typer's effect-row check in #8 enforces that, this default is
+ * the safe fallback. */
+static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
+    (void) self;
+    (void) k;
+    fputs("kai: Fail.fail: ", stderr);
+    if (msg && msg->tag == KAI_STR) {
+        fwrite(msg->as.s.bytes, 1, msg->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    exit(1);
+}
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;

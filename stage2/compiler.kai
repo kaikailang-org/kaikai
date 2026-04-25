@@ -5568,14 +5568,21 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
     # the top of the program is silently unused — no setup, no
     # static evidence node, no diff against pre-#7 codegen.
     let main_row = main_row_labels(decls)
-    let setup = if list_has(main_row, "Console") { default_console_setup() } else { "" }
-    let teardown = if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
+    let console_setup = if list_has(main_row, "Console") { default_console_setup() } else { "" }
+    let fail_setup    = if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" }
+    let console_pop = if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
+    let fail_pop    = if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" }
+    # Pop in LIFO order: Fail was pushed last (after Console), so
+    # pop Fail first. The setup helpers themselves preserve push
+    # order — Console first, then Fail.
     concat_all([
       "int main(int argc, char **argv) {\n",
       "    kai_set_args(argc, argv);\n",
-      setup,
+      console_setup,
+      fail_setup,
       "    KaiValue *_result = kai_main();\n",
-      teardown,
+      fail_pop,
+      console_pop,
       "    kai_decref(_result);\n",
       "    return 0;\n",
       "}\n"
@@ -5617,6 +5624,15 @@ fn default_console_setup() : String =
     "    _kai_default_ev_console.print  = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_print;\n",
     "    _kai_default_ev_console.eprint = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_eprint;\n",
     "    kai_evidence_push(&_kai_default_node_console, \"Console\", &_kai_default_ev_console);\n"
+  ])
+
+fn default_fail_setup() : String =
+  concat_all([
+    "    static EvFail _kai_default_ev_fail;\n",
+    "    static KaiEvidence _kai_default_node_fail;\n",
+    "    _kai_default_ev_fail.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_fail.fail = (KaiValue *(*)(EvFail *, KaiValue *, KaiCont *)) &kai_default_fail_fail;\n",
+    "    kai_evidence_push(&_kai_default_node_fail, \"Fail\", &_kai_default_ev_fail);\n"
   ])
 
 # m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
@@ -5850,6 +5866,12 @@ fn resolve_ty(t: TypeExpr) : Ty {
       else if name == "String" { TyString }
       else if name == "Char" { TyChar }
       else if name == "Unit" { TyUnit }
+      # m7a #7: `Nothing` is the uninhabited type used by `Fail.fail`
+      # (Doc B §`Fail`). The typer can't witness uninhabitedness, so
+      # we treat it as TyAny — a call producing Nothing unifies with
+      # any expected type, which is sound only because the default
+      # handler aborts before any consumer of that "value" runs.
+      else if name == "Nothing" { TyAny }
       else { TyCon(name, resolve_ty_list(targs)) }
     }
     TyList(inner) -> TyListT(resolve_ty(inner))
@@ -10997,7 +11019,10 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let console_d = if list_has(main_row, "Console") and not list_has(existing, "Console") {
     [builtin_console_decl()]
   } else { [] }
-  list_append(console_d, decls)
+  let fail_d = if list_has(main_row, "Fail") and not list_has(existing, "Fail") {
+    [builtin_fail_decl()]
+  } else { [] }
+  list_append(console_d, list_append(fail_d, decls))
 }
 
 fn ty_name_zero(name: String) : TypeExpr =
@@ -11012,6 +11037,12 @@ fn builtin_console_decl() : Decl =
     [
       EOp("print",  [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
       EOp("eprint", [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+fn builtin_fail_decl() : Decl =
+  DEffect(false, "Fail",
+    [
+      EOp("fail", [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
