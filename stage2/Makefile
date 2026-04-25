@@ -718,7 +718,8 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/m7b_11_state_basic.kai \
 	         ../examples/effects/m7b_11_reader_basic.kai \
-	         ../examples/effects/m7b_11_writer_basic.kai; do \
+	         ../examples/effects/m7b_11_writer_basic.kai \
+	         ../examples/effects/m7b_11_followup_distinct_types.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
@@ -727,6 +728,22 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (parametric effect runs end-to-end)" \
 	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_11_followup_arity_error.kai \
+	         ../examples/effects/m7b_11_followup_diag_type_args.kai \
+	         ../examples/effects/m7b_11_followup_resume_type.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_err=../examples/effects/$$name.err.expected; \
+	  rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	  if [ $$rc -eq 0 ]; then \
+	    echo "effects FAIL $$name (expected error, got success)"; exit 1; \
+	  fi; \
+	  while read -r line; do \
+	    grep -qF "$$line" build/s2-$$name.err \
+	      || { echo "effects FAIL $$name (missing diagnostic: $$line)"; \
+	           cat build/s2-$$name.err; exit 1; }; \
+	  done < $$exp_err; \
+	  echo "effects OK $$name (rejected with expected diagnostic)"; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
