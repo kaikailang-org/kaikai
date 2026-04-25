@@ -1,0 +1,15 @@
+# m7b #9 — chained map pipes are left-associative.
+#
+# `xs | f | g` parses as `(xs | f) | g` ≡ `map(map(xs, f), g)`.
+# Starting from [1, 2, 3]:
+#   inc      → [2, 3, 4]
+#   * 2      → [4, 6, 8]
+#   sum      → 18
+
+fn inc(x: Int) : Int = x + 1
+
+fn main() : Int {
+  let out = [1, 2, 3] | inc | { x -> x * 2 }
+  print(int_to_string(reduce(out, 0, (acc, x) => acc + x)))   # 18
+  0
+}
