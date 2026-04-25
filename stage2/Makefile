@@ -430,6 +430,20 @@ test-effects: $(TARGET) build
 	  ./build/s2-$$name \
 	    && echo "effects OK $$name (struct emitted + compiles + runs)" \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_6b_handle_runs.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_evidence_push(&_node, \"Counter\"" build/s2-$$name.c \
+	    && grep -q "kai_evidence_pop()" build/s2-$$name.c \
+	    && grep -q "EvCounter _ev = {0};" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (handle lowering shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name \
+	    && echo "effects OK $$name (handle prologue/epilogue + return clause runs)" \
+	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches

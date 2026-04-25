@@ -5129,14 +5129,43 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let msg = cat2("unfilled hole: ", label)
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
     }
-    EHandle(_, eff_name, _, _, _) -> {
-      # m7a #4b parses handle but does not yet lower it. m7a #6
-      # (perform/handle/resume lowering) replaces this stub with
-      # the actual evidence-passing code.
-      let msg = cat2("handle of `", cat2(eff_name, "` not yet implemented (m7a #6)"))
-      concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
-    }
+    EHandle(body, eff_name, _alias, _clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, ret_opt, fns, variants, lams)
   }
+}
+
+# m7a #6b: lower `handle { body } with Eff [as alias] { clauses }`
+# to its prologue/body/epilogue. This step ships the EvE alloca,
+# the handler-id stamp, the kai_evidence_push/pop pair, and the
+# optional return clause; clause fn-ptr fields stay zero-initialised
+# (NULL) and are populated in m7a #6d alongside the resume closure.
+# Op call dispatch via the EvE struct is m7a #6c — until that lands,
+# any op call inside the body still flows through the legacy
+# kai_field path (which fails to compile if the effect's labels
+# aren't bound), so #6b demos must keep the body op-free.
+fn emit_handle(src: String, body: Expr, eff_name: String,
+               ret_opt: Option[HReturn], fns: [EFn], variants: [EVar],
+               lams: [LamInfo]) : String {
+  let body_c = emit_expr(src, body, fns, variants, lams)
+  let ret_c = match ret_opt {
+    Some(r) -> match r {
+      HR(pname, rexpr, _, _) -> concat_all([
+        "KaiValue *kai_", pname, " = _body_result; ",
+        emit_expr(src, rexpr, fns, variants, lams), ";"
+      ])
+    }
+    None -> "_body_result;"
+  }
+  concat_all([
+    "({ Ev", eff_name, " _ev = {0}; ",
+    "_ev.handler_id = kai_fresh_handler_id(); ",
+    "KaiEvidence _node; ",
+    "kai_evidence_push(&_node, \"", eff_name, "\", &_ev); ",
+    "KaiValue *_body_result = ", body_c, "; ",
+    "kai_evidence_pop(); ",
+    ret_c,
+    " })"
+  ])
 }
 
 fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
