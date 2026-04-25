@@ -1488,13 +1488,25 @@ page the way they are written.
    available as parametric effects; capability bindings of those
    types exist in scope. *Pending.*
 5. **`var x = init`** — pre-resolve desugar + variable
-   specialisation (§*Variable specialisation*). **Parser-only
-   landed; desugar unblocked by #11** — Doc B §3 mandates lowering
-   to `handle { rest } with State[T](init) as name { ... }`,
-   which now exists end-to-end. A first attempt lowered to a
-   1-element `Mutable.array_make` cell-binding instead; that
-   shortcut was reverted to stay faithful to Doc B (locality
-   guarantee, no Mutable-row contamination). *Desugar pending.*
+   specialisation (§*Variable specialisation*). **Landed.** Doc B
+   §3 mandates lowering to `handle { rest } with State[T](init) as
+   name { ... }` with the canonical `get`/`set`/`return` clauses;
+   `desugar_var_decls` (`stage2/compiler.kai`) walks every block,
+   wraps the rest-of-block from each `SVar` onward in that handler
+   shape, and recurses so nested vars nest handlers innermost
+   first. The annotated form `var x: T = init` passes `[T]` as the
+   handler's syntactic type args; the unannotated form leaves the
+   list empty and synth_handle fills `[type_of_init]` from the
+   `init`'s inferred type. A pre-resolve alias rewrite (sibling
+   `rewrite_alias_decls`) turns `name.op(args)` inside the body
+   into `State.op(args)` so the existing op-call codegen
+   dispatches uniformly. The variable-specialisation pass that
+   collapses the canonical handler back to a stack slot
+   (§*Variable specialisation*) remains separate and is still
+   pending. A first attempt at the desugar lowered `var` to a
+   1-element `Mutable.array_make` cell instead; that shortcut was
+   reverted (commit affa903) to stay faithful to Doc B (locality
+   guarantee, no Mutable-row contamination).
 6. **`a[i]` and `a[i] := v`** — pre-resolve desugar pass.
    **Landed.**
 7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
@@ -1602,9 +1614,10 @@ then specialisation (m7b #5) piggybacks on top. m7b #11 and
 both have landed. m7b #13 and #14 are the post-#11 gaps surfaced
 by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
-helper. The remaining m7b items are: #2 (per-op generics), #4
-(`@cap` / `cap := v` sugar), #5b (`var` desugar), #7 (blocked
-on #13 + #14), #8 (diagnostic review), #13, #14.
+helper. m7b #5b (`var` → `State[T]` desugar) also landed. The
+remaining m7b items are: #2 (per-op generics), #4
+(`@cap` / `cap := v` sugar), #7 (blocked on #13 + #14),
+#8 (diagnostic review), #13, #14.
 
 ## Next steps
 
