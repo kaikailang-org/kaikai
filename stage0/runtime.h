@@ -1224,6 +1224,32 @@ static KaiValue *kai_cont_resume(KaiCont *k, KaiValue *v) {
     return k->fn(k->env, v);
 }
 
+/* m7a #7: default Console handler clauses. Both write the string
+ * + a trailing '\n' and resume with `()`. *Self is opaque to the
+ * runtime because `EvConsole` is a compiler-emitted type — the
+ * cast happens at the assignment in the main wrapper.
+ *
+ * EPIPE absorption (Doc B §`Console`/Default handler) is later
+ * polish — for now any write fault propagates through fputs's
+ * default behaviour. The minimal-but-useful path lands first. */
+static KaiValue *kai_default_console_print(void *self, KaiValue *s, KaiCont *k) {
+    (void) self;
+    if (s && s->tag == KAI_STR) {
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stdout);
+    }
+    fputc('\n', stdout);
+    return kai_cont_resume(k, kai_unit());
+}
+
+static KaiValue *kai_default_console_eprint(void *self, KaiValue *s, KaiCont *k) {
+    (void) self;
+    if (s && s->tag == KAI_STR) {
+        fwrite(s->as.s.bytes, 1, s->as.s.len, stderr);
+    }
+    fputc('\n', stderr);
+    return kai_cont_resume(k, kai_unit());
+}
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;

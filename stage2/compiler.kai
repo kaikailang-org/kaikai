@@ -5560,11 +5560,64 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
       "}\n"
     ])
   } else if has_main_decl(decls) {
-    "int main(int argc, char **argv) {\n    kai_set_args(argc, argv);\n    KaiValue *_result = kai_main();\n    kai_decref(_result);\n    return 0;\n}\n"
+    # m7a #7: install default handlers around `kai_main` only for
+    # the builtin effects that appear in `main`'s row. The push/pop
+    # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
+    # pop runs even if `kai_main` returns. Without a `/ Console`
+    # in `main`'s signature, the builtin Console decl injected at
+    # the top of the program is silently unused — no setup, no
+    # static evidence node, no diff against pre-#7 codegen.
+    let main_row = main_row_labels(decls)
+    let setup = if list_has(main_row, "Console") { default_console_setup() } else { "" }
+    let teardown = if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
+    concat_all([
+      "int main(int argc, char **argv) {\n",
+      "    kai_set_args(argc, argv);\n",
+      setup,
+      "    KaiValue *_result = kai_main();\n",
+      teardown,
+      "    kai_decref(_result);\n",
+      "    return 0;\n",
+      "}\n"
+    ])
   } else {
     ""
   }
 }
+
+# m7a #7: extract the row labels declared on `fn main`. A row of
+# `REmpty` returns []; `RClosed([Console, Fail])` returns those
+# labels. The wrapper installs default handlers only for the
+# subset of these that match a builtin effect.
+fn main_row_labels(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DFn(_, n, _, _, row, _, _, _) ->
+        if n == "main" {
+          match row {
+            REmpty       -> []
+            RClosed(lbs) -> lbs
+          }
+        } else { main_row_labels(rest) }
+      _ -> main_row_labels(rest)
+    }
+  }
+}
+
+# m7a #7: emit the static EvConsole + KaiEvidence node and the
+# in-main initialisation that wires the default fn ptrs and pushes
+# the node onto the fiber's evidence stack. Kept as a string-only
+# helper so emit_main_wrapper stays a flat concat.
+fn default_console_setup() : String =
+  concat_all([
+    "    static EvConsole _kai_default_ev_console;\n",
+    "    static KaiEvidence _kai_default_node_console;\n",
+    "    _kai_default_ev_console.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_console.print  = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_print;\n",
+    "    _kai_default_ev_console.eprint = (KaiValue *(*)(EvConsole *, KaiValue *, KaiCont *)) &kai_default_console_eprint;\n",
+    "    kai_evidence_push(&_kai_default_node_console, \"Console\", &_kai_default_ev_console);\n"
+  ])
 
 # m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
 # `EField(EVar(eff), op)` callee, where `eff` is a declared effect,
@@ -10932,6 +10985,35 @@ fn load_prelude(path: String) : Option[[Decl]] {
   }
 }
 
+# m7a #7: builtin effect declarations. The runtime ships a default
+# handler for these effects (Doc B §*Catalog*); the compiler injects
+# the corresponding `effect` decls at the front of every program so
+# the typer can resolve `Console.print(...)` etc. without the user
+# writing a stdlib import. Each effect is only injected if the user
+# (or an imported file) hasn't already declared it.
+fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
+  let existing = collect_effect_names(decls)
+  let main_row = main_row_labels(decls)
+  let console_d = if list_has(main_row, "Console") and not list_has(existing, "Console") {
+    [builtin_console_decl()]
+  } else { [] }
+  list_append(console_d, decls)
+}
+
+fn ty_name_zero(name: String) : TypeExpr =
+  TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
+
+fn param_string_zero(name: String) : Param =
+  Param { pname: name, ptype: Some(ty_name_zero("String")),
+          pline: 0, pcol: 0 }
+
+fn builtin_console_decl() : Decl =
+  DEffect(false, "Console",
+    [
+      EOp("print",  [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
+      EOp("eprint", [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
   let tokens = tokenize(src)
   let lex_errs = report_errors(path, src, tokens)
@@ -10949,7 +11031,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
           None -> 1
           Some(own_decls) -> {
             let expanded = expand_imports(path, search_paths, own_decls)
-            let all_decls = list_append(prelude_decls, expanded)
+            let merged = list_append(prelude_decls, expanded)
+            let all_decls = inject_builtin_effects(merged)
             match mode {
               MAst -> { dump_program(all_decls); 0 }
               MTypes -> { dump_types(own_decls); 0 }

@@ -507,6 +507,25 @@ test-effects: $(TARGET) build
 	    && grep -q "(Int) -> " build/s2-$$name.err \
 	    && echo "effects OK $$name (resume arg-type mismatch caught)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_7_default_console.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_console_print" build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_console" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-handler wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.run.err \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^hello$$"                       build/s2-$$name.out \
+	    && grep -q "^world$$"                  build/s2-$$name.out \
+	    && grep -q "^warn: this goes to stderr$$" build/s2-$$name.run.err \
+	    && echo "effects OK $$name (default Console: stdout + stderr verified)" \
+	    || { echo "effects FAIL $$name (wrong default-handler output)"; \
+	         echo "stdout:"; cat build/s2-$$name.out; \
+	         echo "stderr:"; cat build/s2-$$name.run.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
