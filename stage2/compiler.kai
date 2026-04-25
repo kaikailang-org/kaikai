@@ -1399,6 +1399,12 @@ fn parse_pipe(p: Parser) : PExpr {
 }
 
 fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
+  # Both `|>` (apply pipe) and `|` (map pipe) sit at the lowest binop
+  # level, left-associative. `|` is m7b #9: `xs | f` lowers at parse
+  # time to `map(xs, f)` so the rest of the pipeline sees a plain call.
+  # The `|` variant separator in `type T = A | B` is parsed by
+  # `parse_sum_body`, not the expression grammar, so there is no
+  # ambiguity here.
   if p_at(p, TkPipeApply) {
     let t = p_peek(p)
     let p1 = p_skip_newlines(p_advance(p))
@@ -1406,6 +1412,18 @@ fn parse_pipe_rest(p: Parser, lhs: Expr) : PExpr {
     match r.r {
       None -> err_e(r.p)
       Some(rhs) -> parse_pipe_rest(r.p, mk_expr(EPipe(lhs, rhs), t.line, t.col))
+    }
+  } else if p_at(p, TkPipe) {
+    let t = p_peek(p)
+    let p1 = p_skip_newlines(p_advance(p))
+    let r = parse_or(p1)
+    match r.r {
+      None -> err_e(r.p)
+      Some(rhs) -> {
+        let map_callee = mk_expr(EVar("map"), t.line, t.col)
+        let call = mk_expr(ECall(map_callee, [lhs, rhs]), t.line, t.col)
+        parse_pipe_rest(r.p, call)
+      }
     }
   } else {
     ok_e(p, lhs)
