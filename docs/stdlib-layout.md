@@ -94,6 +94,7 @@ stdlib/
     float.kai
   decimal.kai    pure, stage 2 (top-level module)
   money.kai      pure, stage 2 (top-level module; depends on decimal)
+  loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever)
   io.kai         effects: Console, Stdin (top-level module)
   fs/            effect: File
     file.kai
@@ -161,6 +162,43 @@ land in each module's own spec when implemented.
 
 - `money` — `Money[Currency]` with precision per currency, safe
   arithmetic (no implicit cross-currency ops); depends on `decimal`
+
+### loop (row-polymorphic, stage 2)
+
+Top-level module exposing the canonical Koka-style control-flow
+helpers as ordinary functions. Each helper is row-polymorphic in
+its lambdas — the effect of the predicate / body flows out
+unchanged via the row variable `e`. The functions themselves
+introduce no effect; they are pure recursion with mandatory TCO.
+
+- `loop.while[e](pred: () -> Bool / e, body: () -> Unit / e) : Unit / e`
+- `loop.until[e](pred: () -> Bool / e, body: () -> Unit / e) : Unit / e` — body runs first; do-while shape
+- `loop.repeat[e](n: Int, body: () -> Unit / e) : Unit / e`
+- `loop.forever[e](body: () -> Unit / e) : Nothing / e` — only exits via `Cancel`
+
+Used with the m7b §5 double-trailing-lambda sugar for the natural
+Koka feel:
+
+```kai
+while  { @i > 0 }  { i := @i - 1; io.println("#{@i}") }
+until  { @done }   { process_one() }
+repeat(10)         { io.println("hi") }
+forever            { handle_message() }
+```
+
+The bare names (`while`, `until`, `repeat`, `forever`) are
+auto-imported in stage 2 so user code does not need to write
+`loop.while` explicitly. The qualified form remains legal
+when an explicit reference is preferred.
+
+`while`, `until`, `repeat`, and `forever` are deliberately
+**not** language keywords — they are stdlib functions, callable
+like any other. A user can shadow them by binding the same name
+locally; the compiler does not protect them. This is consistent
+with the Tier 2 principle "few visible concepts, layered" and
+with Doc CLAUDE.md's stance that ordinary stdlib functions are
+preferable to language-level control structures when the row
+machinery suffices.
 
 ### io (`/ Console + Stdin`)
 

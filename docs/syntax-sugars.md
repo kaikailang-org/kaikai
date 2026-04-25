@@ -45,9 +45,10 @@ actually lives:
   motivates; §3 below specifies.
 - `a[i]` / `a[i] := v` — Doc B §*Syntax note: array indexing*
   motivates; §4 below specifies.
-- Double trailing lambdas — motivated by `loop_while`,
+- Double trailing lambdas — motivated by `while`, `until`,
   `if_then_else`, and similar control-flow helpers built as
-  ordinary stdlib functions; §5 below specifies.
+  ordinary stdlib functions (see `docs/stdlib-layout.md` §`loop`);
+  §5 below specifies.
 
 Doc A (`docs/effects.md`) §*Handling* records that the
 `handle { body } with Eff { ... }` form already uses the
@@ -498,7 +499,7 @@ The canonical use is control-flow helpers built as ordinary
 stdlib functions:
 
 ```kai
-loop_while { @i > 0 } { i := @i - 1; io.println("#{@i}") }
+while      { @i > 0 } { i := @i - 1; io.println("#{@i}") }
 until      { @done }  { process_one() }
 if_then_else(p)       { run_a() } { run_b() }
 ```
@@ -541,7 +542,7 @@ indistinguishable blocks is more confusing than verbose.
 
 Three constructs that benefit clearly:
 
-- **`loop_while { cond } { body }`** — predicate then action.
+- **`while { cond } { body }`** — predicate then action.
 - **`if_then_else(p) { a } { b }`** — then-branch then else.
 - **`with_resource(r) { setup } { teardown }`** — RAII-shaped
   bracketed-init pattern.
