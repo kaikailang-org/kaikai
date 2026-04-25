@@ -1644,6 +1644,33 @@ page the way they are written.
     by the 2026-04-25 attempt at #7. Likely needs companion
     work in codegen (lambdas with non-empty rows must close
     over the handler stack accordingly). Blocker of #7. *Pending.*
+15. **Per-instance handler dispatch** — runtime
+    `kai_evidence_lookup_node(name)` is name-keyed + LIFO, so
+    nested `var`s of the same effect+ty_args shadow innermost-wins
+    and the outer cell becomes unreachable from inside the inner
+    body. Cure: the alias rewrite emits a lookup keyed on the
+    specific `handler_id`, not the effect name. Runtime + codegen
+    change. Surfaced by m7b #5b; details and motivating example
+    in §*Variable specialisation* §*Known follow-ups after
+    m7b #5b* item 1. *Pending.*
+16. **Variable specialisation pass** — the optimisation pass
+    promised by Doc B §`State[T]` *Performance* and specified in
+    §*Variable specialisation*. The m7b #5b desugar emits the
+    canonical heap-handler form unconditionally, so today every
+    `var n = 0; n.set(@n + 1)` pays a full op-call (evidence
+    lookup + identity continuation) per access. Trigger check +
+    slot replacement is the missing pass. Independent of #15;
+    either can land first. *Pending.*
+17. **Alias-rewrite shadow tracking** — the pre-emit
+    `rewrite_alias_decls` walker rewrites every `alias.op(args)`
+    inside an `EHandle` body without tracking inner
+    `let alias = ...` shadowing. The resolver catches the
+    resulting type error today, so it is a latent
+    correctness bug rather than a user-visible one. Small change
+    to `rewrite_alias_kind`'s `EBlock` / `ELambda` / `EMatch`
+    cases. Surfaced by m7b #5b; details in §*Variable
+    specialisation* §*Known follow-ups after m7b #5b* item 3.
+    *Pending.*
 
 Within each sub-milestone the ordering is dependency-driven: the
 evidence type generation (m7a #3) unblocks everything else in
@@ -1653,10 +1680,12 @@ then specialisation (m7b #5) piggybacks on top. m7b #11 and
 both have landed. m7b #13 and #14 are the post-#11 gaps surfaced
 by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
-helper. m7b #5b (`var` → `State[T]` desugar) also landed. The
-remaining m7b items are: #2 (per-op generics), #4
-(`@cap` / `cap := v` sugar), #7 (blocked on #13 + #14),
-#8 (diagnostic review), #13, #14.
+helper. m7b #5b (`var` → `State[T]` desugar) landed; #15, #16,
+and #17 are the three known gaps it left behind, promoted from
+the §*Known follow-ups after m7b #5b* subsection. The remaining
+m7b items are: #2 (per-op generics), #4 (`@cap` / `cap := v`
+sugar), #7 (blocked on #13 + #14), #8 (diagnostic review), #13,
+#14, #15, #16, #17.
 
 ## Next steps
 
