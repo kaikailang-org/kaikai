@@ -1009,7 +1009,14 @@ fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line:
 # p_advance is O(1) (takes tail). Peek-ahead uses list destructuring
 # up to depth 3, which covers every lookahead stage 0 does.
 
-type Parser = { file: String, src: String, rest: [Token], had_error: Bool }
+type Parser = { file: String, src: String, rest: [Token], had_error: Bool,
+                # m7b §1: trailing lambdas attach to Calls, but the
+                # condition of `if` / `match` (and similar prefix
+                # constructs that take an Expr followed by a `{`-block)
+                # must not consume the `{` as a trailing lambda. This
+                # flag is set to false while parsing such a cond and
+                # restored when the cond parser finishes.
+                allow_trailing_lambda: Bool }
 
 # A result = a new parser plus an optional payload. `None` means the
 # parser failed (had_error is set on `p`). This mirrors stage 0's
@@ -1029,14 +1036,17 @@ type PPF     = { p: Parser, r: Option[PField] }
 type PEL     = { p: Parser, r: Option[ListElem] }
 
 fn parser_new(file: String, src: String, toks: [Token]) : Parser =
-  Parser { file: file, src: src, rest: toks, had_error: false }
+  Parser { file: file, src: src, rest: toks, had_error: false, allow_trailing_lambda: true }
 
 fn p_mark_err(p: Parser) : Parser =
-  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true }
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: true,
+           allow_trailing_lambda: p.allow_trailing_lambda }
 
 fn p_advance(p: Parser) : Parser {
   match p.rest {
-    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1, had_error: p.had_error }
+    [_, ...rest1] -> Parser { file: p.file, src: p.src, rest: rest1,
+                              had_error: p.had_error,
+                              allow_trailing_lambda: p.allow_trailing_lambda }
     [] -> p
   }
 }
@@ -1141,6 +1151,16 @@ fn p_try_consume(p: Parser, k: TokKind) : Option[Parser] {
 
 fn p_skip_newlines(p: Parser) : Parser {
   if p_at(p, TkNewline) { p_skip_newlines(p_advance(p)) } else { p }
+}
+
+# m7b §1: temporarily disable trailing-lambda attachment for the
+# parser passed in (used by `if` / `match` cond parsing). Returns
+# a parser identical except for the flag. The caller is expected
+# to restore the original flag value after the cond parses by
+# threading the flag back via `p_with_trailing_lambda(p, true)`.
+fn p_with_trailing_lambda(p: Parser, allow: Bool) : Parser {
+  Parser { file: p.file, src: p.src, rest: p.rest, had_error: p.had_error,
+           allow_trailing_lambda: allow }
 }
 
 fn p_skip_newlines_and_semis(p: Parser) : Parser {
@@ -1527,7 +1547,22 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
     let args_r = parse_call_args(p_advance(p))
     match args_r.r {
       None -> err_e(args_r.p)
-      Some(xs) -> parse_postfix_rest(args_r.p, mk_expr(ECall(lhs, xs), t.line, t.col))
+      Some(xs) -> {
+        # m7b §1/§5: same-line `{` after `f(args)` attaches as a
+        # trailing lambda. Up to two consecutive trailings (greedy,
+        # both must be on the same line as the previous token).
+        # Trailing-lambda attachment is disabled for cond positions
+        # (see p_with_trailing_lambda).
+        let lam_r = if args_r.p.allow_trailing_lambda {
+          parse_trailing_lambdas(args_r.p, xs)
+        } else {
+          ok_args(args_r.p, xs)
+        }
+        match lam_r.r {
+          None -> err_e(lam_r.p)
+          Some(xs1) -> parse_postfix_rest(lam_r.p, mk_expr(ECall(lhs, xs1), t.line, t.col))
+        }
+      }
     }
   } else if tk_is(t.kind, TkDot) {
     let p1 = p_advance(p)
@@ -1551,8 +1586,130 @@ fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr {
         }
       }
     }
+  } else if tk_is(t.kind, TkLbrace) and p.allow_trailing_lambda {
+    # m7b §1: paren-free trailing lambda — `f { body }` desugars
+    # to `f(() => body)`, optionally followed by a second trailing
+    # lambda (§5). Same-line is implicit: parse_postfix_rest does
+    # not skip newlines, so a `{` appearing here is on the same
+    # source line as `lhs`. Disabled inside `if` / `match` conds.
+    let lam_r = parse_trailing_lambdas(p, [])
+    match lam_r.r {
+      None -> err_e(lam_r.p)
+      Some(xs1) -> parse_postfix_rest(lam_r.p, mk_expr(ECall(lhs, xs1), t.line, t.col))
+    }
   } else {
     ok_e(p, lhs)
+  }
+}
+
+# m7b §1 + §5 — parse zero, one, or two trailing lambdas after a
+# call site. Each trailing lambda must be on the same line as the
+# preceding token (parse_postfix_rest never skips newlines, so a
+# `TkLbrace` at the head of `p` is by construction same-line).
+# `acc` is the call's existing argument list; the parsed lambdas
+# are appended in source order. Returns the call's full arg list.
+fn parse_trailing_lambdas(p: Parser, acc: [Expr]) : PArgs {
+  if p_at(p, TkLbrace) {
+    let lr = parse_trailing_lambda(p)
+    match lr.r {
+      None -> err_args(lr.p)
+      Some(lam) -> {
+        let acc1 = list_append(acc, [lam])
+        if p_at(lr.p, TkLbrace) {
+          let lr2 = parse_trailing_lambda(lr.p)
+          match lr2.r {
+            None -> err_args(lr2.p)
+            Some(lam2) -> ok_args(lr2.p, list_append(acc1, [lam2]))
+          }
+        } else {
+          ok_args(lr.p, acc1)
+        }
+      }
+    }
+  } else {
+    ok_args(p, acc)
+  }
+}
+
+# Parse a single trailing-lambda `{ (LambdaParams "->")? Block }`.
+# Position is at the `{`. Returns an `ELambda(params, body)` where
+# `body` is an EBlock (the lambda's body block). The block-form
+# `{ x -> body }` desugars to `(x) => body` per syntax-sugars §1.
+fn parse_trailing_lambda(p: Parser) : PExpr {
+  let t = p_peek(p)
+  # Consume `{`.
+  let p1 = p_advance(p)
+  # Decide between `(LambdaParams "->")? Block`. Peek past optional
+  # newlines after `{` to see whether we're staring at a parameter
+  # list. The lookahead is bounded: `Ident ("," Ident)* "->"` or
+  # just `->` for zero arity.
+  let p1n = p_skip_newlines(p1)
+  let pp_r = try_parse_lambda_block_params(p1n)
+  match pp_r {
+    Some(res) -> {
+      # `res.p` is positioned right after `->`. Body is a brace-less
+      # block of statements terminated by `}`.
+      let body_r = parse_lambda_block_body(res.p, t)
+      match body_r.r {
+        None -> err_e(body_r.p)
+        Some(body) -> ok_e(body_r.p, mk_expr(ELambda(res.params, body), t.line, t.col))
+      }
+    }
+    None -> {
+      # Zero-arity trailing lambda: no `params ->` prefix. The body
+      # is the contents of the brace block. Treat as a lambda with
+      # an empty parameter list whose body is the parsed block.
+      let body_r = parse_lambda_block_body(p1, t)
+      match body_r.r {
+        None -> err_e(body_r.p)
+        Some(body) -> ok_e(body_r.p, mk_expr(ELambda([], body), t.line, t.col))
+      }
+    }
+  }
+}
+
+# Parse the contents of a lambda-block body up to the closing `}`.
+# Position is after the optional `params ->` prefix. The body is
+# the same shape as a regular block: zero or more statements
+# followed by an optional final expression. We reuse the existing
+# parse_block_body machinery for this.
+fn parse_lambda_block_body(p: Parser, t: Token) : PExpr {
+  let p0 = p_skip_newlines_and_semis(p)
+  parse_block_body(p0, [], t)
+}
+
+# Bounded-lookahead: tentatively scan for `LambdaParams "->"` or
+# bare `"->"`. Returns Some(parser-after-arrow, params) on match,
+# None otherwise. The scan never consumes tokens of the underlying
+# parser on failure (it's a pure predicate over the token stream).
+type LamBlockParams = { p: Parser, params: [Param] }
+
+fn try_parse_lambda_block_params(p: Parser) : Option[LamBlockParams] {
+  # Zero-arity: `{ -> body }`.
+  if p_at(p, TkArrow) {
+    Some(LamBlockParams { p: p_advance(p), params: [] })
+  } else if p_at(p, TkIdent) {
+    try_parse_lambda_block_params_loop(p, [])
+  } else {
+    None
+  }
+}
+
+fn try_parse_lambda_block_params_loop(p: Parser, acc: [Param]) : Option[LamBlockParams] {
+  let t = p_peek(p)
+  if not tk_is(t.kind, TkIdent) { None }
+  else {
+    let name = tok_source(p.src, t)
+    let p1 = p_advance(p)
+    let pm = Param { pname: name, ptype: None, pline: t.line, pcol: t.col }
+    let acc1 = [pm, ...acc]
+    if p_at(p1, TkComma) {
+      try_parse_lambda_block_params_loop(p_skip_newlines(p_advance(p1)), acc1)
+    } else if p_at(p1, TkArrow) {
+      Some(LamBlockParams { p: p_advance(p1), params: list_reverse(acc1) })
+    } else {
+      None
+    }
   }
 }
 
@@ -2139,12 +2296,17 @@ fn parse_assert(p: Parser, t: Token) : PStmt {
 
 fn parse_if(p: Parser, t: Token) : PExpr {
   let p1 = p_advance(p)
-  let rc = parse_expr(p1)
+  # m7b §1: cond cannot consume a trailing `{` as a trailing lambda
+  # — that `{` is the `if` body. Disable while parsing cond, then
+  # restore the flag's prior value before consuming the body.
+  let prev_atl = p1.allow_trailing_lambda
+  let pc = p_with_trailing_lambda(p1, false)
+  let rc = parse_expr(pc)
   match rc.r {
     None -> err_e(rc.p)
     Some(cond) -> {
       # Then-block
-      let p2 = p_skip_newlines(rc.p)
+      let p2 = p_skip_newlines(p_with_trailing_lambda(rc.p, prev_atl))
       if not p_at(p2, TkLbrace) {
         err_e(p_error_here(p2, "expected `{` after `if` condition"))
       } else {
@@ -2186,11 +2348,15 @@ fn parse_if(p: Parser, t: Token) : PExpr {
 
 fn parse_match(p: Parser, t: Token) : PExpr {
   let p1 = p_advance(p)
-  let rs = parse_expr(p1)
+  # m7b §1: same as `if` — scrutinee cannot eat the `{` that opens
+  # the arms block as a trailing lambda.
+  let prev_atl = p1.allow_trailing_lambda
+  let ps = p_with_trailing_lambda(p1, false)
+  let rs = parse_expr(ps)
   match rs.r {
     None -> err_e(rs.p)
     Some(scrut) -> {
-      let p2 = p_skip_newlines(rs.p)
+      let p2 = p_skip_newlines(p_with_trailing_lambda(rs.p, prev_atl))
       if not p_at(p2, TkLbrace) {
         err_e(p_error_here(p2, "expected `{` after `match` expression"))
       } else {

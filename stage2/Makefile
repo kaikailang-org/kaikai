@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars selfhost
 
 all: $(TARGET)
 
@@ -620,6 +620,48 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (None path output wrong)"; cat build/s2-$$name.out2; exit 1; }; \
 	done
 
+# m7b #3 — syntax sugars (trailing lambdas, lambda-block as
+# expression, double trailing lambdas). Each .kai under
+# `examples/sugars/` either compiles + runs to a known integer
+# (positive cases) or fails with a specific diagnostic (negatives).
+# The positive cases all `print` their final value, the test diffs
+# stdout against a `<name>.out.expected` golden file. Negative
+# cases drop a `<name>.err.expected` line that must appear in the
+# compiler's stderr.
+test-sugars: $(TARGET) build
+	@$(STACK) set -e; \
+	for f in ../examples/sugars/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  exp_out=../examples/sugars/$$name.out.expected; \
+	  exp_err=../examples/sugars/$$name.err.expected; \
+	  if [ -f $$exp_err ]; then \
+	    rc=0; ./$(TARGET) $$f > /dev/null 2> build/s2-$$name.err || rc=$$?; \
+	    if [ $$rc -eq 0 ]; then \
+	      echo "sugars FAIL $$name (expected error, got success)"; exit 1; \
+	    fi; \
+	    while read -r line; do \
+	      grep -q "$$line" build/s2-$$name.err \
+	        || { echo "sugars FAIL $$name (missing diagnostic: $$line)"; \
+	             cat build/s2-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "sugars OK $$name (rejected as expected)"; \
+	  else \
+	    ./$(TARGET) $$f > build/$$name.c \
+	      || { echo "sugars FAIL $$name (kaic2 errored)"; exit 1; }; \
+	    $(CC) $(CFLAGS) -I ../stage0 build/$$name.c -o build/$$name \
+	      || { echo "sugars FAIL $$name (C compile failed)"; exit 1; }; \
+	    ./build/$$name > build/$$name.out \
+	      || { echo "sugars FAIL $$name (run errored)"; cat build/$$name.out; exit 1; }; \
+	    if [ -f $$exp_out ]; then \
+	      diff -q $$exp_out build/$$name.out > /dev/null \
+	        && echo "sugars OK $$name" \
+	        || { echo "sugars DIFF $$name"; diff $$exp_out build/$$name.out; exit 1; }; \
+	    else \
+	      echo "sugars OK $$name (no golden, ran clean)"; \
+	    fi; \
+	  fi; \
+	done
+
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
 # m7a #5: smoke test for the handler-stack runtime primitives.
@@ -664,7 +706,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -673,7 +715,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars
 
 clean:
 	rm -rf build $(TARGET)
