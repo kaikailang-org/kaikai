@@ -5344,9 +5344,17 @@ fn dump_env(env: TyEnv) : Unit =
 #
 # When the `Mutable` effect lands, `array_set` should require it,
 # and these informal rules become a type-level obligation.
-type Subst = { slots: Array[Option[Ty]] }
+type Subst = {
+  slots:     Array[Option[Ty]],
+  row_slots: Array[Option[Row]],
+  row_fresh: Int
+}
 
-fn subst_empty() : Subst = Subst { slots: array_make(64, None) }
+fn subst_empty() : Subst = Subst {
+  slots:     array_make(64, None),
+  row_slots: array_make(16, None),
+  row_fresh: 0
+}
 
 fn subst_lookup(s: Subst, v: Int) : Option[Ty] {
   if v >= array_length(s.slots) { None }
@@ -5360,7 +5368,36 @@ fn subst_extend(s: Subst, v: Int, ty: Ty) : Subst {
     array_grow(s.slots, grown, None)
   } else { s.slots }
   let slots2 = array_set(slots1, v, Some(ty))
-  Subst { slots: slots2 }
+  Subst { slots: slots2, row_slots: s.row_slots, row_fresh: s.row_fresh }
+}
+
+# Row-var substitution (parallel to subst_lookup / subst_extend, but
+# indexed into row_slots). m7a #2 introduces the shape; row vars are
+# only created during unify_row, never elsewhere.
+
+fn subst_row_lookup(s: Subst, v: Int) : Option[Row] {
+  if v >= array_length(s.row_slots) { None }
+  else { array_get(s.row_slots, v) }
+}
+
+fn subst_row_extend(s: Subst, v: Int, r: Row) : Subst {
+  let len = array_length(s.row_slots)
+  let rs1 = if v >= len {
+    let grown = if v + 1 > len * 2 { v + 1 } else { len * 2 }
+    array_grow(s.row_slots, grown, None)
+  } else { s.row_slots }
+  let rs2 = array_set(rs1, v, Some(r))
+  Subst { slots: s.slots, row_slots: rs2, row_fresh: s.row_fresh }
+}
+
+# Allocate a fresh row variable id and bump the counter. Returned in
+# a record because kaikai stage 2 has no tuples.
+type FreshRow = { id: Int, subst: Subst }
+
+fn subst_fresh_row(s: Subst) : FreshRow {
+  let id = s.row_fresh
+  let s1 = Subst { slots: s.slots, row_slots: s.row_slots, row_fresh: id + 1 }
+  FreshRow { id: id, subst: s1 }
 }
 
 # Apply the substitution to a type. Recurses structurally; resolves
@@ -5380,7 +5417,7 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
       None     -> t
     }
     TyListT(inner) -> TyListT(apply_ty(s, inner))
-    TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), row)
+    TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), apply_row(s, row))
     TyCon(name, atys) -> TyCon(name, apply_tys(s, atys))
   }
 }
@@ -5389,6 +5426,192 @@ fn apply_tys(s: Subst, ts: [Ty]) : [Ty] {
   match ts {
     [] -> []
     [t, ...rest] -> [apply_ty(s, t), ...apply_tys(s, rest)]
+  }
+}
+
+# ---- row substitution + unification (m7a #2) -----------------------
+#
+# Rémy-style row unification, per docs/effects-impl.md §*Types: row
+# slot on TyFnT* and Doc A §*Row unification*. In m7a #2 every row at
+# every TyFnT site is `row_empty()`, so the unification path
+# exercises the trivial empty/empty case. The full algorithm is
+# wired in here so m7a #3 onward (where rows actually carry labels
+# and tail variables) just feeds it real data.
+#
+# Canonicality (sorted/dedup labels) is the caller's responsibility.
+# m7a #2 only ever receives empty label lists, so we do not enforce
+# the invariant here; m7a #3 will revisit when labels start flowing.
+
+fn label_concat(a: [Label], b: [Label]) : [Label] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...label_concat(rest, b)]
+  }
+}
+
+fn apply_label_args(s: Subst, l: Label) : Label =
+  Label { eff: l.eff, ty_args: apply_tys(s, l.ty_args) }
+
+fn apply_labels(s: Subst, ls: [Label]) : [Label] {
+  match ls {
+    [] -> []
+    [h, ...rest] -> [apply_label_args(s, h), ...apply_labels(s, rest)]
+  }
+}
+
+# Resolve a row under the current substitution: apply_ty to each
+# label payload, and chase the tail var if it's bound.
+fn apply_row(s: Subst, r: Row) : Row {
+  let labels1 = apply_labels(s, r.labels)
+  match r.tail {
+    None -> Row { labels: labels1, tail: None, display_alias: r.display_alias }
+    Some(v) -> match subst_row_lookup(s, v) {
+      None -> Row { labels: labels1, tail: Some(v), display_alias: r.display_alias }
+      Some(r2) -> {
+        let r2r = apply_row(s, r2)
+        Row {
+          labels: label_concat(labels1, r2r.labels),
+          tail: r2r.tail,
+          display_alias: r.display_alias
+        }
+      }
+    }
+  }
+}
+
+# Does row variable `v` appear in row `r` after applying the current
+# substitution? Standard occurs check, restricted to the tail (row
+# vars cannot appear inside a label's ty_args).
+fn occurs_row(v: Int, r: Row, s: Subst) : Bool {
+  let r1 = apply_row(s, r)
+  match r1.tail {
+    None -> false
+    Some(w) -> v == w
+  }
+}
+
+# Partition two label lists into (both-pairs, only-left, only-right).
+# O(n*m); fine for rows of expected size <10.
+
+type LabelPair = LPair(Label, Label)
+
+type LabelPartition = {
+  both_pairs: [LabelPair],
+  only_left:  [Label],
+  only_right: [Label]
+}
+
+# Find the first label in `ls` whose eff matches; return the label
+# plus the list with it removed (preserving relative order).
+type FindRemove = { found: Label, remain: [Label] }
+
+fn find_remove_label(eff: String, ls: [Label]) : Option[FindRemove] {
+  find_remove_label_loop(eff, ls, [])
+}
+
+fn find_remove_label_loop(eff: String, ls: [Label], seen: [Label]) : Option[FindRemove] {
+  match ls {
+    [] -> None
+    [h, ...rest] -> {
+      if h.eff == eff {
+        Some(FindRemove { found: h, remain: label_concat(seen, rest) })
+      } else {
+        find_remove_label_loop(eff, rest, label_concat(seen, [h]))
+      }
+    }
+  }
+}
+
+fn partition_labels(a: [Label], b: [Label]) : LabelPartition =
+  partition_walk(a, b, [], [])
+
+fn partition_walk(a: [Label], b_remain: [Label],
+                  bp: [LabelPair], ol: [Label]) : LabelPartition {
+  match a {
+    [] -> LabelPartition { both_pairs: bp, only_left: ol, only_right: b_remain }
+    [ah, ...arest] -> match find_remove_label(ah.eff, b_remain) {
+      None -> partition_walk(arest, b_remain, bp, [ah, ...ol])
+      Some(fr) -> partition_walk(arest, fr.remain, [LPair(ah, fr.found), ...bp], ol)
+    }
+  }
+}
+
+# Unify the ty_args of every (left, right) pair where the labels share
+# an effect symbol.
+fn unify_label_pairs(pairs: [LabelPair], s: Subst) : Option[Subst] {
+  match pairs {
+    [] -> Some(s)
+    [LPair(la, lb), ...rest] -> match unify_list(la.ty_args, lb.ty_args, s) {
+      None -> None
+      Some(s1) -> unify_label_pairs(rest, s1)
+    }
+  }
+}
+
+# True iff the label list is empty.
+fn labels_empty(ls: [Label]) : Bool {
+  match ls { [] -> true _ -> false }
+}
+
+# Bind the two row tails per Doc A §*Row unification* steps 2–3.
+# - Both rigid: the only-left and only-right lists must be empty.
+# - One rigid, one flex: bind the flex tail to a row containing the
+#   other side's "only" labels and a None tail (since the rigid side
+#   admitted nothing extra). The "only" list of the rigid side must
+#   be empty.
+# - Both flex: introduce a fresh tail variable τ and bind each side
+#   to a row carrying the *other* side's "only" labels plus τ.
+fn bind_row_tails(at: Option[Int], bt: Option[Int],
+                  oleft: [Label], oright: [Label],
+                  s: Subst) : Option[Subst] {
+  match at {
+    None -> match bt {
+      None -> if labels_empty(oleft) and labels_empty(oright) { Some(s) } else { None }
+      Some(b_id) -> {
+        if not labels_empty(oright) { None }
+        else {
+          let r = Row { labels: oleft, tail: None, display_alias: None }
+          if occurs_row(b_id, r, s) { None }
+          else { Some(subst_row_extend(s, b_id, r)) }
+        }
+      }
+    }
+    Some(a_id) -> match bt {
+      None -> {
+        if not labels_empty(oleft) { None }
+        else {
+          let r = Row { labels: oright, tail: None, display_alias: None }
+          if occurs_row(a_id, r, s) { None }
+          else { Some(subst_row_extend(s, a_id, r)) }
+        }
+      }
+      Some(b_id) -> {
+        if a_id == b_id and labels_empty(oleft) and labels_empty(oright) { Some(s) }
+        else {
+          let fr = subst_fresh_row(s)
+          let s1 = fr.subst
+          let r_for_a = Row { labels: oright, tail: Some(fr.id), display_alias: None }
+          let r_for_b = Row { labels: oleft,  tail: Some(fr.id), display_alias: None }
+          if occurs_row(a_id, r_for_a, s1) { None }
+          else {
+            let s2 = subst_row_extend(s1, a_id, r_for_a)
+            if occurs_row(b_id, r_for_b, s2) { None }
+            else { Some(subst_row_extend(s2, b_id, r_for_b)) }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Unify two effect rows. Returns the extended substitution or None.
+fn unify_row(r1: Row, r2: Row, s: Subst) : Option[Subst] {
+  let a = apply_row(s, r1)
+  let b = apply_row(s, r2)
+  let p = partition_labels(a.labels, b.labels)
+  match unify_label_pairs(p.both_pairs, s) {
+    None -> None
+    Some(s1) -> bind_row_tails(a.tail, b.tail, p.only_left, p.only_right, s1)
   }
 }
 
@@ -5472,10 +5695,13 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       TyListT(b1) -> unify(a1, b1, s)
       _ -> None
     }
-    TyFnT(ap, ar, _) -> match b {
-      TyFnT(bp, br, _) -> match unify_list(ap, bp, s) {
+    TyFnT(ap, ar, arow) -> match b {
+      TyFnT(bp, br, brow) -> match unify_list(ap, bp, s) {
         None -> None
-        Some(s1) -> unify(ar, br, s1)
+        Some(s1) -> match unify(ar, br, s1) {
+          None -> None
+          Some(s2) -> unify_row(arow, brow, s2)
+        }
       }
       _ -> None
     }
