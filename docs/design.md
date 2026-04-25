@@ -144,12 +144,15 @@ arguments:
 
 - **Scope**: full redesign. The current syntax and semantics are input, not constraint.
 - **Backend**: LLVM directly.
-- **Concurrency**: subsumed under effects. Actors = effect capability, not a separate primitive. `spawn`/`send`/`receive` are operations of the `Actor`/`Io` effects.
+- **Concurrency**: subsumed under effects. Fibers and actors are not separate primitives — both ride on top of the effect system.
+  - `spawn` / `await` / `select` / `cancel` are operations of the **`Spawn`** effect; `nursery { n -> ... }` installs the handler that scopes them. See `docs/structured-concurrency.md`.
+  - `send` / `receive` / `self` are operations of the parameterised **`Actor[Msg]`** effect; `spawn_actor`, `spawn_actor_default`, and `with_mailbox` install the handler with a typed mailbox. See `docs/actors.md`.
+  - `Cancel` is its own effect, delivered cooperatively at yield points.
 - **Memory model**: hybrid.
   - **Perceus** (compile-time optimized reference counting, Koka-style) within each fiber.
   - **Isolated fibers** BEAM-style: private heap per fiber, messages copied across boundaries.
   - Goal: compile-time memory-lifetime decisions without a visible borrow checker, predictable latencies via fiber-local GC.
-  - **Provisional escape — opaque mutable `Array[T]`**. The stage 2 inferencer needs O(1) substitution lookups to self-compile in reasonable time; `array_make / length / get / set / grow` are builtins that mutate in place. Treated today as an audited runtime escape (alongside `panic`, FFI, unfilled `?`), *not* as a general-purpose container. The mutation is invisible in the type, which violates Tier 1 "effects visible in types" — accepted as technical debt. **Migration plan**: once the `Mutable` / `State` effect lands, retrofit `array_set` and friends behind it so callers declare the capability. Until then, do not expose `Array[T]` in userland surface code; confine it to the compiler's inferencer and similar linearly-threaded hot paths.
+  - **Provisional escape — opaque mutable `Array[T]`**. The stage 2 inferencer needs O(1) substitution lookups to self-compile in reasonable time; `array_make / length / get / set / grow` are builtins that mutate in place. Treated today as an audited runtime escape (alongside `panic`, FFI, unfilled `?`), *not* as a general-purpose container. The mutation is invisible in the type, which violates Tier 1 "effects visible in types" — accepted as technical debt. **Migration**: specified in `docs/effects-stdlib.md` §`Mutable`. Once m7a lands, `array_*` is retrofitted behind the `Mutable` effect so callers declare the capability; the array-indexing sugar (`a[i]`, `a[i] := v`) ships in m7b. Until then, do not expose `Array[T]` in userland surface code; confine it to the compiler's inferencer and similar linearly-threaded hot paths.
 - **Formal effects model**: capability-passing **Effekt + inference**.
   - Effects as an explicit set of capabilities, passed implicitly by the compiler.
   - **Effect inference in local bodies**: the user does not annotate sets in private functions; the compiler infers them.
@@ -180,7 +183,7 @@ arguments:
   - Post-MVP: property testing (`check ... with a: Int`), benchmarks (`bench`), snapshots, fuzzing, doctests.
   - Motivation: single canonical form, integration with `kai test`, LLM-friendly (LLMs write tests without picking frameworks).
 - **Typed holes** (stage 2): `?` and `?name` are first-class expressions/patterns. At check time the compiler reports the expected type, bindings in scope, and synthesis candidates, both as human-readable text and as JSON (`kai build --holes-json`). Unfilled holes don't break the build — they become a runtime panic — so partial programs run. Designed as the integration point for LLM-assisted editing. Full rationale and syntax in `docs/typed-holes.md`.
-- **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[T]` is a region-branded capability that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`.
+- **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[T]` is a region-branded handle (same brand machinery as `Pid[Msg]` from actors) that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`; the actor surface (mailbox, supervision, `Pid[Msg]`) lives in `docs/actors.md`.
 
 ## MVP scope
 
@@ -252,7 +255,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 - **Concrete syntax consolidation**: eliminate redundancies (`let`/`:=`, `switch`/`cond`/`match`, `|` vs `|>`, collections `[]`/`()`/`{}`, atoms/structs/maps). *Deferred until kaikai-minimal stabilizes.*
 - **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions, none adopted yet.
   - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON).
-  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, and deferred bitwise operators. These are the candidates for closing the *syntax consolidation* decision above.
+  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), and `Range[T]` as a first-class iterable. These are the candidates for closing the *syntax consolidation* decision above.
 
 ## Roadmap
 
@@ -282,14 +285,22 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 5. Verification: stage 1 compiled by stage 0 compiles the ported demos.
 
 **Phase 4 — Basic stdlib and MVP tooling**:
-1. Stdlib: `List`, `Map`, `String`, `Io`, `Option`, `Result`.
+1. Stdlib for stage 1: `List`, `String`, `Option`, `Result`, plus the `Io`-aliased granular effects (`Console`, `Stdin`, `Env`, `File`) under their pre-effects-system shapes.
 2. `kai build`, `kai run`, `kai test` working against stage 1.
 3. Demos rewritten under the new design, running.
 
+`Map[K, V]` and full effects-aware stdlib (`Mutable`, `State[T]`, `Reader[T]`, `Writer[W]`, `Fail`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[Msg]`, `Pid[Msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
+
 **Post-MVP** (out of immediate scope):
 - Stage 2 with LLVM backend directly, full Perceus, effect inference, fibers, BEAM-style scheduler.
-- **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing.
-- **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery.
+- **Effects system** — three pinned design docs:
+  - `docs/effects.md` (Doc A): rows, unification, syntax, `handle` / `resume`, inference. The mental model.
+  - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `Fail`, `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
+  - `docs/effects-impl.md` (Doc C, in progress): CPS transform, handler-stack runtime, codemod for migrating bare builtins.
+- **Syntax sugars** (`docs/syntax-sugars.md`): trailing lambdas, `@cap` / `cap := v`, local `var x = init` cells, array indexing `a[i]` / `a[i] := v`. m7b ships these alongside the effects mechanics.
+- **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing. *Landed in stage 2 m10.*
+- **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
+- **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
 - Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
 - `kai fmt`, `kai repl`, `kai lsp`.
 - Property testing (`check`), benchmarks (`bench`), snapshots.

@@ -12,12 +12,11 @@ thread — private heap, messages copied across fibers,
 one-shot `resume` as tail call. Full spec in
 `docs/structured-concurrency.md`.)
 
-This document (Doc D in the effects series) specifies the
-`Actor[Msg]` effect: operations, mailbox policies, supervision,
-interaction with `Cancel`, and the out-of-scope list. It refers
-back to Doc A (`docs/effects.md`) for the row-and-handler
-semantics, Doc B (`docs/effects-stdlib.md`) for the catalog
-slot reserving `Actor[Msg]`, and
+This document specifies the `Actor[Msg]` effect: operations,
+mailbox policies, supervision, interaction with `Cancel`, and
+the out-of-scope list. It refers back to `docs/effects.md` for
+the row-and-handler semantics, `docs/effects-stdlib.md` for the
+catalog slot reserving `Actor[Msg]`, and
 `docs/structured-concurrency.md` for fiber lifetime rules.
 
 Scope of v1: a single effect `Actor[Msg]`, three canonical
