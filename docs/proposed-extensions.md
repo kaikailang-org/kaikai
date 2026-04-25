@@ -21,33 +21,38 @@ on.
 
 ### LLM-friendly diagnostics family
 
-| Extension                                  | Status   | Depends on              |
-|--------------------------------------------|----------|-------------------------|
-| `todo!(msg) : T`                           | proposed | typed holes             |
-| `kai type <pos> --json`                    | proposed | stage-2 type checker    |
-| Counterexample JSON for exhaustiveness     | proposed | match exhaustiveness    |
-| `axiom name : T`                           | proposed | stage-2 type checker    |
-| `kai effects <target> --json`              | proposed | effect inference        |
-| `?e` — effect holes                        | proposed | typed holes + effects   |
-| `import ?name` — dependency holes          | proposed | module resolution       |
-| `kai lint --json` — canonical-form rules   | proposed | canonical style guide   |
+| Extension                                  | Status        | Depends on              |
+|--------------------------------------------|---------------|-------------------------|
+| `todo!(msg) : T`                           | scheduled m7d | typed holes             |
+| `kai type <pos> --json`                    | proposed      | stage-2 type checker    |
+| Counterexample JSON for exhaustiveness     | proposed      | match exhaustiveness    |
+| `axiom name : T`                           | scheduled m12.7 | stage-2 type checker  |
+| `kai effects <target> --json`              | scheduled m7f | effect inference        |
+| `?e` — effect holes                        | scheduled m7f | typed holes + effects   |
+| `import ?name` — dependency holes          | scheduled m7f | module resolution       |
+| `kai lint --json` — canonical-form rules   | proposed      | canonical style guide   |
 
 ### Language-surface family
 
 | Extension                                  | Status   | Depends on              |
 |--------------------------------------------|----------|-------------------------|
-| Tuples `(T1, T2, ...)`                     | proposed | syntax consolidation    |
-| Record punning `{ x, y }`                  | proposed | parser                  |
-| `variants[T]()` builtin                    | proposed | monomorphisation        |
-| Sum types with constant attributes         | proposed | parser + resolution     |
-| `!` postfix — `Option` / `Result` propagation | proposed (reserved) | `Option` / `Result` in prelude |
-| `@` as-pattern in `match`                  | proposed | parser                  |
-| `?.` optional chaining                     | proposed | parser + type checker   |
-| Bitwise operators (`&`, `~`, `^`, `<<`, `>>`) | deferred | demand-driven        |
-| `Map[K, V]` + `m["key"]` indexing          | proposed | collection design       |
-| Slice syntax `a[i..j]`                     | proposed | `Vector[T]` landing     |
-| Method references as values (`obj.method`) | proposed | parser + brand machinery |
-| `Range[T]` as a first-class iterable       | proposed | collection design       |
+| Tuples `(T1, T2, ...)`                     | gated m8.5  | m8 corpus + measurement  |
+| Record punning `{ x, y }`                  | scheduled m7d | parser                 |
+| `variants[T]()` builtin                    | scheduled m7e | monomorphisation       |
+| Sum types with constant attributes         | proposed     | parser + resolution     |
+| `!` postfix — `Option` / `Result` propagation | scheduled m7e | `Option` / `Result` in prelude |
+| `@` as-pattern in `match`                  | scheduled m7d | parser                 |
+| `?.` optional chaining                     | proposed     | parser + type checker   |
+| Bitwise operators (`&`, `~`, `^`, `<<`, `>>`) | deferred  | demand-driven          |
+| `Map[K, V]` + `m["key"]` indexing          | proposed     | collection design       |
+| Slice syntax `a[i..j]`                     | proposed     | `Vector[T]` landing     |
+| Method references as values (`obj.method`) | scheduled m7f | parser + brand machinery |
+| `Range[T]` as a first-class iterable       | proposed     | collection design       |
+| Pipeline placeholder `_`                   | scheduled m7d | parser                 |
+| Binary pattern matching `<<...>>`          | proposed     | parser + match exhaustiveness |
+| `++` operator (string + list concat)       | scheduled m7d | parser + 2 typer rules |
+| `main()` row inference                     | scheduled m7e | typer + runtime default loader |
+| `use Effect` — open effect in scope        | scheduled m7e | parser + resolver scoping |
 
 ## 1. `todo!(msg) : T` — principled unimplemented
 
@@ -300,9 +305,38 @@ helper functions, where `let (a, b) = ...` collapses two
 binding-lines into one. Blackjack does not exercise that pattern
 heavily.
 
+### Decision gate — post-m8
+
+The decision is **deferred to a measurement protocol after m8
+closes**. Rationale: blackjack (the only concrete data point so
+far) is sequential, has no fibers/actors/nurseries, and does not
+exercise the patterns where tuples plausibly help most:
+
+- `Spawn.spawn(...)` returning `(Pid, Fiber)`.
+- `nursery { n -> ... }` closing with `(results, errors)`.
+- Parsers/scanners returning `(value, rest_of_input)`.
+- Pattern-destructured multi-return in `match` arms.
+
+Post-m8 (fibers + actors + nurseries shipped, Doc B catalog
+fully populated), pick a representative effect-heavy program
+(actor-based service, parser combinator suite, or supervised
+worker pool) and rewrite it under each posture. Decision rule:
+
+- **≥10% line-count savings** OR **≥30% reduction in average
+  signature length on multi-return functions** → **accept**;
+  schedule a follow-up milestone for tuples + destructuring
+  patterns.
+- **Below those thresholds** → **reject formally**; close the
+  open decision, remove tuples from this catalog, document
+  record punning (#10) as the canonical answer.
+
+The gate runs as a one-day measurement task scheduled in
+`docs/stage2-design.md` immediately after m8.
+
 **Cost**: low-to-medium. Parser changes are local; type-system
 extension is one product rule per arity.
-**Depends on**: closing *syntax consolidation* in `design.md`.
+**Depends on**: m8 close (fibers + actors + nurseries available
+for the measurement corpus).
 
 ## 10. Record punning `{ x, y }` — additive sugar
 
@@ -894,6 +928,356 @@ notion of an iterable?".
 **Cost**: medium. New built-in type, helper overloads,
 parser. Coupled with the iterable-abstraction question.
 **Depends on**: collection design (`Vector[T]`, `Map[K, V]`).
+
+## 21. Pipeline placeholder `_`
+
+```kai
+# today (with |> applying as first arg)
+x |> add(2)            # add(x, 2)
+
+# with placeholder
+x |> add(2, _)         # add(2, x)
+x |> insert(map, _, v) # insert(map, x, v)
+```
+
+`_` marks the position the piped value should land in. The
+default (no `_`) keeps current semantics — first argument for
+`|>`, mapped element for `|`. Without `_` the user falls back to
+`x |> (a) => fn(b, a)`, which kills the pipeline shape every
+time the desired slot is not the first.
+
+The placeholder is an *expression-level* token, distinct from `.`
+(implicit-lambda placeholder used in `xs | . > 0`). The two do
+not overlap: `.` builds an unary lambda over the lambda-implicit
+position; `_` substitutes inside an existing call expression.
+Multiple `_` in the same call are an error (would silently
+duplicate side effects of the LHS).
+
+**What it buys**: keeps long pipelines readable when functions
+do not consistently take the value as first argument
+(common in stdlib: `String.replace(haystack, needle, repl)`,
+`Map.insert(m, k, v)`).
+
+**What it costs**: low. Parser sugar — desugars to a fresh
+binding (`let __tmp = lhs in fn(arg, __tmp, arg)`) at the
+pipeline-application site. No type-system change.
+
+**Depends on**: parser. Lands cleanly post-m7b without affecting
+effect rows or monomorphisation.
+
+**Reference**: F# 7 (`|> add 2 _`), Hack (`|> $$.method()`),
+Scala 3 (`_` in eta expansion). The F# 7 form is the closest
+match; the desugaring is identical.
+
+## 22. Binary pattern matching `<<...>>`
+
+```kai
+# parse a length-prefixed packet
+match buf {
+  <<0xFE, version: 8, length: 16, payload: length / binary, rest: binary>> ->
+    handle_v1(version, payload, rest)
+  <<0xFF, _: binary>> ->
+    drop()
+  _ ->
+    Fail.fail("unknown frame")
+}
+
+# build the same shape
+let frame : [Byte] = <<0xFE, 1: 8, payload_len: 16, payload: binary>>
+```
+
+Erlang/Elixir-style binary pattern matching: in a `<<...>>`
+context, each segment carries a size (in bits or bytes), an
+optional unit (`/binary`, `/integer`, `/float`, `/utf8`), and
+optional endianness/signedness modifiers. The same syntax works
+on the LHS of `match` (parsing) and on the RHS of an expression
+(building). Match arms get exhaustiveness checks; size variables
+referenced later in the pattern (`payload: length / binary`)
+must be bound earlier in the same pattern.
+
+**What it buys**:
+- **Native protocol parsing**. FIX 4.x/5.0/FAST, ISO 20022 binary
+  envelopes, SWIFT MX, custom TCP framing — all of these are
+  written today as imperative byte-twiddling. With this feature
+  they are one `match` block.
+- **Diff against ad-hoc parsers**. Hand-rolled parsers leak
+  bounds bugs, off-by-one errors, and silent truncation. The
+  compiler checks lengths and bounds in the pattern itself.
+- **Differential vs mainstream**. Outside Erlang/Elixir/Gleam,
+  no language has this. Rust has `nom` (library, parser
+  combinators); Go has `encoding/binary` (manual). Adding it
+  to kaikai is differential, not me-too — and aligns with the
+  BEAM-heritage of the runtime.
+- **Fintech leverage**. C2 toolkit pitch ("type-safe Money +
+  audit trail") gains a third leg: "type-safe wire format". The
+  three together cover the common fintech surface end-to-end.
+
+**What it costs**: medium-high.
+- Parser: new `<<...>>` form on both expression and pattern
+  sides. Segments parse as `expr ":" size_expr ("/" type_modifier)*`.
+- Typer: each segment is monomorphic (`Int<N>` for integers of
+  fixed bit-width, `Bytes` for binary tails). No effect-row or
+  HM extension; segments unify by structure.
+- Codegen: lower to `array_get` / bit-shift sequences in stage 0,
+  and to platform memcpy/load primitives in LLVM (stage 2). No
+  runtime support library needed for the basic cases.
+- Exhaustiveness: an additional case in the match-checker — a
+  `<<...>>` pattern with a `_: binary` tail is exhaustive for
+  any byte buffer; otherwise the checker reports "incomplete
+  binary match" with a counterexample shape.
+
+**What it does not include (v1 scope)**:
+- No bit-level alignment outside byte boundaries beyond fixed
+  power-of-two segments. (Erlang allows arbitrary bit sizes;
+  kaikai v1 limits to 8/16/32/64 bits + binary tails.)
+- No streaming binaries — the pattern matches against an
+  in-memory `[Byte]`. Streaming is a separate effect (`Net`
+  / `File`) and out of scope here.
+- No checksum / CRC builtins inside the pattern. Those stay
+  as ordinary functions over the parsed fragments.
+
+**Depends on**: parser, match exhaustiveness, `[Byte]` type in
+prelude. Independent of effects/fibers — cleanly post-m12.
+
+**Decision posture**: candidate for its own milestone in the
+m13–m14 range, with a dedicated design doc once the
+fintech-toolkit scope is concrete. Bring forward only if
+C2-pre prioritises a wire-format binding (FIX 4.4 is the
+likeliest first target).
+
+**Reference**: Erlang/OTP `<<>>` syntax (the canonical
+prior art, 25 years of production use), Elixir bitstrings
+(same semantics, modernised lexis), Gleam `BitArray`
+(a recent re-implementation in a typed setting — closest fit
+to what kaikai would adopt).
+
+## 23. `++` operator — string and list concatenation
+
+```kai
+let greeting = "hello, " ++ name ++ "!"
+let merged   = sort(lesser) ++ [pivot] ++ sort(greater)
+```
+
+A single binary operator covering the two concat cases that
+appear constantly in functional code. Resolves to the existing
+prelude functions in lowering:
+
+- `String ++ String  : String`  → `string_concat(a, b)`
+- `[a]    ++ [a]     : [a]`     → `list_append(xs, ys)`
+
+Right-associative, lower precedence than `+`/`-`/`*`/`/`,
+higher than comparison operators. No typeclass; the typer has
+exactly two hardcoded rules — same posture as numeric `+`
+overloaded for `Int` and `Real`.
+
+### What it buys
+
+- **List concat reads as concat**: `sort(lesser) ++ [pivot] ++
+  sort(greater)` versus `list_concat([sort(lesser), [pivot],
+  sort(greater)])` or nested `list_append`s. The list case is
+  the one that actually hurts; string case rides along.
+- **Familiar to every senior**: Haskell, Elm, Erlang use `++`;
+  Elixir uses `<>`/`++`; OCaml uses `^`/`@`; F# uses `+`/`@`.
+  Whichever one a senior knows, kaikai's `++` reads correctly
+  on first glance.
+- **Removes a verbosity that interpolation does not solve**:
+  interpolation handles strings; lists have no interpolation
+  analogue.
+
+### What it costs
+
+- **Parser**: one new binop token, one precedence slot. ~10
+  lines.
+- **Typer**: two type rules, no overload machinery. ~30 lines.
+- **Codegen / desugar**: rewrite `++` to `string_concat` /
+  `list_append` based on the typed AST. ~30 lines.
+- **Stdlib doc churn**: mark `string_concat` and `list_append`
+  as "lowering targets; prefer `++` in source".
+
+Total ~0.5 day at observed velocity.
+
+### Constraints
+
+- **Migration, not addition**: surface drops `string_concat` and
+  `list_append` from idiomatic style — they remain in stdlib as
+  the lowering targets but are not the form callers reach for.
+  This avoids the *intent overlap* concern from CLAUDE.md (the
+  Tier 2 rule against multiple forms with the same intent).
+- **Strings only via `++`, not `+`**: kaikai keeps `+` purely
+  numeric. Overloading `+` for strings (Java/JS/Python style)
+  collides with the strict-arithmetic discipline and would
+  require typeclass-style dispatch the language explicitly
+  rejects.
+
+### Reference
+
+Haskell (`++` for `[a]` and `String = [Char]` unified), Elm
+(`++` for any `appendable`), Erlang (`++` for lists, `<>` for
+binaries; kaikai folds both into `++`), F# (`@` for lists,
+`+` for strings — kaikai picks the more uniform answer).
+
+## 24. `main()` row inference
+
+```kai
+# today: every effect main uses must appear in the row
+fn main() : Unit / Console = Console.print("hi")
+
+# proposed: main is special — typer infers the row, runtime
+# loads the corresponding default handlers automatically
+fn main() = Console.print("hi")
+```
+
+The current rule "row annotation mandatory in public signatures"
+bites at the entry point with no benefit: `main` has no caller
+that needs to read its row, and there is no API surface to
+stabilise. Forcing the annotation is friction without payoff —
+a senior writing their first kaikai program is asked to declare
+something they cannot use wrong.
+
+### What it buys
+
+- **Hello-world is one line again**: `fn main() = Console.print("hi")`.
+- **Demos in `demos/`** drop ceremonial `: Unit / Console + Stdin +
+  Fail` rows on `main` that exist only to satisfy the typer.
+- **Reduces a confusing error class**: today, removing the row
+  from `main` yields "undefined name `Console`" because the
+  resolver does not load the effect that nothing in the
+  signature references. With inference, the body's mention of
+  `Console.print` is enough to load the effect.
+
+### What it costs
+
+- **Typer**: relax the annotation requirement for the `main`
+  symbol; run row inference on the body and adopt the inferred
+  row as `main`'s declared row. ~30 lines.
+- **Runtime / driver**: the default-handler loader already walks
+  `main`'s row to pick which defaults to install. With inference
+  the row comes from the typer pass instead of the source
+  signature; the loader otherwise unchanged.
+- **Diagnostics**: when `main`'s body uses an effect with no
+  default handler, the existing "effect not handled" diagnostic
+  fires with the same shape as today. No new error class.
+
+### Constraints
+
+- **Only `main`**: every other public function still requires an
+  explicit row. The exception is justified by `main` being the
+  entry point with no caller; generalising to "all public fns"
+  re-opens the row-inference debate the design already closed.
+- **Return type still optional for `main`**: `fn main() = ...`
+  reads as `: Unit` by default; `fn main() : Int = exit_code`
+  stays valid for explicit exit codes.
+
+**Cost**: low. ~0.5 day.
+**Depends on**: m7a (effect rows in types) ✓.
+
+**Decision posture**: scheduled for m7e — pure ergonomics, zero
+risk. Removes a recurring papercut without compromising the
+"effects visible in types" principle: effects are still visible
+at every call site (`Console.print`, `File.read`, etc.); they
+are simply not restated in `main`'s signature where they were
+already implied.
+
+## 25. `use Effect` — open an effect in scope
+
+```kai
+# file-level — applies to every fn in the file
+use Console
+
+fn greet(name: String) = println("hello, #{name}")
+fn shout(msg: String)  = eprint("ERR: #{msg}")
+fn main()              = greet("world")
+```
+
+```kai
+# block / fn-level — narrowed scope
+fn write_log(line: String) = {
+  use File
+  let f = open("log.txt")    # File.open
+  write(f, line)             # File.write
+  close(f)                   # File.close
+}
+```
+
+A declaration that brings an effect's operations into the
+surrounding scope without the cap selector. After `use E`,
+every op declared in `E` is callable by its bare name, provided
+the resolution is unambiguous.
+
+### What it buys
+
+- **Compactness for I/O-heavy demos**: hello-world, fizzbuzz,
+  beer_song read as `println(...)` instead of `Console.println(...)`,
+  matching the ergonomics every senior expects from the language.
+- **No global pollution**: scoped to the function (or block) it
+  appears in; outside that scope the operations are not visible
+  by their bare name.
+- **No regression of "effects visible"**: the row of the
+  function still declares `/ Console`. The dot syntax simply
+  becomes optional inside the scope where `use` opens it.
+- **Clear error story**: if two open effects expose the same op
+  name (e.g. `Console.print` and `File.print` both in scope),
+  the resolver emits an ambiguity error and forces explicit
+  qualification. Bare names work only when unambiguous.
+
+### What it costs
+
+- **Parser**: `use Name` as a statement — one new keyword,
+  trivial. ~10 lines.
+- **Resolver**: track an effect's ops as additional bindings in
+  the local scope; reject ambiguous bare-name resolutions.
+  ~50 lines.
+- **Typer**: unchanged. The bare name still resolves to the
+  same op call; the row of the calling function still gains
+  the effect.
+- **Diagnostics**: one new error class — "ambiguous bare name
+  `print`: in scope from both `Console` and `File`; qualify
+  explicitly." Cheap to produce.
+
+### Constraints
+
+- **Three valid scopes**:
+  - File-level `use` at the top of a `.kai` file applies to
+    every declaration in the file. Recommended for files
+    that lean heavily on a single effect (I/O-bound demos,
+    `Console`-only CLI programs).
+  - Block / fn-level `use` narrows the open to a scope.
+    Useful when a single fn touches a different effect from
+    the file's default, or in a library file that wants no
+    file-level imports.
+  - Inner `use` shadows outer for the duration of its scope.
+- **Multiple `use` allowed** with an ambiguity rule: if two
+  open effects expose the same op name (e.g. `Console.print`
+  and `File.print` both in scope), the resolver emits an
+  ambiguity error and forces explicit qualification. Bare
+  names work only when unambiguous.
+- **Does not remove the cap from the row**: `fn main() : Unit
+  / Console = { use Console; println("hi") }` still has
+  `/ Console` in its row — `use` is purely a name-resolution
+  shortcut, not an effect-handling change.
+- **Composes with #24**: `main()` row inference removes the
+  row annotation; `use` removes the cap selector. Together
+  they collapse hello-world to:
+  ```kai
+  use Console
+  fn main() = println("hi")
+  ```
+  Neither requires the other.
+
+### Reference
+
+OCaml `open Module`, F# `open`, Rust `use`, Haskell `import M`
+without qualifier. The mechanism is identical to those
+languages, applied to *effects* rather than modules — the
+underlying resolution mechanism is the same.
+
+**Cost**: low. ~0.5 day.
+**Depends on**: m7a (effect rows + cap selectors) ✓.
+
+**Decision posture**: scheduled for m7e alongside #24
+(`main()` row inference). The two ergonomic wins compose into
+"hello-world is one line" — the most-asked first impression of
+any new language.
 
 ## Deliberately not on this list
 

@@ -252,10 +252,18 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 
 ## Open decisions
 
-- **Concrete syntax consolidation**: eliminate redundancies (`let`/`:=`, `switch`/`cond`/`match`, `|` vs `|>`, collections `[]`/`()`/`{}`, atoms/structs/maps). *Deferred until kaikai-minimal stabilizes.*
-- **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions, none adopted yet.
-  - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON).
-  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), and `Range[T]` as a first-class iterable. These are the candidates for closing the *syntax consolidation* decision above.
+- **Concrete syntax consolidation** (kaikai-minimal stabilised; resolved item-by-item):
+  - `let` vs `:=` — **resolved**: not redundant. `let` introduces an immutable binding; `:=` mutates a `var` cell or array slot (m7b #5, #6). Distinct operations.
+  - `switch` / `cond` / `match` — **resolved**: `match` is the only form. Neither `switch` nor `cond` exist in kaikai-minimal (`kaikai-minimal.md` §`match`). No redundancy to remove.
+  - `|` vs `|>` — **resolved**: both retained with distinct intent. `|>` is apply-pipe (first-arg threading); `|` is map-pipe over a list (m7b #9, see `docs/syntax-sugars.md`). Each form signals a different operation.
+  - collections `[]` / `()` / `{}` — **partially resolved**: `[]` for ordered lists, `{}` for records (named fields). `()` is grouping today; whether it gains a tuples meaning is **gated at m8.5** (`docs/proposed-extensions.md` §9 *Decision gate*).
+  - atoms / structs / maps — **resolved**: kaikai has no atoms (no Erlang-style standalone symbols). Records carry nominal identity; `Map[K, V]` is a lookup table landing with the collection-design pass (m14). Distinct concepts, no overlap.
+
+  Net status: only the `()` / tuples sub-decision remains open; everything else is closed by the practice that landed during stages 0–1 and m7b.
+
+- **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions; status tracked per-item in that document.
+  - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON). Most depend on m11 (diagnostics quality pass); `todo!` scheduled for m7d, `axiom` for m12.7.
+  - *Language-surface features* — tuples `(T1, T2)`, record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), `Range[T]` as a first-class iterable, pipeline placeholder `_`, binary pattern matching `<<...>>`. Six items now scheduled (m7d/m7e); the rest split between collection-design (m14), demand-driven (#12, #15, #16), and standalone candidates (#19, #22).
 
 ## Roadmap
 

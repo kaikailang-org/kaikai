@@ -331,6 +331,62 @@ in.
      toward ~2× because the LLVM optimiser can see through
      the lookup + indirect call when the trivial-clause shape
      is statically visible.
+   - **m7d — ergonomic sugars**: five parser-only additions
+     from `docs/proposed-extensions.md`:
+     - §1 `todo!(msg) : T` — principled unimplemented marker,
+       grep-able replacement for `// TODO`, reuses the typed
+       holes runtime.
+     - §10 record punning `{ x, y }` — drops the
+       `{ x: x, y: y }` boilerplate.
+     - §14 `@` as-patterns in `match` — bind a sub-pattern
+       and the whole scrutinee in one arm.
+     - §21 pipeline placeholder `_` — `x |> fn(a, _, b)`
+       lands the piped value in arbitrary positions.
+     - §23 `++` operator — string and list concatenation,
+       migrating away from `string_concat` / `list_append` as
+       the idiomatic surface. ~30 lines parser/typer/desugar.
+     Independent commits, ~1-2 days total. Lowers the "this
+     feels unfinished" perception for seniors trying v1.
+   - **m7e — error propagation polish**: two additions from
+     `docs/proposed-extensions.md` once `Option` / `Result`
+     stabilise in prelude:
+     - §13 `!` postfix — `expr!` propagates `Option` /
+       `Result` errors to the enclosing `Fail` handler.
+       Syntax already reserved in `kaikai-minimal.md`.
+     - §11 `variants[T]()` builtin — enumerate sum-type
+       constructors at compile time; useful for
+       discriminator code and exhaustive testing helpers.
+     - §24 `main()` row inference — drop the mandatory row
+       annotation on the entry point; typer infers, runtime
+       loads defaults from the inferred row. Removes the
+       "every demo declares its full effect chain on main"
+       papercut.
+     - §25 `use Effect` — open an effect's operations at
+       file or fn/block scope so call sites can drop the cap
+       selector (`println("hi")` instead of
+       `Console.println("hi")`). Composes with §24 to give
+       the one-line hello-world: `use Console` at file top
+       + `fn main() = println("hi")`.
+     ~1.5-2 days total. `!` postfix is the highest-value
+     pending item after UoM and refinements; without it,
+     error handling reads as verbose match boilerplate.
+   - **m7f — LLM affordances + method refs**: four
+     additions from `docs/proposed-extensions.md` whose
+     dependencies are already satisfied (m7a effects, m10
+     typed holes, m6 module resolution, m7b post-state):
+     - §5 `kai effects <target> --json` — emit the effect
+       graph as structured JSON; demonstrable proof of bet B
+       (effects as compile-time audit trail) for fintech.
+     - §6 `?e` — effect holes complementing `?` (m10) and
+       `axiom` (m12.7); rounds out the holes family.
+     - §7 `import ?name` — dependency holes that emit JSON
+       hints for missing modules; m6 cross-file resolution
+       already in place.
+     - §19 Method references as values — `options | n.spawn`
+       over the explicit lambda; doc explicitly defers this
+       to post-m7b, which is the m7f window.
+     ~2-3 days total. Independent JSON emitters + parser
+     sugar; zero typer changes. Post-m7e, pre-m8.
 8. **m8 — Fibers + structured concurrency + actors**: CPS
    scheduler, `Spawn` / `Cancel` effects with default
    handlers, `nursery { n -> ... }` helper, region-branded
@@ -338,6 +394,16 @@ in.
    `Pid[Msg]`, mailbox policies, link/monitor supervision —
    designs in `docs/structured-concurrency.md` and
    `docs/actors.md`.
+8.5. **m8.5 — Tuples decision gate**: one-day measurement task
+    against the open `proposed-extensions.md` §9 decision. Pick
+    one effect-heavy program (actor service / parser combinator
+    suite / supervised worker pool) and rewrite under both
+    postures (records vs tuples + destructuring). Decision rule
+    pinned in §9 *Decision gate*: ≥10% line savings or ≥30%
+    signature shrink → accept and schedule a follow-up
+    implementation milestone; otherwise reject formally and
+    close the open decision in `design.md`. Produces a decision,
+    not code.
 9. **m9 — Supervisor DSL** (post-actors): `one_for_one` /
    `rest_for_one` / `one_for_all` patterns as a stdlib module,
    built on `Monitor` + `Spawn`. Lands once usage data from m8
@@ -360,12 +426,44 @@ in.
     Fintech toolkit (`Money<USD>` ≠ `Money<EUR>` as a compile
     error). Possibly brought forward if Money/Decimal becomes a
     priority. Full design in `docs/units-of-measure.md`.
+12.6. **m12.6 — Refinements + Contracts**: Pony/Ada-style
+    refinement types lite (`Int where >= 0`, `String where
+    matches /.../`) + Eiffel/Ada 2012-style `requires` /
+    `ensures` clauses on functions. Decidable subset, no SMT;
+    static proof where reducible to interval propagation +
+    regex subsumption, runtime checks otherwise. Closes the
+    third leg of the audit-trail-compile-time pitch (effects +
+    refinements + contracts). Composes with m12.5 (UoM): a
+    single field can carry both `Decimal<USD>` and `where >= 0`.
+    Independent of effects/fibers. Full design in
+    `docs/refinements-and-contracts.md`.
+12.7. **m12.7 — Bootstrap helpers**: `axiom name : T` from
+    `docs/proposed-extensions.md` §4 — postulate a typed symbol
+    without a definition, useful for stubbing intrinsics, FFI
+    declarations, and selfhost scaffolding while a real
+    definition is pending. ~0.5 day; reuses the typed-holes
+    runtime infrastructure. Optional but cheap.
 13. **m13 — Property testing + bench**: `check` and `bench`
     blocks, matching runners.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
-    module-organised. `Map[K, V]`, `Vector[T]`, `Range[T]`
-    (collection-design pass — see
-    `docs/proposed-extensions.md` §17, §20).
+    module-organised under `stdlib/core/{list,string,option,result,
+    char,tuple,ordering}.kai` per `docs/stdlib-layout.md`.
+    Includes the **naming-convention migration** from the legacy
+    flat-prefix style (`list_take`, `string_concat`, `opt_map`)
+    to namespaced calls (`list.take`, `string.concat`,
+    `option.map`); legacy names retire after `stage2/compiler.kai`
+    re-validates self-host on the new names. Adds the missing
+    list ops noted in `stdlib-layout.md` §`core.list` (sort,
+    sort_by, max, min, count, contains, flat_map, take_while,
+    drop_while, repeat, head, tail, uniq, zip_with). Also lands
+    the **`print` / `println` consolidation**: the plain builtins
+    `print(s)` / `println(s)` (legacy from pre-m7a, before
+    `Console` existed as an effect) retire from surface, replaced
+    by `Console.print(s)` / `Console.println(s)`. Two forms with
+    identical intent collapse into one — the effect-bearing one
+    consistent with the rest of the I/O surface. Lands the
+    collection-design pass on top: `Map[K, V]`, `Vector[T]`,
+    `Range[T]` (see `docs/proposed-extensions.md` §17, §20).
 15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
     no options (gofmt-style discipline).
 16. **m16 — `kai lsp`** using the stage 2 pipeline.
@@ -380,7 +478,7 @@ exists as a usable language as soon as possible" and treats
 performance work as a follow-up:
 
 ```
-m7a → m7b → m7c → m8 → m12 → m12.5 → m5 → full Perceus → m11/m13/m14/m15-17
+m7a → m7b → m7c → m7d → m7e → m7f → m8 → m8.5 → m12 → m12.5 → m12.6 → m12.7 → m5 → full Perceus → m11/m13/m14/m15-17
 ```
 
 Rationale:
@@ -398,11 +496,35 @@ Rationale:
    path. Lands before m8 because m8's CPS-reified
    continuations are simpler to add on top of an LLVM backend
    that already handles the m7a/m7b shape.
+3.5. **m7d (ergonomic sugars)** — `todo!`, record punning, `@`
+   as-patterns, pipeline placeholder `_`. Four parser-only
+   commits, ~1-2 days, zero risk. Lands here because the
+   mid-flight overhead of sugar additions is lowest while the
+   parser is still warm from m7b. Without m7d the language
+   reads as "almost there" to a senior trying v1.
+3.6. **m7e (error propagation polish)** — `!` postfix on
+   `Option`/`Result`, `variants[T]()` builtin. ~1-2 days.
+   Lands once `Option` and `Result` are firm in prelude (post
+   m7b/m7c). `!` is the highest-value pending sugar after UoM
+   and refinements; without it, error handling reads verbose.
+3.7. **m7f (LLM affordances + method refs)** — `kai effects
+   --json`, `?e` effect holes, `import ?name`, method
+   references as values. ~2-3 days. Lands here because all
+   four dependencies (m7a, m10, m6, post-m7b state) are
+   already satisfied; deferring to m11 would dilute m11's
+   diagnostics-quality scope and delay the bet-B fintech demo
+   (`kai effects --json` as auditable evidence) by a milestone.
 4. **m8 (fibers + structured concurrency + actors)** — closes
    the concurrency surface. The language is "complete" in the
    sense that every promise of the design docs (effects +
    handlers + nurseries + actors + cancellation) compiles and
    runs.
+4.5. **m8.5 (tuples decision gate)** — one-day measurement
+   over an effect-heavy corpus (now available because m8
+   closed) to resolve the open `proposed-extensions.md` §9
+   decision. Produces accept/reject + a closed open-decision
+   in `design.md`, no code. Lands here because m8's
+   multi-return idioms are the corpus the gate needs.
 5. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
    produces a byte-identical output. Stage 1 retires from the
    dev loop. This is the natural moment to evaluate stage 2's
@@ -415,13 +537,27 @@ Rationale:
    error) and it sits cleanly on a self-hosted stage 2.
    Candidate to bring forward if Money/Decimal becomes a priority
    before m12. Full design in `docs/units-of-measure.md`.
-7. **m5 (basic Perceus in the typed IR)** — reuse analysis +
+7. **m12.6 (refinements + contracts)** — refinement types lite
+   (`Int where >= 0`, regex predicates) + Eiffel-style `requires`
+   / `ensures` on functions, decidable subset (no SMT). Lands
+   right after m12.5 because the two share most of the typer
+   machinery (predicate evaluator, runtime check insertion);
+   sequencing them adjacent amortises the design overhead. Closes
+   the audit-trail-compile-time pitch with refinements +
+   contracts as the third leg next to effects in types. Full
+   design in `docs/refinements-and-contracts.md`.
+7.5. **m12.7 (bootstrap helpers)** — `axiom name : T`. Optional,
+   ~0.5 day. Useful for stubbing intrinsics and FFI declarations
+   while their real definitions land. Lands here because m12
+   self-host is the first time selfhost-shaped scaffolding
+   becomes load-bearing.
+8. **m5 (basic Perceus in the typed IR)** — reuse analysis +
    drop insertion. Lands now because it directly improves the
    self-compile speed and validates the IR design under load.
-8. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
+9. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
    unboxing, opt-in regions) — the heavy memory work, scheduled
    after the basic pass has stabilised.
-9. **m11 (diagnostics quality)**, **m13 (property/bench)**,
+10. **m11 (diagnostics quality)**, **m13 (property/bench)**,
    **m14 (stdlib expansion)**, **m15–m17 (tooling)** — these
    are mostly independent and can land in parallel once the
    above is done. m11 in particular benefits from being able

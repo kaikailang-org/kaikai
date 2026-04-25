@@ -59,6 +59,34 @@ subprocesses, and uses bounded concurrency can be written against
 stdlib alone. `ahu` appears when the user wants OTP-style structural
 supervision and named processes.
 
+## Naming convention
+
+Functions in stdlib live under namespaced modules. Callers reach them
+as `module.function`:
+
+```kai
+list.map(xs, f)
+list.filter(xs, p)
+string.split(s, sep)
+option.unwrap_or(o, dflt)
+```
+
+Module names are lowercase (the file path); function names are
+`snake_case`. Effects keep their PascalCase by convention because they
+are types declared with `effect Name { ... }`; effect ops read
+`Console.print(s)`, `File.read(p)`, etc. — the same dot syntax, the
+distinction is *what is on the left*, not *how it is called*.
+
+The flat-prefix style (`list_take`, `string_concat`, `opt_map`) used
+in early stdlib drafts is **deprecated**: it pre-dates m6 module
+resolution and exists only because nothing else worked. Migration is
+agendada en m14 (Stdlib expansion).
+
+The four ubiquitous list operations — `map`, `filter`, `reduce`,
+`each` — keep a flat prelude alias post-migration so common pipelines
+read short (`xs |> map(f) |> filter(p)`). The aliases re-export
+`list.map` / etc. The full set is reached only via `list.*`.
+
 ## Bootstrap layering
 
 Modules are tagged by which compiler stage they require:
