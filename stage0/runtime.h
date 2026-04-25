@@ -1337,6 +1337,15 @@ struct KaiEvidence {
     KaiEvidence *parent;
     const char  *eff_label;     /* canonical effect name (literal or interned). */
     void        *handler;       /* *Ev<Eff> struct; opaque to the runtime. */
+    /* m7a #6e: handle's setjmp target + slot to deposit the discarded
+     * clause's return value. Set by kai_evidence_push_with_jmp; the
+     * op-call site reads them via kai_evidence_lookup_node when
+     * status stays UNRESUMED after the clause returns, then longjmps
+     * with the clause's value as the handle's body result. NULL when
+     * the handle didn't allocate a jmp_buf (the m7a #7 default
+     * handlers always resume, so they never longjmp). */
+    jmp_buf     *handle_jmp;
+    KaiValue   **discard_slot;
 };
 
 typedef struct KaiFiber KaiFiber;
@@ -1359,10 +1368,29 @@ static KaiFiber *kai_current_fiber(void) {
  * links it as the new top. */
 static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
     KaiFiber *f = kai_current_fiber();
-    node->parent    = f->evidence_top;
-    node->eff_label = eff_label;
-    node->handler   = handler;
-    f->evidence_top = node;
+    node->parent       = f->evidence_top;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = NULL;
+    node->discard_slot = NULL;
+    f->evidence_top    = node;
+}
+
+/* m7a #6e: like kai_evidence_push but also stamps the handle's
+ * setjmp/longjmp landing pad. The op-call site uses the node's
+ * `handle_jmp` to abandon the body when the clause discards
+ * `resume`. Default handlers (m7a #7) always resume, so they call
+ * the simpler push variant. */
+static void kai_evidence_push_with_jmp(KaiEvidence *node, const char *eff_label,
+                                        void *handler, jmp_buf *jmp,
+                                        KaiValue **discard_slot) {
+    KaiFiber *f = kai_current_fiber();
+    node->parent       = f->evidence_top;
+    node->eff_label    = eff_label;
+    node->handler      = handler;
+    node->handle_jmp   = jmp;
+    node->discard_slot = discard_slot;
+    f->evidence_top    = node;
 }
 
 /* Pop the topmost Evidence node. The compiled `handle` epilogue
@@ -1391,6 +1419,21 @@ static void *kai_evidence_lookup(const char *eff_label) {
         if (node->eff_label == eff_label
             || strcmp(node->eff_label, eff_label) == 0) {
             return node->handler;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
+/* m7a #6e: same lookup but returns the whole node so the op-call
+ * site can reach the handle's jmp_buf if a discard happens. */
+static KaiEvidence *kai_evidence_lookup_node(const char *eff_label) {
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        if (node->eff_label == eff_label
+            || strcmp(node->eff_label, eff_label) == 0) {
+            return node;
         }
         node = node->parent;
     }

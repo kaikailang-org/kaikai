@@ -4125,11 +4125,15 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           _   -> "kai_unit() /* resume: arity mismatch (m7a #6d expects 1 arg) */"
         }
       } else if string_contains_dot(callee) {
-        # m7a #6c/#6d: op call `Eff.op(args)`. Look up the innermost
-        # EvEff in the fiber's evidence stack, allocate a KaiCont on
-        # the stack initialised with the identity continuation, and
-        # indirect-call the op fn ptr. The clause body inspects the
-        # KaiCont via `resume(v)` (Doc C §*Calling a capability*).
+        # m7a #6c/#6d/#6e: op call `Eff.op(args)`. Look up the
+        # innermost EvEff node, allocate a KaiCont on the stack
+        # (identity continuation for one-shot resume), and indirect-
+        # call the op fn ptr. After the clause returns, if it never
+        # called resume (status stays UNRESUMED), pop the evidence
+        # and longjmp to the enclosing handle's setjmp landing pad
+        # — Doc A §*Discarding the continuation*. The default
+        # handlers (m7a #7) always resume, so the longjmp branch is
+        # a no-op for them; the node's handle_jmp is NULL there.
         let eff_n = dotted_prefix(callee)
         let op_n  = dotted_suffix(callee)
         let arg_str = match args_e {
@@ -4137,10 +4141,16 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
           _  -> cat2(", ", call_args)
         }
         concat_all([
-          "({ Ev", eff_n, " *_ev_op = (Ev", eff_n,
-          " *) kai_evidence_lookup(\"", eff_n, "\"); ",
+          "({ KaiEvidence *_node_op = kai_evidence_lookup_node(\"", eff_n, "\"); ",
+          "Ev", eff_n, " *_ev_op = (Ev", eff_n, " *) _node_op->handler; ",
           "KaiCont _k; kai_cont_init_identity(&_k, _ev_op->handler_id); ",
-          "_ev_op->", op_n, "(_ev_op", arg_str, ", &_k); })"
+          "KaiValue *_op_r = _ev_op->", op_n, "(_ev_op", arg_str, ", &_k); ",
+          "if (_k.status == KAI_CONT_UNRESUMED && _node_op->handle_jmp != NULL) { ",
+            "*_node_op->discard_slot = _op_r; ",
+            "kai_evidence_pop(); ",
+            "longjmp(*_node_op->handle_jmp, 1); ",
+          "} ",
+          "_op_r; })"
         ])
       } else {
       match evar_find(variants, callee) {
@@ -5285,14 +5295,27 @@ fn emit_handle(src: String, body: Expr, eff_name: String,
     }
     None -> "_body_result;"
   }
+  # m7a #6e: handle owns a jmp_buf and a discard-value slot. If a
+  # clause discards `resume`, the op-call site pops the evidence
+  # and longjmps here; the setjmp-else branch picks the discarded
+  # value as `_body_result` and the return clause runs as usual.
+  # Push uses the *_with_jmp variant so the op site can find the
+  # jmp via the looked-up KaiEvidence node.
   concat_all([
     "({ Ev", eff_name, " _ev = {0}; ",
     "_ev.handler_id = kai_fresh_handler_id(); ",
     assigns,
     "KaiEvidence _node; ",
-    "kai_evidence_push(&_node, \"", eff_name, "\", &_ev); ",
-    "KaiValue *_body_result = ", body_c, "; ",
-    "kai_evidence_pop(); ",
+    "jmp_buf _jmp; ",
+    "KaiValue *_discard = NULL; ",
+    "KaiValue *_body_result; ",
+    "if (setjmp(_jmp) == 0) { ",
+      "kai_evidence_push_with_jmp(&_node, \"", eff_name, "\", &_ev, &_jmp, &_discard); ",
+      "_body_result = ", body_c, "; ",
+      "kai_evidence_pop(); ",
+    "} else { ",
+      "_body_result = _discard; ",
+    "} ",
     ret_c,
     " })"
   ])

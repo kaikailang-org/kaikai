@@ -435,7 +435,7 @@ test-effects: $(TARGET) build
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
-	  grep -q "kai_evidence_push(&_node, \"Counter\"" build/s2-$$name.c \
+	  grep -q "kai_evidence_push_with_jmp(&_node, \"Counter\"" build/s2-$$name.c \
 	    && grep -q "kai_evidence_pop()" build/s2-$$name.c \
 	    && grep -q "EvCounter _ev = {0};" build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (handle lowering shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
@@ -451,7 +451,7 @@ test-effects: $(TARGET) build
 	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
 	  grep -q "_ev.tick = &_kai_clause_" build/s2-$$name.c \
 	    && grep -q "_ev.get = &_kai_clause_" build/s2-$$name.c \
-	    && grep -q "kai_evidence_lookup(\"Counter\")" build/s2-$$name.c \
+	    && grep -q "kai_evidence_lookup_node(\"Counter\")" build/s2-$$name.c \
 	    && grep -q "_ev_op->tick(_ev_op, &_k)" build/s2-$$name.c \
 	    && grep -q "_ev_op->get(_ev_op, &_k)"  build/s2-$$name.c \
 	    || { echo "effects FAIL $$name (op dispatch shape wrong)"; cat build/s2-$$name.c; exit 1; }; \
@@ -486,6 +486,20 @@ test-effects: $(TARGET) build
 	  grep -q "continuation resumed twice (handler #" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (double resume aborted with diagnostic)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.run.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_6e_discard_resume.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_evidence_push_with_jmp" build/s2-$$name.c \
+	    && grep -q "if (setjmp(_jmp) == 0)" build/s2-$$name.c \
+	    && grep -q "longjmp(\*_node_op->handle_jmp" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (discard wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name \
+	    && echo "effects OK $$name (discard, discard+return, no-discard all pass)" \
+	    || { echo "effects FAIL $$name (binary asserts failed)"; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m7a_6f_clause_typed.kai; do \
 	  name=$$(basename $$f .kai); \
