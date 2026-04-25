@@ -1198,15 +1198,34 @@ allocation; effects within a fiber behave as specified above.
 6. **Régime-cost benchmark — concrete shape.** §*What C rules
    out* commits to a 2× ceiling against an Effekt-style direct
    baseline, and m7a #9 makes the measurement a milestone gate.
-   But the benchmark itself is unspecified: what workload (a
-   counting `State[Int]`? a `Fail` short-circuit? a fully
-   nested `Io + State + Fail`?), what metric (cycles per
-   `perform`? wall-clock throughput? both?), and what baseline
-   binary (Effekt's own backend? a hand-written direct-style
-   kaikai m7a-A?). Without these pinned, "2× regression" has no
-   anchor.
-   *Open.* Resolve before m7a starts; otherwise the gate is
-   negotiable mid-implementation, which defeats its purpose.
+   *Decided* (m7a #9):
+   - **Workload.** Trivial-clause `Counter.tick()` in a tight
+     loop. The clause body is `resume(())` — the smallest
+     possible `perform`/`resume` round-trip, so the measurement
+     isolates dispatch + cont-check + identity-resume cost
+     without state, allocation, or branch noise. Composite
+     workloads (`State[Int]` counting, nested `Io + State +
+     Fail`) are deferred — they bundle costs that the gate is
+     not trying to measure.
+   - **Metric.** Wall-clock time from `clock_gettime(CLOCK_MONOTONIC)`
+     over N = 10⁷ iterations, reported as ns/op (total / N). The
+     reciprocal (ops/sec) is included for cross-language sanity
+     comparisons but the gate keys off ns/op.
+   - **Baseline.** Plain C: a static function with the same
+     side-effect (incrementing a global) called directly N times,
+     compiled at the same optimisation level. Effekt's own
+     backend was the original Doc C target, but installing
+     Effekt is a heavyweight prerequisite for a milestone gate
+     and the C-direct baseline establishes an absolute lower
+     bound that is reproducible on any laptop. Translating the
+     2× vs Effekt ceiling: published Effekt overhead vs C-direct
+     sits in the 2-3× band, so a 5× ceiling vs C-direct keeps
+     the régime under 2× vs Effekt by transitivity. The exact
+     coefficient is a design judgement, not a measurement —
+     revise if a kaikai↔Effekt direct comparison ever lands.
+   - **Threshold.** **5×** ns/op vs C-direct. Above this, the
+     régime decision (régime C, surface Effekt over Koka-style
+     evidence-passing runtime) is revisited per §*Fallback*.
 
 7. **Per-op generics for non-trivially-copyable `T`.** §*Per-op
    type generics* describes the erased ABI as "raw bytes +

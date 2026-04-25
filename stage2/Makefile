@@ -631,6 +631,16 @@ test-effect-runtime: build
 	  && echo "effect-runtime OK" \
 	  || { echo "effect-runtime FAIL"; exit 1; }
 
+# m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
+# vs a C-direct call with the same side effect. Threshold 5× ns/op
+# (Doc C §*Open questions* #6). Compiled at -O2 to match how kaikai
+# code will be released; -O0 would over-penalise the effect path
+# (more frame overhead) without changing the design conclusion.
+bench-effects: build
+	@$(CC) -O2 -std=c99 -Wall -Wno-unused-function -I ../stage0 \
+	    bench/bench_perform_resume.c -o build/bench_perform_resume
+	@./build/bench_perform_resume
+
 selfhost: $(TARGET) build
 	@$(STACK) set -e; \
 	./$(TARGET) $(SRC) > build/kaic2b.c; \
