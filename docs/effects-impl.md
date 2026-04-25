@@ -1170,8 +1170,12 @@ allocation; effects within a fiber behave as specified above.
    thread-local is cheap but ties fibers to kernel threads; a
    fiber-struct field is one more indirection but preserves
    migration across threads.
-   *Tentative:* fiber-struct field. Confirm when m8 scheduler
-   lands.
+   *Decided:* fiber-struct field, even in m7a where the runtime
+   still has only an implicit single fiber. The cost today is
+   one extra indirection at every `handle` push/pop and at every
+   `perform` lookup; the benefit is that m8 (the real scheduler)
+   needs no refactor of the handler-stack runtime — it only
+   adds the spawn/yield logic on top.
 
 4. **Per-op generics and the evidence struct's ABI.** If a
    stdlib effect's op set changes between versions, the evidence
@@ -1228,6 +1232,20 @@ allocation; effects within a fiber behave as specified above.
    partly in the child), the lexical guarantee weakens.
    *Open.* Revisit when `docs/fibers-impl.md` pins the
    spawn/yield model.
+
+9. **Hole reports inside effect contexts.** Typed holes
+   (`docs/typed-holes.md`) report the expected type and the
+   visible scope at the hole site, including for ordinary
+   bodies. A hole inside a handler clause body should also
+   surface the *effect context*: which clause it appears in,
+   which op signature constrains its result, what the surrounding
+   `handle`'s `S` type is. None of that is reported today; the
+   stub at m7a #4e treats clause bodies like ordinary
+   expressions. Without it, the LLM-authorability bet (Tier 3,
+   `CLAUDE.md`) loses precision exactly where effect-typed
+   programs need it most.
+   *Open.* Resolve once clause-body type-checking lands (later
+   in m7a or alongside m7a #6).
 
 ## Milestones m7a and m7b
 
