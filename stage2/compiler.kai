@@ -3571,7 +3571,61 @@ fn check_program(file: String, decls: [Decl]) : Int {
   let e1 = add_all(e0, prelude_names())
   let e2 = register_decls(e1, decls)
   let e3 = chk_decls(e2, decls)
-  if e3.had_error { 1 } else { 0 }
+  let eff_names = collect_effect_names(decls)
+  let row_errs = check_row_labels(decls, file, eff_names)
+  if e3.had_error or row_errs > 0 { 1 } else { 0 }
+}
+
+# ---- m7a #3c: name resolution for effect labels in rows ----
+# Every label that appears in a `T / Eff + ...` suffix must refer to
+# a declared effect. Anything else is a compile error. m7a #3 does
+# not yet build evidence types or check the body's row against the
+# declared row — those are #3d and #8.
+
+fn collect_effect_names(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, _, _, _) -> [name, ...collect_effect_names(rest)]
+      _ -> collect_effect_names(rest)
+    }
+  }
+}
+
+fn check_row_labels(decls: [Decl], file: String, eff_names: [String]) : Int {
+  match decls {
+    [] -> 0
+    [d, ...rest] -> check_decl_row_labels(d, file, eff_names) + check_row_labels(rest, file, eff_names)
+  }
+}
+
+fn check_decl_row_labels(d: Decl, file: String, eff_names: [String]) : Int {
+  match d {
+    DFn(_, _, _, _, rexpr, _, line, col) -> check_row_expr(rexpr, file, line, col, eff_names)
+    _ -> 0
+  }
+}
+
+fn check_row_expr(re: RowExpr, file: String, line: Int, col: Int, eff_names: [String]) : Int {
+  match re {
+    REmpty -> 0
+    RClosed(names) -> check_label_names(names, file, line, col, eff_names)
+  }
+}
+
+fn check_label_names(names: [String], file: String, line: Int, col: Int, eff_names: [String]) : Int {
+  match names {
+    [] -> 0
+    [n, ...rest] -> {
+      let here =
+        if list_has(eff_names, n) { 0 }
+        else {
+          let _ = diag_error(file, line, col, string_concat("unknown effect: ", n))
+          1
+        }
+      here + check_label_names(rest, file, line, col, eff_names)
+    }
+  }
 }
 
 # ====================================================================

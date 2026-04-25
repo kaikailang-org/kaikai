@@ -317,6 +317,15 @@ test-effects: $(TARGET) build
 	  grep -q "expected \`:\` before operation return type" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/parse_row_unknown_effect.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (unknown effect accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "unknown effect: Unknown" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
