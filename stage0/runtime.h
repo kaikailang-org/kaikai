@@ -1139,6 +1139,91 @@ static void kai_assert_check(KaiValue *cond, const char *msg) {
     }
 }
 
+/* =================================================================
+ * Effects: handler-stack runtime (m7a #5)
+ * =================================================================
+ *
+ * Per docs/effects-impl.md §*Handler-stack runtime*. Each fiber
+ * owns a stack of Evidence nodes; m7a operates with a single
+ * implicit fiber (kai_main_fiber), but the layout is per-fiber so
+ * m8's real scheduler can introduce fibers without refactoring
+ * this part of the runtime (Doc C OQ #3, decided).
+ *
+ * The Evidence node itself is intentionally untyped on the
+ * `handler` slot: each effect's compiled `Ev<Eff>` struct lives
+ * elsewhere; the call site casts back to *Ev<Eff> at the point
+ * where the effect name is statically known.
+ *
+ * m7a #6 will wire `handle { ... } with Eff { ... }` lowering to
+ * call kai_evidence_push / kai_evidence_pop, and `Eff.op(args)` to
+ * call kai_evidence_lookup.
+ */
+
+typedef struct KaiEvidence KaiEvidence;
+struct KaiEvidence {
+    KaiEvidence *parent;
+    const char  *eff_label;     /* canonical effect name (literal or interned). */
+    void        *handler;       /* *Ev<Eff> struct; opaque to the runtime. */
+};
+
+typedef struct KaiFiber KaiFiber;
+struct KaiFiber {
+    KaiEvidence *evidence_top;
+    /* Future: per-fiber stack/heap/scheduler links land here. */
+};
+
+/* m7a #5: single implicit fiber. m8's scheduler will hand back
+ * the current fiber instead of returning &kai_main_fiber. */
+static KaiFiber kai_main_fiber = { NULL };
+
+static KaiFiber *kai_current_fiber(void) {
+    return &kai_main_fiber;
+}
+
+/* Push an Evidence node onto the current fiber's stack. The caller
+ * owns the node's storage — typically `alloca`'d inside a compiled
+ * `handle` prologue. This primitive only fills its fields and
+ * links it as the new top. */
+static void kai_evidence_push(KaiEvidence *node, const char *eff_label, void *handler) {
+    KaiFiber *f = kai_current_fiber();
+    node->parent    = f->evidence_top;
+    node->eff_label = eff_label;
+    node->handler   = handler;
+    f->evidence_top = node;
+}
+
+/* Pop the topmost Evidence node. The compiled `handle` epilogue
+ * always pairs with a matching push (Doc C §*Per-fiber isolation*
+ * balance invariant). Pop on an empty stack is a compiler bug; it
+ * silently no-ops here so a malformed prologue/epilogue cannot
+ * corrupt unrelated memory. */
+static void kai_evidence_pop(void) {
+    KaiFiber *f = kai_current_fiber();
+    if (f->evidence_top != NULL) {
+        f->evidence_top = f->evidence_top->parent;
+    }
+}
+
+/* Walk the current fiber's stack and return the innermost handler
+ * for `eff_label`. Returns NULL if no matching handler is in
+ * scope — which would indicate a compiler bug, since the type
+ * checker rejects unhandled effects. The fast path is pointer
+ * equality (most labels are literal strings shared at the call
+ * site); strcmp is the fallback for edge cases like dynamically-
+ * generated label strings. */
+static void *kai_evidence_lookup(const char *eff_label) {
+    KaiFiber *f = kai_current_fiber();
+    KaiEvidence *node = f->evidence_top;
+    while (node != NULL) {
+        if (node->eff_label == eff_label
+            || strcmp(node->eff_label, eff_label) == 0) {
+            return node->handler;
+        }
+        node = node->parent;
+    }
+    return NULL;
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC diagnostic pop
 #endif

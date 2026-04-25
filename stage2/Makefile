@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-modules test-modules-path selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path selfhost
 
 all: $(TARGET)
 
@@ -416,6 +416,15 @@ test-effects: $(TARGET) build
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
 # a fixed point.
+# m7a #5: smoke test for the handler-stack runtime primitives.
+# Builds a small C program against runtime.h and runs it. m7a #6
+# will provide the end-to-end coverage from compiled kaikai code.
+test-effect-runtime: build
+	@$(CC) $(CFLAGS) -I ../stage0 tests/effect_runtime_test.c -o build/effect_runtime_test
+	@./build/effect_runtime_test \
+	  && echo "effect-runtime OK" \
+	  || { echo "effect-runtime FAIL"; exit 1; }
+
 selfhost: $(TARGET) build
 	@$(STACK) set -e; \
 	./$(TARGET) $(SRC) > build/kaic2b.c; \
@@ -439,7 +448,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -448,7 +457,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime
 
 clean:
 	rm -rf build $(TARGET)
