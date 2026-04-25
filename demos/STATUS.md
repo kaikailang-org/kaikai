@@ -55,7 +55,9 @@ the compiler is.
 | `euler4` | nested recursion, palindrome via digit reverse |
 | `euler5` | LCM via gcd + recursion |
 | `euler6` | arithmetic series vs sum of squares |
-| `state` | `var` cell (m7b #5), closures, `Mutable` effect |
+| `state` | `var` cell + `:=` short form (m7b #4 / target), closures |
+| `state_var` | `var x = init` desugar to `with State[T](init) as x` (m7b #5b) — explicit `x.get()` / `x.set(v)` |
+| `state_explicit` | `handle ... with State[Int](0)` (m7b #11 parametric effects) |
 | `beer_song` | match with literal arms, recursion, string interpolation |
 | `imc` | match with guards on `Real` |
 | `spiral` | `array_make` + array indexing (m7b #6) + `var` cells + `while` loop (`stdlib/loop.kai`) + `++` (m7d §23) |
