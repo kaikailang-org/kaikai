@@ -19,9 +19,9 @@ Three tiers, ordered by how non-negotiable they are. When principles conflict, t
 1. **Safe at compile time**
    - Memory safety by default.
    - No null; `Option[T]` always.
-   - Effects visible in types: IO, errors, cancellation, spawn. A function cannot be called from a context that does not handle its effects.
+   - Effects visible in types: every effect a function uses appears in its row (`/ Console + File + Cancel`, etc.). A function cannot be called from a context that does not handle its effects. Catalog and defaults pinned in `docs/effects-stdlib.md` (Doc B).
    - Explicit runtime escapes, audited not incidental: `panic`, unfilled `?`, `todo!`, unbound `axiom`, FFI crossings, **opaque mutable `Array[T]`**.
-   - The Array escape is provisional: `array_make / get / set / grow` mutate in place and the mutation is not visible in the type. It exists so the stage 2 inferencer can index its substitution by TyVar id in O(1). It must migrate behind a `Mutable` / `State` effect once effects land, and must not be used as a general-purpose container in new code.
+   - The Array escape is provisional: `array_make / get / set / grow` mutate in place and the mutation is not visible in the type. It exists so the stage 2 inferencer can index its substitution by TyVar id in O(1). Migration specified in `docs/effects-stdlib.md` §`Mutable`: `array_*` retrofits behind the `Mutable` effect in m7a, with the array-indexing sugar (`a[i]`, `a[i] := v`) shipping in m7b. Must not be used as a general-purpose container in new code.
 
 2. **Runtime-efficient**
    - Monomorphisation of generics.
@@ -75,8 +75,11 @@ Do not cite these in design arguments:
 
 - **Backend**: LLVM directly (stage 2). Stages 0 and 1 emit portable C.
 - **Memory**: hybrid **Perceus** (compile-time optimized RC, Koka-style) inside each fiber + **isolated fibers** BEAM-style (private heap, messages copied). No borrow checker.
-- **Effects**: capability-passing **Effekt + inference**. Effects as an explicit set; inferred in local bodies; mandatory annotation in public signatures.
-- **Concurrency**: actors subsumed under effects. `spawn`/`send`/`receive` are operations of the `Actor`/`Io` effects.
+- **Effects**: capability-passing **Effekt + inference**. Effects as an explicit set; inferred in local bodies; mandatory annotation in public signatures. Three pinned design docs: `docs/effects.md` (Doc A — semantics), `docs/effects-stdlib.md` (Doc B — catalog and defaults), `docs/effects-impl.md` (Doc C — CPS transform and runtime). Sugars (trailing lambdas, `@cap` / `cap := v`, `var`, `a[i]`) live in `docs/syntax-sugars.md` and ship in m7b.
+- **Concurrency**: fibers and actors live entirely inside the effect system.
+  - `spawn` / `await` / `select` / `cancel` are ops of the **`Spawn`** effect (`docs/structured-concurrency.md`).
+  - `send` / `receive` / `self` are ops of the parameterised **`Actor[Msg]`** effect (`docs/actors.md`).
+  - `Cancel` is a separate effect for cooperative cancellation.
 - **FFI**: crossing to C via the `Ffi` effect capability. Declarations use `extern "C" fn name(args) : T`.
 - **Tooling**: single `kai` binary with subcommands (`build`/`run`/`test`/`fmt`/`repl`/`lsp`/`doc`).
 - **Tests**: builtin syntax (`test "..." { ... }` + `assert`), integrated with `kai test`.
@@ -84,14 +87,14 @@ Do not cite these in design arguments:
 ## Three-stage bootstrap
 
 - **Stage 0** — minimal C compiler. Zero dependencies. Compiles **kaikai-minimal** → portable C.
-- **Stage 1** — intermediate compiler in kaikai-minimal. Compiles **full kaikai** (effects + handlers + basic Perceus) → C or LLVM IR.
+- **Stage 1** — intermediate compiler in kaikai-minimal. Compiles **enough of full kaikai to compile stage 2** (basic effects + handlers + basic Perceus + monomorphisation) → C. Full effect catalog, m7b sugars, fibers, and actors land in stage 2 (`docs/stage2-design.md`).
 - **Stage 2** — definitive compiler in full kaikai. Direct LLVM backend. Self-hosted.
 
 Any machine with `cc` can bootstrap from scratch:
 
 ```sh
 cc stage0/*.c -o kaic0
-./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -o kaic1
+./kaic0 stage1/compiler.kai > stage1.c && cc stage1.c -I stage0 -o kaic1
 ./kaic1 demos/fizzbuzz.kai -o fizzbuzz
 ./fizzbuzz
 ```
