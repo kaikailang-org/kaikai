@@ -5481,11 +5481,50 @@ fn collect_decls(ds: [Decl], st: LamCollect) : LamCollect {
 fn efn_name(e: EFn) : String = match e { EFn(n, _) -> n }
 fn evar_name(v: EVar) : String = match v { EV(n, _) -> n }
 
-fn build_globals(fns: [EFn], variants: [EVar]) : [String] {
+fn build_globals(fns: [EFn], variants: [EVar], eff_names: [String], op_quals: [String]) : [String] {
   let p = prelude_names()
   let f = map(fns, efn_name)
   let v = map(variants, evar_name)
-  list_append(p, list_append(f, v))
+  # Effect names (e.g. `Console`) and qualified op references
+  # (`Console.print`) are not runtime values; they are
+  # name-resolved at op-call sites via the evidence stack.
+  # `desugar_op_calls_callee` rewrites `EField(EVar(Eff), op)` into
+  # `EVar("Eff.op")` (a single qualified ident), so without
+  # including the qualified form in globals, `fv_expr` would treat
+  # `Console.print` as a free variable inside a lambda body and the
+  # lambda lifter would capture it, emitting invalid C
+  # (`kai_Console.print` is not a valid C identifier).
+  list_append(p,
+    list_append(f,
+      list_append(v,
+        list_append(eff_names, op_quals))))
+}
+
+# For every `effect Eff { op_a(...) : T  op_b(...) : U }` decl,
+# yield the qualified ident strings `"Eff.op_a"`, `"Eff.op_b"`.
+# These match what `desugar_op_calls_callee` produces when it
+# rewrites `Eff.op(args)` callees into `EVar("Eff.op")`.
+fn op_qualified_names_for(eff_name: String, ops: [EffectOp], acc: [String]) : [String] {
+  match ops {
+    [] -> acc
+    [o, ...rest] -> match o {
+      EOp(op_name, _, _, _, _) ->
+        op_qualified_names_for(eff_name, rest,
+          [string_concat(eff_name, string_concat(".", op_name)), ...acc])
+    }
+  }
+}
+
+fn collect_op_qualified_names(decls: [Decl]) : [String] {
+  match decls {
+    [] -> []
+    [d, ...rest] -> match d {
+      DEffect(_, name, ops, _, _) ->
+        list_append(op_qualified_names_for(name, ops, []),
+                    collect_op_qualified_names(rest))
+      _ -> collect_op_qualified_names(rest)
+    }
+  }
 }
 
 # ---- lambda helper emission ----
@@ -6473,7 +6512,8 @@ fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) :
   let decls = desugar_op_calls_decls(raw_decls, eff_names)
   let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
-  let globals = build_globals(fns, variants)
+  let op_quals = collect_op_qualified_names(decls)
+  let globals = build_globals(fns, variants, eff_names, op_quals)
   let st0 = lc_new(globals)
   let st = collect_decls(decls, st0)
   let lams = st.lams
@@ -12023,12 +12063,14 @@ fn llvm_emit_lambda_bodies(lams: [LamInfo], fns: [EFn], vs: [EVar], start_id: In
   }
 }
 
-fn llvm_build_globals_names(fns: [EFn], vs: [EVar]) : [String] = build_globals(fns, vs)
+fn llvm_build_globals_names(fns: [EFn], vs: [EVar], eff_names: [String], op_quals: [String]) : [String] = build_globals(fns, vs, eff_names, op_quals)
 
 fn emit_program_llvm(path: String, src: String, decls: [Decl], test_mode: Bool) : String {
   let fns = register_fn_decls(decls)
   let vs = register_variants(decls)
-  let globals = llvm_build_globals_names(fns, vs)
+  let eff_names = collect_effect_names(decls)
+  let op_quals = collect_op_qualified_names(decls)
+  let globals = llvm_build_globals_names(fns, vs, eff_names, op_quals)
   let st0 = lc_new(globals)
   let lc = collect_decls(decls, st0)
   let lams = lc.lams

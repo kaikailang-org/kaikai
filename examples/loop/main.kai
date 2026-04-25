@@ -1,10 +1,9 @@
 # Smoke test for stdlib/loop.kai — exercises `repeat` end-to-end.
 #
-# Uses paren form for `repeat` to avoid a separate codegen bug
-# (closures that capture effect ops by name produce malformed C
-# today; tracked as a follow-up). The body is a top-level function
-# that calls `Console.print` directly; row variable `e` of `repeat`
-# unifies with `Console` at the call site.
+# Uses paren+trailing form: `repeat(3) { Console.print("hi") }`. The
+# body is a trailing-lambda block (m7b #3); its row is `Console`,
+# which propagates out via `repeat`'s row variable `e` (m7b #12)
+# into `main`'s row.
 #
 # Wire-up: invoked with `--path stdlib`, so `import loop` resolves
 # to `stdlib/loop.kai`. `import` brings names into scope without a
@@ -12,10 +11,8 @@
 
 import loop
 
-fn say_hi() : Unit / Console = Console.print("hi")
-
 fn main() : Int / Console = {
-  repeat(3, say_hi)
+  repeat(3) { Console.print("hi") }
   Console.print("done")
   0
 }
