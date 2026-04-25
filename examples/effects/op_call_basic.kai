@@ -1,17 +1,16 @@
-# m7a #4a smoke test (positive) — `Eff.op(args)` parses, resolves
-# against the effect's op signatures, and type-checks against the
-# op's parameter types and return type.
+# m7a #4a + #4c smoke test (positive) — `Eff.op(args)` parses,
+# resolves against the effect's op signatures, type-checks, and
+# the caller's declared row covers the effect.
 #
-# This file does *not* assert the body's row matches the function's
-# declared row (that's m7a #4c) nor that the runtime call lowers
-# correctly (that's m7a #6); only that the type checker accepts it.
+# Runtime lowering is m7a #6; this file only exercises the type
+# checker.
 
 effect Io {
   print(s: String) : Unit
   read_line() : String
 }
 
-fn main() : Int {
+fn main() : Int / Io {
   Io.print("hello")
   0
 }

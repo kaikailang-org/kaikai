@@ -1,0 +1,15 @@
+# m7a #4c negative test — a function performs Io.print but its
+# declared row is empty. The checker accumulates "Io" while
+# walking the body and at the function boundary verifies the
+# inferred row is a subset of the declared row. Result: the
+# missing effect is reported with a dedicated diagnostic.
+
+effect Io {
+  print(s: String) : Unit
+}
+
+fn greet() : Unit {
+  Io.print("hi")
+}
+
+fn main() : Int { 0 }

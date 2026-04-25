@@ -7,7 +7,11 @@ effect Io {
   print(s: String) : Unit
 }
 
-fn main() : Int {
+# NOTE m7a #4c: the body's row contains Io because Io.print is
+# called inside the `handle`. m7a #4d will remove Io from the
+# body's row at the `handle` boundary; until then we declare it
+# on the enclosing function's row so the program type-checks.
+fn main() : Int / Io {
   let r = handle {
     Io.print("inside")
     42

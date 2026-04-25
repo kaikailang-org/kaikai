@@ -1,12 +1,17 @@
-# m7a #4b smoke test (positive) — `Eff as alias` rebinds the
-# capability inside the body. The alias appears in the AST as a
-# Some(...) on the EHandle node.
+# m7a #4b smoke test — `Eff as alias` parses cleanly and shows up
+# on the EHandle node as Some(alias). The current checker does
+# *not* yet bind `log` inside the body (alias resolution lands
+# alongside m7a #4d's handle-row removal), so this demo is
+# parser-only: the AST contains the alias, but type-checking
+# currently rejects `log.print` as an undefined name. The Makefile
+# asserts both: AST contains "as log" and the diagnostic mentions
+# the unbound name.
 
 effect Io {
   print(s: String) : Unit
 }
 
-fn main() : Int {
+fn main() : Int / Io {
   handle {
     log.print("via alias")
     0

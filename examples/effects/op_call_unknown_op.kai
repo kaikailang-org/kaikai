@@ -7,7 +7,7 @@ effect Io {
   print(s: String) : Unit
 }
 
-fn main() : Int {
+fn main() : Int / Io {
   Io.unknown("hi")
   0
 }

@@ -6391,7 +6391,8 @@ type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
 #                   name            line col fresh scope      env_fresh
 
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
-                    insts: [CallSite], holes: [HoleSite] }
+                    insts: [CallSite], holes: [HoleSite],
+                    row: [String] }    # m7a #4c: effect labels accumulated by op calls in the current body
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -6411,27 +6412,41 @@ type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
-               recs: recs, errs: 0, insts: [], holes: [] }
+               recs: recs, errs: 0, insts: [], holes: [], row: [] }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes }
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes, row: st.row }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes }
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes, row: st.row }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes }
+               recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes, row: st.row }
+
+# m7a #4c: mark that the current body has performed an op of `eff`.
+# Adds the name to the accumulator if not already present (syntactic
+# dedup; row variables are not yet in scope at this layer).
+fn st_add_effect(st: InferState, eff: String) : InferState {
+  if list_has(st.row, eff) { st }
+  else {
+    InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+                 recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+                 row: [eff, ...st.row] }
+  }
+}
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes }
+               recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
+               row: st.row }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes] }
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
+               row: st.row }
 
 # Half-open range [lo, hi) as a list of ints. Used to name the fresh
 # TyVarT ids minted by one call-site's instantiation.
@@ -6542,7 +6557,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     recs: inner.recs,
     errs: inner.errs,
     insts: inner.insts,
-    holes: inner.holes
+    holes: inner.holes,
+    row: inner.row
   }
 
 # ---- parameter typing ----
@@ -6827,9 +6843,26 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
-  let ty = apply_ty(st2.sub, rv.ty)
+  # m7a #4c: this op call commits the caller to the effect.
+  let st3 = st_add_effect(st2, dotted_prefix(key))
+  let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
-  mk_inferred(st2, ty, root)
+  mk_inferred(st3, ty, root)
+}
+
+# Extract `Eff` from `Eff.op` so st_add_effect can record only the
+# label, not the dotted form.
+fn dotted_prefix(s: String) : String =
+  dotted_prefix_loop(s, 0, string_length(s))
+
+fn dotted_prefix_loop(s: String, i: Int, n: Int) : String {
+  if i >= n { s }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, 0, i) } else { dotted_prefix_loop(s, i + 1, n) }
+      None    -> s
+    }
+  }
 }
 
 # Synthesise a placeholder callee for the typed AST that emit later
@@ -7648,19 +7681,54 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
       let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
+      # m7a #4c: every effect performed inside the body must appear
+      # in the function's declared row. Open rows (with a tail var)
+      # are deferred — for now all rows are RClosed.
+      let st2 = check_body_row(st1, nm, row, line, col)
       let _ = if verbose {
-        print_inferred_fn(nm, apply_ty(st1.sub, declared_ret), apply_tys(st1.sub, added.tys), line, col)
+        print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
       } else { () }
-      let resolved = resolve_callsites(list_reverse(st1.insts), st1.sub)
-      let hole_reports = resolve_holes(list_reverse(st1.holes), st1.sub)
+      let resolved = resolve_callsites(list_reverse(st2.insts), st2.sub)
+      let hole_reports = resolve_holes(list_reverse(st2.holes), st2.sub)
       TypedDecl {
         decl: DFn(is_pub, nm, ps, opt_ret, row, rb.expr, line, col),
-        errs: st1.errs,
+        errs: st2.errs,
         insts: resolved,
         holes: hole_reports
       }
     }
     _ -> TypedDecl { decl: d, errs: 0, insts: [], holes: [] }
+  }
+}
+
+# m7a #4c: enforce that every effect the body performs appears in
+# the declared row. Open rows (with a tail variable) are deferred
+# — RClosed handles all current uses.
+fn check_body_row(st: InferState, fname: String, declared: RowExpr,
+                  line: Int, col: Int) : InferState {
+  let declared_names = match declared {
+    REmpty       -> []
+    RClosed(ns)  -> ns
+  }
+  check_body_row_loop(st, fname, st.row, declared_names, line, col)
+}
+
+fn check_body_row_loop(st: InferState, fname: String, performed: [String],
+                       declared: [String], line: Int, col: Int) : InferState {
+  match performed {
+    [] -> st
+    [eff, ...rest] ->
+      if list_has(declared, eff) {
+        check_body_row_loop(st, fname, rest, declared, line, col)
+      } else {
+        diag_error(st.file, line, col,
+          string_concat("effect not handled: ",
+            string_concat(eff,
+              string_concat(" (function `",
+                string_concat(fname,
+                  "` performs the op but its row does not declare it)")))))
+        check_body_row_loop(st_bump_err(st), fname, rest, declared, line, col)
+      }
   }
 }
 
