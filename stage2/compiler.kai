@@ -4868,10 +4868,28 @@ type Ty
   | TyChar
   | TyUnit
   | TyListT(Ty)                         # resolved list type
-  | TyFnT([Ty], Ty)                     # resolved function type
+  | TyFnT([Ty], Ty, Row)                # resolved function type (with effect row)
   | TyCon(String, [Ty])                 # user-defined type constructor application
   | TyVarT(Int)                         # unification variable
   | TyAny                               # placeholder for "not yet resolved"
+
+# Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
+# The slot is reserved here in m7a #1; row unification (m7a #2) and
+# evidence-bearing rows (m7a #3+) populate it. For now every TyFnT
+# carries an empty row.
+type Label = { eff: String, ty_args: [Ty] }
+
+type Row = {
+  labels:        [Label],          # invariant: sorted by eff, syntactically deduplicated
+  tail:          Option[Int],      # row variable id, parallel to TyVarT
+  display_alias: Option[String],   # for diagnostics only; ignored by unification
+}
+
+fn row_empty() : Row = Row {
+  labels:        [],
+  tail:          None,
+  display_alias: None
+}
 
 fn resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, resolve_ty)
 
@@ -4887,7 +4905,7 @@ fn resolve_ty(t: TypeExpr) : Ty {
       else { TyCon(name, resolve_ty_list(targs)) }
     }
     TyList(inner) -> TyListT(resolve_ty(inner))
-    TyFn(fps, fret) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret))
+    TyFn(fps, fret) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_empty())
   }
 }
 
@@ -4908,7 +4926,7 @@ fn sig_of_decl(d: Decl) : Option[Ty] {
         Some(rty) -> resolve_ty(rty)
         None -> TyUnit
       }
-      Some(TyFnT(pts, ret))
+      Some(TyFnT(pts, ret, row_empty()))
     }
     _ -> None
   }
@@ -4927,7 +4945,7 @@ fn ty_to_string(t: Ty) : String {
     TyChar   -> "Char"
     TyUnit   -> "Unit"
     TyListT(inner) -> cat3("[", ty_to_string(inner), "]")
-    TyFnT(ps, ret) ->
+    TyFnT(ps, ret, _) ->
       concat_all([
         "(", join_with(ty_string_list(ps), ", "), ") -> ", ty_to_string(ret)
       ])
@@ -5043,7 +5061,7 @@ fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, ty)
 
 fn tv(n: Int) : Ty = TyVarT(n)
 
-fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret)
+fn fn_ty(ps: [Ty], ret: Ty) : Ty = TyFnT(ps, ret, row_empty())
 
 fn list_ty(t: Ty) : Ty = TyListT(t)
 
@@ -5362,7 +5380,7 @@ fn apply_ty(s: Subst, t: Ty) : Ty {
       None     -> t
     }
     TyListT(inner) -> TyListT(apply_ty(s, inner))
-    TyFnT(params, ret) -> TyFnT(apply_tys(s, params), apply_ty(s, ret))
+    TyFnT(params, ret, row) -> TyFnT(apply_tys(s, params), apply_ty(s, ret), row)
     TyCon(name, atys) -> TyCon(name, apply_tys(s, atys))
   }
 }
@@ -5388,7 +5406,7 @@ fn occurs(v: Int, t: Ty, s: Subst) : Bool {
   match t1 {
     TyVarT(n) -> n == v
     TyListT(inner) -> occurs(v, inner, s)
-    TyFnT(params, ret) -> occurs_any(v, [ret, ...params], s)
+    TyFnT(params, ret, _) -> occurs_any(v, [ret, ...params], s)
     TyCon(_, atys) -> occurs_any(v, atys, s)
     _ -> false
   }
@@ -5454,8 +5472,8 @@ fn unify_heads(a: Ty, b: Ty, s: Subst) : Option[Subst] {
       TyListT(b1) -> unify(a1, b1, s)
       _ -> None
     }
-    TyFnT(ap, ar) -> match b {
-      TyFnT(bp, br) -> match unify_list(ap, bp, s) {
+    TyFnT(ap, ar, _) -> match b {
+      TyFnT(bp, br, _) -> match unify_list(ap, bp, s) {
         None -> None
         Some(s1) -> unify(ar, br, s1)
       }
@@ -6326,7 +6344,7 @@ fn check_variant_pattern(st: InferState, cname: String, subpats: [Pattern], expe
     Some(sc) -> {
       let inst = st_instantiate(st, sc)
       match inst.ty {
-        TyFnT(aps, ret) -> {
+        TyFnT(aps, ret, _) -> {
           let what = string_concat("variant pattern '", string_concat(cname, "'"))
           let s1 = st_unify(inst.st, expected, ret, what, line, col)
           check_subpat_list(s1, subpats, aps, line, col)
@@ -6495,7 +6513,7 @@ fn arms_cover_variant(arms: [Arm], target: String) : Bool {
 fn extract_return_tycon(sc: TyScheme) : Option[String] {
   match sc {
     Scheme(_, ty) -> match ty {
-      TyFnT(_, ret) -> match ret {
+      TyFnT(_, ret, _) -> match ret {
         TyCon(nm, _) -> Some(nm)
         _            -> None
       }
@@ -7110,7 +7128,7 @@ fn list_has_int(xs: [Int], n: Int) : Bool {
 fn synth_return_structural(sc: TyScheme) : Bool {
   match sc {
     Scheme(vars, ty) -> match ty {
-      TyFnT(_, ret) -> match ret {
+      TyFnT(_, ret, _) -> match ret {
         TyVarT(v) -> not list_has_int(vars, v)
         _         -> true
       }
@@ -7173,7 +7191,7 @@ fn synth_try_entry(all_scope: [TyEntry], te: TyEntry, expected: Ty, fresh: Int) 
   match unify(inst.ty, expected, subst_empty()) {
     Some(_) -> Some(te.name)
     None    -> match inst.ty {
-      TyFnT(ps, r) -> {
+      TyFnT(ps, r, _) -> {
         if synth_return_structural(te.scheme) {
           match unify(r, expected, subst_empty()) {
             None     -> None
