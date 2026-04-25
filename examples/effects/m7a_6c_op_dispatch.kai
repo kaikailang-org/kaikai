@@ -1,0 +1,30 @@
+# m7a #6c smoke test — `Eff.op(args)` calls inside a `handle ...
+# with` body now dispatch through the EvE struct (Doc C §*Calling
+# a capability*). Each clause is emitted as a top-level C function
+# named `_kai_clause_<line>_<col>_<op>`, and `resume(v)` is treated
+# as direct-style identity (full CPS reification lands in m7a #6d).
+#
+# The body invokes Counter.tick() twice (each call returns Unit,
+# discarded) and Counter.get() once. The handler clauses are
+# stateless: tick resumes with `()`, get resumes with `7`. The
+# return clause is identity, so the handle's value is the body's
+# tail expression — Counter.get(), which the get clause makes 7.
+
+effect Counter {
+  tick() : Unit
+  get() : Int
+}
+
+fn main() : Int {
+  let r = handle {
+    Counter.tick()
+    Counter.tick()
+    Counter.get()
+  } with Counter {
+    tick(resume) -> resume(())
+    get(resume) -> resume(7)
+    return(x) -> x
+  }
+  assert r == 7
+  0
+}

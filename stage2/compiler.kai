@@ -4112,6 +4112,32 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
   let call_args = emit_call_args(src, args_e, fns, variants, lams)
   match f.kind {
     EVar(callee) -> {
+      # m7a #6c: `resume(v)` is direct-style identity in this régime
+      # — the clause body returns `v` and the surrounding op-call
+      # site receives it as the op's result. m7a #6d will replace
+      # this with a reified-continuation call.
+      if callee == "resume" {
+        match args_e {
+          [a] -> emit_expr(src, a, fns, variants, lams)
+          _   -> "kai_unit() /* resume: arity mismatch (m7a #6c expects 1 arg) */"
+        }
+      } else if string_contains_dot(callee) {
+        # m7a #6c: op call `Eff.op(args)`. Look up the innermost EvEff
+        # in the fiber's evidence stack and indirect-call the op fn ptr
+        # (Doc C §*Calling a capability*). The trailing NULL is the
+        # KaiCont placeholder; m7a #6d threads the real continuation.
+        let eff_n = dotted_prefix(callee)
+        let op_n  = dotted_suffix(callee)
+        let arg_str = match args_e {
+          [] -> ""
+          _  -> cat2(", ", call_args)
+        }
+        concat_all([
+          "({ Ev", eff_n, " *_ev_op = (Ev", eff_n,
+          " *) kai_evidence_lookup(\"", eff_n, "\"); ",
+          "_ev_op->", op_n, "(_ev_op", arg_str, ", (KaiCont *) 0); })"
+        ])
+      } else {
       match evar_find(variants, callee) {
         Some(_) -> emit_variant_call(callee, list_length(args_e), call_args)
         None -> match prelude_find(callee) {
@@ -4126,6 +4152,7 @@ fn emit_call_expr(src: String, f: Expr, args_e: [Expr], fns: [EFn], variants: [E
             ])
           }
         }
+      }
       }
     }
     _ -> {
@@ -4610,6 +4637,17 @@ fn has_interp(span: String, i: Int, end: Int) : Bool {
 
 type LamInfo = LamInfo(Int, Int, Int, [Param], [String], Expr)
 
+# m7a #6c: each handler op clause becomes a top-level C function.
+# The id pair (handle_line, handle_col) plus op_name uniquely names
+# the clause (HCs do not nest within the same handle, and two
+# handles cannot share both line and column). `params` is the
+# clause's surface param list — the last one is the conventional
+# `resume` binding (Doc A §*resume: one-shot, explicit*); m7a #6c
+# treats `resume(v)` as direct-style identity and does not need to
+# distinguish args from resume in the C signature beyond skipping
+# the trailing slot.
+type ClauseInfo = CI(Int, Int, String, String, [Param], Expr)
+
 fn find_lam(lams: [LamInfo], line: Int, col: Int) : Option[LamInfo] {
   match lams {
     [] -> None
@@ -4783,9 +4821,10 @@ fn fv_interp_parts(parts: [IPart], own: [String], globals: [String], acc: [Strin
 
 # ---- lambda collection pass ----
 
-type LamCollect = { next_id: Int, lams: [LamInfo], globals: [String] }
+type LamCollect = { next_id: Int, lams: [LamInfo], clauses: [ClauseInfo], globals: [String] }
 
-fn lc_new(globals: [String]) : LamCollect = LamCollect { next_id: 0, lams: [], globals: globals }
+fn lc_new(globals: [String]) : LamCollect =
+  LamCollect { next_id: 0, lams: [], clauses: [], globals: globals }
 
 fn params_to_names(ps: [Param]) : [String] =
   map(ps, (pm) => pm.pname)
@@ -4816,7 +4855,7 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
       let own = params_to_names(params)
       let caps = fv_expr(body, own, st.globals, [])
       let info = LamInfo(id, x.line, x.col, params, caps, body)
-      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams], globals: st.globals }
+      let st1 = LamCollect { next_id: id + 1, lams: [info, ...st.lams], clauses: st.clauses, globals: st.globals }
       collect_expr(body, st1)
     }
     ERecordLit(_, fields) -> collect_field_inits(fields, st)
@@ -4831,10 +4870,31 @@ fn collect_expr(x: Expr, st: LamCollect) : LamCollect {
     }
     EPipe(a, b) -> collect_expr(b, collect_expr(a, st))
     EHole(_) -> st
-    EHandle(body, _, _, clauses, ret_opt) -> {
-      let s1 = collect_expr(body, st)
+    EHandle(body, eff_name, _, clauses, ret_opt) -> {
+      let s0 = lc_record_clauses(clauses, eff_name, x.line, x.col, st)
+      let s1 = collect_expr(body, s0)
       let s2 = collect_hclauses(clauses, s1)
       match ret_opt { Some(r) -> collect_hreturn(r, s2) None -> s2 }
+    }
+  }
+}
+
+# m7a #6c: append one ClauseInfo per HClause of this handle. The
+# (line, col) of the EHandle node is reused as the clause's stable
+# id; the op_name disambiguates among clauses of the same handle.
+fn lc_record_clauses(cs: [HClause], eff: String, hline: Int, hcol: Int,
+                     st: LamCollect) : LamCollect {
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(op_name, params, body, _, _) -> {
+        let info = CI(hline, hcol, eff, op_name, params, body)
+        let st1 = LamCollect {
+          next_id: st.next_id, lams: st.lams,
+          clauses: [info, ...st.clauses], globals: st.globals
+        }
+        lc_record_clauses(rest, eff, hline, hcol, st1)
+      }
     }
   }
 }
@@ -5014,6 +5074,71 @@ fn emit_one_lam_forward(l: LamInfo) : String =
 fn emit_lam_forward_decls(lams: [LamInfo]) : String =
   concat_all(map(lams, emit_one_lam_forward))
 
+# m7a #6c — clause body emission. Each HClause becomes a top-level
+# C function whose name encodes the EHandle's source position plus
+# the op name (collisions are impossible since two distinct HCs
+# either belong to different handles or carry different op names).
+# The signature matches the EvE field type pinned in #6a:
+#   `static KaiValue *_kai_clause_<line>_<col>_<op>(EvE *self, args..., KaiCont *k)`.
+# `resume` is the surface convention for the trailing param and is
+# never part of the C signature — the body uses `resume(v)` as
+# direct-style identity (m7a #6c only). m7a #6d will replace this
+# with a reified continuation closure.
+
+fn op_args_only(params: [Param]) : [Param] {
+  match params {
+    [] -> []
+    [_] -> []                       # the lone trailing `resume`
+    [p, ...rest] -> [p, ...op_args_only(rest)]
+  }
+}
+
+fn clause_fn_name(line: Int, col: Int, op: String) : String =
+  concat_all([
+    "_kai_clause_", int_to_string(line), "_", int_to_string(col), "_", op
+  ])
+
+fn emit_clause_sig(c: ClauseInfo) : String {
+  match c {
+    CI(line, col, eff, op_name, params, _) -> {
+      let op_args = op_args_only(params)
+      let arg_str = match op_args {
+        [] -> ""
+        _  -> cat2(", ", join_with(map(op_args, (pm) => cat2("KaiValue *kai_", pm.pname)), ", "))
+      }
+      concat_all([
+        "static KaiValue *", clause_fn_name(line, col, op_name),
+        "(Ev", eff, " *self", arg_str, ", KaiCont *k)"
+      ])
+    }
+  }
+}
+
+fn emit_clause_forward(c: ClauseInfo) : String =
+  cat2(emit_clause_sig(c), ";\n")
+
+fn emit_clause_forwards(cs: [ClauseInfo]) : String =
+  concat_all(map(cs, emit_clause_forward))
+
+fn emit_clause_body(src: String, c: ClauseInfo, fns: [EFn], variants: [EVar],
+                     lams: [LamInfo]) : String {
+  match c {
+    CI(_, _, _, _, _, body) -> {
+      let body_c = emit_expr(src, body, fns, variants, lams)
+      concat_all([
+        emit_clause_sig(c), " {\n",
+        "    (void) self; (void) k;\n",
+        "    return ", body_c, ";\n",
+        "}\n\n"
+      ])
+    }
+  }
+}
+
+fn emit_clause_bodies(src: String, cs: [ClauseInfo], fns: [EFn], variants: [EVar],
+                      lams: [LamInfo]) : String =
+  concat_all(map(cs, (c) => emit_clause_body(src, c, fns, variants, lams)))
+
 fn emit_closure_caps(caps: [String]) : String =
   join_with(map(caps, (c) => cat2("kai_", c)), ", ")
 
@@ -5129,24 +5254,23 @@ fn emit_expr(src: String, x: Expr, fns: [EFn], variants: [EVar], lams: [LamInfo]
       let msg = cat2("unfilled hole: ", label)
       concat_all(["kai_prelude_panic(kai_str(\"", msg, "\"))"])
     }
-    EHandle(body, eff_name, _alias, _clauses, ret_opt) ->
-      emit_handle(src, body, eff_name, ret_opt, fns, variants, lams)
+    EHandle(body, eff_name, _alias, clauses, ret_opt) ->
+      emit_handle(src, body, eff_name, clauses, ret_opt, x.line, x.col, fns, variants, lams)
   }
 }
 
-# m7a #6b: lower `handle { body } with Eff [as alias] { clauses }`
-# to its prologue/body/epilogue. This step ships the EvE alloca,
+# m7a #6b/#6c: lower `handle { body } with Eff [as alias] { clauses }`
+# to its prologue/body/epilogue. m7a #6b shipped the EvE alloca,
 # the handler-id stamp, the kai_evidence_push/pop pair, and the
-# optional return clause; clause fn-ptr fields stay zero-initialised
-# (NULL) and are populated in m7a #6d alongside the resume closure.
-# Op call dispatch via the EvE struct is m7a #6c — until that lands,
-# any op call inside the body still flows through the legacy
-# kai_field path (which fails to compile if the effect's labels
-# aren't bound), so #6b demos must keep the body op-free.
+# optional return clause; m7a #6c populates each op fn-ptr with the
+# top-level clause function emitted by emit_clause_body, so that op
+# calls inside the body dispatch through the EvE.
 fn emit_handle(src: String, body: Expr, eff_name: String,
-               ret_opt: Option[HReturn], fns: [EFn], variants: [EVar],
-               lams: [LamInfo]) : String {
+               clauses: [HClause],
+               ret_opt: Option[HReturn], hline: Int, hcol: Int,
+               fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
   let body_c = emit_expr(src, body, fns, variants, lams)
+  let assigns = emit_clause_assignments(eff_name, clauses, hline, hcol)
   let ret_c = match ret_opt {
     Some(r) -> match r {
       HR(pname, rexpr, _, _) -> concat_all([
@@ -5159,6 +5283,7 @@ fn emit_handle(src: String, body: Expr, eff_name: String,
   concat_all([
     "({ Ev", eff_name, " _ev = {0}; ",
     "_ev.handler_id = kai_fresh_handler_id(); ",
+    assigns,
     "KaiEvidence _node; ",
     "kai_evidence_push(&_node, \"", eff_name, "\", &_ev); ",
     "KaiValue *_body_result = ", body_c, "; ",
@@ -5166,6 +5291,19 @@ fn emit_handle(src: String, body: Expr, eff_name: String,
     ret_c,
     " })"
   ])
+}
+
+fn emit_clause_assignments(eff_name: String, cs: [HClause],
+                           hline: Int, hcol: Int) : String {
+  match cs {
+    [] -> ""
+    [c, ...rest] -> match c {
+      HC(op_name, _, _, _, _) -> concat_all([
+        "_ev.", op_name, " = &", clause_fn_name(hline, hcol, op_name), "; ",
+        emit_clause_assignments(eff_name, rest, hline, hcol)
+      ])
+    }
+  }
 }
 
 fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]) : String {
@@ -5423,23 +5561,183 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
   }
 }
 
-fn emit_program(file: String, src: String, decls: [Decl], test_mode: Bool) : String {
+# m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
+# `EField(EVar(eff), op)` callee, where `eff` is a declared effect,
+# into `EVar("eff.op")`. emit_call_expr then dispatches it through
+# kai_evidence_lookup. All other expression shapes are traversed
+# verbatim — only call sites are touched.
+fn desugar_op_calls_decls(ds: [Decl], effs: [String]) : [Decl] =
+  map(ds, (d) => desugar_op_calls_decl(d, effs))
+
+fn desugar_op_calls_decl(d: Decl, effs: [String]) : Decl {
+  match d {
+    DFn(pub_, n, ps, ret, row, body, l, c) ->
+      DFn(pub_, n, ps, ret, row, desugar_op_calls_expr(body, effs), l, c)
+    DTest(desc, body, l, c) ->
+      DTest(desc, desugar_op_calls_expr(body, effs), l, c)
+    _ -> d
+  }
+}
+
+fn desugar_op_calls_expr(e: Expr, effs: [String]) : Expr =
+  Expr { kind: desugar_op_calls_kind(e.kind, effs),
+         line: e.line, col: e.col, ty: e.ty }
+
+fn desugar_op_calls_callee(callee: Expr, effs: [String]) : Expr {
+  match callee.kind {
+    EField(base, op_name) -> match base.kind {
+      EVar(name) ->
+        if list_has(effs, name) {
+          mk_expr(EVar(string_concat(name, string_concat(".", op_name))),
+                  callee.line, callee.col)
+        } else { desugar_op_calls_expr(callee, effs) }
+      _ -> desugar_op_calls_expr(callee, effs)
+    }
+    _ -> desugar_op_calls_expr(callee, effs)
+  }
+}
+
+fn desugar_op_calls_exprs(es: [Expr], effs: [String]) : [Expr] =
+  map(es, (a) => desugar_op_calls_expr(a, effs))
+
+fn desugar_op_calls_stmts(ss: [Stmt], effs: [String]) : [Stmt] =
+  map(ss, (s) => desugar_op_calls_stmt(s, effs))
+
+fn desugar_op_calls_opt_expr(opt: Option[Expr], effs: [String]) : Option[Expr] {
+  match opt {
+    Some(e) -> Some(desugar_op_calls_expr(e, effs))
+    None    -> None
+  }
+}
+
+fn desugar_op_calls_clauses(cs: [HClause], effs: [String]) : [HClause] =
+  map(cs, (c) => desugar_op_calls_clause(c, effs))
+
+fn desugar_op_calls_clause(c: HClause, effs: [String]) : HClause {
+  match c {
+    HC(n, ps, b, hl, hc) -> HC(n, ps, desugar_op_calls_expr(b, effs), hl, hc)
+  }
+}
+
+fn desugar_op_calls_opt_return(opt: Option[HReturn], effs: [String]) : Option[HReturn] {
+  match opt {
+    Some(r) -> Some(desugar_op_calls_return(r, effs))
+    None    -> None
+  }
+}
+
+fn desugar_op_calls_return(r: HReturn, effs: [String]) : HReturn {
+  match r {
+    HR(p, rb, rl, rc) -> HR(p, desugar_op_calls_expr(rb, effs), rl, rc)
+  }
+}
+
+fn desugar_op_calls_arms(arms: [Arm], effs: [String]) : [Arm] =
+  map(arms, (a) => desugar_op_calls_arm(a, effs))
+
+fn desugar_op_calls_arm(a: Arm, effs: [String]) : Arm {
+  match a {
+    Arm(p, g, b) -> Arm(p, desugar_op_calls_opt_expr(g, effs),
+                       desugar_op_calls_expr(b, effs))
+  }
+}
+
+fn desugar_op_calls_fields(fs: [FieldInit], effs: [String]) : [FieldInit] =
+  map(fs, (f) => desugar_op_calls_field(f, effs))
+
+fn desugar_op_calls_field(f: FieldInit, effs: [String]) : FieldInit {
+  match f {
+    FI(n, v) -> FI(n, desugar_op_calls_expr(v, effs))
+  }
+}
+
+fn desugar_op_calls_elems(els: [ListElem], effs: [String]) : [ListElem] =
+  map(els, (el) => desugar_op_calls_elem(el, effs))
+
+fn desugar_op_calls_elem(el: ListElem, effs: [String]) : ListElem {
+  match el {
+    ElPlain(x)  -> ElPlain(desugar_op_calls_expr(x, effs))
+    ElSpread(x) -> ElSpread(desugar_op_calls_expr(x, effs))
+  }
+}
+
+fn desugar_op_calls_kind(k: ExprKind, effs: [String]) : ExprKind {
+  match k {
+    ECall(callee, args_) ->
+      ECall(desugar_op_calls_callee(callee, effs),
+            desugar_op_calls_exprs(args_, effs))
+    EBlock(stmts, tail) -> EBlock(
+      desugar_op_calls_stmts(stmts, effs),
+      desugar_op_calls_opt_expr(tail, effs))
+    EIf(c, t_, eo) -> EIf(
+      desugar_op_calls_expr(c, effs),
+      desugar_op_calls_expr(t_, effs),
+      desugar_op_calls_opt_expr(eo, effs))
+    EBinop(op, a, b) ->
+      EBinop(op, desugar_op_calls_expr(a, effs), desugar_op_calls_expr(b, effs))
+    EUnop(op, x) -> EUnop(op, desugar_op_calls_expr(x, effs))
+    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> EHandle(
+      desugar_op_calls_expr(body, effs), eff_name, alias_opt,
+      desugar_op_calls_clauses(clauses, effs),
+      desugar_op_calls_opt_return(ret_opt, effs))
+    ELambda(ps, b) -> ELambda(ps, desugar_op_calls_expr(b, effs))
+    EMatch(scr, arms) -> EMatch(
+      desugar_op_calls_expr(scr, effs),
+      desugar_op_calls_arms(arms, effs))
+    EPipe(a, b) ->
+      EPipe(desugar_op_calls_expr(a, effs), desugar_op_calls_expr(b, effs))
+    EField(base, fname) -> EField(desugar_op_calls_expr(base, effs), fname)
+    EIndex(a, b) ->
+      EIndex(desugar_op_calls_expr(a, effs), desugar_op_calls_expr(b, effs))
+    ERecordLit(name, fields) -> ERecordLit(name,
+      desugar_op_calls_fields(fields, effs))
+    EList(elems) -> EList(desugar_op_calls_elems(elems, effs))
+    ERange(a, b, opt_step) -> ERange(
+      desugar_op_calls_expr(a, effs),
+      desugar_op_calls_expr(b, effs),
+      desugar_op_calls_opt_expr(opt_step, effs))
+    _ -> k
+  }
+}
+
+fn desugar_op_calls_stmt(s: Stmt, effs: [String]) : Stmt {
+  match s {
+    SLet(pat, ann, rhs) -> SLet(pat, ann, desugar_op_calls_expr(rhs, effs))
+    SAssert(c, m) -> SAssert(desugar_op_calls_expr(c, effs),
+                              desugar_op_calls_opt_expr(m, effs))
+    SExprStmt(x) -> SExprStmt(desugar_op_calls_expr(x, effs))
+  }
+}
+
+fn emit_program(file: String, src: String, raw_decls: [Decl], test_mode: Bool) : String {
+  # m7a #6c: rewrite `Eff.op(args)` callees from `EField(EVar(Eff), op)`
+  # to `EVar("Eff.op")` before code emission. The typer (synth_op_call_with_scheme)
+  # produces this form internally, but check_infer is a diagnostic-only
+  # pass — it does not propagate the rewritten AST back to all_decls.
+  # This standalone walker closes the gap; the next pipeline iteration
+  # (Doc C §*Pipeline order and desugaring*) will fold it into a proper
+  # post-resolve desugar pass.
+  let eff_names = collect_effect_names(raw_decls)
+  let decls = desugar_op_calls_decls(raw_decls, eff_names)
   let fns = register_fn_decls(decls)
   let variants = register_variants(decls)
   let globals = build_globals(fns, variants)
   let st0 = lc_new(globals)
   let st = collect_decls(decls, st0)
   let lams = st.lams
+  let clauses_info = st.clauses
   let header = "/* generated by kaikai stage 2 */\n#include \"runtime.h\"\n\n"
   let eff_structs = effect_struct_decls(decls)
+  let clause_fwd = emit_clause_forwards(clauses_info)
   let fwd = fn_forward_decls(decls)
   let thunk_fwd = thunk_forward_decls(decls)
   let lam_fwd = emit_lam_forward_decls(lams)
   let bodies = fn_bodies(src, decls, fns, variants, lams)
   let lam_bodies = emit_lam_helpers(src, lams, fns, variants)
+  let clause_bodies = emit_clause_bodies(src, clauses_info, fns, variants, lams)
   let tests = emit_all_tests(src, decls, fns, variants, lams)
   let main_wr = emit_main_wrapper(decls, test_mode)
-  concat_all([header, eff_structs, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, tests, main_wr])
+  concat_all([header, eff_structs, clause_fwd, fwd, "\n", thunk_fwd, "\n", lam_fwd, "\n", bodies, lam_bodies, clause_bodies, tests, main_wr])
 }
 
 # ====================================================================
@@ -6846,7 +7144,7 @@ fn synth(st: InferState, e: Expr) : Inferred {
 # Alias resolution (`Eff as log`) is also deferred.
 fn synth_handle(st: InferState, e: Expr) : Inferred {
   match e.kind {
-    EHandle(body, eff_name, alias_opt, clauses, _ret_opt) -> {
+    EHandle(body, eff_name, alias_opt, clauses, ret_opt) -> {
       # m7a #4e: alias rebinds the capability inside the body.
       let st_aliased = match alias_opt {
         Some(a) -> st_push_alias(st, a, eff_name)
@@ -6861,7 +7159,17 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # m7a #4e: every clause name must be a declared op of `eff_name`.
       let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
-      mk_inferred(st_out2, rb.ty, with_ty(e, rb.ty))
+      # m7a #6c: rebuild the handle with the typed body so emit sees
+      # transformed op calls (`Eff.op(...)` → `EVar("Eff.op")` callee).
+      # Clause bodies + return body keep their parsed shape — clause-body
+      # type-checking is Doc C OQ #9 (deferred). Their bodies do not
+      # currently contain op calls in the m7a demos, so the EField/EVar
+      # discrepancy does not bite codegen there.
+      let new_e = with_ty(
+        mk_expr(EHandle(rb.expr, eff_name, alias_opt, clauses, ret_opt),
+                e.line, e.col),
+        rb.ty)
+      mk_inferred(st_out2, rb.ty, new_e)
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
   }
@@ -7071,6 +7379,33 @@ fn dotted_prefix_loop(s: String, i: Int, n: Int) : String {
     match char_at(s, i) {
       Some(c) -> if c == '.' { string_slice(s, 0, i) } else { dotted_prefix_loop(s, i + 1, n) }
       None    -> s
+    }
+  }
+}
+
+# m7a #6c: pair to dotted_prefix. Extract `op` from `Eff.op`.
+fn dotted_suffix(s: String) : String =
+  dotted_suffix_loop(s, 0, string_length(s))
+
+fn dotted_suffix_loop(s: String, i: Int, n: Int) : String {
+  if i >= n { s }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { string_slice(s, i + 1, n) } else { dotted_suffix_loop(s, i + 1, n) }
+      None    -> s
+    }
+  }
+}
+
+fn string_contains_dot(s: String) : Bool =
+  string_contains_dot_loop(s, 0, string_length(s))
+
+fn string_contains_dot_loop(s: String, i: Int, n: Int) : Bool {
+  if i >= n { false }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '.' { true } else { string_contains_dot_loop(s, i + 1, n) }
+      None    -> false
     }
   }
 }
