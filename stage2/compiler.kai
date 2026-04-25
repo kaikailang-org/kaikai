@@ -7164,19 +7164,113 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # m7a #4e: every clause name must be a declared op of `eff_name`.
       let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
-      # m7a #6c: rebuild the handle with the typed body so emit sees
-      # transformed op calls (`Eff.op(...)` → `EVar("Eff.op")` callee).
-      # Clause bodies + return body keep their parsed shape — clause-body
-      # type-checking is Doc C OQ #9 (deferred). Their bodies do not
-      # currently contain op calls in the m7a demos, so the EField/EVar
-      # discrepancy does not bite codegen there.
+      # m7a #6f: type-check each clause body. Each op clause binds
+      # its surface params to the op signature's arg types, and the
+      # trailing `resume` to `(op_ret) -> S_fresh`. Body errors
+      # surface here. The body's type is *not* unified with S — full
+      # CPS reification is a later milestone (Doc C OQ #9).
+      let st_clauses = check_clauses_types(st_out2, eff_name, clauses)
+      # m7a #6f: return clause refines the handle's overall type:
+      # `T_body` becomes the type of `x`, and the handle's type is
+      # whatever `rexpr` produces. Without a return clause the
+      # identity gives `T_body` directly.
+      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty)
       let new_e = with_ty(
-        mk_expr(EHandle(rb.expr, eff_name, alias_opt, clauses, ret_opt),
+        mk_expr(EHandle(rb.expr, eff_name, alias_opt, clauses, r_typed.ret_opt),
                 e.line, e.col),
-        rb.ty)
-      mk_inferred(st_out2, rb.ty, new_e)
+        r_typed.ty)
+      mk_inferred(r_typed.st, r_typed.ty, new_e)
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
+  }
+}
+
+type RetTyped = { st: InferState, ty: Ty, ret_opt: Option[HReturn] }
+
+fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
+                           body_ty: Ty) : RetTyped {
+  match ret_opt {
+    None    -> RetTyped { st: st, ty: body_ty, ret_opt: None }
+    Some(r) -> match r {
+      HR(pname, rexpr, line, col) -> {
+        let outer = st
+        let env1 = ty_env_add(st.env, pname, mono(body_ty))
+        let st1 = st_set_env(st, env1)
+        let rr = synth(st1, rexpr)
+        let st_out = st_restore_entries(outer, rr.st)
+        let ty = apply_ty(st_out.sub, rr.ty)
+        RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(pname, rr.expr, line, col)) }
+      }
+    }
+  }
+}
+
+# m7a #6f: type-check each handler clause body under an env that
+# binds the op's args and `resume`. The trailing param is `resume`
+# by surface convention; the rest map positionally to the op's
+# declared parameter types. If the clause's arity does not match
+# the op's signature we fall back to fresh tyvars for any unbound
+# slot — clause-arity validation is a separate diagnostic-baseline
+# task (m7a #8).
+fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause]) : InferState {
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(op_name, params, body, _, _) -> {
+        let outer = st
+        let st_bound = bind_clause_env(st, eff_name, op_name, params)
+        let rb = synth(st_bound, body)
+        let st_out = st_restore_entries(outer, rb.st)
+        check_clauses_types(st_out, eff_name, rest)
+      }
+    }
+  }
+}
+
+fn bind_clause_env(st: InferState, eff_name: String, op_name: String,
+                   params: [Param]) : InferState {
+  let key = string_concat(eff_name, string_concat(".", op_name))
+  match ty_env_lookup(st.env, key) {
+    None     -> bind_params_lenient(st, params)
+    Some(sc) -> {
+      let inst = st_instantiate(st, sc)
+      match inst.ty {
+        TyFnT(arg_tys, ret_ty, _) -> bind_params_with_sig(inst.st, params, arg_tys, ret_ty)
+        _                          -> bind_params_lenient(inst.st, params)
+      }
+    }
+  }
+}
+
+fn bind_params_with_sig(st: InferState, params: [Param], arg_tys: [Ty],
+                         ret_ty: Ty) : InferState {
+  match params {
+    []      -> st
+    [last]  -> bind_resume_param(st, last, ret_ty)
+    [p, ...rest] -> match arg_tys {
+      []           -> bind_params_lenient(st, params)
+      [a, ...rest_a] -> {
+        let env1 = ty_env_add(st.env, p.pname, mono(a))
+        bind_params_with_sig(st_set_env(st, env1), rest, rest_a, ret_ty)
+      }
+    }
+  }
+}
+
+fn bind_resume_param(st: InferState, p: Param, ret_ty: Ty) : InferState {
+  let f = st_fresh_ty(st)
+  let resume_ty = TyFnT([ret_ty], f.ty, row_empty())
+  st_set_env(f.st, ty_env_add(f.st.env, p.pname, mono(resume_ty)))
+}
+
+fn bind_params_lenient(st: InferState, params: [Param]) : InferState {
+  match params {
+    []      -> st
+    [p, ...rest] -> {
+      let f = st_fresh_ty(st)
+      let env1 = ty_env_add(f.st.env, p.pname, mono(f.ty))
+      bind_params_lenient(st_set_env(f.st, env1), rest)
+    }
   }
 }
 
