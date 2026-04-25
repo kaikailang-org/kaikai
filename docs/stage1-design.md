@@ -7,7 +7,7 @@ Stage 1 is the **dogfooding** step: a compiler for kaikai, written in kaikai its
 ## Relationship to stage 0
 
 - Stage 0 (`./kaic0`) compiles **stage 1's sources** (kaikai-minimal) into C, which `cc` then turns into `./kaic1`.
-- Stage 1 (`./kaic1`) compiles **full kaikai** (or, initially, kaikai-minimal) into C as well. The LLVM backend is deferred to stage 2.
+- Stage 1 (`./kaic1`) compiles **enough of full kaikai to compile stage 2** into C as well. The LLVM backend, the full effect catalog (Console / Stdin / Env / File / State / Reader / Writer / Mutable), m7b sugars (trailing lambdas, `@cap` / `cap := v`, `var`, `a[i]`), fibers, and actors are deferred to stage 2 — see `docs/stage2-design.md` §*Milestones within stage 2*.
 - **Fixed-point bootstrap**: once stage 1 accepts the same subset stage 0 does, `kaic1` must compile `stage1/*.kai` and produce a binary behaviorally identical to `kaic1` itself. This is the self-hosting checkpoint.
 
 Stage 0 is not thrown away yet: it remains the one C-only ingress into the ecosystem. Stage 1 replaces it as the working compiler.
@@ -18,7 +18,7 @@ Stage 0 is not thrown away yet: it remains the one C-only ingress into the ecosy
 - **Speed**: stage 1 still targets correctness and readability. Compile-time performance is a stage 2 concern.
 - **Full Perceus**: only *basic* reuse analysis lands in stage 1 (see below). Reuse-in-place and drop specialization are stage 2.
 - **Effect inference**: explicit effect annotations on every function that uses effects. Inference lands in stage 2.
-- **Fibers, actors, scheduler**: post-MVP.
+- **Fibers, actors, scheduler**: stage 2 m8 — see `docs/structured-concurrency.md` and `docs/actors.md`.
 - **Pretty-printed errors**: `file:line:col: message` is enough. Span underlining is optional.
 - **Incremental compilation**: single-shot batch compiler.
 
@@ -164,7 +164,7 @@ Stage 1 must *compile* more than stage 0 does. Added features, in intended imple
 1. **Placeholder lambda shorthand** (`. < 5`, `.name`). Desugars to `(x) => x < 5`, `(x) => x.name` at parse time.
 2. **Record update syntax** `{ p with x: 10 }`. Desugars to a full-field literal that copies the rest.
 3. **Full pattern matching**: nested patterns, or-patterns, guard clauses with complex expressions. Stage 0's match is already good; stage 1 extends with compile-time exhaustiveness checking.
-4. **Effects with handlers** (no inference): `effect E { op1(args) : T }`, `handle { ... } with { op1(x, k) -> ... }`, `perform E.op1(arg)`. Compiled to CPS transforms — ordinary functions plus a continuation argument. This is a big chunk and gets its own milestones.
+4. **Effects with handlers** (no inference): `effect E { op1(args) : T }`, `handle { body } with E { op1(args, resume) -> expr }`, `E.op1(arg)` (method-call form, not `perform`). Sintax follows `docs/effects.md` (Doc A); the catalog of stdlib effects supported in stage 1 is the minimum that lets stage 2 self-compile (typically `Console`, `File`, `Fail`, plus `Mutable` for the inferencer). Compiled to CPS transforms — ordinary functions plus a continuation argument. This is a big chunk and gets its own milestones; the full design is `docs/effects-impl.md` (Doc C).
 5. **Monomorphized generics**: stage 0 uses uniform boxing and skips specialization. Stage 1 introduces type-directed monomorphization for the emitted C: each generic instantiation yields a specialized copy of the function.
 6. **Basic Perceus**: insert `kai_incref`/`kai_decref` using linearity analysis. "Last use" gets no incref, "drop" inserted at scope exit. No reuse-in-place yet.
 7. **`|` map pipe**: `xs | f` desugars to `map(xs, f)`. Together with `|>`, completes the Elixir-style pipeline vocabulary.
