@@ -663,6 +663,46 @@ test-effects: $(TARGET) build
 	  grep -q "unknown effect in alias body: Int" build/s2-$$name.err \
 	    && echo "effects OK $$name (non-effect label rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_12_row_var_pure_body.kai \
+	         ../examples/effects/m7b_12_row_var_console.kai \
+	         ../examples/effects/m7b_12_row_var_compose.kai \
+	         ../examples/effects/m7b_12_row_var_concrete_plus_var.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > /dev/null \
+	    && echo "effects OK $$name (row var instantiated + ran)" \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_12_row_var_two_vars.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (two row vars accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "row variable must be the last item in the row" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_12_row_var_var_first.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (label after row var accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "row variable must be the last item in the row" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7b_12_row_var_uppercase.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (uppercase label as row var accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "unknown effect: E" build/s2-$$name.err \
+	    && echo "effects OK $$name (uppercase treated as label, rejected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,

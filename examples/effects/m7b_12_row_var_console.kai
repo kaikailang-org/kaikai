@@ -1,0 +1,19 @@
+# m7b #12 positive — a row-polymorphic helper called with a body
+# that performs Console: the row variable instantiates to Console
+# and the call type-checks in a `/ Console` context.
+#
+# The body is a regular fn (rather than a lambda) so the call
+# uses the existing op-dispatch path; the test exercises row-var
+# inference end-to-end without depending on a separate work item
+# (lambda capture of effect ops, currently unimplemented).
+
+fn say_hi() : Unit / Console {
+  Console.print("hi")
+}
+
+fn say(body: () -> Unit / e) : Unit / e = body()
+
+fn main() : Int / Console {
+  say(say_hi)
+  0
+}

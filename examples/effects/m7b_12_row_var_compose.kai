@@ -1,0 +1,21 @@
+# m7b #12 positive — chained row-polymorphic helpers compose. Each
+# call site fresh-instantiates its callee's row variable, so
+# `say` and `say_twice` can both be called from the same scope
+# with their `e`s unified independently against whatever the
+# argument's row turns out to be.
+
+fn say(body: () -> Unit / e) : Unit / e = body()
+
+fn say_twice(body: () -> Unit / e) : Unit / e = {
+  say(body)
+  say(body)
+}
+
+fn say_hi() : Unit / Console {
+  Console.print("hi")
+}
+
+fn main() : Int / Console {
+  say_twice(say_hi)
+  0
+}
