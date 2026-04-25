@@ -8479,9 +8479,27 @@ type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
 
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite],
-                    row: [String],     # m7a #4c: effect labels accumulated by op calls in the current body
+                    # m7b #11i: row accumulator carries full Labels (eff
+                    # name + ty_args). Op calls add the parametric label
+                    # built from the op's instantiation (`inst.fresh`);
+                    # `synth_handle` filters by name + ty_args unification
+                    # so distinct instantiations of the same effect stay
+                    # separate when their ty_args do not unify.
+                    row: [Label],
                     eff_uses: [EffUse],   # m7a #8: per-label first-use site for diagnostics
-                    aliases: [AliasBinding] }   # m7a #4e: `Eff as log` bindings active in scope
+                    aliases: [AliasBinding],   # m7a #4e: `Eff as log` bindings active in scope
+                    # m7b #11l: when type-checking a stateful handler's
+                    # clause body, a ResumeBind tracks the effect's
+                    # answer type and the handler-state type so
+                    # `resume(v)` and `resume(v, ns)` calls validate
+                    # against the right shape. None outside clauses or
+                    # in stateless clauses (in which case the standard
+                    # env binding is the source of truth).
+                    clause_resume: Option[ResumeBind] }
+
+# m7b #11l — answer type + handler-state type for the currently-walked
+# clause body of a stateful handler.
+type ResumeBind = RB(Ty, Ty)
 
 # m7a #8: first-use record per effect label in the current body.
 # `check_body_row` reads this when it needs to point a diagnostic
@@ -8515,36 +8533,132 @@ type InferredFInits = { st: InferState, fis: [FieldInit] }
 fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
                recs: recs, errs: 0, insts: [], holes: [], row: [],
-               eff_uses: [], aliases: [] }
+               eff_uses: [], aliases: [], clause_resume: None }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
-# m7a #4c: mark that the current body has performed an op of `eff`.
-# Adds the name to the accumulator if not already present (syntactic
-# dedup; row variables are not yet in scope at this layer). m7a #8
-# also records the source position of the first occurrence so that
-# diagnostics can point at the op call instead of the function decl.
-fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState {
-  if list_has(st.row, eff) { st }
+# m7a #4c / m7b #11i: mark that the current body has performed an op
+# of `eff` with the given type-arg instantiation. Labels with the same
+# `eff` but unifiable ty_args dedup; labels with the same `eff` but
+# non-unifiable ty_args are kept distinct so a body can perform e.g.
+# `Reader[Int]` and `Reader[String]` and have both flow through.
+fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
+  if label_present_unifiable(st.row, lab, st.sub) { st }
   else {
     InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                 row: [eff, ...st.row],
-                 eff_uses: [EU(eff, line, col), ...st.eff_uses],
-                 aliases: st.aliases }
+                 row: [lab, ...st.row],
+                 eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
+                 aliases: st.aliases,
+                 clause_resume: st.clause_resume }
+  }
+}
+
+# Compatibility wrapper for stateless / non-parametric op calls. The
+# pattern carries no type args.
+fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState =
+  st_add_label(st, Label { eff: eff, ty_args: [] }, line, col)
+
+# True iff `target.eff` matches some label in `row` AND the existing
+# label's ty_args unify with target.ty_args under the current sub.
+# Used as a syntactic-dedup guard; non-unifying same-name labels do not
+# match here (so the row keeps both, and the resolver / handler-filter
+# pass decides their fate).
+fn label_present_unifiable(row: [Label], target: Label, s: Subst) : Bool {
+  match row {
+    [] -> false
+    [h, ...rest] ->
+      if h.eff == target.eff and labels_args_unify(h.ty_args, target.ty_args, s) {
+        true
+      } else {
+        label_present_unifiable(rest, target, s)
+      }
+  }
+}
+
+# Speculative arity + unification check on two ty_arg lists. Wrong
+# arity → no match. Used by st_add_label and the handler-filter pass.
+# Pure under apply_ty (does not extend the substitution) — the actual
+# unification later in synth_op_call_with_scheme is what mutates the
+# sub.
+fn labels_args_unify(a: [Ty], b: [Ty], s: Subst) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [ah, ...arest] -> match b {
+      [] -> false
+      [bh, ...brest] -> {
+        let aa = apply_ty(s, ah)
+        let bb = apply_ty(s, bh)
+        if ty_unifiable_shallow(aa, bb) { labels_args_unify(arest, brest, s) }
+        else { false }
+      }
+    }
+  }
+}
+
+# Conservative shape-check on already-substituted types. Two TyVars
+# never block a match; concrete-vs-concrete must agree structurally.
+# Stricter than full unify (no substitution side effect) but enough
+# for the dedup / filter decisions in this layer.
+fn ty_unifiable_shallow(a: Ty, b: Ty) : Bool {
+  match a {
+    TyVarT(_) -> true
+    TyAny     -> true
+    _ -> match b {
+      TyVarT(_) -> true
+      TyAny     -> true
+      _ -> ty_eq_shape(a, b)
+    }
+  }
+}
+
+# Structural equality on resolved Tys — used only as a fallback in
+# `ty_unifiable_shallow`. Excludes TyVarT/TyAny which short-circuit
+# above. Approximates HM-equality for concrete types.
+fn ty_eq_shape(a: Ty, b: Ty) : Bool {
+  match a {
+    TyInt    -> match b { TyInt -> true _ -> false }
+    TyReal   -> match b { TyReal -> true _ -> false }
+    TyBool   -> match b { TyBool -> true _ -> false }
+    TyString -> match b { TyString -> true _ -> false }
+    TyChar   -> match b { TyChar -> true _ -> false }
+    TyUnit   -> match b { TyUnit -> true _ -> false }
+    TyListT(ai) -> match b { TyListT(bi) -> ty_eq_shape(ai, bi) _ -> false }
+    TyFnT(ap, ar, _) -> match b {
+      TyFnT(bp, br, _) -> ty_list_eq_shape(ap, bp) and ty_eq_shape(ar, br)
+      _ -> false
+    }
+    TyCon(an, atas) -> match b {
+      TyCon(bn, btas) -> an == bn and ty_list_eq_shape(atas, btas)
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+fn ty_list_eq_shape(a: [Ty], b: [Ty]) : Bool {
+  match a {
+    [] -> match b { [] -> true _ -> false }
+    [h, ...rest] -> match b {
+      [] -> false
+      [h2, ...rest2] -> ty_eq_shape(h, h2) and ty_list_eq_shape(rest, rest2)
+    }
   }
 }
 
@@ -8552,17 +8666,19 @@ fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState 
 # synth_handle to switch into an empty inner row before walking
 # the body, then to merge the filtered body-row back with the
 # outer row.
-fn st_set_row(st: InferState, new_row: [String]) : InferState =
+fn st_set_row(st: InferState, new_row: [Label]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: new_row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
-               aliases: [AB(alias, eff), ...st.aliases] }
+               aliases: [AB(alias, eff), ...st.aliases],
+               clause_resume: st.clause_resume }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -8570,9 +8686,17 @@ fn st_pop_alias(st: InferState) : InferState {
     [_, ...rest] ->
       InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                   row: st.row, eff_uses: st.eff_uses, aliases: rest }
+                   row: st.row, eff_uses: st.eff_uses, aliases: rest,
+                   clause_resume: st.clause_resume }
   }
 }
+
+# m7b #11l — push / pop / read the clause resume binding.
+fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: rb }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -8585,12 +8709,14 @@ fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
-               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
+               clause_resume: st.clause_resume }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -8731,7 +8857,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     holes: inner.holes,
     row: inner.row,
     eff_uses: inner.eff_uses,
-    aliases: outer.aliases
+    aliases: outer.aliases,
+    clause_resume: outer.clause_resume
   }
 
 # ---- parameter typing ----
@@ -8918,47 +9045,43 @@ fn synth(st: InferState, e: Expr) : Inferred {
 fn synth_handle(st: InferState, e: Expr) : Inferred {
   match e.kind {
     EHandle(body, eff_name, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
-      # m7b #11: type-check the init expression in the outer scope
-      # (it does not see the body's bindings). The init type is *not*
-      # unified with the effect's tparam: for `State[T]` the init is a
-      # `T`, but for `Writer[W]` the init is `[W]` — the relationship
-      # is per-effect, not a row-arg invariant. Per-effect typing of
-      # the handler-state slot is deferred to a later sub-task; until
-      # then the body's uses of `state` / `log` (bound to TyAny in the
-      # checker) carry the typing burden.
+      # m7b #11l: type-check the init expression in the outer scope.
+      # The init's inferred type IS the handler-state type — it is
+      # propagated into the clauses so `state` / `log` and 2-arg
+      # `resume(v, ns)` are typed precisely (no TyAny escape).
       let init_typed_st = match init_opt {
         Some(ie) -> {
           let ri = synth(st, ie)
-          IT { st: ri.st, init_opt: Some(ri.expr) }
+          let ity = apply_ty(ri.st.sub, ri.ty)
+          IT { st: ri.st, init_opt: Some(ri.expr), state_ty: Some(ity) }
         }
-        None -> IT { st: st, init_opt: None }
+        None -> IT { st: st, init_opt: None, state_ty: None }
       }
       # m7a #4e: alias rebinds the capability inside the body.
       let st_aliased = match alias_opt {
         Some(a) -> st_push_alias(init_typed_st.st, a, eff_name)
         None    -> init_typed_st.st
       }
+      let resolved_eff_tyargs = resolve_ty_list(eff_tyargs)
       let prev_row = st_aliased.row
       let st_in = st_set_row(st_aliased, [])
       let rb = synth(st_in, body)
-      let body_row_minus = filter_string_ne(rb.st.row, eff_name)
-      let merged = merge_string_lists(prev_row, body_row_minus)
+      # m7b #11i: filter out *only* the labels whose ty_args unify with
+      # the handler's instantiation. Labels with the same eff name but
+      # non-unifiable ty_args remain and propagate to the outer row —
+      # they need their own enclosing handler.
+      let body_row_minus = filter_labels_matching(rb.st.row, eff_name,
+                                                    resolved_eff_tyargs, rb.st.sub)
+      let merged = merge_label_lists(prev_row, body_row_minus, rb.st.sub)
       let st_out0 = st_set_row(rb.st, merged)
       let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
       # m7a #4e: every clause name must be a declared op of `eff_name`.
       let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
-      # m7a #6f: type-check each clause body. Each op clause binds
-      # its surface params to the op signature's arg types, and the
-      # trailing `resume` to `(op_ret) -> S_fresh`. Body errors
-      # surface here. The body's type is *not* unified with S — full
-      # CPS reification is a later milestone (Doc C OQ #9).
       let stateful = match init_opt { Some(_) -> true None -> false }
-      let st_clauses = check_clauses_types(st_out2, eff_name, clauses, stateful)
-      # m7a #6f: return clause refines the handle's overall type:
-      # `T_body` becomes the type of `x`, and the handle's type is
-      # whatever `rexpr` produces. Without a return clause the
-      # identity gives `T_body` directly.
-      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty, stateful)
+      let st_clauses = check_clauses_types(st_out2, eff_name, clauses,
+                                            stateful, init_typed_st.state_ty)
+      let r_typed = check_return_clause_opt(st_clauses, ret_opt, rb.ty,
+                                             stateful, init_typed_st.state_ty)
       let new_e = with_ty(
         mk_expr(EHandle(rb.expr, eff_name, eff_tyargs, init_typed_st.init_opt,
                          alias_opt, clauses, r_typed.ret_opt),
@@ -8970,30 +9093,29 @@ fn synth_handle(st: InferState, e: Expr) : Inferred {
   }
 }
 
-# m7b #11: thread an init's typed sub-expression alongside the inferred
-# state.
-type IT = { st: InferState, init_opt: Option[Expr] }
+# m7b #11: thread an init's typed sub-expression and resolved
+# handler-state type alongside the inferred state.
+type IT = { st: InferState, init_opt: Option[Expr], state_ty: Option[Ty] }
 
 type RetTyped = { st: InferState, ty: Ty, ret_opt: Option[HReturn] }
 
 fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
-                           body_ty: Ty, stateful: Bool) : RetTyped {
+                           body_ty: Ty, stateful: Bool,
+                           state_ty: Option[Ty]) : RetTyped {
   match ret_opt {
     None    -> RetTyped { st: st, ty: body_ty, ret_opt: None }
     Some(r) -> match r {
       HR(pname, rexpr, line, col) -> {
         let outer = st
         let env1 = ty_env_add(st.env, pname, mono(body_ty))
-        # m7b #11: stateful handlers expose `state` (and the alias `log`)
-        # in the return clause too, so `return(x) -> (x, state)` works.
-        # The handler-state type is left as TyAny in this milestone —
-        # full per-instantiation typing is row-with-ty-args propagation
-        # (deferred). TyAny short-circuits unify, so `(x, state)` is
-        # safe but loses the precise pair type at this layer.
+        # m7b #11l: `state` / `log` get the actual handler-state type
+        # in the return clause so `return(x) -> (x, state)` types as
+        # `(body_ty, state_ty)`.
+        let sty = match state_ty { Some(t) -> t None -> TyAny }
         let env2 =
           if stateful {
-            ty_env_add(ty_env_add(env1, "state", mono(TyAny)),
-                       "log", mono(TyAny))
+            ty_env_add(ty_env_add(env1, "state", mono(sty)),
+                       "log", mono(sty))
           } else { env1 }
         let st1 = st_set_env(st, env2)
         let rr = synth(st1, rexpr)
@@ -9013,66 +9135,93 @@ fn check_return_clause_opt(st: InferState, ret_opt: Option[HReturn],
 # slot — clause-arity validation is a separate diagnostic-baseline
 # task (m7a #8).
 fn check_clauses_types(st: InferState, eff_name: String, cs: [HClause],
-                        stateful: Bool) : InferState {
+                        stateful: Bool, state_ty: Option[Ty]) : InferState {
   match cs {
     [] -> st
     [c, ...rest] -> match c {
       HC(op_name, params, body, _, _) -> {
         let outer = st
-        let st_bound = bind_clause_env(st, eff_name, op_name, params, stateful)
-        # m7b #11: stateful handlers bind `state` / `log` inside every
-        # clause body (TyAny — see check_return_clause_opt comment).
-        let st_state =
+        # m7b #11l: bind the clause params; the trailing `resume` gets
+        # a stateful-aware binding (see bind_resume_param). For stateful
+        # handlers, st.clause_resume is set to RB(answer_ty, state_ty)
+        # so synth_call can validate `resume(v)` and `resume(v, ns)`
+        # calls with the right shape.
+        let bind_res = bind_clause_env_typed(st, eff_name, op_name, params,
+                                              stateful, state_ty)
+        let sty = match state_ty { Some(t) -> t None -> TyAny }
+        let env_bound = bind_res.st.env
+        let env_with_sl =
           if stateful {
-            let e1 = ty_env_add(st_bound.env, "state", mono(TyAny))
-            let e2 = ty_env_add(e1, "log", mono(TyAny))
-            st_set_env(st_bound, e2)
-          } else { st_bound }
-        let rb = synth(st_state, body)
-        let st_out = st_restore_entries(outer, rb.st)
-        check_clauses_types(st_out, eff_name, rest, stateful)
+            ty_env_add(ty_env_add(env_bound, "state", mono(sty)),
+                       "log", mono(sty))
+          } else { env_bound }
+        let st_env = st_set_env(bind_res.st, env_with_sl)
+        let st_resume = if stateful {
+          match state_ty {
+            Some(sv) -> st_set_clause_resume(st_env,
+              Some(RB(bind_res.answer_ty, sv)))
+            None -> st_env
+          }
+        } else { st_env }
+        let rb = synth(st_resume, body)
+        let st_out0 = st_restore_entries(outer, rb.st)
+        let st_out = st_set_clause_resume(st_out0, outer.clause_resume)
+        check_clauses_types(st_out, eff_name, rest, stateful, state_ty)
       }
     }
   }
 }
 
-fn bind_clause_env(st: InferState, eff_name: String, op_name: String,
-                   params: [Param], stateful: Bool) : InferState {
+# m7b #11l — bind clause params; also returns the answer type recovered
+# from the op's instantiated signature so the caller can build a
+# precise resume binding.
+type ClauseBindRes = { st: InferState, answer_ty: Ty }
+
+fn bind_clause_env_typed(st: InferState, eff_name: String, op_name: String,
+                          params: [Param], stateful: Bool,
+                          state_ty: Option[Ty]) : ClauseBindRes {
   let key = string_concat(eff_name, string_concat(".", op_name))
   match ty_env_lookup(st.env, key) {
-    None     -> bind_params_lenient(st, params)
+    None     -> ClauseBindRes { st: bind_params_lenient(st, params), answer_ty: TyAny }
     Some(sc) -> {
       let inst = st_instantiate(st, sc)
       match inst.ty {
-        TyFnT(arg_tys, ret_ty, _) -> bind_params_with_sig(inst.st, params, arg_tys, ret_ty, stateful)
-        _                          -> bind_params_lenient(inst.st, params)
+        TyFnT(arg_tys, ret_ty, _) -> {
+          let bound = bind_params_with_sig_typed(inst.st, params, arg_tys, ret_ty,
+                                                   stateful, state_ty)
+          ClauseBindRes { st: bound, answer_ty: ret_ty }
+        }
+        _ -> ClauseBindRes { st: bind_params_lenient(inst.st, params), answer_ty: TyAny }
       }
     }
   }
 }
 
-fn bind_params_with_sig(st: InferState, params: [Param], arg_tys: [Ty],
-                         ret_ty: Ty, stateful: Bool) : InferState {
+fn bind_params_with_sig_typed(st: InferState, params: [Param], arg_tys: [Ty],
+                                ret_ty: Ty, stateful: Bool,
+                                state_ty: Option[Ty]) : InferState {
   match params {
     []      -> st
-    [last]  -> bind_resume_param(st, last, ret_ty, stateful)
+    [last]  -> bind_resume_param_typed(st, last, ret_ty, stateful, state_ty)
     [p, ...rest] -> match arg_tys {
       []           -> bind_params_lenient(st, params)
       [a, ...rest_a] -> {
         let env1 = ty_env_add(st.env, p.pname, mono(a))
-        bind_params_with_sig(st_set_env(st, env1), rest, rest_a, ret_ty, stateful)
+        bind_params_with_sig_typed(st_set_env(st, env1), rest, rest_a, ret_ty,
+                                     stateful, state_ty)
       }
     }
   }
 }
 
-# m7b #11: in stateful clauses (`with State[T](init)` / `with Writer[W]([])`)
-# the user can call `resume` with one or two arguments — the second
-# argument writes the new handler-state. To accept both shapes from
-# the same scheme, bind `resume` to TyAny in stateful clauses;
-# unification short-circuits on TyAny so any arity passes. Stateless
-# clauses keep the precise `(ret_ty) -> ?fresh` form.
-fn bind_resume_param(st: InferState, p: Param, ret_ty: Ty, stateful: Bool) : InferState {
+# m7b #11l — stateless clauses bind `resume : (answer_ty) -> ?fresh`.
+# Stateful clauses still bind `resume` to mono(TyAny) at the env
+# level (so name lookup succeeds and arity errors don't surface as
+# "unknown identifier"); the actual precise typing of `resume(v)` and
+# `resume(v, ns)` is performed by synth_call's special-case using the
+# st.clause_resume binding pushed by check_clauses_types.
+fn bind_resume_param_typed(st: InferState, p: Param, ret_ty: Ty,
+                            stateful: Bool, state_ty: Option[Ty]) : InferState {
   if stateful {
     st_set_env(st, ty_env_add(st.env, p.pname, mono(TyAny)))
   } else {
@@ -9116,21 +9265,36 @@ fn check_clause_names(st: InferState, eff: String, cs: [HClause],
   }
 }
 
-fn filter_string_ne(xs: [String], target: String) : [String] {
+# m7b #11i — filter labels whose `eff` matches `eff_name` AND whose
+# ty_args unify with `tyargs`. This is the handler-removal path: only
+# the labels matching the handler's instantiation are dropped from the
+# body's row. A handler `with Reader[Int]` does NOT remove a body's
+# `Reader[String]` label.
+fn filter_labels_matching(xs: [Label], eff_name: String, tyargs: [Ty],
+                           sub: Subst) : [Label] {
   match xs {
     [] -> []
     [h, ...rest] ->
-      if h == target { filter_string_ne(rest, target) }
-      else { [h, ...filter_string_ne(rest, target)] }
+      if h.eff == eff_name and labels_args_unify(h.ty_args, tyargs, sub) {
+        filter_labels_matching(rest, eff_name, tyargs, sub)
+      } else {
+        [h, ...filter_labels_matching(rest, eff_name, tyargs, sub)]
+      }
   }
 }
 
-fn merge_string_lists(a: [String], b: [String]) : [String] {
+# Merge two label lists, deduplicating by (eff name + unifiable
+# ty_args). Used when synth_handle stitches the outer row back with
+# the body's residual labels.
+fn merge_label_lists(a: [Label], b: [Label], sub: Subst) : [Label] {
   match b {
     [] -> a
     [h, ...rest] ->
-      if list_has(a, h) { merge_string_lists(a, rest) }
-      else { merge_string_lists([h, ...a], rest) }
+      if label_present_unifiable(a, h, sub) {
+        merge_label_lists(a, rest, sub)
+      } else {
+        merge_label_lists([h, ...a], rest, sub)
+      }
   }
 }
 
@@ -9180,27 +9344,84 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList {
 }
 
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred {
-  match try_op_call(st, callee, args_, line, col) {
+  # m7b #11l: special-case `resume(...)` inside a stateful clause
+  # body. The clause's enclosing handler installs `st.clause_resume`
+  # = Some(RB(answer_ty, state_ty)); a 1-arg `resume(v)` requires
+  # `v : answer_ty`, a 2-arg `resume(v, ns)` additionally requires
+  # `ns : state_ty`. Outside stateful clauses, the standard env
+  # binding of `resume` carries the typing.
+  match try_resume_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None -> {
-      let rc = synth(st, callee)
-      let ra = synth_many(rc.st, args_)
+    None ->
+      match try_op_call(st, callee, args_, line, col) {
+        Some(inf) -> inf
+        None -> {
+          let rc = synth(st, callee)
+          let ra = synth_many(rc.st, args_)
+          let rv = st_fresh_ty(ra.st)
+          # m7b #12: build the expected function type with an *open*
+          # row (a fresh row variable in the tail) so that calling a
+          # function whose declared row is non-empty or carries its
+          # own row variable doesn't force-bind the callee's tail to
+          # the empty row at the call site. The fresh row var absorbs
+          # whatever residual labels the callee carries; the caller's
+          # effect tracking is handled separately by `st_add_label`
+          # for op calls.
+          let fr = subst_fresh_row(rv.st.sub)
+          let st_fresh = st_set_sub(rv.st, fr.subst)
+          let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
+          let expected = TyFnT(ra.tys, rv.ty, expected_row)
+          let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
+          let ty = apply_ty(st2.sub, rv.ty)
+          let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
+          mk_inferred(st2, ty, root)
+        }
+      }
+  }
+}
+
+# m7b #11l — type-check `resume(v)` / `resume(v, ns)` inside a
+# stateful clause body. Returns None when the call is not a resume
+# inside a stateful clause (caller falls through to the standard path).
+fn try_resume_call(st: InferState, callee: Expr, args_: [Expr],
+                    line: Int, col: Int) : Option[Inferred] {
+  match callee.kind {
+    EVar(name) ->
+      if name == "resume" {
+        match st.clause_resume {
+          None -> None
+          Some(rb) -> Some(synth_resume_call(st, rb, args_, callee, line, col))
+        }
+      } else { None }
+    _ -> None
+  }
+}
+
+fn synth_resume_call(st: InferState, rb: ResumeBind, args_: [Expr],
+                      callee: Expr, line: Int, col: Int) : Inferred {
+  match rb {
+    RB(answer_ty, state_ty) -> {
+      let ra = synth_many(st, args_)
       let rv = st_fresh_ty(ra.st)
-      # m7b #12: build the expected function type with an *open* row
-      # (a fresh row variable in the tail) so that calling a function
-      # whose declared row is non-empty or carries its own row variable
-      # doesn't force-bind the callee's tail to the empty row at the
-      # call site. The fresh row var absorbs whatever residual labels
-      # the callee carries; the caller's effect tracking is handled
-      # separately by `st_add_effect` for op calls.
-      let fr = subst_fresh_row(rv.st.sub)
-      let st_fresh = st_set_sub(rv.st, fr.subst)
-      let expected_row = Row { labels: [], tail: Some(fr.id), display_alias: None }
-      let expected = TyFnT(ra.tys, rv.ty, expected_row)
-      let st2 = st_unify(st_fresh, rc.ty, expected, "function call", line, col)
-      let ty = apply_ty(st2.sub, rv.ty)
-      let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
-      mk_inferred(st2, ty, root)
+      let st_after = match ra.tys {
+        [a]     -> st_unify(rv.st, a, answer_ty,
+                             "resume answer", line, col)
+        [a, ns] -> {
+          let s1 = st_unify(rv.st, a, answer_ty,
+                              "resume answer", line, col)
+          st_unify(s1, ns, state_ty,
+                    "resume new state", line, col)
+        }
+        _ -> {
+          diag_error(rv.st.file, line, col,
+            "resume call: expected 1 or 2 arguments inside a stateful clause")
+          st_bump_err(rv.st)
+        }
+      }
+      let ty = apply_ty(st_after.sub, rv.ty)
+      let resume_root = with_ty(mk_expr(EVar("resume"), callee.line, callee.col), TyAny)
+      let root = with_ty(mk_expr(ECall(resume_root, ra.exprs), line, col), ty)
+      mk_inferred(st_after, ty, root)
     }
   }
 }
@@ -9284,16 +9505,32 @@ fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
 
 fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
                               key: String, line: Int, col: Int) : Inferred {
-  let inst = st_instantiate(st, sc)
+  # m7b #11i: capture the fresh ids minted by instantiation. For
+  # parametric effects (where the scheme quantifies over the effect's
+  # tparams) these fresh tyvars are the row label's ty_args. For
+  # stateless effects the list is empty and we add a bare-name label.
+  let inst = st_instantiate_report(st, sc)
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
-  # m7a #4c: this op call commits the caller to the effect.
-  let st3 = st_add_effect(st2, dotted_prefix(key), line, col)
+  let eff_n = dotted_prefix(key)
+  let row_args = resolve_fresh_ids(inst.fresh, st2.sub)
+  let lab = Label { eff: eff_n, ty_args: row_args }
+  let st3 = st_add_label(st2, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
+}
+
+# Apply the substitution to a list of fresh-tyvar ids, producing the
+# resolved type for each. Avoids an inline lambda that would capture
+# the substitution and confuse stage 1's capture analyser.
+fn resolve_fresh_ids(ids: [Int], sub: Subst) : [Ty] {
+  match ids {
+    [] -> []
+    [id, ...rest] -> [apply_ty(sub, TyVarT(id)), ...resolve_fresh_ids(rest, sub)]
+  }
 }
 
 # Extract `Eff` from `Eff.op` so st_add_effect can record only the
@@ -10207,45 +10444,95 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
 # open declared row.
 fn check_body_row(st: InferState, fname: String, declared: RowExpr,
                   line: Int, col: Int) : InferState {
+  # m7b #11i + #11k: every body label must match a declared label by
+  # eff name AND unifiable ty_args. `Reader[Int]` body label paired
+  # with `Reader[String]` declared label is a row mismatch.
+  # m7b #12: an open row (ROpen) absorbs extras through its tail
+  # variable, so the body-vs-declared subset check is unconstrained.
   match declared {
-    REmpty       -> check_body_row_loop(st, fname, st.row, [], line, col)
-    RClosed(lbs) -> check_body_row_loop(st, fname, st.row, row_label_names(lbs), line, col)
-    # m7b #12: an open row absorbs any extras through its tail
-    # variable; the row check is unconstrained.
+    REmpty       -> check_body_row_label_loop(st, fname, st.row, [], line, col)
+    RClosed(lbs) -> check_body_row_label_loop(st, fname, st.row,
+                                                row_labels_of_rls(lbs), line, col)
     ROpen(_, _)  -> st
   }
 }
 
-# m7a #8: per-label diagnostic. For each effect the body performed
-# but the function did not declare, point at the *op call site*
-# (recorded in `st.eff_uses` at synth_op_call_with_scheme), say
-# which function's row should have included it, and offer both
-# fixes — extend the signature or wrap the call site in a handle.
-# Doc C §*Diagnostic quality* §*Effect not handled* prescribes the
-# shape; m7a #8 wires it up. Falls back to the function's decl
-# span when the use site was not recorded (the open-row paths in
-# Doc A §*Inference* will reach this branch once they ship).
-fn check_body_row_loop(st: InferState, fname: String, performed: [String],
-                       declared: [String], fline: Int, fcol: Int) : InferState {
+# m7b #11i — label-aware body-vs-declared check. For each label the
+# body performed, look for an `eff`-name match in the declared list;
+# unify ty_args with `unify_label_args` (extends the substitution).
+# Unification failure or absence both report "effect not handled" with
+# the parametric label rendered in full.
+fn check_body_row_label_loop(st: InferState, fname: String, performed: [Label],
+                              declared: [Label], fline: Int, fcol: Int) : InferState {
   match performed {
     [] -> st
-    [eff, ...rest] ->
-      if list_has(declared, eff) {
-        check_body_row_loop(st, fname, rest, declared, fline, fcol)
-      } else {
-        let use_eu = lookup_eff_use(st.eff_uses, eff)
-        match use_eu {
-          EU(_, uline, ucol) -> {
-            let line = if uline >= 0 { uline } else { fline }
-            let col  = if ucol  >= 0 { ucol  } else { fcol  }
-            diag_error(st.file, line, col,
-              string_concat("effect not handled: ", eff))
-            diag_note("`#{fname}`'s declared row does not include `#{eff}`")
-            diag_help("either declare `#{fname} : ... / #{eff}`, or wrap this call site in `handle { ... } with #{eff} { ... }`")
-            check_body_row_loop(st_bump_err(st), fname, rest, declared, fline, fcol)
+    [lab, ...rest] -> {
+      let st1 = match find_matching_declared(declared, lab, st) {
+        Some(s_after) -> s_after
+        None -> {
+          let use_eu = lookup_eff_use(st.eff_uses, lab.eff)
+          match use_eu {
+            EU(_, uline, ucol) -> {
+              let line = if uline >= 0 { uline } else { fline }
+              let col  = if ucol  >= 0 { ucol  } else { fcol  }
+              let lab_str = label_to_string(apply_label_args(st.sub, lab))
+              diag_error(st.file, line, col,
+                string_concat("effect not handled: ", lab_str))
+              diag_note("`#{fname}`'s declared row does not include `#{lab_str}`")
+              diag_help("either declare `#{fname} : ... / #{lab_str}`, or wrap this call site in `handle { ... } with #{lab_str} { ... }`")
+              st_bump_err(st)
+            }
           }
         }
       }
+      check_body_row_label_loop(st1, fname, rest, declared, fline, fcol)
+    }
+  }
+}
+
+# m7b #11i — find a declared label whose eff name and ty_args unify
+# with the body's label. Side effect: if a match is found, the unifier
+# may bind tyvars on the body label's ty_args to concrete declared
+# types. Returns the post-unification InferState, or None on no match.
+fn find_matching_declared(declared: [Label], target: Label,
+                            st: InferState) : Option[InferState] {
+  match declared {
+    [] -> None
+    [d, ...rest] ->
+      if d.eff == target.eff and labels_args_unify(d.ty_args, target.ty_args, st.sub) {
+        Some(unify_label_args_into(d.ty_args, target.ty_args, st))
+      } else {
+        find_matching_declared(rest, target, st)
+      }
+  }
+}
+
+# Unify two ty_arg lists, propagating any new bindings into st.sub.
+# Mismatched length → no-op (caller already excluded that case via
+# labels_args_unify which requires equal length).
+fn unify_label_args_into(a: [Ty], b: [Ty], st: InferState) : InferState {
+  match a {
+    [] -> st
+    [ah, ...arest] -> match b {
+      [] -> st
+      [bh, ...brest] -> {
+        let st1 = st_unify(st, ah, bh, "row label type argument", -1, -1)
+        unify_label_args_into(arest, brest, st1)
+      }
+    }
+  }
+}
+
+# m7b #11k — render a Label for diagnostics. Bare-name labels render
+# as the eff name; parameterised labels render as `Eff[T1, T2]` with
+# each ty_arg passed through `ty_to_string` so unbound TyVars show as
+# `?tN`.
+fn label_to_string(l: Label) : String {
+  match l.ty_args {
+    [] -> l.eff
+    _ -> concat_all([
+      l.eff, "[", join_with(map(l.ty_args, ty_to_string), ", "), "]"
+    ])
   }
 }
 
