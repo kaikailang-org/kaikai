@@ -351,6 +351,15 @@ in.
 12. **m12 — Self-hosting checkpoint**: `kaic2
     stage2/compiler.kai` produces a byte-identical output.
     Stage 1 retired from the dev loop.
+12.5. **m12.5 — Units of Measure**: F#-style first-class units
+    on numeric primitives (`Real<USD>`, `Int<Seconds>`,
+    `Real<m / sec^2>`), unit-polymorphic functions
+    (`fn area[u: Unit](w: Real<u>, h: Real<u>) : Real<u^2>`),
+    abelian-group unification in the typer, units erased before
+    codegen. Independent of effects/fibers; benefits the C2
+    Fintech toolkit (`Money<USD>` ≠ `Money<EUR>` as a compile
+    error). Possibly brought forward if Money/Decimal becomes a
+    priority. Full design in `docs/units-of-measure.md`.
 13. **m13 — Property testing + bench**: `check` and `bench`
     blocks, matching runners.
 14. **m14 — Stdlib expansion**: stage-2-native stdlib,
@@ -371,7 +380,7 @@ exists as a usable language as soon as possible" and treats
 performance work as a follow-up:
 
 ```
-m7a → m7b → m7c → m8 → m12 → m5 → full Perceus → m11/m13/m14/m15-17
+m7a → m7b → m7c → m8 → m12 → m12.5 → m5 → full Perceus → m11/m13/m14/m15-17
 ```
 
 Rationale:
@@ -399,13 +408,20 @@ Rationale:
    dev loop. This is the natural moment to evaluate stage 2's
    performance, because once stage 1 is gone, stage 2's speed
    is the development speed.
-6. **m5 (basic Perceus in the typed IR)** — reuse analysis +
+6. **m12.5 (units of measure)** — F#-style first-class units on
+   numeric primitives. Isolated change to the typer/parser; codegen
+   intact. Lands here because it is the first concrete fintech
+   differentiator (`Money<USD>` ≠ `Money<EUR>` as a compile
+   error) and it sits cleanly on a self-hosted stage 2.
+   Candidate to bring forward if Money/Decimal becomes a priority
+   before m12. Full design in `docs/units-of-measure.md`.
+7. **m5 (basic Perceus in the typed IR)** — reuse analysis +
    drop insertion. Lands now because it directly improves the
    self-compile speed and validates the IR design under load.
-7. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
+8. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
    unboxing, opt-in regions) — the heavy memory work, scheduled
    after the basic pass has stabilised.
-8. **m11 (diagnostics quality)**, **m13 (property/bench)**,
+9. **m11 (diagnostics quality)**, **m13 (property/bench)**,
    **m14 (stdlib expansion)**, **m15–m17 (tooling)** — these
    are mostly independent and can land in parallel once the
    above is done. m11 in particular benefits from being able
