@@ -347,6 +347,71 @@ in.
 16. **m16 — `kai lsp`** using the stage 2 pipeline.
 17. **m17 — `kai repl`** using the stage 2 pipeline + holes.
 
+## Recommended ordering — the direct path
+
+The `m1, m2, …, m17` numbering is stable for cross-references
+but it is **not** the order we are landing them in. After m1–m4
+are stable, the recommended path optimises for "kaikai
+exists as a usable language as soon as possible" and treats
+performance work as a follow-up:
+
+```
+m7a → m7b → m8 → m12 → m5 → full Perceus → m11/m13/m14/m15-17
+```
+
+Rationale:
+
+1. **m7a (effects mechanics)** — already in progress. Unblocks
+   every subsequent doc (effects, sugars, fibers, actors)
+   because they all assume row inference + handler runtime.
+2. **m7b (effects ergonomics)** — ships the sugars (trailing
+   lambdas, `@cap`/`:=`, `var`, `a[i]`, aliases). The code in
+   `effects-stdlib.md` and `actors.md` reads as written only
+   after m7b lands.
+3. **m8 (fibers + structured concurrency + actors)** — closes
+   the concurrency surface. The language is "complete" in the
+   sense that every promise of the design docs (effects +
+   handlers + nurseries + actors + cancellation) compiles and
+   runs.
+4. **m12 (self-hosting checkpoint)** — `kaic2 stage2/compiler.kai`
+   produces a byte-identical output. Stage 1 retires from the
+   dev loop. This is the natural moment to evaluate stage 2's
+   performance, because once stage 1 is gone, stage 2's speed
+   is the development speed.
+5. **m5 (basic Perceus in the typed IR)** — reuse analysis +
+   drop insertion. Lands now because it directly improves the
+   self-compile speed and validates the IR design under load.
+6. **Full Perceus** (§2 — reuse-in-place, drop specialisation,
+   unboxing, opt-in regions) — the heavy memory work, scheduled
+   after the basic pass has stabilised.
+7. **m11 (diagnostics quality)**, **m13 (property/bench)**,
+   **m14 (stdlib expansion)**, **m15–m17 (tooling)** — these
+   are mostly independent and can land in parallel once the
+   above is done. m11 in particular benefits from being able
+   to run end-to-end on the full feature set.
+
+Why this order and not "Perceus first":
+
+- m7a/m7b/m8 deliver the **language**. Without them, stage 2 is
+  a self-hosted kaikai-minimal with extras — not the language
+  the design docs describe. Performance is a constant-factor
+  improvement on top of an existing language, not the language
+  itself.
+- The current RC scheme (stage 0's uniform boxing + manual
+  incref/decref) is **functionally complete**. Programs run
+  correctly; they are just slower than they will be after m5.
+- m12 is the natural quality gate. Sliding Perceus before m12
+  means doing the work twice (once on a partial language, once
+  after fibers/actors land).
+- Items beyond m12 (m5, full Perceus, m11/m13/m14, tooling) can
+  be parallelised much more freely than the m7a→m7b→m8 chain,
+  which is sequential by nature (each depends on the previous).
+
+This ordering is recorded in `docs/stage1-design.md` §Features
+item 6 (basic Perceus deferred from stage 1 to stage 2 m5) and
+mirrored in this section so the next contributor can find the
+critical path without re-deriving it from the milestone list.
+
 ## What stage 2 deliberately does not ship
 
 - Gradual typing, dependent types, refinement types.
