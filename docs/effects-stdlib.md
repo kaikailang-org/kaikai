@@ -17,20 +17,27 @@ and used by the stdlib sparingly.
 
 ## Catalog
 
-| Effect       | Purpose                                       | Default handler?      |
-|--------------|-----------------------------------------------|-----------------------|
-| `Console`    | stdout and stderr output                      | yes (runtime, if in `main`'s row) |
-| `Stdin`      | terminal input                                | yes (runtime, if in `main`'s row) |
-| `Env`        | command-line args and process environment     | yes (runtime, if in `main`'s row) |
-| `File`       | filesystem read/write                         | yes (runtime, if in `main`'s row) |
-| `Fail`       | abort with a message                          | no (unhandled = compile error) |
-| `State[T]`   | value-threaded mutable state                  | no (user supplies)    |
-| `Reader[T]`  | read-only ambient value                       | no (user supplies)    |
-| `Writer[W]`  | accumulating log / output                     | no (user supplies)    |
-| `Mutable`    | heap cells and arrays (the `Array` escape)    | yes (runtime-trivial, invisible in user code) |
-| `Cancel`     | cooperative cancellation                      | yes (scheduler-wired) |
-| `Spawn`      | fibers and nurseries                          | yes (root nursery) — cross-ref `docs/structured-concurrency.md` |
-| `Ffi`        | crossings to C via `extern "C"` declarations  | yes (compiler-synthesised) |
+| Effect          | Purpose                                       | Default handler?      |
+|-----------------|-----------------------------------------------|-----------------------|
+| `Console`       | stdout and stderr output                      | yes (runtime, if in `main`'s row) |
+| `Stdin`         | terminal input                                | yes (runtime, if in `main`'s row) |
+| `Env`           | command-line args and process environment     | yes (runtime, if in `main`'s row) |
+| `File`          | filesystem read/write                         | yes (runtime, if in `main`'s row) |
+| `Clock`         | wall-clock and monotonic time, sleep          | yes (runtime, if in `main`'s row) |
+| `Random`        | non-cryptographic randomness                  | yes (runtime, if in `main`'s row) |
+| `SecureRandom`  | cryptographically-secure randomness           | yes (runtime, if in `main`'s row) |
+| `NetTcp`        | TCP byte-level networking                     | yes (runtime, if in `main`'s row) |
+| `NetUdp`        | UDP byte-level networking                     | yes (runtime, if in `main`'s row) |
+| `NetDns`        | DNS resolution                                | yes (runtime, if in `main`'s row) |
+| `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
+| `Fail`          | abort with a message                          | no (unhandled = compile error) |
+| `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
+| `Reader[T]`     | read-only ambient value                       | no (user supplies)    |
+| `Writer[W]`     | accumulating log / output                     | no (user supplies)    |
+| `Mutable`       | heap cells and arrays (the `Array` escape)    | yes (runtime-trivial, invisible in user code) |
+| `Cancel`        | cooperative cancellation                      | yes (scheduler-wired) |
+| `Spawn`         | fibers and nurseries                          | yes (root nursery) — cross-ref `docs/structured-concurrency.md` |
+| `Ffi`           | crossings to C via `extern "C"` declarations  | yes (compiler-synthesised) |
 
 Mailboxes and message passing (`Actor[Msg]`) are deferred to a
 separate spec, `docs/actors.md`, because the mailbox model
@@ -53,6 +60,15 @@ does "several of the above" and the precise breakdown is not
 worth spelling out. Diagnostics keep the alias when it resolves
 cleanly and expand to the label set only on mismatch, per Doc A
 §*Open questions* #5.
+
+`Clock`, `Random`, `SecureRandom`, the `Net` family
+(`NetTcp + NetUdp + NetDns`, with `Net` as alias), and `Process`
+are kept *out* of the `Io` alias. Networking and process control
+have distinct operational costs (latency, peer failure,
+fork/exec weight) and a function that "logs and reads config"
+should not silently gain capability over the network or over
+subprocesses just because both sit under a convenience name.
+Each of those effects appears explicitly in signatures.
 
 "Default handler" means: if `main`'s row contains this effect and
 no user handler appears, the runtime installs a stdlib-provided
@@ -442,6 +458,430 @@ timing decided when the first real use case pushes them:
 - Streaming: chunked read/write without loading the whole file.
   Likely needs a companion effect (a stateful file handle), not
   just new `File` ops.
+
+## `Clock`
+
+### Declaration
+
+```kai
+effect Clock {
+  now()              : WallTime
+  monotonic()        : Instant
+  sleep(d: Duration) : Unit
+}
+```
+
+- `now()` returns the current wall-clock time as a `WallTime`.
+  Subject to wall-clock jumps (NTP corrections, manual clock
+  changes); use for user-facing timestamps, not for measuring
+  intervals.
+- `monotonic()` returns a monotonic timestamp as an `Instant` —
+  a clock that never goes backwards. Its origin is unspecified;
+  only differences are meaningful. Use for measuring elapsed time
+  and for deadlines.
+- `sleep(d)` suspends the current fiber for at least `d`. The
+  scheduler may resume the fiber later than `d` if other work is
+  pending — `d` is a lower bound, not a deadline. If the fiber's
+  row contains `Cancel`, a cancellation delivered while the fiber
+  is asleep wakes it through the standard `Cancel.raise()` path.
+
+`WallTime`, `Instant`, and `Duration` are stdlib types declared
+by the `time` module (see `docs/stdlib-layout.md`). The two
+timestamp types are deliberately distinct so the type system
+prevents mixing wall-clock and monotonic readings in arithmetic
+— a common source of bugs (Rust and Go take the same approach).
+Subtraction of two `Instant` values yields a `Duration`;
+`monotonic() - earlier` is the standard "how long has it been"
+idiom. `WallTime` supports comparison and formatting but
+intervals between two `WallTime` values are advisory only,
+because the wall clock can jump.
+
+### Why `Clock` and not pure
+
+Reading the clock is non-deterministic and depends on process
+state (which clock source is selected, how the OS is set). Same
+argument as `Env`: a function whose result depends on surrounding
+process state cannot be pure.
+
+### Default handler
+
+Runtime-installed around `main` when `Clock` is in the row.
+
+- `now` calls `clock_gettime(CLOCK_REALTIME, ...)` via `Ffi`.
+- `monotonic` calls `clock_gettime(CLOCK_MONOTONIC, ...)`.
+- `sleep` registers the fiber as suspended with the scheduler's
+  timer wheel, keyed on `monotonic() + d`. The scheduler resumes
+  the fiber when the deadline elapses, or earlier if `Cancel` is
+  delivered.
+
+The handler never short-circuits; clock ops always resume.
+
+### Error model
+
+`clock_gettime` is infallible on supported platforms (Linux,
+macOS, FreeBSD; the only documented `EINVAL` returns are for
+clock IDs the runtime never passes). A failure here is treated
+the same as `Console`: panic with a banner on stderr.
+
+### What's not in v1 (planned extensions)
+
+- Calendar arithmetic (years, months, time zones, DST). v1 keeps
+  `Instant` and `Duration` opaque and timezone-agnostic; calendar
+  types and conversions land in a future `time.calendar`
+  extension.
+- Named timers (cancellable via handle): `at(deadline: Instant) :
+  Timer`, `cancel(t: Timer) : Unit`. The `sleep`-via-`Cancel`
+  pattern covers most needs; named timers are for cases where
+  one fiber arms a timer that another fiber cancels.
+
+## `Random`
+
+### Declaration
+
+```kai
+effect Random {
+  int_range(lo: Int, hi: Int) : Int
+  float()                     : Float
+  bytes(n: Int)               : [Byte]
+}
+```
+
+- `int_range(lo, hi)` returns a uniformly-distributed value in
+  the half-open interval `[lo, hi)`. Calling with `lo >= hi` is
+  a panic — there is no meaningful value to return; the
+  inferencer does not catch this.
+- `float()` returns a value in `[0.0, 1.0)` with 53 bits of
+  precision.
+- `bytes(n)` returns a list of `n` bytes drawn from the same
+  stream.
+
+`Random` is for non-cryptographic uses: simulations, sampling,
+test fixtures. Cryptographic randomness lives in `SecureRandom`
+(next section), declared as a separate effect for the safety
+reason spelled out there.
+
+### Why `Random` and not pure
+
+Each call returns a different value depending on the PRNG state.
+Same justification as `Env` and `Clock`: the result depends on
+ambient process state (the PRNG's hidden cursor), not on
+arguments alone.
+
+### Default handler
+
+Runtime-installed around `main` when `Random` is in the row. The
+handler holds a per-process PCG64 instance, seeded from
+`SecureRandom.bytes` at startup. Each op draws from that instance
+and resumes; the handler never short-circuits.
+
+The default handler is **not deterministic across runs**. Tests
+that need reproducibility install their own `Random` handler with
+a fixed seed, in the same shape as the `Console` capture pattern.
+
+### Error model
+
+PRNG ops are infallible. `int_range(l, h)` with `l >= h` is a
+panic (programming error), not a `Fail`.
+
+### What's not in v1 (planned extensions)
+
+- Distributions: `gaussian(mean, stddev)`, `exponential(rate)`,
+  `poisson(lambda)`. Compose on top of the four primitive ops
+  and live in the `random` stdlib module rather than as new ops.
+- Sampling helpers: `choice(xs)`, `shuffle(xs)`, `sample(xs, k)`.
+  Same locality argument — pure given the underlying primitives.
+- Reseeding: `seed(s: Int)`. Useful for fuzzing harnesses;
+  deferred pending a use case that demands it.
+
+## `SecureRandom`
+
+### Declaration
+
+```kai
+effect SecureRandom {
+  bytes(n: Int) : [Byte]
+  int()         : Int
+}
+```
+
+A cryptographically-secure RNG. The op set is intentionally
+minimal: bytes and ints are enough for crypto primitives that
+live above this effect; specialised distributions or stream APIs
+are out of scope.
+
+### Why separate from `Random`
+
+`SecureRandom` is kept deliberately separate from `Random` so
+that a test handler stubbing `Random` cannot weaken
+security-sensitive paths (token generation, key material,
+nonces). A signature `/ SecureRandom + Random` is unusual but
+legal: it declares both that the function uses non-secure
+randomness *and* secure randomness, with no implicit conflation
+of the two.
+
+### Default handler
+
+Runtime-installed around `main` when `SecureRandom` is in the row.
+
+- Linux: `getrandom(2)` with `flags = 0` (block until the kernel
+  pool has enough entropy on first call; never blocks afterward).
+- macOS / *BSD: `arc4random_buf(3)`.
+- Windows (post-MVP): `BCryptGenRandom`.
+
+The handler never short-circuits unless the syscall actually
+fails, which on these platforms only happens under catastrophic
+conditions (kernel pool unrecoverable). v1 treats such failures
+as panics, the same as `Console` and `Clock`.
+
+### Error model
+
+Infallible in v1 from the caller's perspective. The handler may
+panic if the OS RNG is unavailable, but no `Result` / `Fail`
+shape is exposed — code that needs cryptographic randomness
+cannot run if the OS cannot provide it.
+
+### What's not in v1 (planned extensions)
+
+- `key(n: Int) : Key` returning a typed key wrapper. Belongs
+  with the future `crypto.key` module, not with `SecureRandom`.
+- A streaming API for very large draws. The current `bytes(n)`
+  is fine through MVP-scale use cases.
+
+## `NetTcp`, `NetUdp`, `NetDns` (alias `Net`)
+
+### Declaration
+
+```kai
+effect NetTcp {
+  connect(host: String, port: Int)              : Result[Conn, String]
+  listen(host: String, port: Int)               : Result[Listener, String]
+  accept(l: Listener)                           : Result[Conn, String]
+  send(c: Conn, data: [Byte])                   : Result[Int, String]
+  recv(c: Conn, max: Int)                       : Result[[Byte], String]
+  close(c: Conn)                                : Unit
+}
+
+effect NetUdp {
+  bind(host: String, port: Int)                 : Result[UdpSocket, String]
+  send(s: UdpSocket, dst: SocketAddr, data: [Byte]) : Result[Int, String]
+  recv(s: UdpSocket, max: Int)                  : Result[(SocketAddr, [Byte]), String]
+  close(s: UdpSocket)                           : Unit
+}
+
+effect NetDns {
+  resolve(host: String)                         : Result[[IpAddr], String]
+}
+
+type Net = NetTcp + NetUdp + NetDns
+```
+
+The three effects cover the byte-level networking capability,
+each focused on one protocol family. The `Net` alias bundles
+them when a function does several at once and the precise
+breakdown is not worth spelling out — same pattern as `Io =
+Console + Stdin + Env + File`.
+
+Higher-level protocols (HTTP, WebSocket, gRPC) live in stdlib
+modules that *use* the relevant effects — they do not introduce
+new effects of their own. An HTTP client uses `/ NetTcp + NetDns`;
+a UDP-only DNS-over-UDP probe uses `/ NetUdp + NetDns`.
+
+`Conn`, `Listener`, `UdpSocket`, `IpAddr`, and `SocketAddr` are
+opaque types declared by the `net.tcp` / `net.udp` / `net.dns`
+modules. v1 treats them as nominal handles; their internal
+representation is implementation-defined.
+
+### Why three effects with an alias
+
+The three families are kept distinct rather than fused into a
+single `Net` effect because:
+
+- Capability gating at the protocol boundary is meaningful: a
+  component that should only resolve names but never open
+  sockets uses `/ NetDns` and is statically prevented from going
+  further.
+- Each effect has few ops (DNS is a single op), keeping the
+  catalog readable and the per-effect handler small.
+- The `Net` alias keeps the brief case ergonomic: a function
+  that uses TCP, UDP, and DNS together writes `/ Net`, exactly
+  as it would have under a single fused effect.
+
+### Error model
+
+Every op except the `close` variants returns `Result[_,
+String]`. Network errors are rich and callers routinely branch
+on motive (host not found, connection refused, peer closed,
+timeout). v1 keeps the payload as a raw `String`; a structured
+`NetError` sum is deferred, same as `File`.
+
+`NetTcp.close` and `NetUdp.close` return `Unit` rather than
+`Result`: closing a socket can technically fail, but no caller
+does anything useful with that information. The handler logs
+and swallows.
+
+`NetTcp.recv` returns `Ok([])` when the peer has closed the
+connection cleanly. Callers distinguish "no data yet" from "peer
+gone" by the empty list, matching the POSIX `recv() == 0`
+convention. Asking for `max = 0` is a panic — there is no useful
+"read zero bytes" call.
+
+### Default handler
+
+Runtime-installed around `main` for each of `NetTcp`, `NetUdp`,
+`NetDns` independently when present in the row. Each op maps to
+a POSIX socket call (`socket`, `connect`, `bind`, `listen`,
+`accept`, `send`, `recv`, `close`) via `Ffi`. DNS resolution
+goes through `getaddrinfo(3)`.
+
+Blocking ops (`NetTcp.connect`, `NetTcp.accept`, `NetTcp.send`,
+`NetTcp.recv`, the UDP equivalents, `NetDns.resolve`) suspend
+the fiber via the scheduler's reactor (kqueue on macOS / *BSD,
+epoll on Linux). The underlying file descriptor is set to
+`O_NONBLOCK` and the fiber yields until the readiness event
+fires, exactly the same mechanism as `Clock.sleep`. A `Cancel`
+raised mid-call unwinds out of the op with no half-written
+state visible to user code.
+
+### Stdlib helper
+
+The "abort if anything goes wrong" pattern lifts `Result` into
+`Fail`, same shape as `read_file_or_fail`:
+
+```kai
+pub fn tcp_connect_or_fail(host: String, port: Int) : Conn / NetTcp + Fail {
+  match NetTcp.connect(host, port) {
+    Ok(c)  -> c
+    Err(m) -> Fail.fail("connect #{host}:#{port}: #{m}")
+  }
+}
+```
+
+### What's not in v1 (planned extensions)
+
+- TLS: `tls_wrap(c: Conn, cfg: TlsConfig) : Result[Conn,
+  String]`. Lands as a separate `Tls` effect, not as new
+  `NetTcp` ops, because the configuration surface (cert chains,
+  SNI, ALPN) is large enough to warrant its own design.
+- Unix domain sockets: `uds_connect`, `uds_listen`. Same shape
+  as TCP, deferred until a use case demands them. Likely a
+  fourth `NetUds` effect under the same `Net` alias.
+- Raw / packet sockets: out of scope for stdlib; FFI is the
+  right tool for such low-level work.
+- HTTP/2 and HTTP/3: the `net.http` stdlib module ships
+  HTTP/1.1 in v1; the multiplexed protocols come post-MVP as
+  modules over the same `NetTcp` (and `NetUdp` for QUIC) — no
+  new effect needed.
+
+## `Process`
+
+### Declaration
+
+```kai
+effect Process {
+  start(cmd: String, args: [String])  : Result[Child, String]
+  wait(c: Child)                      : Result[Exit, String]
+  kill(c: Child, sig: Signal)         : Result[Unit, String]
+  exit(code: Int)                     : Nothing
+}
+```
+
+- `start` launches a child process and returns a handle.
+  Deliberately not named `spawn` to avoid clash with the `Spawn`
+  effect (kaikai fibers); see §*Why `Process` and not `Spawn`*.
+  Standard fds (stdin/stdout/stderr) inherit from the parent
+  unless the caller redirects them via the `os.process` module's
+  pipe helpers, which build on top of these ops.
+- `wait` blocks until the child exits and returns its exit
+  status. The fiber suspends via the scheduler's reactor
+  (`pidfd_open` on Linux; SIGCHLD-driven on macOS / *BSD).
+- `kill` delivers a signal to the child. The signal set is the
+  POSIX-canonical subset (`SIGTERM`, `SIGKILL`, `SIGINT`, …)
+  declared by the `os.process` module.
+- `exit` terminates the current process with the given code. It
+  never resumes; the return type is `Nothing`. The canonical user
+  surface for this op is `os.exit` (top-level helper exposed by
+  the stdlib `os` module per `docs/stdlib-layout.md`); calling
+  `Process.exit` directly is legal but not idiomatic.
+
+`Child`, `Exit`, and `Signal` are opaque types declared by the
+`os.process` module.
+
+### Why `Process` and not `Spawn`
+
+`Spawn` is the kaikai-fibers effect — lightweight in-process
+units of execution that share an address space. `Process` is the
+OS-level effect — separate processes with their own address
+space, lifecycle, and signal handling. The two are unrelated in
+implementation and deliberately kept apart; conflating them
+would let a function that "only spawns a fiber" silently gain
+the right to start a subprocess. The op-level naming reinforces
+this: `Process.start` rather than `Process.spawn` so the word
+"spawn" is reserved for the fiber primitive.
+
+### Error model
+
+`start`, `wait`, and `kill` return `Result[_, String]`. Common
+faults a caller might branch on: "binary not found" (start),
+"child already reaped" (wait), "no such process" (kill). v1
+keeps the payload as a raw `String`, same as `File` and the
+`Net` family.
+
+`exit` does not have an error model — it does not resume.
+
+### Default handler
+
+Runtime-installed around `main` when `Process` is in the row.
+
+- `start` on POSIX is `fork(2)` + `execvp(3)`; on Windows
+  (post-MVP) `CreateProcess`.
+- `wait` blocks via the scheduler's reactor: on Linux, register
+  the child's `pidfd` with epoll and yield; on macOS / *BSD, a
+  SIGCHLD handler wakes the awaiting fiber. Cancellation
+  unwinds out of the wait without reaping the child — see
+  `wait_or_kill` below for the canonical cancel-aware pattern.
+- `kill` is `kill(2)`.
+- `exit` is libc `_exit(code)`. No flushing of stdio buffers; the
+  caller must `print` everything they want printed before
+  calling `exit`. (kaikai's `Console` writes are unbuffered, so
+  the practical impact is small.)
+
+### Stdlib helper
+
+A cancel-aware wait that signals the child if its own fiber is
+cancelled, then re-raises:
+
+```kai
+pub fn wait_or_kill(c: Child, on_cancel: Signal) : Result[Exit, String] / Process + Cancel {
+  handle {
+    Process.wait(c)
+  } with Cancel {
+    raise(_) -> {
+      let _ = Process.kill(c, on_cancel)
+      Cancel.raise()
+    }
+  }
+}
+```
+
+The common call is `wait_or_kill(child, SIGTERM)`. The handler
+runs only when the wait is interrupted by cancellation; on a
+clean exit, control flows past the `with` clause and the
+`Result` from `Process.wait` is returned untouched.
+
+### What's not in v1 (planned extensions)
+
+- Stdio redirection helpers: `start_with_pipes`, returning a
+  `Child` plus reader/writer endpoints for stdin/stdout/stderr.
+  Likely lives in `os.process` rather than as new `Process` ops.
+- Working-directory and environment overrides per start:
+  `start_with_env`, `start_in_dir`. Same locality argument.
+- Process-group and session control (`setsid`, `setpgid`).
+  Useful for daemonising; out of MVP scope.
+- Async signal handling: a `signal_install(sig, handler)` op so
+  a program can react to `SIGTERM` / `SIGINT` from `main`. The
+  graceful-shutdown story currently routes through the
+  runtime-installed default that converts `SIGTERM` / `SIGINT`
+  into a root-`Cancel`; user-installed handlers come post-MVP.
 
 ## `Fail`
 

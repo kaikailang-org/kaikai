@@ -1,0 +1,365 @@
+# stdlib layout
+
+Physical and conceptual organisation of `stdlib/` in the kaikai repo.
+This doc is the index: what modules exist, what paths they live at,
+what effects they declare, and where the line runs between stdlib and
+the forthcoming `ahu` layer. It is **not** an API reference — each
+module gets its own spec when implemented.
+
+Pinned decisions come from the stdlib discussion of 2026-04-24.
+Doc A (`effects.md`), Doc B (`effects-stdlib.md`), and Doc C
+(`effects-impl.md`) remain the sources of truth for effect semantics,
+catalog, and CPS lowering respectively. This doc sits on top of B: B
+lists the effects, this doc lists the modules that use them.
+
+## Purpose
+
+Three things this doc fixes, one at a time:
+
+1. **The tree** — a canonical list of module paths under `stdlib/`,
+   so contributors know where new code goes without a per-module
+   debate.
+2. **The ambition** — that kaikai's stdlib is "Go-wide": batteries
+   included for networking, time, random, OS, encoding, regex, crypto
+   basics. Not a minimalist core that relies on third-party packages
+   for common work. The initial MVP ships a subset of this tree; see
+   Open Questions for what defers.
+3. **The frontier with `ahu`** — stdlib owns primitives; `ahu` owns
+   OTP-style application patterns. The rule below decides edge cases
+   without reopening the debate each time.
+
+## Scope rule — stdlib vs ahu
+
+The division follows a single operational principle:
+
+> **stdlib provides primitives of a domain. `ahu` provides patterns
+> that compose multiple primitives with policy (supervision, restart,
+> lifecycle, registration).**
+
+Worked examples of the rule in action:
+
+| Thing                              | Location | Reason                                                               |
+|------------------------------------|----------|----------------------------------------------------------------------|
+| `net.tcp.connect`, `net.http.get`  | stdlib   | single-domain primitive; usable in a CLI script without ahu          |
+| connection pool with backoff       | `ahu`    | policy across `Net` + `Cancel` + `Clock` + restart                   |
+| `process.spawn`, `process.wait`    | stdlib   | single-domain primitive; running `ls -la`                            |
+| supervised port program            | `ahu`    | composes `Process` + `supervisor` restart policy                     |
+| `nursery` (scoped `Spawn` + cancel-on-fail) | stdlib | safe default scope over `Spawn` — policy in its own spec    |
+| `supervisor` (restart strategies)  | `ahu`    | configurable policy, supervision tree shape                          |
+| `Actor[Msg]` — mailbox + send/receive | stdlib | primitive concurrency communication, same tier as `Spawn`           |
+| `GenServer`-analog (state + callbacks) | `ahu`| OTP pattern on top of `Actor[Msg]`                                   |
+
+If it requires `Cancel` + `Clock` (timeouts, deadlines) to be usable,
+that is already stdlib (both are stdlib effects). It is only `ahu`
+when it introduces **restart / supervision / lifecycle / registry**
+semantics.
+
+Consequence: a complete program that speaks HTTP, reads files, spawns
+subprocesses, and uses bounded concurrency can be written against
+stdlib alone. `ahu` appears when the user wants OTP-style structural
+supervision and named processes.
+
+## Bootstrap layering
+
+Modules are tagged by which compiler stage they require:
+
+- **Stage 1** — compiles with kaikai-minimal (no effects, no row
+  polymorphism, no typeclasses; parametric HM only). Only `core/*`
+  lives here. This is the set that bootstraps with `kaic0`.
+- **Stage 2** — requires the full language (effects, row
+  polymorphism, Perceus, monomorphisation). Everything else.
+
+The `stdlib/` directory does not reshuffle itself between stages; the
+stage 1 driver (`kaic0` / `kaic1`) prepends only `core/*` as prelude,
+the stage 2 driver prepends the full `core/*` plus a curated set of
+auto-imports (TBD in a later pass).
+
+## Module tree
+
+```
+stdlib/
+  core/          pure, stage 1
+    list.kai
+    string.kai
+    option.kai
+    result.kai
+    char.kai
+    tuple.kai
+    ordering.kai
+  collections/   pure, stage 2
+    map.kai
+    set.kai
+  math/          pure, stage 2
+    int.kai
+    float.kai
+  decimal.kai    pure, stage 2 (top-level module)
+  money.kai      pure, stage 2 (top-level module; depends on decimal)
+  io.kai         effects: Console, Stdin (top-level module)
+  fs/            effect: File
+    file.kai
+    dir.kai
+    path.kai     pure helpers (could live in core; grouped here for locality)
+  os/            effects: Env, Process
+    env.kai
+    args.kai
+    process.kai
+  time.kai       effect: Clock (top-level module: WallTime, Instant, Duration, now, monotonic, sleep, deadline_in)
+  random.kai     effect: Random (top-level module)
+  random_secure.kai  effect: SecureRandom (top-level module; separate effect for safety)
+  net/           effects: NetTcp, NetUdp, NetDns (alias Net = NetTcp + NetUdp + NetDns)
+    tcp.kai      uses NetTcp
+    udp.kai      uses NetUdp
+    dns.kai      uses NetDns
+    url.kai      pure URL parsing
+    http.kai     client only, uses NetTcp + NetDns; server-side belongs to the web framework
+  encoding/      pure, stage 2
+    json.kai
+    utf8.kai
+    base64.kai
+    hex.kai
+  regexp.kai     pure, stage 2 (top-level module)
+  crypto/        pure, stage 2
+    hash.kai     sha256, sha512, blake3
+    mac.kai      hmac
+  concurrent/    effects: Spawn, Cancel (Actor[Msg] deferred to docs/actors.md)
+    nursery.kai
+    actor.kai
+  testing.kai    integrates with `kai test` (top-level module)
+```
+
+## Per-module summary
+
+Terse — one line per module, listing declared effects. Full signatures
+land in each module's own spec when implemented.
+
+### core (pure, stage 1)
+
+- `core.list` — map, filter, foldl, foldr, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product
+- `core.string` — starts_with, ends_with, trim, split, join, repeat, slice, length, to_lower, to_upper, replace, contains, chars
+- `core.option` — is_some, is_none, map, and_then, unwrap_or, or_else
+- `core.result` — is_ok, is_err, map, map_err, and_then, unwrap_or
+- `core.char` — is_digit, is_alpha, is_alnum, is_space, to_lower, to_upper
+- `core.tuple` — swap, fst, snd for 2-tuples
+- `core.ordering` — `Ordering` type, chain, reverse
+
+### collections (pure, stage 2)
+
+- `collections.map` — ordered map: empty, insert, get, remove, keys, values, merge
+- `collections.set` — ordered set: empty, insert, remove, contains, union, intersection
+
+### math (pure, stage 2)
+
+- `math.int` — abs, min, max, pow, gcd, div_mod, shl, shr, and, or, xor, not, popcount, leading_zeros, trailing_zeros
+- `math.float` — sqrt, pow, exp, log, sin/cos/tan/atan2, floor, ceil, round, is_nan, is_inf
+
+### decimal (pure, stage 2)
+
+- `decimal` — arbitrary-precision decimal arithmetic with rounding
+  modes (top-level module: `decimal.add`, `decimal.from_string`, …)
+
+### money (pure, stage 2)
+
+- `money` — `Money[Currency]` with precision per currency, safe
+  arithmetic (no implicit cross-currency ops); depends on `decimal`
+
+### io (`/ Console + Stdin`)
+
+Single top-level module. Per-function effects: `print` / `println` /
+`eprint` / `eprintln` declare `/ Console`; `read_line` / `read_all`
+declare `/ Stdin`.
+
+- `io` — `print`, `println`, `eprint`, `eprintln`, `read_line`, `read_all`
+
+### fs (`/ File`)
+
+- `fs.file` — `read_file`, `write_file`, `append`, `exists`, `delete`, `rename`, `metadata`
+- `fs.dir` — `list_dir`, `create_dir`, `remove_dir`, `walk`
+- `fs.path` — pure: `join`, `split`, `basename`, `dirname`, `extension`, `normalize`
+
+### os (`/ Env + Process`)
+
+- `os.env` — `get`, `set`, `unset`, `all`
+- `os.args` — `argv`, `program_name`
+- `os.process` — `start(cmd, args)`, `wait`, `wait_or_kill`, `pipe_stdout`, `pipe_stdin`, `signal`, `kill`
+- `os.exit` — top-level helper exposed directly under `os`,
+  physically inside `process.kai`. Takes an exit code. Effect:
+  `/ Process` (exiting is observable). Mechanism for surfacing it
+  at the top level (re-export, package-level body, …) is a
+  module-system design decision pending in stage 2.
+
+### time (`/ Clock`)
+
+Single top-level module. Contains both the types (`Instant`,
+`Duration`) and the operations (`now`, `sleep`, `deadline_in`).
+
+- `time` — `WallTime`, `Instant`, `Duration`, `now()` (wall),
+  `monotonic()`, comparison/subtraction on instants, duration
+  arithmetic (millis, seconds, minutes, …), `sleep(d)`,
+  `deadline_in(d)` — integrates with `Cancel`
+
+### random (`/ Random`) and random_secure (`/ SecureRandom`)
+
+Two separate top-level modules with **separate effects**, deliberately
+not unified. A test handler that stubs `Random` does not affect
+security-sensitive code paths.
+
+- `random` — `int_range`, `float`, `bytes`, plus pure helpers
+  (`shuffle`, `choice`, `sample`) built on top; the default
+  handler is seedable for tests
+- `random_secure` — `int`, `bytes`, cryptographic-grade primitives;
+  not seedable
+
+### net (`/ NetTcp`, `/ NetUdp`, `/ NetDns`; alias `Net = NetTcp + NetUdp + NetDns`)
+
+- `net.tcp` — `connect`, `listen`, `accept`, read/write (`/ NetTcp`)
+- `net.udp` — `bind`, `send`, `recv` (`/ NetUdp`)
+- `net.dns` — `resolve`, `resolve_all`, `reverse_lookup` (`/ NetDns`)
+- `net.url` — pure: `parse`, `format`, `join`, `query_*`
+- `net.http` — client only: `get`, `post`, `put`, `delete`, `request`; headers, body, timeouts (`/ NetTcp + NetDns`)
+
+Server-side HTTP (`net.http.server`) is deferred — it belongs with the
+web framework product (C1 in the roadmap), not in stdlib, because its
+design surface (router, middleware, graceful shutdown) is much larger
+than what a primitive module should expose.
+
+### encoding (pure, stage 2)
+
+- `encoding.json` — `encode`, `decode`
+- `encoding.utf8` — `validate`, `decode`, `encode`, `chars`
+- `encoding.base64` — `encode`, `decode` (standard + URL-safe)
+- `encoding.hex` — `encode`, `decode`
+
+### regexp (pure, stage 2)
+
+- `regexp` — `compile`, `match`, `find_all`, `replace`, `split` (top-level module)
+
+MVP target: RE2-style deterministic engine (no backreferences, linear
+time). Validation before stabilising syntax.
+
+### crypto (pure, stage 2)
+
+- `crypto.hash` — `sha256`, `sha512`, `blake3`. Legacy hashes
+  (`sha1`, `md5`) are also available for interop with existing
+  systems but flagged in the spec as not for new security work.
+- `crypto.mac` — `hmac_sha256`, `hmac_sha512`
+
+Symmetric and asymmetric ciphers deferred to post-MVP — the design
+surface (key management, nonces, AEAD) is deep enough to warrant its
+own doc, and most use cases through MVP are hashing and HMAC for auth
+tokens.
+
+### concurrent (`/ Spawn`, `/ Cancel`)
+
+The `Actor[Msg]` effect is deferred to `docs/actors.md`; once that
+spec lands, it is added to this header.
+
+- `concurrent.nursery` — scoped `spawn` / `await` / `select` with
+  cancel-on-failure. The stdlib-provided safe scope over `Spawn`.
+  Policy detailed in its own spec; restart policies live in
+  `ahu.supervisor`.
+- `concurrent.actor` — mailbox primitive: `send`, `receive`, `self`.
+  Spec detail lives in `docs/actors.md`.
+
+### testing
+
+- `testing` — assertions (`assert`, `assert_eq`, `assert_ne`,
+  `assert_raises`) and integration with the `test "..." { ... }`
+  block syntax and `kai test` subcommand. Effect: `/ Fail` for
+  failing assertions (caught by the test runner handler).
+
+## Naming conventions
+
+- **Paths on disk**: slash-separated (`stdlib/concurrent/nursery.kai`).
+- **Import paths in code**: dot-separated (`import net.http`).
+- **Function calls**: `module.function` (`net.http.get(url)`). No
+  package-level prefixes inside function names.
+- **Migration from today's `list_*` / `string_*`**: those are a
+  stopgap for kaikai-minimal, which lacks modules. When stage 2's
+  module system lands, `list_map` becomes `list.map`, `string_trim`
+  becomes `string.trim`, and the prefix convention is retired.
+  Stage 1 code (kaikai-minimal) keeps the `list_*` / `string_*`
+  prefixes — the migration only applies to stage 2 code where the
+  module system exists.
+- **Type constructors**: PascalCase (`Some`, `None`, `Ok`, `Err`).
+  Unchanged.
+- **Type names**: PascalCase (`List`, `String`, `Option`, `Instant`,
+  `Duration`). Unchanged.
+- **Function and variable names**: `snake_case`. Unchanged.
+
+## What stays out of stdlib (ahu territory)
+
+For reference, so the frontier is explicit in both docs:
+
+- `ahu.supervisor` — restart strategies (`one_for_one`,
+  `one_for_all`, `rest_for_one`), backoff, max-restarts-in-window.
+- `ahu.app` — application lifecycle, dependency graph between apps,
+  graceful shutdown propagating `Cancel` from SIGTERM/SIGINT.
+- `ahu.registry` — process naming (local and optionally global).
+- `ahu.genserver` — GenServer-analog: stateful process with typed
+  `handle_call` / `handle_cast` / `handle_info` callbacks on top of
+  `concurrent.actor`.
+- Observability (`ahu.log`, `ahu.trace`, `ahu.metrics`) — tentative;
+  may land in `ahu` or stay out of the initial ahu scope. See Open
+  Questions.
+
+Not in stdlib and not in ahu either (external products, each with
+their own repo and name from the Rapa Nui pool per
+`kaikai-docs/framework-naming.md`):
+
+- Web framework: HTTP server, router, middleware, templating, auth.
+- Fintech toolkit: ledger, audit hash-chain, ISO 20022 bindings.
+  (But the `decimal` and `money` top-level modules **are** stdlib —
+  they are frontloaded primitives per the roadmap.)
+- IA toolkit: LLM clients, agent orchestration, vector stores.
+
+## Open questions
+
+1. **`concurrent.channel`** (Go-style channels).
+   - (a) Ship. Con: double model of communication with
+     `concurrent.actor`; "which do I use" confusion.
+   - (b) Don't ship. Users wanting a queue use `concurrent.actor`
+     with a minimal mailbox-owner process.
+   - *Tentative: (b), no channels in stdlib.*
+
+2. **Observability (log/trace/metrics)**: stdlib or ahu?
+   - (a) All in ahu. Pro: structured logging ties into supervisor
+     trees naturally. Con: writing to stderr becomes awkward for a
+     script that doesn't touch ahu.
+   - (b) Minimal `log` in stdlib (stderr-backed, effect `Log` or
+     reusing `Console`), structured `ahu.log`/`ahu.trace` on top.
+   - (c) All in stdlib, with ahu only providing handlers.
+   - *Tentative: (b).*
+
+3. **`database/sql` interface** (Go-style abstract interface, drivers
+   external).
+   - *Deferred to post-MVP.* Too much design surface (connection
+     pooling, transactions, prepared statements, cursor lifecycle)
+     for the initial stdlib push. Reassess after ahu lands.
+
+4. **HTTP/2 and HTTP/3** in `net.http`.
+   - MVP: HTTP/1.1 only. H2 and H3 post-MVP, as modules over the
+     same `NetTcp` (and `NetUdp` for QUIC) — no new effect needed.
+     Flagged here so the API is shaped with that evolution in
+     mind (no H1-specific types leaking into public surface).
+
+5. **`testing` auto-import**. Tests are builtin syntax; should
+   the `testing` module auto-import inside `test "..." { ... }` blocks?
+   - *Tentative: yes, auto-imported only within test blocks.*
+
+## Next steps
+
+Once this doc is reviewed and pinned:
+
+1. Extend `docs/effects-stdlib.md` (Doc B) with declarations for
+   `NetTcp`, `NetUdp`, `NetDns`, `Clock`, `Random`, `SecureRandom`,
+   `Process`, matching the existing per-effect format (Declaration
+   / Default handler / Error model / Stdlib helpers).
+2. Move the current `stdlib/core.kai` monolith into the `core/*`
+   subdirectory (`list.kai`, `string.kai`, …). This is a stage-1-safe
+   refactor; functions stay the same, only the file layout changes.
+   Keep the `list_*` / `string_*` function names for now — the
+   rename to `list.map` / `string.trim` waits for the module system.
+3. Land one stage-2 module end-to-end (candidate: `time`) as the
+   template for the rest. Drives whatever compiler plumbing the
+   effect requires and validates the `Clock` handler contract before
+   rolling out `Net` / `Random` / `Process`.
