@@ -41,7 +41,7 @@ type TokKind
   | TkAnd | TkAs | TkAssert | TkEffect | TkElse | TkFalse | TkFn
   | TkHandle | TkIf | TkImport
   | TkLet | TkMatch | TkNot | TkOr | TkPub | TkTest | TkTrue | TkType
-  | TkWith
+  | TkVar | TkWith
   # literals
   | TkInt | TkReal | TkChar | TkString
   # identifiers
@@ -78,7 +78,7 @@ fn tk_name(k: TokKind) : String {
     TkIf -> "if" TkImport -> "import"
     TkLet -> "let" TkMatch -> "match" TkNot -> "not" TkOr -> "or"
     TkPub -> "pub" TkTest -> "test" TkTrue -> "true" TkType -> "type"
-    TkWith -> "with"
+    TkVar -> "var" TkWith -> "with"
     TkInt -> "INT" TkReal -> "REAL" TkChar -> "CHAR" TkString -> "STRING"
     TkIdent -> "IDENT" TkUnderscore -> "_"
     TkLparen -> "(" TkRparen -> ")" TkLbracket -> "[" TkRbracket -> "]"
@@ -204,6 +204,7 @@ fn keyword_kind(text: String) : TokKind {
   else if text == "test" { TkTest }
   else if text == "true" { TkTrue }
   else if text == "type" { TkType }
+  else if text == "var" { TkVar }
   else if text == "with" { TkWith }
   else { TkIdent }
 }
@@ -940,6 +941,11 @@ type Stmt
   # field path). Lowered to a `Mutable.array_set`-style call by the
   # pre-resolve `desugar_index_assign` pass; never reaches the checker.
   | SIndexAssign(Expr, Expr, Expr, Int, Int)
+  # m7b #5: local mutable cell `var name [: T] = init`. The pre-resolve
+  # `desugar_var_decls` pass rewrites every block containing an SVar into
+  # a nested `handle { rest } with State[T](init) as name { ... }` so SVar
+  # never reaches the resolver. The line/col point at the `var` keyword.
+  | SVar(String, Option[TypeExpr], Expr, Int, Int)
 
 type Pattern = { pkind: PatKind, line: Int, col: Int }
 
@@ -1116,6 +1122,7 @@ fn tk_is(a: TokKind, b: TokKind) : Bool {
     TkTest       -> match b { TkTest -> true _ -> false }
     TkTrue       -> match b { TkTrue -> true _ -> false }
     TkType       -> match b { TkType -> true _ -> false }
+    TkVar        -> match b { TkVar -> true _ -> false }
     TkWith       -> match b { TkWith -> true _ -> false }
     TkInt        -> match b { TkInt -> true _ -> false }
     TkReal       -> match b { TkReal -> true _ -> false }
@@ -2295,6 +2302,8 @@ fn parse_stmt(p: Parser) : PStmt {
   let t = p_peek(p)
   if tk_is(t.kind, TkLet) {
     parse_let(p, t)
+  } else if tk_is(t.kind, TkVar) {
+    parse_var(p, t)
   } else if tk_is(t.kind, TkAssert) {
     parse_assert(p, t)
   } else {
@@ -2381,6 +2390,46 @@ fn parse_let(p: Parser, t: Token) : PStmt {
             None -> err_s(re.p)
             Some(rhs) -> ok_s(re.p, SLet(pat, ty_opt_r.r, rhs))
           }
+        }
+      }
+    }
+  }
+}
+
+# m7b #5: `var name (: T)? = init` — local mutable cell. The pre-resolve
+# desugar pass (desugar_var_decls) rewrites every block containing an
+# SVar into a nested `handle { rest } with State[T](init) as name { ... }`,
+# so SVar is a parser-only AST shape. No `var name` (without `= init`)
+# form: rejected here with a syntax error.
+fn parse_var(p: Parser, t: Token) : PStmt {
+  let p1 = p_advance(p)
+  let nt = p_peek(p1)
+  if not tk_is(nt.kind, TkIdent) {
+    err_s(p_error(p1, nt, "expected identifier after `var`"))
+  } else {
+    let name = tok_source(p1.src, nt)
+    let p2 = p_advance(p1)
+    let ty_opt_r =
+      if p_at(p2, TkColon) {
+        let rt = parse_type(p_advance(p2))
+        match rt.r {
+          None -> PTy { p: rt.p, r: None }
+          Some(ty) -> PTy { p: rt.p, r: Some(ty) }
+        }
+      } else {
+        PTy { p: p2, r: None }
+      }
+    if ty_opt_r.p.had_error and not p2.had_error { err_s(ty_opt_r.p) }
+    else {
+      let p_eq = p_skip_newlines(ty_opt_r.p)
+      if not p_at(p_eq, TkEq) {
+        err_s(p_error_here(p_eq, "expected `=` in var binding (initialiser is required)"))
+      } else {
+        let p_rhs = p_skip_newlines(p_advance(p_eq))
+        let re = parse_expr(p_rhs)
+        match re.r {
+          None -> err_s(re.p)
+          Some(rhs) -> ok_s(re.p, SVar(name, ty_opt_r.r, rhs, t.line, t.col))
         }
       }
     }
@@ -3570,6 +3619,11 @@ fn dump_stmt(s: Stmt, depth: Int) : Unit {
       dump_expr(idx, depth + 1)
       dump_expr(val, depth + 1)
     }
+    SVar(name, opt_ty, rhs, line, col) -> {
+      emit_line(depth, "var #{name} @#{int_to_string(line)}:#{int_to_string(col)}")
+      match opt_ty { Some(ty) -> dump_type(ty, depth + 1) None -> () }
+      dump_expr(rhs, depth + 1)
+    }
   }
 }
 
@@ -4051,6 +4105,13 @@ fn chk_stmt(e: Env, s: Stmt) : Env {
       let e1 = chk_expr(e, base)
       let e2 = chk_expr(e1, idx)
       chk_expr(e2, val)
+    }
+    # m7b #5: `var name` — should be desugared away pre-resolve. Mirror
+    # the SLet shape (resolve init, bind name) so the match remains
+    # exhaustive without changing resolve semantics.
+    SVar(name, _, rhs, line, col) -> {
+      let e1 = chk_expr(e, rhs)
+      bind_pat(e1, mk_pat(PBind(name), line, col))
     }
   }
 }
@@ -5143,6 +5204,10 @@ fn fv_stmt(s: Stmt, own: [String], globals: [String], acc: [String]) : [String] 
       let acc2 = fv_expr(i, own, globals, acc1)
       fv_expr(v, own, globals, acc2)
     }
+    # m7b #5: `var name = init` — desugared away pre-resolve. The free
+    # variables of the init expression contribute; the bound name is a
+    # local introduction (handled by the surrounding scope).
+    SVar(_, _, rhs, _, _) -> fv_expr(rhs, own, globals, acc)
   }
 }
 
@@ -5326,6 +5391,8 @@ fn collect_stmt(s: Stmt, st: LamCollect) : LamCollect {
       let s2 = collect_expr(i, s1)
       collect_expr(v, s2)
     }
+    # m7b #5: `var name = init` — desugared away pre-resolve.
+    SVar(_, _, rhs, _, _) -> collect_expr(rhs, st)
   }
 }
 
@@ -5686,6 +5753,9 @@ fn emit_stmt(src: String, s: Stmt, fns: [EFn], variants: [EVar], lams: [LamInfo]
     # m7b #6: index-assign desugars away pre-resolve; this arm is dead
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, _, _) -> "/* SIndexAssign: should have been desugared */ "
+    # m7b #5: `var name = init` desugars away pre-resolve; this arm
+    # is dead code in normal compilation but keeps the match exhaustive.
+    SVar(_, _, _, _, _) -> "/* SVar: should have been desugared */ "
   }
 }
 
@@ -6195,6 +6265,12 @@ fn desugar_op_calls_stmt(s: Stmt, effs: [String]) : Stmt {
       SIndexAssign(desugar_op_calls_expr(b, effs),
                    desugar_op_calls_expr(i, effs),
                    desugar_op_calls_expr(v, effs), l, c)
+    # m7b #5: `var name = init` — desugars to `handle ... with State[T](init)`
+    # pre-resolve, so this arm is dead in normal compilation. Recursing
+    # into `init` keeps the pass safe even if a future debug-mode skips
+    # the var-desugar step.
+    SVar(n, ty, rhs, l, c) ->
+      SVar(n, ty, desugar_op_calls_expr(rhs, effs), l, c)
   }
 }
 
@@ -6256,6 +6332,11 @@ fn desugar_index_stmt(s: Stmt) : Stmt {
                          line, col)
       SExprStmt(call)
     }
+    # m7b #5: pass through; the var-desugar pass below transforms SVar
+    # into a `handle ... with State[T](init)` form. Until that pass runs
+    # we still need to recurse into `init` so any nested `a[i]` inside
+    # the initialiser is rewritten.
+    SVar(n, ty, rhs, l, c) -> SVar(n, ty, desugar_index_expr(rhs), l, c)
   }
 }
 
@@ -8816,6 +8897,26 @@ fn synth_stmt(st: InferState, stmt: Stmt) : OneStmt {
       let rv = synth(ri.st, v)
       OneStmt { st: rv.st, stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, line, col) }
     }
+    # m7b #5: `var name = init` should be desugared away pre-resolve. If
+    # one reaches inference, treat it as `let name = init` so the match
+    # stays exhaustive without changing inference behaviour.
+    SVar(name, ann, rhs, line, col) -> {
+      let rr = synth(st, rhs)
+      let binding_st = match ann {
+        None -> rr.st
+        Some(te) -> {
+          let declared = resolve_ty(te)
+          st_unify(rr.st, declared, rr.ty, "var annotation", line, col)
+        }
+      }
+      let binding_ty = match ann {
+        None -> rr.ty
+        Some(te) -> resolve_ty(te)
+      }
+      let pat = mk_pat(PBind(name), line, col)
+      let after = check_pattern(binding_st, pat, binding_ty)
+      OneStmt { st: after, stmt: SVar(name, ann, rr.expr, line, col) }
+    }
   }
 }
 
@@ -9614,6 +9715,10 @@ fn dump_typed_stmt(s: Stmt, depth: Int) : Unit {
       dump_typed_expr(b, depth + 1)
       dump_typed_expr(i, depth + 1)
       dump_typed_expr(v, depth + 1)
+    }
+    SVar(n, _, rhs, _, _) -> {
+      emit_line(depth, "var #{n}")
+      dump_typed_expr(rhs, depth + 1)
     }
   }
 }
@@ -11022,6 +11127,12 @@ fn llvm_emit_stmt(e: LlvmEmit, s: Stmt) : LlvmEmit {
     # code in normal compilation but keeps the match exhaustive.
     SIndexAssign(_, _, _, line, col) -> {
       eprint("llvm: SIndexAssign reached llvm emitter at #{int_to_string(line)}:#{int_to_string(col)}")
+      e
+    }
+    # m7b #5: SVar should be desugared away pre-resolve; this arm is
+    # dead code in normal compilation but keeps the match exhaustive.
+    SVar(_, _, _, line, col) -> {
+      eprint("llvm: SVar reached llvm emitter at #{int_to_string(line)}:#{int_to_string(col)}")
       e
     }
   }
