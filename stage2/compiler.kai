@@ -7041,16 +7041,21 @@ fn dump_types(decls: [Decl]) : Unit {
 # type schemes + environment (M2b)
 # ====================================================================
 #
-# A TyScheme is `Scheme(bound_vars, Ty)`: the vars in `bound_vars`
-# appear as TyVarT(n) inside `Ty` and are meant to be instantiated
-# to fresh variables at each use site. M2b only builds the env; the
-# instantiation mechanics live in M2c.
+# A TyScheme is `Scheme(bound_vars, bound_rvars, Ty)`: the type-var
+# ids in `bound_vars` appear as TyVarT(n) inside `Ty`; the row-var
+# ids in `bound_rvars` appear as `Row { tail: Some(n) }` inside any
+# TyFnT in `Ty`. Both kinds are instantiated to fresh ids at each
+# use site (M2c for type vars, m7b #12 for row vars). The bound ids
+# are scheme-local — bound-id 0 in scheme A and bound-id 0 in scheme
+# B refer to different vars; the instantiation step rewrites them
+# through a temporary substitution before they reach the inferencer's
+# main subst slots.
 #
 # A TyEnv is a flat association list of (name, scheme) entries plus a
 # fresh-variable counter used later. Lookups are linear — fine at this
 # stage (a few dozen entries).
 
-type TyScheme = Scheme([Int], Ty)
+type TyScheme = Scheme([Int], [Int], Ty)
 
 type TyEntry = { name: String, scheme: TyScheme }
 
@@ -7096,9 +7101,11 @@ fn uppercase_names_loop(es: [TyEntry], acc: [String]) : [String] {
 
 # ---- small constructors ----
 
-fn mono(ty: Ty) : TyScheme = Scheme([], ty)
+fn mono(ty: Ty) : TyScheme = Scheme([], [], ty)
 
-fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, ty)
+fn scheme(vars: [Int], ty: Ty) : TyScheme = Scheme(vars, [], ty)
+
+fn scheme_full(vars: [Int], rvars: [Int], ty: Ty) : TyScheme = Scheme(vars, rvars, ty)
 
 fn tv(n: Int) : Ty = TyVarT(n)
 
@@ -7279,18 +7286,131 @@ fn add_variants_loop(env: TyEnv, tname: String, tparams: [String], vs: [Variant]
   }
 }
 
+# m7b #12 — collect all distinct row-variable names appearing in the
+# row positions of a function declaration's signature: the outer
+# return-row plus every nested `TyFn` row inside parameter types and
+# the return type. Order of first occurrence is preserved so each
+# decl gets a stable assignment of bound row-var ids.
+fn collect_decl_rvars(d: Decl) : [String] {
+  match d {
+    DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
+      let acc0 = collect_rvars_in_row(rexpr, [])
+      let acc1 = collect_rvars_in_params(params, acc0)
+      match opt_ret {
+        Some(rty) -> collect_rvars_in_typeexpr(rty, acc1)
+        None      -> acc1
+      }
+    }
+    _ -> []
+  }
+}
+
+fn collect_rvars_in_row(re: RowExpr, acc: [String]) : [String] {
+  match re {
+    REmpty -> acc
+    RClosed(_) -> acc
+    ROpen(rv, _) -> if list_has(acc, rv) { acc } else { list_append(acc, [rv]) }
+  }
+}
+
+fn collect_rvars_in_params(ps: [Param], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> {
+      let acc1 = match p.ptype {
+        Some(te) -> collect_rvars_in_typeexpr(te, acc)
+        None     -> acc
+      }
+      collect_rvars_in_params(rest, acc1)
+    }
+  }
+}
+
+fn collect_rvars_in_typeexpr(t: TypeExpr, acc: [String]) : [String] {
+  match t.tkind {
+    TyName(_, tas) -> collect_rvars_in_typeexprs(tas, acc)
+    TyList(inner)  -> collect_rvars_in_typeexpr(inner, acc)
+    TyFn(ps, ret, rexpr) -> {
+      let acc1 = collect_rvars_in_typeexprs(ps, acc)
+      let acc2 = collect_rvars_in_typeexpr(ret, acc1)
+      collect_rvars_in_row(rexpr, acc2)
+    }
+  }
+}
+
+fn collect_rvars_in_typeexprs(ts: [TypeExpr], acc: [String]) : [String] {
+  match ts {
+    [] -> acc
+    [t, ...rest] -> collect_rvars_in_typeexprs(rest, collect_rvars_in_typeexpr(t, acc))
+  }
+}
+
+fn mk_rvbinds_loop(names: [String], i: Int, acc: [RVBind]) : [RVBind] {
+  match names {
+    [] -> list_reverse(acc)
+    [n, ...rest] -> mk_rvbinds_loop(rest, i + 1, [RVB(n, i), ...acc])
+  }
+}
+
+fn mk_rvbinds(names: [String]) : [RVBind] = mk_rvbinds_loop(names, 0, [])
+
+fn rvbind_ids_loop(binds: [RVBind], acc: [Int]) : [Int] {
+  match binds {
+    [] -> list_reverse(acc)
+    [b, ...rest] -> match b {
+      RVB(_, i) -> rvbind_ids_loop(rest, [i, ...acc])
+    }
+  }
+}
+
+fn rvbind_ids(binds: [RVBind]) : [Int] = rvbind_ids_loop(binds, [])
+
+# Resolve a TypeExpr under both the type-parameter and row-variable
+# binding contexts. Variant of `resolve_ty` used by paths that need
+# row vars wired to their bound ids (m7b #12).
+fn resolve_ty_with_rvbinds(t: TypeExpr, rbinds: [RVBind]) : Ty {
+  match t.tkind {
+    TyName(name, tas) -> {
+      if name == "Int" { TyInt }
+      else if name == "Real"   { TyReal }
+      else if name == "Bool"   { TyBool }
+      else if name == "String" { TyString }
+      else if name == "Char"   { TyChar }
+      else if name == "Unit"   { TyUnit }
+      else if name == "Nothing" { TyAny }
+      else { TyCon(name, map(tas, (a) => resolve_ty_with_rvbinds(a, rbinds))) }
+    }
+    TyList(inner) -> TyListT(resolve_ty_with_rvbinds(inner, rbinds))
+    TyFn(fps, fret, rexpr) ->
+      TyFnT(map(fps, (p) => resolve_ty_with_rvbinds(p, rbinds)),
+            resolve_ty_with_rvbinds(fret, rbinds),
+            row_of_expr_with_rbinds(rexpr, rbinds))
+  }
+}
+
+fn param_ty_with_rvbinds(pm: Param, rbinds: [RVBind]) : Ty {
+  match pm.ptype {
+    Some(te) -> resolve_ty_with_rvbinds(te, rbinds)
+    None     -> TyAny
+  }
+}
+
 fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   match d {
     DFn(_, _, params, opt_ret, rexpr, _, _, _) -> {
-      # Function-level generics are inferred later; for now everything
-      # that uses a user function is monomorphic. Type variables can be
-      # added in M2c when generic inference lands.
-      let pts = map(params, param_ty)
+      # m7b #12: collect row-variable names per decl, allocate small
+      # bound ids (0, 1, ...) in order of appearance, build the body
+      # type with those ids in tail positions. The scheme generalises
+      # over them so each call site fresh-instantiates.
+      let names = collect_decl_rvars(d)
+      let rbinds = mk_rvbinds(names)
+      let pts = map(params, (p) => param_ty_with_rvbinds(p, rbinds))
       let ret = match opt_ret {
-        Some(rty) -> resolve_ty(rty)
+        Some(rty) -> resolve_ty_with_rvbinds(rty, rbinds)
         None      -> TyUnit
       }
-      Some(mono(TyFnT(pts, ret, row_of_expr(rexpr))))
+      let body = TyFnT(pts, ret, row_of_expr_with_rbinds(rexpr, rbinds))
+      Some(scheme_full([], rvbind_ids(rbinds), body))
     }
     _ -> None
   }
@@ -7348,12 +7468,14 @@ fn build_ty_env(decls: [Decl]) : BuiltEnv {
 
 fn scheme_to_string(sc: TyScheme) : String {
   match sc {
-    Scheme(vars, ty) -> match vars {
-      [] -> ty_to_string(ty)
-      _  -> concat_all([
-        "forall ", join_with(map(vars, (n) => cat2("?t", int_to_string(n))), " "),
-        ". ", ty_to_string(ty)
-      ])
+    Scheme(vars, rvars, ty) -> {
+      let tv_part = map(vars, (n) => cat2("?t", int_to_string(n)))
+      let rv_part = map(rvars, (n) => cat2("?r", int_to_string(n)))
+      let all = list_append(tv_part, rv_part)
+      match all {
+        [] -> ty_to_string(ty)
+        _  -> concat_all(["forall ", join_with(all, " "), ". ", ty_to_string(ty)])
+      }
     }
   }
 }
@@ -7817,7 +7939,7 @@ fn max_id_loop(vs: [Int], acc: Int) : Int {
 # clamping up to `max(vars) + 1`, fresh vars never alias any bound id.
 fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
   match sc {
-    Scheme(vars, body) -> {
+    Scheme(vars, _, body) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if env.fresh >= need { env.fresh } else { need }
@@ -7826,6 +7948,36 @@ fn instantiate(env: TyEnv, sc: TyScheme) : Instantiated {
       Instantiated { env: env1, ty: apply_ty(sub, body) }
     }
   }
+}
+
+# Build a temporary substitution that maps each bound row-var id in
+# `rvars` to a fresh row-variable id allocated from `s.row_fresh`.
+# Returns the temp substitution (only used to rewrite the scheme body)
+# and the updated subst with the fresh counter advanced.
+type FreshRowSubst = { temp: Subst, sub: Subst }
+
+fn mk_fresh_row_subst_loop(rvars: [Int], temp: Subst, s: Subst) : FreshRowSubst {
+  match rvars {
+    [] -> FreshRowSubst { temp: temp, sub: s }
+    [v, ...rest] -> {
+      let fr = subst_fresh_row(s)
+      let r = Row { labels: [], tail: Some(fr.id), display_alias: None }
+      let temp1 = subst_row_extend(temp, v, r)
+      mk_fresh_row_subst_loop(rest, temp1, fr.subst)
+    }
+  }
+}
+
+fn mk_fresh_row_subst(rvars: [Int], s: Subst) : FreshRowSubst {
+  # Fresh ids must be drawn from a counter strictly greater than any
+  # bound id in `rvars`; otherwise the temp substitution might map a
+  # bound id `v` to a Row whose tail is `v` (when v == row_fresh) and
+  # apply_row would loop forever.
+  let need = if rvars == [] { 0 } else { max_id_loop(rvars, 0) + 1 }
+  let s_seed = if s.row_fresh >= need { s }
+               else { Subst { slots: s.slots, row_slots: s.row_slots,
+                              row_fresh: need } }
+  mk_fresh_row_subst_loop(rvars, subst_empty(), s_seed)
 }
 
 # ====================================================================
@@ -8112,7 +8264,7 @@ fn st_instantiate(st: InferState, sc: TyScheme) : TyRes {
 
 fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes {
   match sc {
-    Scheme(vars, _) -> {
+    Scheme(vars, _, _) -> {
       let n = list_length(vars)
       let need = if n == 0 { 0 } else { max_id_loop(vars, 0) + 1 }
       let start = if st.env.fresh >= need { st.env.fresh } else { need }
@@ -8150,6 +8302,13 @@ fn param_ty_or_fresh(st: InferState, pm: Param) : TyRes {
   }
 }
 
+fn param_ty_or_fresh_with_rvbinds(st: InferState, pm: Param, rbinds: [RVBind]) : TyRes {
+  match pm.ptype {
+    Some(te) -> ty_res(st, resolve_ty_with_rvbinds(te, rbinds))
+    None     -> st_fresh_ty(st)
+  }
+}
+
 # Add fn parameters to the type environment. Doesn't produce an Expr
 # list (params aren't expressions), just the param types for later
 # function-type construction.
@@ -8168,6 +8327,27 @@ fn add_infer_params_loop(st: InferState, ps: [Param], acc: [Ty]) : InferredParam
 }
 
 fn add_infer_params(st: InferState, ps: [Param]) : InferredParams = add_infer_params_loop(st, ps, [])
+
+# m7b #12: variant of `add_infer_params` that resolves param types
+# under a row-variable binding context — used by `infer_decl` so the
+# function body's view of every parameter type carries the same
+# bound row-var ids that `fn_scheme_of_decl` chose for the scheme.
+fn add_infer_params_with_rvbinds_loop(st: InferState, ps: [Param],
+                                      rbinds: [RVBind], acc: [Ty]) : InferredParams {
+  match ps {
+    [] -> InferredParams { st: st, tys: list_reverse(acc) }
+    [pm, ...rest] -> {
+      let pr = param_ty_or_fresh_with_rvbinds(st, pm, rbinds)
+      let env2 = ty_env_add(pr.st.env, pm.pname, mono(pr.ty))
+      let st2 = st_set_env(pr.st, env2)
+      add_infer_params_with_rvbinds_loop(st2, rest, rbinds, [pr.ty, ...acc])
+    }
+  }
+}
+
+fn add_infer_params_with_rvbinds(st: InferState, ps: [Param],
+                                 rbinds: [RVBind]) : InferredParams =
+  add_infer_params_with_rvbinds_loop(st, ps, rbinds, [])
 
 # ---- record instantiation ----
 
@@ -9230,7 +9410,7 @@ fn arms_cover_variant(arms: [Arm], target: String) : Bool {
 
 fn extract_return_tycon(sc: TyScheme) : Option[String] {
   match sc {
-    Scheme(_, ty) -> match ty {
+    Scheme(_, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyCon(nm, _) -> Some(nm)
         _            -> None
@@ -9484,19 +9664,20 @@ fn return_site_of(e: Expr) : Expr {
 fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, ps, opt_ret, row, body, line, col) -> {
+      # m7b #12: row-variable binding context for this decl. The
+      # bound ids match those produced by fn_scheme_of_decl so the
+      # body's params agree with the scheme stored in the env.
+      let rbinds = mk_rvbinds(collect_decl_rvars(d))
       let st0 = infer_state_new(file, env, prelude_len, recs)
-      let added = add_infer_params(st0, ps)
+      let added = add_infer_params_with_rvbinds(st0, ps, rbinds)
       let rb = synth(added.st, body)
       let declared_ret = match opt_ret {
-        Some(rty) -> resolve_ty(rty)
+        Some(rty) -> resolve_ty_with_rvbinds(rty, rbinds)
         None      -> TyUnit
       }
       let what = string_concat("return type of ", nm)
       let ret_site = return_site_of(body)
       let st1 = st_unify(rb.st, declared_ret, rb.ty, what, ret_site.line, ret_site.col)
-      # m7a #4c: every effect performed inside the body must appear
-      # in the function's declared row. Open rows (with a tail var)
-      # are deferred — for now all rows are RClosed.
       let st2 = check_body_row(st1, nm, row, line, col)
       let _ = if verbose {
         print_inferred_fn(nm, apply_ty(st2.sub, declared_ret), apply_tys(st2.sub, added.tys), line, col)
@@ -9910,7 +10091,7 @@ fn list_has_int(xs: [Int], n: Int) : Bool {
 # which still constrain the substitution meaningfully.
 fn synth_return_structural(sc: TyScheme) : Bool {
   match sc {
-    Scheme(vars, ty) -> match ty {
+    Scheme(vars, _, ty) -> match ty {
       TyFnT(_, ret, _) -> match ret {
         TyVarT(v) -> not list_has_int(vars, v)
         _         -> true
