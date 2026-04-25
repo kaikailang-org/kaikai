@@ -3608,9 +3608,20 @@ fn chk_expr(e: Env, x: Expr) : Env {
     }
     EPipe(a, b) -> chk_expr(chk_expr(e, a), b)
     EHole(_) -> e          # holes bind no names; checker lets them pass silently
-    EHandle(body, _, _, clauses, ret_opt) -> {
-      let e1 = chk_expr(e, body)
-      let e2 = chk_handler_clauses(e1, clauses)
+    EHandle(body, _, alias_opt, clauses, ret_opt) -> {
+      # m7a #4e: `Eff as log` makes `log` a binding that names
+      # the capability inside the body. We push a scope so the
+      # name disappears once the body is done.
+      let body_env = match alias_opt {
+        Some(alias) -> env_add(env_push(e), alias)
+        None        -> e
+      }
+      let e1 = chk_expr(body_env, body)
+      let restored = match alias_opt {
+        Some(_) -> env_pop(e1)
+        None    -> e1
+      }
+      let e2 = chk_handler_clauses(restored, clauses)
       match ret_opt {
         Some(r) -> chk_handler_return(e2, r)
         None    -> e2
@@ -6392,7 +6403,15 @@ type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
 
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite],
-                    row: [String] }    # m7a #4c: effect labels accumulated by op calls in the current body
+                    row: [String],     # m7a #4c: effect labels accumulated by op calls in the current body
+                    aliases: [AliasBinding] }   # m7a #4e: `Eff as log` bindings active in scope
+
+# Stack entry for `Eff as log`. The stack is pushed on entering
+# the body of a `handle ... with Eff as log { ... }` and popped
+# on exit. try_op_call consults it when the dotted lookup fails:
+# `log.print` walks the stack, finds `log → Io`, and retries as
+# `Io.print`.
+type AliasBinding = AB(String, String)   # alias_name, eff_name
 
 # `TyRes` is the narrow result returned by pure type operations that
 # don't consume or produce an expression (fresh var, instantiate a
@@ -6412,19 +6431,22 @@ type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
-               recs: recs, errs: 0, insts: [], holes: [], row: [] }
+               recs: recs, errs: 0, insts: [], holes: [], row: [], aliases: [] }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes, row: st.row }
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, aliases: st.aliases }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
-               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes, row: st.row }
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, aliases: st.aliases }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
-               recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes, row: st.row }
+               recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
+               row: st.row, aliases: st.aliases }
 
 # m7a #4c: mark that the current body has performed an op of `eff`.
 # Adds the name to the accumulator if not already present (syntactic
@@ -6434,7 +6456,7 @@ fn st_add_effect(st: InferState, eff: String) : InferState {
   else {
     InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                 row: [eff, ...st.row] }
+                 row: [eff, ...st.row], aliases: st.aliases }
   }
 }
 
@@ -6445,17 +6467,41 @@ fn st_add_effect(st: InferState, eff: String) : InferState {
 fn st_set_row(st: InferState, new_row: [String]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: new_row }
+               row: new_row, aliases: st.aliases }
+
+# m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
+fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
+  InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+               recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+               row: st.row, aliases: [AB(alias, eff), ...st.aliases] }
+
+fn st_pop_alias(st: InferState) : InferState {
+  match st.aliases {
+    [] -> st
+    [_, ...rest] ->
+      InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
+                   recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
+                   row: st.row, aliases: rest }
+  }
+}
+
+fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
+  match aliases {
+    [] -> None
+    [AB(alias, eff), ...rest] ->
+      if alias == name { Some(eff) } else { lookup_alias(rest, name) }
+  }
+}
 
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
-               row: st.row }
+               row: st.row, aliases: st.aliases }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
-               row: st.row }
+               row: st.row, aliases: st.aliases }
 
 # Half-open range [lo, hi) as a list of ints. Used to name the fresh
 # TyVarT ids minted by one call-site's instantiation.
@@ -6567,7 +6613,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     errs: inner.errs,
     insts: inner.insts,
     holes: inner.holes,
-    row: inner.row
+    row: inner.row,
+    aliases: outer.aliases
   }
 
 # ---- parameter typing ----
@@ -6725,16 +6772,47 @@ fn synth(st: InferState, e: Expr) : Inferred {
 # Alias resolution (`Eff as log`) is also deferred.
 fn synth_handle(st: InferState, e: Expr) : Inferred {
   match e.kind {
-    EHandle(body, eff_name, _alias_opt, _clauses, _ret_opt) -> {
-      let prev_row = st.row
-      let st_in = st_set_row(st, [])
+    EHandle(body, eff_name, alias_opt, clauses, _ret_opt) -> {
+      # m7a #4e: alias rebinds the capability inside the body.
+      let st_aliased = match alias_opt {
+        Some(a) -> st_push_alias(st, a, eff_name)
+        None    -> st
+      }
+      let prev_row = st_aliased.row
+      let st_in = st_set_row(st_aliased, [])
       let rb = synth(st_in, body)
       let body_row_minus = filter_string_ne(rb.st.row, eff_name)
       let merged = merge_string_lists(prev_row, body_row_minus)
-      let st_out = st_set_row(rb.st, merged)
-      mk_inferred(st_out, rb.ty, with_ty(e, rb.ty))
+      let st_out0 = st_set_row(rb.st, merged)
+      let st_out1 = match alias_opt { Some(_) -> st_pop_alias(st_out0) None -> st_out0 }
+      # m7a #4e: every clause name must be a declared op of `eff_name`.
+      let st_out2 = check_clause_names(st_out1, eff_name, clauses, e.line, e.col)
+      mk_inferred(st_out2, rb.ty, with_ty(e, rb.ty))
     }
     _ -> mk_inferred(st, TyAny, with_ty(e, TyAny))
+  }
+}
+
+fn check_clause_names(st: InferState, eff: String, cs: [HClause],
+                      line: Int, col: Int) : InferState {
+  match cs {
+    [] -> st
+    [c, ...rest] -> match c {
+      HC(name, _, _, cline, ccol) -> {
+        let key = string_concat(eff, string_concat(".", name))
+        match ty_env_lookup(st.env, key) {
+          Some(_) -> check_clause_names(st, eff, rest, line, col)
+          None -> {
+            diag_error(st.file, cline, ccol,
+              string_concat("unknown op `",
+                string_concat(name,
+                  string_concat("` on effect `",
+                    string_concat(eff, "` (handler clause does not match any declared op)")))))
+            check_clause_names(st_bump_err(st), eff, rest, line, col)
+          }
+        }
+      }
+    }
   }
 }
 
@@ -6833,14 +6911,32 @@ fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
                line: Int, col: Int) : Option[Inferred] {
   match callee.kind {
     EField(base, op_name) -> match base.kind {
-      EVar(eff_name) -> {
-        let key = string_concat(eff_name, string_concat(".", op_name))
+      EVar(name) -> {
+        # First try the literal name (`Io`, `Mutable`, ...).
+        let key = string_concat(name, string_concat(".", op_name))
         match ty_env_lookup(st.env, key) {
           Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key, line, col))
           None ->
-            if is_effect_in_env(st.env, eff_name) {
-              Some(synth_op_call_unknown_op(st, eff_name, op_name, line, col))
-            } else { None }
+            if is_effect_in_env(st.env, name) {
+              Some(synth_op_call_unknown_op(st, name, op_name, line, col))
+            } else {
+              # m7a #4e: maybe `name` is an alias bound by an
+              # enclosing `handle ... with Eff as name`. Resolve
+              # to the underlying effect and retry.
+              match lookup_alias(st.aliases, name) {
+                None -> None
+                Some(eff) -> {
+                  let key2 = string_concat(eff, string_concat(".", op_name))
+                  match ty_env_lookup(st.env, key2) {
+                    Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key2, line, col))
+                    None ->
+                      if is_effect_in_env(st.env, eff) {
+                        Some(synth_op_call_unknown_op(st, eff, op_name, line, col))
+                      } else { None }
+                  }
+                }
+              }
+            }
         }
       }
       _ -> None

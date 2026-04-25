@@ -376,12 +376,9 @@ test-effects: $(TARGET) build
 	done; \
 	for f in ../examples/effects/handle_alias.kai; do \
 	  name=$$(basename $$f .kai); \
-	  ./$(TARGET) --ast $$f > build/s2-$$name.ast 2> /dev/null || true; \
-	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null || true; \
-	  grep -q "handle Io as log" build/s2-$$name.ast \
-	    && grep -q "undefined name \`log\`" build/s2-$$name.err \
-	    && echo "effects OK $$name (alias parsed, checker xfail until alias-resolution)" \
-	    || { echo "effects FAIL $$name (parse or xfail mismatch)"; echo "--- AST:"; cat build/s2-$$name.ast; echo "--- ERR:"; cat build/s2-$$name.err; exit 1; }; \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    && echo "effects OK $$name (alias resolved)" \
+	    || { echo "effects FAIL $$name"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
 	for f in ../examples/effects/handle_bad_no_with.kai; do \
 	  name=$$(basename $$f .kai); \
@@ -406,6 +403,15 @@ test-effects: $(TARGET) build
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
 	    && echo "effects OK $$name (handle removes effect)" \
 	    || { echo "effects FAIL $$name (handle did not remove effect)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/handle_unknown_clause.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (unknown clause accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "unknown op \`unknown\` on effect \`Io\`" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
