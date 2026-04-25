@@ -1303,26 +1303,79 @@ page the way they are written.
 
 1. **Closed effect aliases** — `type Io = Console + Stdin +
    Env + File`; desugared at resolve time to the label set;
-   display hint preserved per §*Row normalisation*.
+   display hint preserved per §*Row normalisation*. **Landed.**
 2. **Per-op type generics** — §*Per-op type generics*; Mutable's
    `array_make[T]` / `array_get[T]` / `array_set[T]` migrate to
-   this form.
+   this form. *Pending.*
 3. **Trailing lambdas** — pre-resolve desugar pass
-   (`docs/syntax-sugars.md` §*Trailing lambdas*).
+   (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
+   single trailing, lambda-block as expression, double trailing.
+   **Landed.**
 4. **`@cap` and `cap := v`** — post-resolve desugar pass
    (depends on capability bindings produced by resolve).
+   **Blocked on #11** — `@cap` only applies to `State[T].get()`
+   and `Reader[T].ask()`; until parametric effects exist there
+   are no capability bindings of those types.
 5. **`var x = init`** — pre-resolve desugar + variable
-   specialisation (§*Variable specialisation*).
+   specialisation (§*Variable specialisation*). **Parser-only
+   landed; desugar blocked on #11** — Doc B §3 mandates lowering
+   to `handle { rest } with State[T](init) as name { ... }`,
+   which requires `State[T]` to exist. A first attempt lowered
+   to a 1-element `Mutable.array_make` cell-binding instead;
+   that shortcut was reverted to stay faithful to Doc B (locality
+   guarantee, no Mutable-row contamination). The desugar lands
+   once #11 is in.
 6. **`a[i]` and `a[i] := v`** — pre-resolve desugar pass.
+   **Landed.**
 7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
-   §*Open questions* #2 resolved in their favour).
+   §*Open questions* #2 resolved in their favour). **Blocked on
+   #11** — both effects are type-parameterised; pre-flight on
+   the original m7b #7 attempt confirmed m7a's `effect` parser
+   does not accept `[T]`, `RowExpr` cannot carry per-effect type
+   args, and `EHandle` has no slot for handler-state init.
 8. **Diagnostic review** — every message rewritten against the
-   stage 2 §8 bar.
+   stage 2 §8 bar. *Lands last.*
+9. **`|` map pipe** — binary operator wired in the parser,
+   pre-resolve desugar to `map(xs, f)` (or `list_map`).
+   Originally outside the m7b plan; landed as a sub-task
+   surfaced by Linus-style review of #3. **Landed.**
+10. *Reserved.*
+11. **Parametric effects** — the umbrella sub-milestone that
+    unblocks #4, #5 (desugar half), and #7. Scope:
+    - parser: `effect Foo[T] { ops }` accepts type parameters;
+    - AST: `DEffect` carries `[String]` tparams; `RowExpr`
+      carries per-label type args (e.g. `Reader[Int]` distinct
+      from `Reader[String]` in the row); `EHandle` carries an
+      `Option[Expr]` init for `with Eff[T](init)`;
+    - resolver: per-instance substitution of op signatures
+      (`Reader[Int].ask : Int` vs `Reader[String].ask : String`);
+    - inferencer: type-arg unification per row label;
+    - codegen: per-instantiation handler-struct emission, op
+      dispatch parameterised by the type instantiation;
+    - diagnostics: render `Reader[Int]`, not `Reader`.
+    First end-to-end user: `State[T]`. Once that lands,
+    `Reader[T]` and `Writer[W]` become the trivial stdlib pair
+    of #7. Comparable in scope to m7a #6 + #7 + #8 combined.
+12. **Open row variables in user-written signatures** —
+    `pub fn while(pred: () -> Bool / e, body: () -> Unit / e) :
+    Unit / e` etc. Today the resolver (`check_row_expr` in
+    `stage2/compiler.kai`) treats every label name as an effect
+    declaration and rejects unknown names; row variables only
+    appear at inference time via `unify_row` (m7a #2). To make
+    row-polymorphic stdlib helpers (`while`, `until`, `repeat`,
+    `forever`) writable, the row syntax must accept a row
+    variable position — distinct from a label, scoped to the
+    function's type parameters. Independent of #11; the two
+    can land in either order. Blocker of `stdlib/loop.kai` as
+    specified in `docs/stdlib-layout.md` §`loop`.
 
 Within each sub-milestone the ordering is dependency-driven: the
 evidence type generation (m7a #3) unblocks everything else in
 m7a; the desugar pass (m7b #3–#6) runs as a single addition and
-then specialisation (m7b #5) piggybacks on top.
+then specialisation (m7b #5) piggybacks on top. m7b #11 and
+#12 are large enough to be milestones in their own right and
+should each get a dedicated sub-design-doc when their turn
+arrives.
 
 ## Next steps
 
