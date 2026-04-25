@@ -1,0 +1,20 @@
+# m7a #7 — default File handler. `read_file` and `write_file`
+# return `Result[T, String]`; the default forwards to the prelude
+# helpers (which already produce that shape). Doc B §`File`. The
+# demo writes a file under /tmp, reads it back, and prints the
+# contents — exercising both ops + Result pattern matching.
+
+fn main() : Int / Console + File {
+  match File.write_file("/tmp/kai_m7a_7.txt", "hello from kaikai\n") {
+    Ok(_)    -> ()
+    Err(msg) -> {
+      Console.eprint("write failed: #{msg}")
+      ()
+    }
+  }
+  match File.read_file("/tmp/kai_m7a_7.txt") {
+    Ok(s)    -> Console.print(s)
+    Err(msg) -> Console.eprint("read failed: #{msg}")
+  }
+  0
+}

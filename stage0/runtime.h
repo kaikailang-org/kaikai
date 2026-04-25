@@ -1268,6 +1268,70 @@ static KaiValue *kai_default_fail_fail(void *self, KaiValue *msg, KaiCont *k) {
     exit(1);
 }
 
+/* m7a #7: default Stdin handler. Doc B §`Stdin` declares
+ * `read_line() : Option[String] / Fail`; m7a simplifies to
+ * `: Option[String]` (no /Fail propagation yet — fread errors
+ * panic the same way Console does). EOF maps to None; any byte
+ * read returns Some(line) with the trailing '\n' stripped if
+ * present. */
+static KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k) {
+    (void) self;
+    size_t cap = 128, n = 0;
+    char *buf = (char *) malloc(cap);
+    if (!buf) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    int ch;
+    while ((ch = fgetc(stdin)) != EOF && ch != '\n') {
+        if (n + 1 >= cap) { cap *= 2; buf = (char *) realloc(buf, cap); }
+        buf[n++] = (char) ch;
+    }
+    if (ch == EOF && n == 0) {
+        free(buf);
+        return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+    }
+    KaiValue *s = kai_str_from_bytes(buf, n);
+    free(buf);
+    KaiValue *some = kai_variant(0, "Some", 1, &s);
+    return kai_cont_resume(k, some);
+}
+
+/* m7a #7: default Env handlers. `args()` reuses kai_prelude_args
+ * (returns a [String] of argv[1..]); `var(name)` wraps getenv:
+ * present → Some(value), absent → None. */
+static KaiValue *kai_default_env_args(void *self, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_args());
+}
+
+static KaiValue *kai_default_env_var(void *self, KaiValue *name, KaiCont *k) {
+    (void) self;
+    if (!name || name->tag != KAI_STR) {
+        return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+    }
+    char nbuf[1024];
+    size_t nlen = name->as.s.len < sizeof(nbuf) - 1 ? name->as.s.len : sizeof(nbuf) - 1;
+    memcpy(nbuf, name->as.s.bytes, nlen);
+    nbuf[nlen] = '\0';
+    const char *got = getenv(nbuf);
+    if (!got) return kai_cont_resume(k, kai_variant(0, "None", 0, NULL));
+    KaiValue *s = kai_str(got);
+    KaiValue *some = kai_variant(0, "Some", 1, &s);
+    return kai_cont_resume(k, some);
+}
+
+/* m7a #7: default File handlers. Both reuse the prelude helpers
+ * which already produce `Result[T, String]` shapes (Doc B §`File`
+ * error model). */
+static KaiValue *kai_default_file_read_file(void *self, KaiValue *path, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_read_file(path));
+}
+
+static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
+                                              KaiValue *contents, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_write_file(path, contents));
+}
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;

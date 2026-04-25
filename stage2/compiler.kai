@@ -5563,26 +5563,17 @@ fn emit_main_wrapper(decls: [Decl], test_mode: Bool) : String {
     # m7a #7: install default handlers around `kai_main` only for
     # the builtin effects that appear in `main`'s row. The push/pop
     # pair is syntactically balanced (Doc C §*Per-fiber isolation*);
-    # pop runs even if `kai_main` returns. Without a `/ Console`
-    # in `main`'s signature, the builtin Console decl injected at
-    # the top of the program is silently unused — no setup, no
-    # static evidence node, no diff against pre-#7 codegen.
+    # pop runs even if `kai_main` returns. Pops are emitted in
+    # reverse-push order so the evidence stack stays LIFO-balanced.
     let main_row = main_row_labels(decls)
-    let console_setup = if list_has(main_row, "Console") { default_console_setup() } else { "" }
-    let fail_setup    = if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" }
-    let console_pop = if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
-    let fail_pop    = if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" }
-    # Pop in LIFO order: Fail was pushed last (after Console), so
-    # pop Fail first. The setup helpers themselves preserve push
-    # order — Console first, then Fail.
+    let setup    = default_setups_for(main_row)
+    let teardown = default_pops_for(main_row)
     concat_all([
       "int main(int argc, char **argv) {\n",
       "    kai_set_args(argc, argv);\n",
-      console_setup,
-      fail_setup,
+      setup,
       "    KaiValue *_result = kai_main();\n",
-      fail_pop,
-      console_pop,
+      teardown,
       "    kai_decref(_result);\n",
       "    return 0;\n",
       "}\n"
@@ -5633,6 +5624,56 @@ fn default_fail_setup() : String =
     "    _kai_default_ev_fail.handler_id = kai_fresh_handler_id();\n",
     "    _kai_default_ev_fail.fail = (KaiValue *(*)(EvFail *, KaiValue *, KaiCont *)) &kai_default_fail_fail;\n",
     "    kai_evidence_push(&_kai_default_node_fail, \"Fail\", &_kai_default_ev_fail);\n"
+  ])
+
+fn default_stdin_setup() : String =
+  concat_all([
+    "    static EvStdin _kai_default_ev_stdin;\n",
+    "    static KaiEvidence _kai_default_node_stdin;\n",
+    "    _kai_default_ev_stdin.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_stdin.read_line = (KaiValue *(*)(EvStdin *, KaiCont *)) &kai_default_stdin_read_line;\n",
+    "    kai_evidence_push(&_kai_default_node_stdin, \"Stdin\", &_kai_default_ev_stdin);\n"
+  ])
+
+fn default_env_setup() : String =
+  concat_all([
+    "    static EvEnv _kai_default_ev_env;\n",
+    "    static KaiEvidence _kai_default_node_env;\n",
+    "    _kai_default_ev_env.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_env.args = (KaiValue *(*)(EvEnv *, KaiCont *)) &kai_default_env_args;\n",
+    "    _kai_default_ev_env.var  = (KaiValue *(*)(EvEnv *, KaiValue *, KaiCont *)) &kai_default_env_var;\n",
+    "    kai_evidence_push(&_kai_default_node_env, \"Env\", &_kai_default_ev_env);\n"
+  ])
+
+fn default_file_setup() : String =
+  concat_all([
+    "    static EvFile _kai_default_ev_file;\n",
+    "    static KaiEvidence _kai_default_node_file;\n",
+    "    _kai_default_ev_file.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_file.read_file  = (KaiValue *(*)(EvFile *, KaiValue *, KaiCont *)) &kai_default_file_read_file;\n",
+    "    _kai_default_ev_file.write_file = (KaiValue *(*)(EvFile *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_file_write_file;\n",
+    "    kai_evidence_push(&_kai_default_node_file, \"File\", &_kai_default_ev_file);\n"
+  ])
+
+# m7a #7: assemble the full setup block for the builtins listed in
+# `main`'s row, push order Console → Fail → Stdin → Env → File.
+fn default_setups_for(main_row: [String]) : String =
+  concat_all([
+    if list_has(main_row, "Console") { default_console_setup() } else { "" },
+    if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
+    if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
+    if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
+    if list_has(main_row, "File")    { default_file_setup() }    else { "" }
+  ])
+
+# Pops in reverse-push order so the evidence stack drains LIFO.
+fn default_pops_for(main_row: [String]) : String =
+  concat_all([
+    if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Fail")    { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Console") { "    kai_evidence_pop();\n" } else { "" }
   ])
 
 # m7a #6c: pre-emit op-call desugar. Walk the AST and rewrite every
@@ -8155,11 +8196,15 @@ fn variants_of_type_loop(es: [TyEntry], target: String, acc: [String]) : [String
   match es {
     [] -> list_reverse(acc)
     [e, ...rest] -> {
+      # Effect ops are registered as `Eff.op` (m7a #4a) — those
+      # names also start uppercase but are not sum-type constructors,
+      # so the exhaustiveness check would otherwise treat them as
+      # missing variants of any matching return type.
       let first_upper = match char_at(e.name, 0) {
         Some(c) -> c >= 'A' and c <= 'Z'
         None    -> false
       }
-      if first_upper {
+      if first_upper and not string_contains_dot(e.name) {
         match extract_return_tycon(e.scheme) {
           Some(tn) -> if tn == target {
             variants_of_type_loop(rest, target, [e.name, ...acc])
@@ -11016,17 +11061,44 @@ fn load_prelude(path: String) : Option[[Decl]] {
 fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let existing = collect_effect_names(decls)
   let main_row = main_row_labels(decls)
-  let console_d = if list_has(main_row, "Console") and not list_has(existing, "Console") {
-    [builtin_console_decl()]
-  } else { [] }
-  let fail_d = if list_has(main_row, "Fail") and not list_has(existing, "Fail") {
-    [builtin_fail_decl()]
-  } else { [] }
-  list_append(console_d, list_append(fail_d, decls))
+  let console_d = inject_one(main_row, existing, "Console", builtin_console_decl())
+  let fail_d    = inject_one(main_row, existing, "Fail",    builtin_fail_decl())
+  let stdin_d   = inject_one(main_row, existing, "Stdin",   builtin_stdin_decl())
+  let env_d     = inject_one(main_row, existing, "Env",     builtin_env_decl())
+  let file_d    = inject_one(main_row, existing, "File",    builtin_file_decl())
+  list_append(console_d,
+    list_append(fail_d,
+      list_append(stdin_d,
+        list_append(env_d,
+          list_append(file_d, decls)))))
+}
+
+fn inject_one(main_row: [String], existing: [String],
+              name: String, decl: Decl) : [Decl] {
+  if list_has(main_row, name) and not list_has(existing, name) { [decl] }
+  else { [] }
 }
 
 fn ty_name_zero(name: String) : TypeExpr =
   TypeExpr { tkind: TyName(name, []), line: 0, col: 0 }
+
+fn ty_named_zero(name: String, targs: [TypeExpr]) : TypeExpr =
+  TypeExpr { tkind: TyName(name, targs), line: 0, col: 0 }
+
+fn ty_list_zero(inner: TypeExpr) : TypeExpr =
+  TypeExpr { tkind: TyList(inner), line: 0, col: 0 }
+
+fn ty_option_string_zero() : TypeExpr =
+  ty_named_zero("Option", [ty_name_zero("String")])
+
+fn ty_result_string_string_zero() : TypeExpr =
+  ty_named_zero("Result", [ty_name_zero("String"), ty_name_zero("String")])
+
+fn ty_result_unit_string_zero() : TypeExpr =
+  ty_named_zero("Result", [ty_name_zero("Unit"), ty_name_zero("String")])
+
+fn ty_list_string_zero() : TypeExpr =
+  ty_list_zero(ty_name_zero("String"))
 
 fn param_string_zero(name: String) : Param =
   Param { pname: name, ptype: Some(ty_name_zero("String")),
@@ -11043,6 +11115,28 @@ fn builtin_fail_decl() : Decl =
   DEffect(false, "Fail",
     [
       EOp("fail", [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
+    ], 0, 0)
+
+fn builtin_stdin_decl() : Decl =
+  DEffect(false, "Stdin",
+    [EOp("read_line", [], ty_option_string_zero(), 0, 0)], 0, 0)
+
+fn builtin_env_decl() : Decl =
+  DEffect(false, "Env",
+    [
+      EOp("args", [], ty_list_string_zero(), 0, 0),
+      EOp("var",  [param_string_zero("name")], ty_option_string_zero(), 0, 0)
+    ], 0, 0)
+
+fn builtin_file_decl() : Decl =
+  DEffect(false, "File",
+    [
+      EOp("read_file",
+          [param_string_zero("path")],
+          ty_result_string_string_zero(), 0, 0),
+      EOp("write_file",
+          [param_string_zero("path"), param_string_zero("contents")],
+          ty_result_unit_string_zero(), 0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {

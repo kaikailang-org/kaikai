@@ -542,6 +542,56 @@ test-effects: $(TARGET) build
 	  grep -q "^kai: Fail.fail: bad input$$" build/s2-$$name.run.err \
 	    && echo "effects OK $$name (default Fail: aborts with banner)" \
 	    || { echo "effects FAIL $$name (wrong banner)"; cat build/s2-$$name.run.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_7_default_env.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_env_args" build/s2-$$name.c \
+	    && grep -q "kai_default_env_var"  build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-Env wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  PATH=/usr/bin ./build/s2-$$name foo bar > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^argc=2$$"   build/s2-$$name.out \
+	    && grep -q "^PATH set$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (default Env: args + var)" \
+	    || { echo "effects FAIL $$name (output unexpected)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_7_default_file.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_file_read_file"  build/s2-$$name.c \
+	    && grep -q "kai_default_file_write_file" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-File wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^hello from kaikai$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (default File: write+read roundtrip)" \
+	    || { echo "effects FAIL $$name (roundtrip output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m7a_7_default_stdin.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_stdin_read_line" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-Stdin wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  printf "hi there\n" | ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^got: hi there$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (default Stdin: read_line Some)" \
+	    || { echo "effects FAIL $$name (Some path output wrong)"; cat build/s2-$$name.out; exit 1; }; \
+	  printf "" | ./build/s2-$$name > build/s2-$$name.out2 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero on EOF)"; exit 1; }; \
+	  grep -q "^eof$$" build/s2-$$name.out2 \
+	    && echo "effects OK $$name (default Stdin: read_line None on EOF)" \
+	    || { echo "effects FAIL $$name (None path output wrong)"; cat build/s2-$$name.out2; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches
