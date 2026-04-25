@@ -1,0 +1,60 @@
+# Mini fintech ledger. Exercises the audit-trail-compile-time pitch:
+# Units of Measure (m12.5) + refinement types + contracts (m12.6).
+
+use Console
+
+unit USD
+unit EUR
+
+type AccountId = String where matches /^acc_[a-zA-Z0-9]{8}$/
+
+type Account = {
+  id:           AccountId,
+  balance:      Decimal<USD> where >= 0,
+  transactions: Int          where >= 0,
+}
+
+fn deposit(acc: Account, amount: Decimal<USD>) : Account
+  requires amount > 0.0
+  ensures  result.balance == acc.balance + amount
+  ensures  result.transactions == acc.transactions + 1
+=
+  { acc with
+    balance      = acc.balance + amount,
+    transactions = acc.transactions + 1
+  }
+
+fn transfer(from: Account, to: Account, amount: Decimal<USD>) : (Account, Account)
+  / Audit
+  requires from.id != to.id
+  requires amount > 0.0
+  requires from.balance >= amount
+  ensures  result.0.balance + result.1.balance == from.balance + to.balance
+  ensures  result.0.transactions == from.transactions + 1
+  ensures  result.1.transactions == to.transactions + 1
+=
+  Audit.log("transfer #{from.id} -> #{to.id}: #{decimal_to_string(amount)} USD")
+  let from2 = { from with
+    balance      = from.balance - amount,
+    transactions = from.transactions + 1 }
+  let to2   = { to with
+    balance      = to.balance + amount,
+    transactions = to.transactions + 1 }
+  (from2, to2)
+
+fn main() = {
+  let alice = Account {
+    id:           "acc_alice001",
+    balance:      100.00<USD>,
+    transactions: 0,
+  }
+  let bob = Account {
+    id:           "acc_bob00001",
+    balance:      50.00<USD>,
+    transactions: 0,
+  }
+
+  let (alice2, bob2) = transfer(alice, bob, 30.00<USD>)
+  println("alice: #{decimal_to_string(alice2.balance)} USD")
+  println("bob:   #{decimal_to_string(bob2.balance)} USD")
+}

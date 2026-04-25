@@ -1,0 +1,31 @@
+use Console
+
+fn sort(xs: [Int]) : [Int] = match xs {
+  []              -> []
+  [pivot, ...rest] -> {
+    let lesser  = rest |> filter((x) => x < pivot)
+    let greater = rest |> filter((x) => x >= pivot)
+    sort(lesser) ++ [pivot] ++ sort(greater)
+  }
+}
+
+fn main() = {
+  let sorted = sort([5, 2, 8, 1, 9, 3, 7, 4, 6])
+  sorted |> map(int_to_string) |> each(println)
+}
+
+test "empty list" {
+  assert sort([]) == []
+}
+
+test "single element" {
+  assert sort([42]) == [42]
+}
+
+test "already sorted" {
+  assert sort([1, 2, 3]) == [1, 2, 3]
+}
+
+test "reverse sorted" {
+  assert sort([3, 2, 1]) == [1, 2, 3]
+}

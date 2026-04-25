@@ -1,0 +1,17 @@
+use Console
+
+fn factorial(n: Int where >= 0) : Int where >= 1 =
+  if n == 0 { 1 } else { n * factorial(n - 1) }
+
+fn main() = [0..10] |> each((n) =>
+  println("#{int_to_string(n)}! = #{int_to_string(factorial(n))}"))
+
+test "factorial base cases" {
+  assert factorial(0) == 1
+  assert factorial(1) == 1
+}
+
+test "factorial small values" {
+  assert factorial(5) == 120
+  assert factorial(10) == 3628800
+}
