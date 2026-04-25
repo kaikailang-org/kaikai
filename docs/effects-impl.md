@@ -939,6 +939,45 @@ the canonical handler runs normally. The compiler emits a comment
 in `--dump=cps` diagnostics noting which specialisations fired
 and which didn't, for debugging the m7b ergonomy claim.
 
+### Known follow-ups after m7b #5b
+
+The desugar is faithful to Doc B §`State[T]` *Syntax note*; three
+gaps remain between the lowered code and what Doc B implies should
+"just work":
+
+1. **Per-instance handler dispatch.** The runtime's
+   `kai_evidence_lookup_node(name)` is name-keyed and LIFO, so
+   nested `var`s of the same effect+ty_args shadow innermost-wins
+   — same as a `let` of the same name shadows an outer binding.
+   Doc B's "Nested vars nest handlers" stops short of saying the
+   outer cell stays reachable from inside the inner's body, and
+   today it doesn't: `var a = 0; var b = 0; { ... a.set(1) ... }`
+   inside `b`'s body hits `b`. The cure is per-`handler_id`
+   dispatch — the alias rewrite would emit a node lookup keyed on
+   the specific handler instance instead of the effect name. The
+   m7b #5b fixtures sidestep the gap by scoping the inner cell in
+   its own sub-block (so the inner handler pops before the outer
+   cell is touched again). Specifying and landing per-instance
+   dispatch is a runtime + codegen change worth its own task.
+
+2. **Variable specialisation (§*Variable specialisation*) is
+   still pending.** The desugar emits the canonical heap-handler
+   form unconditionally; until specialisation lands, every
+   `var n = 0; n.set(@n + 1)` pays a full op-call (evidence
+   lookup + identity continuation) per access. Doc B §`State[T]`
+   *Performance* promised this lowers to a stack slot when the
+   four trigger conditions hold — the trigger check + slot
+   replacement is the missing pass.
+
+3. **Shadowing in the pre-emit alias rewrite.** The walker rewrites
+   every `alias.op(args)` it finds inside an `EHandle` body
+   without tracking inner `let alias = ...` shadowing. Today the
+   resolver / inferencer would catch the resulting type error
+   (the inner `alias` resolves to the let-bound value, not a
+   capability), but the rewrite is technically incorrect. Adding
+   shadow tracking is a small change to `rewrite_alias_kind`'s
+   `EBlock` / `ELambda` / `EMatch` cases.
+
 ## Per-op type generics
 
 Doc B amended Doc A §*Out of scope for v1* item 3: per-op type
