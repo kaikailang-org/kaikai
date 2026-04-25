@@ -6920,7 +6920,14 @@ type HoleSite = HS(Option[String], Int, Int, Int, [TyEntry], Int)
 type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs: [RecInfo], errs: Int,
                     insts: [CallSite], holes: [HoleSite],
                     row: [String],     # m7a #4c: effect labels accumulated by op calls in the current body
+                    eff_uses: [EffUse],   # m7a #8: per-label first-use site for diagnostics
                     aliases: [AliasBinding] }   # m7a #4e: `Eff as log` bindings active in scope
+
+# m7a #8: first-use record per effect label in the current body.
+# `check_body_row` reads this when it needs to point a diagnostic
+# at the op call that caused the row to widen, instead of pinning
+# the whole error to the function's declaration site.
+type EffUse = EU(String, Int, Int)
 
 # Stack entry for `Eff as log`. The stack is pushed on entering
 # the body of a `handle ... with Eff as log { ... }` and popped
@@ -6947,32 +6954,37 @@ type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
-               recs: recs, errs: 0, insts: [], holes: [], row: [], aliases: [] }
+               recs: recs, errs: 0, insts: [], holes: [], row: [],
+               eff_uses: [], aliases: [] }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
-               row: st.row, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
 
 # m7a #4c: mark that the current body has performed an op of `eff`.
 # Adds the name to the accumulator if not already present (syntactic
-# dedup; row variables are not yet in scope at this layer).
-fn st_add_effect(st: InferState, eff: String) : InferState {
+# dedup; row variables are not yet in scope at this layer). m7a #8
+# also records the source position of the first occurrence so that
+# diagnostics can point at the op call instead of the function decl.
+fn st_add_effect(st: InferState, eff: String, line: Int, col: Int) : InferState {
   if list_has(st.row, eff) { st }
   else {
     InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                  recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                 row: [eff, ...st.row], aliases: st.aliases }
+                 row: [eff, ...st.row],
+                 eff_uses: [EU(eff, line, col), ...st.eff_uses],
+                 aliases: st.aliases }
   }
 }
 
@@ -6983,13 +6995,14 @@ fn st_add_effect(st: InferState, eff: String) : InferState {
 fn st_set_row(st: InferState, new_row: [String]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: new_row, aliases: st.aliases }
+               row: new_row, eff_uses: st.eff_uses, aliases: st.aliases }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-               row: st.row, aliases: [AB(alias, eff), ...st.aliases] }
+               row: st.row, eff_uses: st.eff_uses,
+               aliases: [AB(alias, eff), ...st.aliases] }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -6997,7 +7010,7 @@ fn st_pop_alias(st: InferState) : InferState {
     [_, ...rest] ->
       InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
-                   row: st.row, aliases: rest }
+                   row: st.row, eff_uses: st.eff_uses, aliases: rest }
   }
 }
 
@@ -7012,12 +7025,25 @@ fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
 fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
-               row: st.row, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
-               row: st.row, aliases: st.aliases }
+               row: st.row, eff_uses: st.eff_uses, aliases: st.aliases }
+
+# m7a #8: lookup the recorded first-use line/col of an effect label.
+# Returns (-1, -1) when the effect was never tracked — that should
+# only happen when the row was set via st_set_row from outside, in
+# which case the caller falls back to the function's decl span.
+fn lookup_eff_use(uses: [EffUse], target: String) : EffUse {
+  match uses {
+    [] -> EU(target, -1, -1)
+    [u, ...rest] -> match u {
+      EU(name, _, _) -> if name == target { u } else { lookup_eff_use(rest, target) }
+    }
+  }
+}
 
 # Half-open range [lo, hi) as a list of ints. Used to name the fresh
 # TyVarT ids minted by one call-site's instantiation.
@@ -7130,6 +7156,7 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     insts: inner.insts,
     holes: inner.holes,
     row: inner.row,
+    eff_uses: inner.eff_uses,
     aliases: outer.aliases
   }
 
@@ -7600,7 +7627,7 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
   # m7a #4c: this op call commits the caller to the effect.
-  let st3 = st_add_effect(st2, dotted_prefix(key))
+  let st3 = st_add_effect(st2, dotted_prefix(key), line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
@@ -8500,21 +8527,35 @@ fn check_body_row(st: InferState, fname: String, declared: RowExpr,
   check_body_row_loop(st, fname, st.row, declared_names, line, col)
 }
 
+# m7a #8: per-label diagnostic. For each effect the body performed
+# but the function did not declare, point at the *op call site*
+# (recorded in `st.eff_uses` at synth_op_call_with_scheme), say
+# which function's row should have included it, and offer both
+# fixes — extend the signature or wrap the call site in a handle.
+# Doc C §*Diagnostic quality* §*Effect not handled* prescribes the
+# shape; m7a #8 wires it up. Falls back to the function's decl
+# span when the use site was not recorded (the open-row paths in
+# Doc A §*Inference* will reach this branch once they ship).
 fn check_body_row_loop(st: InferState, fname: String, performed: [String],
-                       declared: [String], line: Int, col: Int) : InferState {
+                       declared: [String], fline: Int, fcol: Int) : InferState {
   match performed {
     [] -> st
     [eff, ...rest] ->
       if list_has(declared, eff) {
-        check_body_row_loop(st, fname, rest, declared, line, col)
+        check_body_row_loop(st, fname, rest, declared, fline, fcol)
       } else {
-        diag_error(st.file, line, col,
-          string_concat("effect not handled: ",
-            string_concat(eff,
-              string_concat(" (function `",
-                string_concat(fname,
-                  "` performs the op but its row does not declare it)")))))
-        check_body_row_loop(st_bump_err(st), fname, rest, declared, line, col)
+        let use_eu = lookup_eff_use(st.eff_uses, eff)
+        match use_eu {
+          EU(_, uline, ucol) -> {
+            let line = if uline >= 0 { uline } else { fline }
+            let col  = if ucol  >= 0 { ucol  } else { fcol  }
+            diag_error(st.file, line, col,
+              string_concat("effect not handled: ", eff))
+            diag_note("`#{fname}`'s declared row does not include `#{eff}`")
+            diag_help("either declare `#{fname} : ... / #{eff}`, or wrap this call site in `handle { ... } with #{eff} { ... }`")
+            check_body_row_loop(st_bump_err(st), fname, rest, declared, fline, fcol)
+          }
+        }
       }
   }
 }

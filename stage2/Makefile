@@ -522,6 +522,18 @@ test-effects: $(TARGET) build
 	    && echo "effects OK $$name (resume arg-type mismatch caught)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done; \
+	for f in ../examples/effects/m7a_8_diag_effect_not_handled.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null \
+	    && { echo "effects FAIL $$name (unhandled effect accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "effect not handled: Fail" build/s2-$$name.err \
+	    && grep -q "process.*declared row does not include" build/s2-$$name.err \
+	    && grep -q "process : ... / Fail" build/s2-$$name.err \
+	    && grep -q "with Fail" build/s2-$$name.err \
+	    && echo "effects OK $$name (Doc C shape: error + note + help)" \
+	    || { echo "effects FAIL $$name (wrong diag shape)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
 	for f in ../examples/effects/m7a_7_default_console.kai; do \
 	  name=$$(basename $$f .kai); \
 	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
