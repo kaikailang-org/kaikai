@@ -342,6 +342,30 @@ test-effects: $(TARGET) build
 	  grep -q "type mismatch in function call" build/s2-$$name.err \
 	    && echo "effects OK $$name (rejected as expected)" \
 	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/op_call_basic.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    && echo "effects OK $$name (op call accepted)" \
+	    || { echo "effects FAIL $$name (op call rejected)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/op_call_unknown_op.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (unknown op accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "unknown op unknown on effect Io" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/op_call_wrong_arg.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f 2> build/s2-$$name.err > /dev/null && \
+	    { echo "effects FAIL $$name (wrong arg accepted)"; exit 1; } \
+	    || true; \
+	  grep -q "type mismatch in op call Io.print" build/s2-$$name.err \
+	    && echo "effects OK $$name (rejected as expected)" \
+	    || { echo "effects FAIL $$name (wrong diagnostic)"; cat build/s2-$$name.err; exit 1; }; \
 	done
 
 # Self-hosting: kaic2 compiles its own source, and the round-trip reaches

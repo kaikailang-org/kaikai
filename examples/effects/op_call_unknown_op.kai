@@ -1,0 +1,13 @@
+# m7a #4a negative test — referring to an op that the effect did
+# not declare must produce a dedicated diagnostic, not the generic
+# "unknown identifier" error. The effect itself (Io) exists, so
+# the failure is on the op (`unknown`).
+
+effect Io {
+  print(s: String) : Unit
+}
+
+fn main() : Int {
+  Io.unknown("hi")
+  0
+}

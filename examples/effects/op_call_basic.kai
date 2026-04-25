@@ -1,0 +1,17 @@
+# m7a #4a smoke test (positive) — `Eff.op(args)` parses, resolves
+# against the effect's op signatures, and type-checks against the
+# op's parameter types and return type.
+#
+# This file does *not* assert the body's row matches the function's
+# declared row (that's m7a #4c) nor that the runtime call lowers
+# correctly (that's m7a #6); only that the type checker accepts it.
+
+effect Io {
+  print(s: String) : Unit
+  read_line() : String
+}
+
+fn main() : Int {
+  Io.print("hello")
+  0
+}

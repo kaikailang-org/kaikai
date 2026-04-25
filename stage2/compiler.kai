@@ -5499,9 +5499,31 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
           None     -> env
         }
         DType(_, _, _, _, _, _) -> add_variants_of_decl(env, d)
+        DEffect(_, eff_name, ops, _, _) -> add_effect_op_sigs(env, eff_name, ops)
         _ -> env
       }
       add_decls_loop(env1, rest)
+    }
+  }
+}
+
+# m7a #4a: register each effect op under the dotted key "Eff.op"
+# in the type env. When synth_call sees `ECall(EField(EVar(Eff),
+# op), args)`, it looks up that key and treats the call as an op
+# invocation. Per-op type generics (m7b) will replace the monomorphic
+# scheme with one that carries the op's own quantifiers.
+fn add_effect_op_sigs(env: TyEnv, eff_name: String, ops: [EffectOp]) : TyEnv {
+  match ops {
+    [] -> env
+    [op, ...rest] -> match op {
+      EOp(op_name, params, ret, _, _) -> {
+        let pts = map(params, param_ty)
+        let ret_ty = resolve_ty(ret)
+        let sc = mono(TyFnT(pts, ret_ty, row_empty()))
+        let key = string_concat(eff_name, string_concat(".", op_name))
+        let env1 = ty_env_add(env, key, sc)
+        add_effect_op_sigs(env1, eff_name, rest)
+      }
     }
   }
 }
@@ -6414,15 +6436,99 @@ fn synth_many(st: InferState, es: [Expr]) : InferredList {
 }
 
 fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred {
-  let rc = synth(st, callee)
-  let ra = synth_many(rc.st, args_)
+  match try_op_call(st, callee, args_, line, col) {
+    Some(inf) -> inf
+    None -> {
+      let rc = synth(st, callee)
+      let ra = synth_many(rc.st, args_)
+      let rv = st_fresh_ty(ra.st)
+      let expected = fn_ty(ra.tys, rv.ty)
+      let st2 = st_unify(rv.st, rc.ty, expected, "function call", line, col)
+      let ty = apply_ty(st2.sub, rv.ty)
+      let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
+      mk_inferred(st2, ty, root)
+    }
+  }
+}
+
+# m7a #4a: detect the surface shape `Eff.op(args)` and treat it as
+# an op call. `Eff` must be a declared effect (its op signatures
+# were registered under dotted keys by `add_effect_op_sigs`). Args
+# are unified against the op's parameter types; the result type
+# is the op's return type. Adding `Eff` to the caller's row is
+# m7a #4c.
+#
+# An "effect name" is detected by scanning the env for any entry
+# of the form `Eff.<something>` — equivalent to "this name has
+# at least one op registered". If `Eff` is an effect but the op
+# is missing, we emit a dedicated diagnostic instead of falling
+# through to the generic `unknown identifier` path.
+fn try_op_call(st: InferState, callee: Expr, args_: [Expr],
+               line: Int, col: Int) : Option[Inferred] {
+  match callee.kind {
+    EField(base, op_name) -> match base.kind {
+      EVar(eff_name) -> {
+        let key = string_concat(eff_name, string_concat(".", op_name))
+        match ty_env_lookup(st.env, key) {
+          Some(sc) -> Some(synth_op_call_with_scheme(st, sc, args_, key, line, col))
+          None ->
+            if is_effect_in_env(st.env, eff_name) {
+              Some(synth_op_call_unknown_op(st, eff_name, op_name, line, col))
+            } else { None }
+        }
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+fn is_effect_in_env(env: TyEnv, eff_name: String) : Bool =
+  is_effect_in_env_loop(env.entries, string_concat(eff_name, "."))
+
+fn is_effect_in_env_loop(entries: [TyEntry], prefix: String) : Bool {
+  match entries {
+    [] -> false
+    [e, ...rest] ->
+      if string_has_prefix(e.name, prefix) { true }
+      else { is_effect_in_env_loop(rest, prefix) }
+  }
+}
+
+fn string_has_prefix(s: String, p: String) : Bool {
+  let pl = string_length(p)
+  if string_length(s) < pl { false }
+  else { string_slice(s, 0, pl) == p }
+}
+
+fn synth_op_call_unknown_op(st: InferState, eff_name: String, op_name: String,
+                             line: Int, col: Int) : Inferred {
+  diag_error(st.file, line, col,
+    string_concat("unknown op ", string_concat(op_name,
+      string_concat(" on effect ", eff_name))))
+  let st1 = st_bump_err(st)
+  mk_inferred(st1, TyAny, with_ty(mk_expr(EVar(eff_name), line, col), TyAny))
+}
+
+fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
+                              key: String, line: Int, col: Int) : Inferred {
+  let inst = st_instantiate(st, sc)
+  let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
-  let st2 = st_unify(rv.st, rc.ty, expected, "function call", line, col)
+  let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
   let ty = apply_ty(st2.sub, rv.ty)
-  let root = with_ty(mk_expr(ECall(rc.expr, ra.exprs), line, col), ty)
+  let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st2, ty, root)
 }
+
+# Synthesise a placeholder callee for the typed AST that emit later
+# turns into the runtime op-dispatch call. For m7a #4a we keep the
+# original surface shape (EField/EVar) so the existing emitter path
+# falls through; m7a #6 (lowering) will replace this with a proper
+# op-dispatch node.
+fn callee_expr_for_op(key: String, line: Int, col: Int) : Expr =
+  mk_expr(EVar(key), line, col)
 
 fn field_root(obj_expr: Expr, fnm: String, line: Int, col: Int, ty: Ty) : Expr =
   with_ty(mk_expr(EField(obj_expr, fnm), line, col), ty)
