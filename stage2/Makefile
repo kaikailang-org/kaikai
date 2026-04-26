@@ -10,7 +10,7 @@ SRC     := compiler.kai
 # feeds $(SRC) to kaic1 or kaic2. Harmless where the shell refuses.
 STACK := ulimit -s 32768 2>/dev/null || true;
 
-.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop selfhost
+.PHONY: all clean test test-fast test-tokens test-ast test-check test-run test-blocks test-holes test-effects test-effect-runtime test-modules test-modules-path test-sugars test-loop test-stdlib selfhost
 
 all: $(TARGET)
 
@@ -281,6 +281,35 @@ test-writer: $(TARGET) build
 	diff -q ../examples/writer/main.out.expected build/writer.out > /dev/null \
 	  && echo "writer OK" \
 	  || { echo "writer DIFF"; diff ../examples/writer/main.out.expected build/writer.out; exit 1; }
+
+# m14-pre — stdlib/core.kai list-op smoke tests. Each fixture under
+# examples/stdlib/ is compiled with `kaic1 --prelude ../stdlib/core.kai`
+# (the new functions live in core, no module import needed) and its
+# stdout is diffed against `<name>.out.expected`. One fixture per
+# group of related ops: list_basic, list_*-by, list_sort, …
+#
+# Why kaic1, not kaic2: kaic2's HM typer currently rejects calls to
+# polymorphic prelude functions (`list_take([1,2,3], 2)` from a
+# foreign file fails with "expected ([a], Int) -> [a], found ([Int],
+# Int) -> ?t1 / ?e0"). bin/kai — the production end-user driver —
+# routes through kaic1, where this works. The kaic2 prelude path is
+# part of m14 proper (see stage2-design.md §m14, naming-convention
+# migration + selfhost re-validation); m14-pre intentionally
+# exercises the kaic1 path that today's users hit.
+test-stdlib: $(KAIC1) build
+	@set -e; \
+	for f in ../examples/stdlib/*.kai; do \
+	  name=$$(basename $$f .kai); \
+	  $(KAIC1) --prelude ../stdlib/core.kai $$f > build/stdlib-$$name.c \
+	    || { echo "stdlib FAIL $$name (kaic1 errored)"; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/stdlib-$$name.c -o build/stdlib-$$name \
+	    || { echo "stdlib FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/stdlib-$$name > build/stdlib-$$name.out \
+	    || { echo "stdlib FAIL $$name (run errored)"; cat build/stdlib-$$name.out; exit 1; }; \
+	  diff -q ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out > /dev/null \
+	    && echo "stdlib OK $$name" \
+	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \
+	done
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
@@ -860,7 +889,7 @@ selfhost-llvm: $(TARGET) build
 	  && echo "llvm self-hosting fixed point: OK" \
 	  || { echo "llvm self-hosting fixed point: DIFF"; exit 1; }
 
-test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer
+test: test-tokens test-ast test-types test-env test-infer test-infer-check test-dump-typed test-dump-mono test-check test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib
 
 # Fast subset for iterative development: skips every subtarget that
 # runs kaic2 (or kaic1) against the compiler's own source. Each of
@@ -869,7 +898,7 @@ test: test-tokens test-ast test-types test-env test-infer test-infer-check test-
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer
+test-fast: test-infer test-infer-check test-dump-typed test-dump-mono test-run test-blocks test-llvm test-modules test-modules-path test-holes test-effects test-effect-runtime test-sugars test-loop test-reader test-writer test-stdlib
 
 clean:
 	rm -rf build $(TARGET)

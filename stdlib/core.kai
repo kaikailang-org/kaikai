@@ -110,6 +110,284 @@ pub fn list_map_indexed_loop(xs: [a], f: (Int, a) -> b, i: Int) : [b] {
 pub fn list_map_indexed(xs: [a], f: (Int, a) -> b) : [b] =
   list_map_indexed_loop(xs, f, 0)
 
+# Returns `Some(first)` for a non-empty list, `None` otherwise. O(1)
+# and total — never panics. Distinct from `list_nth(xs, 0)` only in
+# clarity at call sites.
+pub fn list_head(xs: [a]) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(h)
+  }
+}
+
+# Returns `Some(rest)` for a non-empty list, `None` for `[]`.
+# Shares structure with `xs`; no allocation. Distinct from
+# `list_drop(xs, 1)` which returns `[]` for an empty list rather
+# than `None` — `list_tail` preserves the empty-vs-non-empty
+# distinction.
+pub fn list_tail(xs: [a]) : Option[[a]] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(t)
+  }
+}
+
+# Returns a list of `n` copies of `x`. `n <= 0` yields `[]`.
+# Allocates `n` cons cells; the element `x` is shared, not
+# duplicated, so mutating `x` after the call (only possible via
+# the `Array[T]` escape) would be visible through every position.
+pub fn list_repeat(x: a, n: Int) : [a] {
+  if n <= 0 { [] }
+  else { [x, ...list_repeat(x, n - 1)] }
+}
+
+# Tail-recursive accumulator for `list_count`. Internal.
+pub fn list_count_loop(xs: [a], p: (a) -> Bool, acc: Int) : Int {
+  match xs {
+    [] -> acc
+    [h, ...t] -> if p(h) { list_count_loop(t, p, acc + 1) }
+                 else    { list_count_loop(t, p, acc) }
+  }
+}
+
+# Counts how many elements of `xs` satisfy `p`. O(n); empty list
+# yields 0. `p` is invoked exactly once per element.
+pub fn list_count(xs: [a], p: (a) -> Bool) : Int =
+  list_count_loop(xs, p, 0)
+
+# Returns true iff some element of `xs` is structurally equal to
+# `x` per the runtime's recursive `==`. Short-circuits on the
+# first match. Note that closures are never equal (the runtime
+# returns false), so `list_contains` over a list of closures is
+# always false.
+pub fn list_contains(xs: [a], x: a) : Bool {
+  match xs {
+    [] -> false
+    [h, ...t] -> if h == x { true } else { list_contains(t, x) }
+  }
+}
+
+# Returns the longest prefix of `xs` whose elements all satisfy
+# `p`. As soon as `p(h)` is false the recursion stops and the
+# already-matched prefix is returned. Empty list yields `[]`.
+# `p` is invoked at most `length(prefix) + 1` times — once per
+# accepted element plus once on the first rejection (if any).
+pub fn list_take_while(xs: [a], p: (a) -> Bool) : [a] {
+  match xs {
+    [] -> []
+    [h, ...t] -> if p(h) { [h, ...list_take_while(t, p)] } else { [] }
+  }
+}
+
+# Returns `xs` with its longest `p`-satisfying prefix removed.
+# Mirrors `list_take_while`: the two together split `xs` into
+# (prefix, rest) without scanning the tail past the first
+# rejection. Once `p(h)` is false the rest of `xs` (including `h`)
+# is returned as-is, sharing structure with the input.
+pub fn list_drop_while(xs: [a], p: (a) -> Bool) : [a] {
+  match xs {
+    [] -> []
+    [h, ...t] -> if p(h) { list_drop_while(t, p) } else { xs }
+  }
+}
+
+# Tail-recursive worker for list_uniq. `seen` is the accumulator
+# of already-emitted elements (in reverse order); `out` is the
+# accumulator of the deduplicated prefix (also reverse). Both are
+# reversed at the call site.
+pub fn list_uniq_loop(xs: [Int], seen: [Int], out: [Int]) : [Int] {
+  match xs {
+    [] -> list_reverse(out)
+    [h, ...t] -> if list_contains(seen, h) { list_uniq_loop(t, seen, out) }
+                 else { list_uniq_loop(t, [h, ...seen], [h, ...out]) }
+  }
+}
+
+# Returns `xs` with subsequent duplicates removed, preserving
+# first-occurrence order. O(n²) worst case (linear membership
+# check per element); the Int-only signature keeps v1 small —
+# the polymorphic / Map-backed variants land with collections.map
+# in m14 proper.
+pub fn list_uniq(xs: [Int]) : [Int] = list_uniq_loop(xs, [], [])
+
+# Tail-recursive worker for list_max. `best` is the running
+# maximum; `xs` is the unscanned tail.
+pub fn list_max_loop(xs: [Int], best: Int) : Int {
+  match xs {
+    [] -> best
+    [h, ...t] -> if h > best { list_max_loop(t, h) }
+                 else        { list_max_loop(t, best) }
+  }
+}
+
+# Returns `Some(largest)` over `xs`, `None` for `[]`. Total
+# (no panic on empty); the caller decides what to do with `None`.
+# Int-only for v1 — see list_max_by for the by-key variant.
+pub fn list_max(xs: [Int]) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_max_loop(t, h))
+  }
+}
+
+# Tail-recursive worker for list_min.
+pub fn list_min_loop(xs: [Int], best: Int) : Int {
+  match xs {
+    [] -> best
+    [h, ...t] -> if h < best { list_min_loop(t, h) }
+                 else        { list_min_loop(t, best) }
+  }
+}
+
+# Returns `Some(smallest)` over `xs`, `None` for `[]`.
+pub fn list_min(xs: [Int]) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_min_loop(t, h))
+  }
+}
+
+# Tail-recursive worker for list_max_by. Carries both the
+# running best element and its already-evaluated key, so `key`
+# is invoked exactly once per element of the original list.
+pub fn list_max_by_loop(xs: [a], key: (a) -> Int, best: a, best_k: Int) : a {
+  match xs {
+    [] -> best
+    [h, ...t] -> {
+      let k = key(h)
+      if k > best_k { list_max_by_loop(t, key, h, k) }
+      else          { list_max_by_loop(t, key, best, best_k) }
+    }
+  }
+}
+
+# Returns `Some(elem)` whose `key(elem)` is largest, `None` for
+# `[]`. Stable on ties: the *first* element with the maximal key
+# wins. `key` is invoked exactly once per element.
+pub fn list_max_by(xs: [a], key: (a) -> Int) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_max_by_loop(t, key, h, key(h)))
+  }
+}
+
+# Tail-recursive worker for list_min_by.
+pub fn list_min_by_loop(xs: [a], key: (a) -> Int, best: a, best_k: Int) : a {
+  match xs {
+    [] -> best
+    [h, ...t] -> {
+      let k = key(h)
+      if k < best_k { list_min_by_loop(t, key, h, k) }
+      else          { list_min_by_loop(t, key, best, best_k) }
+    }
+  }
+}
+
+# Returns `Some(elem)` whose `key(elem)` is smallest, `None` for
+# `[]`. Stable on ties: first-wins.
+pub fn list_min_by(xs: [a], key: (a) -> Int) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_min_by_loop(t, key, h, key(h)))
+  }
+}
+
+# Maps `f` over `xs` and concatenates the results into one list.
+# Equivalent to `list_concat(map(xs, f))` but allocates the
+# intermediate lists in declaration order without the explicit
+# concat traversal at the end. Empty input yields `[]`; an `f`
+# that always returns `[]` also yields `[]`.
+pub fn list_flat_map(xs: [a], f: (a) -> [b]) : [b] {
+  match xs {
+    [] -> []
+    [h, ...t] -> list_append(f(h), list_flat_map(t, f))
+  }
+}
+
+# Zips `xs` and `ys` element-wise through `f`. Terminates at the
+# shorter list — the leftover suffix of the longer one is
+# discarded silently. `f` is invoked exactly `min(length(xs),
+# length(ys))` times. Use cases: parallel-traverse two equal-
+# length lists, or compute pairwise sums / diffs with `f = +`.
+pub fn list_zip_with(xs: [a], ys: [b], f: (a, b) -> c) : [c] {
+  match xs {
+    [] -> []
+    [hx, ...tx] -> match ys {
+      [] -> []
+      [hy, ...ty] -> [f(hx, hy), ...list_zip_with(tx, ty, f)]
+    }
+  }
+}
+
+# Standard 3-way Int comparator. Negative when a<b, zero when
+# equal, positive when a>b. Caller never sees the magnitude — only
+# the sign matters. Used as the default comparator for list_sort.
+pub fn int_cmp(a: Int, b: Int) : Int {
+  if a < b { 0 - 1 }
+  else if a > b { 1 }
+  else { 0 }
+}
+
+# Tail-recursive merge worker. `acc` is the merged prefix in
+# reverse cons order; reversed and prepended at the call site
+# when one input is exhausted. The `cmp(hx, hy) <= 0` branch
+# (left-wins on ties) is what makes the sort stable.
+pub fn list_merge_by_loop(xs: [a], ys: [a], cmp: (a, a) -> Int, acc: [a]) : [a] {
+  match xs {
+    [] -> list_append(list_reverse(acc), ys)
+    [hx, ...tx] -> match ys {
+      [] -> list_append(list_reverse(acc), xs)
+      [hy, ...ty] -> if cmp(hx, hy) <= 0 {
+                       list_merge_by_loop(tx, ys, cmp, [hx, ...acc])
+                     } else {
+                       list_merge_by_loop(xs, ty, cmp, [hy, ...acc])
+                     }
+    }
+  }
+}
+
+# Merges two cmp-sorted lists into one cmp-sorted list. Stable
+# on ties: elements from the left input come first when their
+# keys are equal — list_sort_by relies on this for overall
+# stability.
+pub fn list_merge_by(xs: [a], ys: [a], cmp: (a, a) -> Int) : [a] =
+  list_merge_by_loop(xs, ys, cmp, [])
+
+# Stable merge sort. O(n log n) comparisons in the worst case;
+# allocates O(n) cons cells per level of recursion (the merged
+# prefixes). Empty / singleton inputs are returned as-is.
+#
+# Why merge sort, not quicksort: kaikai's `[a]` is a singly-
+# linked cons list with no O(1) random access and no in-place
+# swap, so quicksort's locality + swap advantages do not apply.
+# Merge sort matches the data structure (split + merge are both
+# pure recursion over cons), guarantees O(n log n) in the worst
+# case, and stays stable for free. The array-backed quicksort
+# in demos/quicksort.kai is a different beast — it operates on
+# the mutable `Array[T]` escape and is not the canonical stdlib
+# sort.
+#
+# The split is via list_take + list_drop on n/2 — recomputing
+# `length` per recursion is O(n) at each level, giving the
+# overall complexity an extra constant factor. Acceptable for
+# v1; the in-place / array-backed variant lands with collections
+# in m14 proper.
+pub fn list_sort_by(xs: [a], cmp: (a, a) -> Int) : [a] {
+  let n = list_length(xs)
+  if n <= 1 { xs }
+  else {
+    let mid = n / 2
+    let left = list_take(xs, mid)
+    let right = list_drop(xs, mid)
+    list_merge_by(list_sort_by(left, cmp), list_sort_by(right, cmp), cmp)
+  }
+}
+
+# Sort an Int list ascending. Stable, O(n log n). Equivalent to
+# `list_sort_by(xs, int_cmp)`; provided as a thin convenience
+# because Int sorting is the common case.
+pub fn list_sort(xs: [Int]) : [Int] = list_sort_by(xs, int_cmp)
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
