@@ -5443,8 +5443,11 @@ fn fv_expr(x: Expr, own: [String], globals: [String], acc: [String]) : [String] 
       match opt_step { Some(s) -> fv_expr(s, own, globals, acc1) None -> acc1 }
     }
     EBlock(stmts, opt_final) -> {
-      let acc1 = fv_stmts(stmts, own, globals, acc)
-      match opt_final { Some(f) -> fv_expr(f, own, globals, acc1) None -> acc1 }
+      # m7b #18: track the scope as it grows through SLet / SVar so
+      # the optional trailing expression sees the same bindings the
+      # earlier statements introduced.
+      let r = fv_stmts_scoped(stmts, own, globals, acc)
+      match opt_final { Some(f) -> fv_expr(f, r.own, globals, r.acc) None -> r.acc }
     }
     EPipe(a, b) -> fv_expr(b, own, globals, fv_expr(a, own, globals, acc))
     EHole(_) -> acc
@@ -5467,7 +5470,14 @@ fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) :
     [] -> acc
     [c, ...rest] -> match c {
       HC(_, params, body, _, _) -> {
-        let own1 = list_concat_strings(map(params, (pm) => pm.pname), own)
+        # m7b #18: stateful handler clauses see two magic bindings —
+        # `state` and `log` — that the codegen aliases to the
+        # evidence struct's slot. Always include them in `own` so the
+        # free-var collector does not promote them to lambda captures
+        # when the whole `with State[T]` sits inside a closure body
+        # (e.g. desugared `var` inside a lambda).
+        let own_magic = ["state", "log", ...own]
+        let own1 = list_concat_strings(map(params, (pm) => pm.pname), own_magic)
         let acc1 = fv_expr(body, own1, globals, acc)
         fv_hclauses(rest, own, globals, acc1)
       }
@@ -5477,7 +5487,10 @@ fn fv_hclauses(cs: [HClause], own: [String], globals: [String], acc: [String]) :
 
 fn fv_hreturn(r: HReturn, own: [String], globals: [String], acc: [String]) : [String] {
   match r {
-    HR(name, body, _, _) -> fv_expr(body, [name, ...own], globals, acc)
+    # m7b #18: same `state` / `log` magic bindings as in
+    # `fv_hclauses` apply here (Doc C §m7b #11l: stateful return
+    # clauses see the handler-state alias too).
+    HR(name, body, _, _) -> fv_expr(body, [name, "state", "log", ...own], globals, acc)
   }
 }
 
@@ -5499,10 +5512,53 @@ fn fv_arms(arms: [Arm], own: [String], globals: [String], acc: [String]) : [Stri
   match arms {
     [] -> acc
     [a, ...rest] -> match a {
-      Arm(_, opt_g, body) -> {
-        let acc1 = match opt_g { Some(g) -> fv_expr(g, own, globals, acc) None -> acc }
-        fv_arms(rest, own, globals, fv_expr(body, own, globals, acc1))
+      Arm(pat, opt_g, body) -> {
+        # m7b #18: extend `own` with the pattern's bound names so the
+        # guard and body don't treat them as free vars when the arm
+        # sits inside a lambda body.
+        let own1 = pat_bindings(pat, own)
+        let acc1 = match opt_g { Some(g) -> fv_expr(g, own1, globals, acc) None -> acc }
+        fv_arms(rest, own, globals, fv_expr(body, own1, globals, acc1))
       }
+    }
+  }
+}
+
+# m7b #18: collect every name a pattern would bind into the accumulator,
+# mirroring `bind_pat` (resolver) but operating on a [String] instead of
+# an Env. Used by `fv_arms` and `fv_stmts` to keep `let` / pattern-bound
+# names out of a lambda's free-var capture set.
+fn pat_bindings(pat: Pattern, acc: [String]) : [String] {
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PBind(name) -> [name, ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = pat_bindings_loop(pats, acc)
+      match opt_rest {
+        Some(rname) -> [rname, ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> pat_bindings_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_bindings_loop(fields, acc)
+    PRecord(fields) -> pfield_bindings_loop(fields, acc)
+    PHole(_) -> acc
+  }
+}
+
+fn pat_bindings_loop(ps: [Pattern], acc: [String]) : [String] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pat_bindings_loop(rest, pat_bindings(p, acc))
+  }
+}
+
+fn pfield_bindings_loop(fs: [PField], acc: [String]) : [String] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pfield_bindings_loop(rest, pat_bindings(sub, acc))
     }
   }
 }
@@ -5527,9 +5583,31 @@ fn fv_list_elems(es: [ListElem], own: [String], globals: [String], acc: [String]
 }
 
 fn fv_stmts(ss: [Stmt], own: [String], globals: [String], acc: [String]) : [String] {
+  let r = fv_stmts_scoped(ss, own, globals, acc)
+  r.acc
+}
+
+# m7b #18: scoped variant of `fv_stmts` that also returns the scope as
+# extended by every SLet / SVar in the list. Used by `EBlock` so the
+# optional trailing expression sees the bindings introduced earlier in
+# the block.
+type FvScoped = { own: [String], acc: [String] }
+
+fn fv_stmts_scoped(ss: [Stmt], own: [String], globals: [String], acc: [String]) : FvScoped {
   match ss {
-    [] -> acc
-    [s, ...rest] -> fv_stmts(rest, own, globals, fv_stmt(s, own, globals, acc))
+    [] -> FvScoped { own: own, acc: acc }
+    [s, ...rest] -> match s {
+      SLet(pat, _, rhs) -> {
+        let acc1 = fv_expr(rhs, own, globals, acc)
+        let own1 = pat_bindings(pat, own)
+        fv_stmts_scoped(rest, own1, globals, acc1)
+      }
+      SVar(name, _, rhs, _, _) -> {
+        let acc1 = fv_expr(rhs, own, globals, acc)
+        fv_stmts_scoped(rest, [name, ...own], globals, acc1)
+      }
+      _ -> fv_stmts_scoped(rest, own, globals, fv_stmt(s, own, globals, acc))
+    }
   }
 }
 
