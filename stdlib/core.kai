@@ -292,6 +292,33 @@ pub fn list_min_by(xs: [a], key: (a) -> Int) : Option[a] {
   }
 }
 
+# Maps `f` over `xs` and concatenates the results into one list.
+# Equivalent to `list_concat(map(xs, f))` but allocates the
+# intermediate lists in declaration order without the explicit
+# concat traversal at the end. Empty input yields `[]`; an `f`
+# that always returns `[]` also yields `[]`.
+pub fn list_flat_map(xs: [a], f: (a) -> [b]) : [b] {
+  match xs {
+    [] -> []
+    [h, ...t] -> list_append(f(h), list_flat_map(t, f))
+  }
+}
+
+# Zips `xs` and `ys` element-wise through `f`. Terminates at the
+# shorter list — the leftover suffix of the longer one is
+# discarded silently. `f` is invoked exactly `min(length(xs),
+# length(ys))` times. Use cases: parallel-traverse two equal-
+# length lists, or compute pairwise sums / diffs with `f = +`.
+pub fn list_zip_with(xs: [a], ys: [b], f: (a, b) -> c) : [c] {
+  match xs {
+    [] -> []
+    [hx, ...tx] -> match ys {
+      [] -> []
+      [hy, ...ty] -> [f(hx, hy), ...list_zip_with(tx, ty, f)]
+    }
+  }
+}
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
