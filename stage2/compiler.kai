@@ -8043,6 +8043,60 @@ fn ty_to_string(t: Ty) : String {
   }
 }
 
+# m4c #2 — name-mangling helpers for monomorphisation.
+#
+# `mangle_name(name, [Ty]) : String` produces a deterministic,
+# C-identifier-safe name for a polymorphic decl instantiated at a
+# concrete type tuple. The empty tuple maps back to `name` (no
+# instantiation, e.g. fully monomorphic decls). For non-empty tuples
+# the form is `name__mono__T1[__T2...]`, with each `Tn` rendered by
+# `mangle_ty` using bracketed sentinels (`L_..._E` for lists,
+# `_O_..._C` for type-constructor argument lists, `F_..._R_..._E`
+# for function arrows). The sentinels make the encoding unambiguous:
+# `Foo[Bar]` and a hypothetical user fn named `Foo_Bar` cannot
+# collide. Effects are erased — two instantiations that differ only
+# in the row of an inner `TyFnT` mangle the same, by design (Perceus
+# operates on values, not on rows).
+#
+# The mangler errors implicitly on `TyVarT` / `TyAny`: a resolved
+# call-site tuple should not contain unresolved variables. If one
+# slips through the renderer emits `TVAR` / `Any` and the resulting
+# duplicate is caught by the m4c #3 collision check.
+
+fn mangle_ty(t: Ty) : String {
+  match t {
+    TyInt    -> "Int"
+    TyReal   -> "Real"
+    TyBool   -> "Bool"
+    TyString -> "String"
+    TyChar   -> "Char"
+    TyUnit   -> "Unit"
+    TyListT(inner) -> concat_all(["L_", mangle_ty(inner), "_E"])
+    TyFnT(ps, ret, _) -> concat_all([
+      "F_", join_with(map(ps, mangle_ty), "_"),
+      "_R_", mangle_ty(ret), "_E"
+    ])
+    TyCon(cname, tas) -> {
+      match tas {
+        [] -> cname
+        [h, ...rest] -> concat_all([cname, "_O_",
+                                    join_with(map(tas, mangle_ty), "_"),
+                                    "_C"])
+      }
+    }
+    TyVarT(_) -> "TVAR"
+    TyAny     -> "Any"
+  }
+}
+
+fn mangle_name(name: String, tys: [Ty]) : String {
+  match tys {
+    [] -> name
+    [h, ...rest] -> concat_all([name, "__mono__",
+                                join_with(map(tys, mangle_ty), "__")])
+  }
+}
+
 # Render a Row as the ` / Eff1 + Eff2` suffix used in fn-type
 # strings. Empty row → empty string. Open row tail → trailing
 # `+ ?eN`. Each label uses `label_to_string` so type args render.
@@ -11727,6 +11781,30 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
+# ---- `--dump-mono-out`: planned mangled names per call site ----
+#
+# Same input as `--dump-mono` (the resolved-call-site list); output
+# adds the mangled name `mangle_name` would produce for each tuple.
+# Diagnostic for m4c #2; m4c #3 will use these names to mint the
+# specialised decls. Lines look like:
+#   foo@line:col  [Int, Bool]  ->  foo__mono__Int__Bool
+
+fn dump_mono_out_line(cs: ResolvedCS) : Unit {
+  match cs {
+    RCS(nm, line, col, tys) -> {
+      let tys_str = join_with(ty_string_list(tys), ", ")
+      let mname = mangle_name(nm, tys)
+      print("#{nm}@#{int_to_string(line)}:#{int_to_string(col)}  [#{tys_str}]  ->  #{mname}")
+    }
+  }
+}
+
+fn dump_mono_out(file: String, decls: [Decl]) : Int {
+  let r = infer_program(file, decls, false)
+  r.insts |> each(dump_mono_out_line)
+  r.errs
+}
+
 # ---- m4c — monomorphise (identity, m4c #1) ----
 #
 # Sits between `infer_program` and `emit_program*` in the pipeline.
@@ -13932,6 +14010,7 @@ type Mode
   | MCheck
   | MDumpTyped
   | MDumpMono
+  | MDumpMonoOut
   | MHoles
   | MHolesJson
   | MEmitLlvm
@@ -13983,6 +14062,8 @@ fn parse_cli_loop(rest: [String], opts: CliOptions) : CliOptions {
         parse_cli_loop(more, cli_with_mode(opts, MDumpTyped))
       } else if a == "--dump-mono" {
         parse_cli_loop(more, cli_with_mode(opts, MDumpMono))
+      } else if a == "--dump-mono-out" {
+        parse_cli_loop(more, cli_with_mode(opts, MDumpMonoOut))
       } else if a == "--holes" {
         parse_cli_loop(more, cli_with_mode(opts, MHoles))
       } else if a == "--holes-json" {
@@ -14037,6 +14118,7 @@ fn usage() : Unit {
   eprint("  --check            run name resolution and HM inference; report errors and exit")
   eprint("  --dump-typed       run HM inference and dump the typed AST with per-node Ty")
   eprint("  --dump-mono        list call-site instantiations (name, loc, resolved type args)")
+  eprint("  --dump-mono-out    list call-site instantiations with planned mangled monomorphic names")
   eprint("  --holes            report every typed hole (`?` / `?name`) with expected type + scope")
   eprint("  --holes-json       same as --holes, but JSON array for machine consumption")
   eprint("  --strict-holes     treat every unfilled hole as a compilation error (default: warning)")
@@ -14335,6 +14417,10 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
               MDumpMono -> {
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk } else { dump_mono(path, all_decls) }
+              }
+              MDumpMonoOut -> {
+                let chk = check_program(path, all_decls)
+                if chk != 0 { chk } else { dump_mono_out(path, all_decls) }
               }
               MHoles -> {
                 let chk = check_program(path, all_decls)
