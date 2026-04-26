@@ -1546,12 +1546,43 @@ page the way they are written.
      Verified by `m7b_2b_mutable_default` (runtime default) and
      `m7b_2b_mutable_intercept` (user handler). `ref_*` ops
      deferred — kaikai has no surface `Ref[T]` type today.
-   - **#2c — cleanup / Mutable internal migration** (audit; if
-     Doc B's `Unit` shape proves more idiomatic, migrate every
-     `array_*` call in `stage2/compiler.kai` to
-     `Mutable.array_*` and accept `Mutable` in every helper's row
-     via the runtime default). *Pending — scope expanded vs the
-     original plan to include this question.*
+   - **#2c — Mutable internal migration audit**. **Landed as
+     "no migration" decision.** Doc B §`Mutable` *Migration plan*
+     anticipated migrating every prelude `array_*` call inside
+     `stage2/compiler.kai` to `Mutable.array_*` so the compiler's
+     internal helpers also pay `Mutable` in their row (with the
+     runtime default making it transparent). The audit here
+     surfaced a hard blocker:
+
+     **Stage 0 cannot parse effect rows on function signatures.**
+     `stage0/parser.c` only knows `TK_SLASH` as multiplication /
+     division (used in `parse_mul_rest`); there is no `parse_row_suffix`
+     equivalent. Since `stage2/compiler.kai` is parsed by stage 0
+     (then stage 1 and stage 2 in the bootstrap chain), it cannot
+     write `: T / Mutable` in any signature without breaking the
+     stage 0 build.
+
+     Migration would therefore require either:
+     1. teaching stage 0 to parse and ignore effect rows
+        (~stage 0 grammar extension; non-trivial and against the
+        kaikai-minimal spirit);
+     2. waiting for stage 2 to bootstrap from stage 1 only (drop
+        the stage 0 dependency, which is a deliberate architectural
+        choice — see CLAUDE.md "Three-stage bootstrap").
+
+     Neither is in scope for m7. Decision: keep the current shape
+     (compiler uses prelude `array_*` raw, with no Mutable in its
+     row; users get `Mutable.array_*` with full effect tracking).
+     The "two parallel APIs for mutation" cost is transitory —
+     when stage 2 stops being bootstrapped from stage 0, the
+     compiler can migrate to `Mutable.array_*` uniformly.
+
+     Other audit findings:
+     - `Ref[T]` ops in Doc B remain deferred (no surface `Ref[T]`
+       type yet).
+     - The Doc B `array_set : … -> Unit` shape divergence
+       documented in #2b stands; revisit when the bootstrap split
+       changes.
 3. **Trailing lambdas** — pre-resolve desugar pass
    (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
    single trailing, lambda-block as expression, double trailing.
@@ -1742,11 +1773,10 @@ and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
 capture) landed too, surfaced while exercising the polymorphic
 helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
 landed, completing the user-facing surface of the `var` workflow.
-m7b #2a (per-op generics mechanism) and #2b (Mutable
-introduction) both landed; #2c (audit + decide whether to
-migrate the compiler's internal `array_*` calls) remains. The
-remaining m7b items are: #2c, #8 (diagnostic review), #15, #16,
-#17.
+m7b #2a (per-op generics mechanism), #2b (Mutable introduction),
+and #2c (audit, "no migration" decision pinned to stage 0
+parser limitations) all landed. The remaining m7b items are:
+#8 (diagnostic review), #15, #16, #17.
 
 ## Next steps
 
