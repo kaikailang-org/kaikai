@@ -14229,6 +14229,11 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # default-handler setup is gated separately on `main`'s row in
   # `default_setups_for`.
   let mutable_d = inject_unconditional(existing, "Mutable", builtin_mutable_decl())
+  # m8 #9: Link / Monitor — typer-side declarations only in v1; the
+  # runtime registry + cross-fiber delivery land with the m8.x
+  # cooperative scheduler.
+  let link_d    = inject_unconditional(existing, "Link",    builtin_link_decl())
+  let monitor_d = inject_unconditional(existing, "Monitor", builtin_monitor_decl())
   # m8 #2: Spawn ships the canonical pinning point op `yield()`. The
   # full op set (spawn / await / select / cancel) lands in #3, after
   # the per-op-generics shape is settled. inject_unconditional so the
@@ -14263,7 +14268,9 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                   list_append(mutable_d,
                     list_append(spawn_d,
                       list_append(cancel_d,
-                        list_append(actor_d, decls))))))))))))
+                        list_append(actor_d,
+                          list_append(link_d,
+                            list_append(monitor_d, decls))))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14316,7 +14323,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor", "Link", "Monitor"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14454,6 +14461,40 @@ fn builtin_actor_decl() : Decl =
            param_typed_zero("msg", ty_name_zero("Msg"))],
           ty_name_zero("Unit"), 0, 0),
       EOp("receive", [], [], ty_name_zero("Msg"), 0, 0)
+    ], 0, 0)
+
+# m8 #9: Link — bidirectional supervision. `link(peer)` registers a
+# bidirectional crash-propagation between the current actor and
+# `peer`: if either crashes, the other receives `Cancel.raise()` at
+# its next yield point. v1 declares the type surface but the cross-
+# fiber propagation lands with the m8.x cooperative scheduler — in
+# the inline-eager v1 a child fiber's panic aborts the program before
+# any peer can react. The Doc spec uses `Pid[_]` (existential pid);
+# v1 uses Pid[Nothing] which TyAny-erases the message type, giving
+# the same "any pid" surface without needing existential types in
+# the typer.
+fn builtin_link_decl() : Decl =
+  DEffect(false, "Link", [],
+    [
+      EOp("link", [], [param_typed_zero("peer", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# m8 #9: Monitor — unidirectional supervision. `monitor(target)`
+# registers the current actor as an observer of `target`; when
+# `target` terminates, a `MonitorDown(ref, cause)` message is
+# delivered to the observer's own mailbox. `demonitor(ref)`
+# withdraws the subscription. v1 declares the type surface; the
+# runtime registry + delivery on termination land with the m8.x
+# scheduler. Demos exercise the supervision *pattern* through the
+# Actor[Msg] mailbox + spawn primitives directly.
+fn builtin_monitor_decl() : Decl =
+  DEffect(false, "Monitor", [],
+    [
+      EOp("monitor", [], [param_typed_zero("target", ty_named_zero("Pid", [ty_name_zero("Nothing")]))],
+          ty_name_zero("MonitorRef"), 0, 0),
+      EOp("demonitor", [], [param_typed_zero("ref", ty_name_zero("MonitorRef"))],
+          ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 # m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
