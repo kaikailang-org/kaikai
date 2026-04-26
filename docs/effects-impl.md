@@ -1564,9 +1564,11 @@ page the way they are written.
    Without both, the helpers either fail to type-check or only
    work for monomorphic body types — and the brief explicitly
    asks for nested distinct instantiations
-   (`Reader[Int]` inside `Reader[String]`). Promotion to
-   `stdlib/reader.kai` and `stdlib/writer.kai` resumes once
-   #13 and #14 land. *Pending.*
+   (`Reader[Int]` inside `Reader[String]`). **Unblocked** as of
+   #13 + #14; promotion to `stdlib/reader.kai` and
+   `stdlib/writer.kai` is now mechanical — the polymorphic helpers
+   already work end-to-end on inline lambda bodies (see
+   `examples/effects/m7b_14_*_helper.kai`). *Pending.*
 8. **Diagnostic review** — every message rewritten against the
    stage 2 §8 bar. *Lands last.*
 9. **`|` map pipe** — binary operator wired in the parser,
@@ -1623,26 +1625,27 @@ page the way they are written.
     via `add_infer_params_with_binds`. Same HM machinery as the
     pre-existing builtin polymorphic prelude functions
     (`array_make`, `list_append`, etc.); the gap was only at the
-    user-fn entry point. Lambdas with effect rows still hit #14,
-    so polymorphic helper bodies must be passed by name until #14
-    lands. **Landed.**
-14. **Lambda effect rows** — `synth_lambda`
-    (`stage2/compiler.kai:9846`) builds the lambda's type as
-    `fn_ty(args, ret)` with no row slot, so effects invoked
-    inside the body (`Reader.ask()`, `Writer.tell(...)`) accumulate
-    on the *enclosing* function's `st.row` rather than on the
-    lambda's own type. `repeat(3) { Console.print("hi") }`
-    appears to work today only because `Console` is default-
-    handled and main happens to declare it — the leak is
-    benign. For effects without default handlers (`Reader[T]`,
-    `Writer[W]`) and for any callee that wants to *contain*
-    the effect of its body argument (every handler-runner
-    helper), the lambda must carry the effect in its own type
-    so the unification of `() -> S / Reader[T]` with the lambda
-    type binds the row correctly. Required for #7. Surfaced
-    by the 2026-04-25 attempt at #7. Likely needs companion
-    work in codegen (lambdas with non-empty rows must close
-    over the handler stack accordingly). Blocker of #7. *Pending.*
+    user-fn entry point. **Landed.**
+14. **Lambda effect rows** — effects invoked inside a lambda body
+    now stay in the lambda type's own row instead of leaking to the
+    enclosing function. Surfaced by the 2026-04-25 attempt at #7.
+    Implementation: `synth_lambda` snapshots the enclosing row,
+    swaps it for `[]` while walking the body, then restores the
+    snapshot — same pattern as `synth_handle`. The captured body
+    row becomes the closed `Row` attached to the `TyFnT` lambda
+    type via a new `labels_to_closed_row` helper. Callers get the
+    effect through normal call-site row propagation (`EApp` of a
+    fn-typed value already merges the callee's row into the
+    enclosing scope), so no codegen change was needed; the runtime
+    handler stack is already a per-fiber dynamic-scope mechanism
+    independent of the lambda type. `eff_uses` (per-label first-use
+    diagnostics) intentionally stays unscoped so error spans still
+    point at the right call. Combined with #13 this enables Doc B's
+    polymorphic helper shapes (`with_state[T, S]`,
+    `with_reader[T, S]`, `with_writer[W]`) applied to inline lambda
+    bodies. Verified end-to-end with `m7b_14_state_helper.kai`,
+    `m7b_14_reader_helper.kai`, `m7b_14_writer_helper.kai`.
+    **Landed.**
 15. **Per-instance handler dispatch** — runtime
     `kai_evidence_lookup_node(name)` is name-keyed + LIFO, so
     nested `var`s of the same effect+ty_args shadow innermost-wins
@@ -1681,11 +1684,12 @@ by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
 helper. m7b #5b (`var` → `State[T]` desugar) landed; #15, #16,
 and #17 are the three known gaps it left behind, promoted from
-the §*Known follow-ups after m7b #5b* subsection. m7b #13
-(fn-level type parameters) landed; #7 still blocks on #14
-(lambda effect rows). The remaining m7b items are: #2 (per-op
-generics), #4 (`@cap` / `cap := v` sugar), #7 (blocked on #14),
-#8 (diagnostic review), #14, #15, #16, #17.
+the §*Known follow-ups after m7b #5b* subsection. m7b #13 and
+#14 both landed; #7 is now fully unblocked — promotion of
+`with_reader[T, S]` / `with_writer[W]` from `examples/effects/`
+fixtures into `stdlib/` is mechanical. The remaining m7b items
+are: #2 (per-op generics), #4 (`@cap` / `cap := v` sugar),
+#7 (unblocked), #8 (diagnostic review), #15, #16, #17.
 
 ## Next steps
 
