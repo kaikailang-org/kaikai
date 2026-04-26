@@ -104,11 +104,71 @@ struct KaiValue {
 /* Forward declarations used across sections. */
 static int       kai_truthy(KaiValue *v);
 
+/* Refcount tracing (m5 #0): always-compiled counters; the per-process
+   report at exit is gated on the env var KAI_TRACE_RC. The counters
+   add 4 increments per kai_alloc and 2 per kai_free_value — cheap
+   enough that the always-on path costs ~ns per allocation, but small
+   enough that we keep them on rather than ifdef'ing them in/out
+   (otherwise a measurement run would need a runtime rebuild). */
+static int64_t kai_rc_alloc_total = 0;
+static int64_t kai_rc_free_total  = 0;
+static int64_t kai_rc_live_now    = 0;
+static int64_t kai_rc_live_peak   = 0;
+static int64_t kai_rc_alloc_by_tag[16] = {0};
+
+static const char *kai_rc_tag_name(int t) {
+    switch (t) {
+        case KAI_UNIT:    return "unit";
+        case KAI_BOOL:    return "bool";
+        case KAI_INT:     return "int";
+        case KAI_REAL:    return "real";
+        case KAI_CHAR:    return "char";
+        case KAI_STR:     return "str";
+        case KAI_NIL:     return "nil";
+        case KAI_CONS:    return "cons";
+        case KAI_RECORD:  return "record";
+        case KAI_VARIANT: return "variant";
+        case KAI_CLOSURE: return "closure";
+        case KAI_ARRAY:   return "array";
+        default:          return "?";
+    }
+}
+
+static void kai_rc_report(void) {
+    if (!getenv("KAI_TRACE_RC")) return;
+    int64_t leaked = kai_rc_alloc_total - kai_rc_free_total;
+    fprintf(stderr,
+        "[KAI_TRACE_RC] alloc_total=%lld free_total=%lld leaked=%lld live_peak=%lld\n",
+        (long long) kai_rc_alloc_total,
+        (long long) kai_rc_free_total,
+        (long long) leaked,
+        (long long) kai_rc_live_peak);
+    for (int i = 0; i < 16; i++) {
+        if (kai_rc_alloc_by_tag[i] > 0) {
+            fprintf(stderr, "[KAI_TRACE_RC]   tag %-7s allocs=%lld\n",
+                    kai_rc_tag_name(i),
+                    (long long) kai_rc_alloc_by_tag[i]);
+        }
+    }
+}
+
+static int kai_rc_registered = 0;
+static void kai_rc_register_once(void) {
+    if (kai_rc_registered) return;
+    kai_rc_registered = 1;
+    atexit(kai_rc_report);
+}
+
 static KaiValue *kai_alloc(KaiTag tag) {
     KaiValue *v = (KaiValue *) calloc(1, sizeof(KaiValue));
     if (!v) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
     v->rc = 1;
     v->tag = (int32_t) tag;
+    /* trace */
+    kai_rc_alloc_total++;
+    kai_rc_live_now++;
+    if (kai_rc_live_now > kai_rc_live_peak) kai_rc_live_peak = kai_rc_live_now;
+    if ((int) tag >= 0 && (int) tag < 16) kai_rc_alloc_by_tag[(int) tag]++;
     return v;
 }
 
@@ -144,6 +204,9 @@ static void kai_free_value(KaiValue *v) {
         default: break;
     }
     free(v);
+    /* trace */
+    kai_rc_free_total++;
+    kai_rc_live_now--;
 }
 
 static void kai_decref(KaiValue *v) {
@@ -835,6 +898,11 @@ static char       **kai_g_argv = NULL;
 static void kai_set_args(int argc, char **argv) {
     kai_g_argc = argc;
     kai_g_argv = argv;
+    /* Lazy registration: kai_set_args runs once at program start from
+       the emitted main wrapper. atexit fires only when the env var
+       gates a report, so the side effect is harmless when tracing is
+       off. Keeps the emitter unchanged — no new emit site needed. */
+    kai_rc_register_once();
 }
 
 static KaiValue *kai_prelude_args(void) {
