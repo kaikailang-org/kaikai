@@ -1511,10 +1511,33 @@ static KaiValue *kai_default_spawn_cancel(void *self, KaiValue *fib_v, KaiCont *
     (void) self;
     if (fib_v && fib_v->tag == KAI_FIBER && fib_v->as.fib) {
         fib_v->as.fib->cancel_requested = 1;
-        /* m8 #4 will turn this flag into a Cancel.raise() at the
-         * next op-call boundary on that fiber. v1 just records it. */
+        /* m8 #4 records the flag; the cooperative-yield delivery
+         * (inject Cancel.raise() at the next op-call boundary on
+         * that fiber) lands together with the m8.x ucontext or
+         * full-CPS scheduler. In the inline-eager v1, the target
+         * fiber is already DONE by the time cancel runs, so the
+         * flag is harmless — Spawn.cancel + Cancel still type-
+         * check correctly so user code can be written against the
+         * final API. */
     }
     return kai_cont_resume(k, kai_unit());
+}
+
+/* m8 #4: default Cancel.raise handler. Doc B §`Cancel`/Default
+ * handler: an unhandled Cancel.raise() unwinds the fiber cleanly
+ * (the runtime delivers "no silent survivors"). v1 mirrors Fail's
+ * default: write a banner + exit(0). A user-installed handler
+ * (`with Cancel { raise(resume) -> cleanup }`) discards resume and
+ * the m7a #6e setjmp/longjmp pair unwinds to the wrapping handle —
+ * that is the actual "fiber unwinds out of the wrapped block"
+ * semantics from Doc B §*Handling for cleanup*. The exit code is 0
+ * (not 1 like Fail) because cancellation is an expected termination
+ * path, not a programmer error. */
+static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
+    (void) self;
+    (void) k;
+    fputs("kai: Cancel.raise: unhandled (fiber cancelled)\n", stderr);
+    exit(0);
 }
 
 /* (typedef forward-declared above, before KaiFiber.) */

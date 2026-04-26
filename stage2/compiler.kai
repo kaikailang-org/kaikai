@@ -6684,6 +6684,20 @@ fn default_mutable_setup() : String =
     "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
   ])
 
+# m8 #4: emit EvCancel + push it between the I/O group and Spawn
+# (Doc B §*Installation order*). Single op `raise()`. The default
+# resumes by exiting the program; user-installed Cancel handlers
+# can wrap a region to run cleanup before the unwind escapes the
+# wrapping `handle` block.
+fn default_cancel_setup() : String =
+  concat_all([
+    "    static EvCancel _kai_default_ev_cancel;\n",
+    "    static KaiEvidence _kai_default_node_cancel;\n",
+    "    _kai_default_ev_cancel.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_cancel.raise = (KaiValue *(*)(EvCancel *, KaiCont *)) &kai_default_cancel_raise;\n",
+    "    kai_evidence_push(&_kai_default_node_cancel, \"Cancel\", &_kai_default_ev_cancel);\n"
+  ])
+
 # m8 #2/#3: emit EvSpawn + push it as the innermost default-handler
 # node (Doc B §*Installation order*: Spawn sits closest to main,
 # Cancel the layer below it, the I/O group below that). Wires all
@@ -6702,11 +6716,12 @@ fn default_spawn_setup() : String =
     "    kai_evidence_push(&_kai_default_node_spawn, \"Spawn\", &_kai_default_ev_spawn);\n"
   ])
 
-# m7a #7 + m7b #2b + m8 #2: assemble the full setup block for the
+# m7a #7 + m7b #2b + m8 #2/#4: assemble the full setup block for the
 # builtins listed in `main`'s row. Push order Console → Fail → Stdin →
-# Env → File → Mutable → Spawn matches Doc B §*Installation order*:
-# Spawn is innermost (last pushed, first looked up); Cancel will sit
-# between Mutable and Spawn once it lands in m8 #4.
+# Env → File → Mutable → Cancel → Spawn matches Doc B §*Installation
+# order*: Spawn innermost (last pushed, first looked up); Cancel the
+# layer below it (root nursery flags fibers, Cancel handler unwinds);
+# Mutable below Cancel (I/O cluster).
 fn default_setups_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Console") { default_console_setup() } else { "" },
@@ -6715,6 +6730,7 @@ fn default_setups_for(main_row: [String]) : String =
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
     if list_has(main_row, "File")    { default_file_setup() }    else { "" },
     if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" },
+    if list_has(main_row, "Cancel")  { default_cancel_setup() }  else { "" },
     if list_has(main_row, "Spawn")   { default_spawn_setup() }   else { "" }
   ])
 
@@ -6722,6 +6738,7 @@ fn default_setups_for(main_row: [String]) : String =
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Spawn")   { "    kai_evidence_pop();\n" } else { "" },
+    if list_has(main_row, "Cancel")  { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
@@ -14122,6 +14139,15 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # Console/Stdin/Env/File/Fail; that is an m7a #7 follow-up, not m8
   # scope.)
   let spawn_d   = inject_unconditional(existing, "Spawn",  builtin_spawn_decl())
+  # m8 #4: Cancel — single op `raise() : Nothing`. Same
+  # decoupling as Spawn: the typer always knows about it (so user-
+  # written cleanup handlers `with Cancel { raise(_) -> ... }`
+  # compile), but the runtime default-handler push is gated on main's
+  # row in default_setups_for. Per Doc B §*Installation order*,
+  # Cancel sits between the I/O group and Spawn (the root nursery
+  # is what flags fibers for cancellation, but the Cancel handler
+  # itself is the unwind target).
+  let cancel_d  = inject_unconditional(existing, "Cancel", builtin_cancel_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
@@ -14131,7 +14157,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
               list_append(reader_d,
                 list_append(writer_d,
                   list_append(mutable_d,
-                    list_append(spawn_d, decls))))))))))
+                    list_append(spawn_d,
+                      list_append(cancel_d, decls)))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14184,7 +14211,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14297,6 +14324,20 @@ fn builtin_mutable_decl() : Decl =
            param_typed_zero("init", ty_name_zero("T"))],
           ty_named_zero("Array", [ty_name_zero("T")]),
           0, 0)
+    ], 0, 0)
+
+# m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
+# The default handler exits the program with a banner; user code
+# installs its own `with Cancel { raise(resume) -> cleanup }` to
+# catch the unwind and run cleanup. Cooperative-yield delivery
+# (the scheduler injecting Cancel.raise() at the next op-call
+# boundary) lands together with the m8.x ucontext or full-CPS
+# scheduler. Six-field EOp shape (op_tparams = [], no per-op
+# generics).
+fn builtin_cancel_decl() : Decl =
+  DEffect(false, "Cancel", [],
+    [
+      EOp("raise", [], [], ty_name_zero("Nothing"), 0, 0)
     ], 0, 0)
 
 # m8 #2/#3: Spawn — non-parametric effect. Per Doc B §`Spawn`, the

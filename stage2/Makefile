@@ -820,6 +820,43 @@ test-effects: $(TARGET) build
 	    && grep -q "^after await$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (effect row propagates through fiber_spawn)" \
 	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  grep -q "kai_default_cancel_raise" build/s2-$$name.c \
+	    && grep -q "kai_evidence_push(&_kai_default_node_cancel" build/s2-$$name.c \
+	    || { echo "effects FAIL $$name (default-Cancel wiring missing)"; cat build/s2-$$name.c; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.run.err; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "effects FAIL $$name (default Cancel should exit 0, got $$rc)"; exit 1; \
+	  fi; \
+	  grep -q "^before raise$$" build/s2-$$name.out \
+	    || { echo "effects FAIL $$name (output before raise missing)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "Cancel.raise: unhandled" build/s2-$$name.run.err \
+	    && echo "effects OK $$name (default Cancel: banner + exit 0)" \
+	    || { echo "effects FAIL $$name (banner missing on stderr)"; cat build/s2-$$name.run.err; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_4_cancel_caught.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; exit 1; }; \
+	  grep -q "^before handle$$" build/s2-$$name.out \
+	    && grep -q "^inside handle$$" build/s2-$$name.out \
+	    && grep -q "^cleanup ran$$" build/s2-$$name.out \
+	    && grep -q "^after handle$$" build/s2-$$name.out \
+	    && grep -q "^42$$" build/s2-$$name.out \
+	    && grep -v "^never reached$$" build/s2-$$name.out > /dev/null \
+	    && echo "effects OK $$name (with Cancel handler unwinds + clause value returned)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done
 
 # m7b — syntax sugars. Currently covers m7b #3 (trailing lambdas,
