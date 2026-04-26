@@ -110,6 +110,63 @@ pub fn list_map_indexed_loop(xs: [a], f: (Int, a) -> b, i: Int) : [b] {
 pub fn list_map_indexed(xs: [a], f: (Int, a) -> b) : [b] =
   list_map_indexed_loop(xs, f, 0)
 
+# Returns `Some(first)` for a non-empty list, `None` otherwise. O(1)
+# and total — never panics. Distinct from `list_nth(xs, 0)` only in
+# clarity at call sites.
+pub fn list_head(xs: [a]) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(h)
+  }
+}
+
+# Returns `Some(rest)` for a non-empty list, `None` for `[]`.
+# Shares structure with `xs`; no allocation. Distinct from
+# `list_drop(xs, 1)` which returns `[]` for an empty list rather
+# than `None` — `list_tail` preserves the empty-vs-non-empty
+# distinction.
+pub fn list_tail(xs: [a]) : Option[[a]] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(t)
+  }
+}
+
+# Returns a list of `n` copies of `x`. `n <= 0` yields `[]`.
+# Allocates `n` cons cells; the element `x` is shared, not
+# duplicated, so mutating `x` after the call (only possible via
+# the `Array[T]` escape) would be visible through every position.
+pub fn list_repeat(x: a, n: Int) : [a] {
+  if n <= 0 { [] }
+  else { [x, ...list_repeat(x, n - 1)] }
+}
+
+# Tail-recursive accumulator for `list_count`. Internal.
+pub fn list_count_loop(xs: [a], p: (a) -> Bool, acc: Int) : Int {
+  match xs {
+    [] -> acc
+    [h, ...t] -> if p(h) { list_count_loop(t, p, acc + 1) }
+                 else    { list_count_loop(t, p, acc) }
+  }
+}
+
+# Counts how many elements of `xs` satisfy `p`. O(n); empty list
+# yields 0. `p` is invoked exactly once per element.
+pub fn list_count(xs: [a], p: (a) -> Bool) : Int =
+  list_count_loop(xs, p, 0)
+
+# Returns true iff some element of `xs` is structurally equal to
+# `x` per the runtime's recursive `==`. Short-circuits on the
+# first match. Note that closures are never equal (the runtime
+# returns false), so `list_contains` over a list of closures is
+# always false.
+pub fn list_contains(xs: [a], x: a) : Bool {
+  match xs {
+    [] -> false
+    [h, ...t] -> if h == x { true } else { list_contains(t, x) }
+  }
+}
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
