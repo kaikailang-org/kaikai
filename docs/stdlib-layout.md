@@ -123,6 +123,8 @@ stdlib/
   decimal.kai    pure, stage 2 (top-level module)
   money.kai      pure, stage 2 (top-level module; depends on decimal)
   loop.kai       row-polymorphic, stage 2 (top-level module: while, until, repeat, forever)
+  reader.kai     effect: Reader[T] (top-level module: with_reader)
+  writer.kai     effect: Writer[W] (top-level module: with_writer)
   io.kai         effects: Console, Stdin (top-level module)
   fs/            effect: File
     file.kai

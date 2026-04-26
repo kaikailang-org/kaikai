@@ -1551,24 +1551,20 @@ page the way they are written.
 7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
    §*Open questions* #2 resolved in their favour). The effect
    declarations are builtin-injected by `inject_builtin_effects`
-   and the inline `handle ... with Reader[T]` / `with Writer[W]`
-   forms work end-to-end as #11 fixtures
-   (`examples/effects/m7b_11_reader_basic.kai`,
-   `m7b_11_writer_basic.kai`). **Blocked on #13 + #14** —
-   surfaced by a 2026-04-25 attempt at #7: Doc B's required
-   helpers `with_reader[T, S](env, body) : S` and
-   `with_writer[W, S](body) : (S, [W])` need (a) polymorphic
-   user-function signatures (`fn name[T, S](...)`, see #13) and
-   (b) lambda bodies that carry their effect row in their own
-   type rather than leaking it to the enclosing function (#14).
-   Without both, the helpers either fail to type-check or only
-   work for monomorphic body types — and the brief explicitly
-   asks for nested distinct instantiations
-   (`Reader[Int]` inside `Reader[String]`). **Unblocked** as of
-   #13 + #14; promotion to `stdlib/reader.kai` and
-   `stdlib/writer.kai` is now mechanical — the polymorphic helpers
-   already work end-to-end on inline lambda bodies (see
-   `examples/effects/m7b_14_*_helper.kai`). *Pending.*
+   (since #11); `stdlib/reader.kai` and `stdlib/writer.kai` ship
+   the `with_reader[T, S]` / `with_writer[W]` helpers Doc B
+   mandates so users do not have to inline
+   `handle ... with Reader[T] { ... }` at every call site.
+   Initially blocked on #13 + #14 (surfaced by the 2026-04-25
+   attempt — polymorphic helpers need fn-level type parameters
+   AND lambda bodies that carry their own row); both landed,
+   then this finished. `with_writer` returns just `[W]` rather
+   than the Doc B `(S, [W])` shape because kaikai does not yet
+   have a tuple type at the surface — harvest the body's value
+   via `var` or a closure if needed; tuple form is a follow-up.
+   Test wired into `test-reader` and `test-writer` (Makefile);
+   examples in `examples/reader/` and `examples/writer/`.
+   **Landed.**
 8. **Diagnostic review** — every message rewritten against the
    stage 2 §8 bar. *Lands last.*
 9. **`|` map pipe** — binary operator wired in the parser,
@@ -1684,12 +1680,10 @@ by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
 helper. m7b #5b (`var` → `State[T]` desugar) landed; #15, #16,
 and #17 are the three known gaps it left behind, promoted from
-the §*Known follow-ups after m7b #5b* subsection. m7b #13 and
-#14 both landed; #7 is now fully unblocked — promotion of
-`with_reader[T, S]` / `with_writer[W]` from `examples/effects/`
-fixtures into `stdlib/` is mechanical. The remaining m7b items
-are: #2 (per-op generics), #4 (`@cap` / `cap := v` sugar),
-#7 (unblocked), #8 (diagnostic review), #15, #16, #17.
+the §*Known follow-ups after m7b #5b* subsection. m7b #13, #14,
+and #7 all landed in sequence after #5b. The remaining m7b
+items are: #2 (per-op generics), #4 (`@cap` / `cap := v` sugar),
+#8 (diagnostic review), #15, #16, #17.
 
 ## Next steps
 
