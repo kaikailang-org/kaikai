@@ -1386,16 +1386,36 @@ struct KaiEvidence {
 typedef struct KaiFiber KaiFiber;
 struct KaiFiber {
     KaiEvidence *evidence_top;
-    /* Future: per-fiber stack/heap/scheduler links land here. */
+    /* m8 #1: scheduler scaffolding. The fields are zero on the
+     * implicit kai_main_fiber and stay zero until m8 #2/#3 wire the
+     * Spawn handler + cooperative scheduler that actually populate
+     * them. Layout pinned now so emitted EvSpawn structs and any
+     * helper that takes a KaiFiber * compile against the final
+     * shape from the start. */
+    int             cancel_requested;  /* set by Spawn.cancel(target) (#4) */
+    int             cancel_delivered;  /* set after Cancel.raise() injected once (#4) */
+    KaiFiber       *sched_next;        /* intrusive ready-queue link (#3) */
+    KaiFiber       *parent;            /* spawning fiber, NULL for the root (#3) */
 };
 
-/* m7a #5: single implicit fiber. m8's scheduler will hand back
- * the current fiber instead of returning &kai_main_fiber. */
-static KaiFiber kai_main_fiber = { NULL };
+/* m7a #5: single implicit fiber. m8's real scheduler (#3) replaces
+ * kai_current_fiber's body with a "current of the run-queue" lookup;
+ * the function signature stays the same so every m7a call site
+ * (kai_evidence_push / pop / lookup) keeps working unchanged. */
+static KaiFiber kai_main_fiber = { NULL, 0, 0, NULL, NULL };
 
 static KaiFiber *kai_current_fiber(void) {
     return &kai_main_fiber;
 }
+
+/* m8 #1: ready queue. Empty until #3 enqueues spawned fibers; the
+ * head/tail pair lets enqueue (tail) and dequeue (head) stay O(1)
+ * without traversing on the cooperative single-thread scheduler.
+ * Doc B §`Spawn` defers the policy choice to Doc C; FIFO is the
+ * simplest one that satisfies the structured-concurrency drain
+ * semantics. */
+static KaiFiber *kai_ready_head = NULL;
+static KaiFiber *kai_ready_tail = NULL;
 
 /* Push an Evidence node onto the current fiber's stack. The caller
  * owns the node's storage — typically `alloca`'d inside a compiled
