@@ -1015,8 +1015,12 @@ type Decl
   | DEffect(Bool, String, [String], [EffectOp], Int, Int)
 
 # An operation declared inside an `effect Eff { ... }` block.
-# name(params) : ret_ty — no body, no `fn` keyword.
-type EffectOp = EOp(String, [Param], TypeExpr, Int, Int)
+# name[op_tparams](params) : ret_ty — no body, no `fn` keyword.
+# m7b #2: per-op type generics. `op_tparams` is the optional
+# `[T1, T2]` between op name and `(args)`. Empty for monomorphic
+# ops; non-empty when the op signature itself quantifies over
+# types (Doc B §`Mutable`'s `array_get[T]`, etc.).
+type EffectOp = EOp(String, [String], [Param], TypeExpr, Int, Int)
 
 # TBEffectAlias holds a closed sum of effect labels, e.g.
 # `type Io = Console + Stdin + Env + File` (m7b #1). The body is a
@@ -3239,10 +3243,23 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps {
     } else {
       let opname = tok_source(p0.src, id)
       let p1 = p_advance(p0)
-      if not p_at(p1, TkLparen) {
-        PEffectOps { p: p_error_here(p1, "expected `(` after operation name"), r: None }
-      } else {
-        let p2 = p_skip_newlines(p_advance(p1))
+      # m7b #2: optional `[T1, T2]` op-level tparams before `(args)`.
+      # Reuses parse_type_params_loop (m7b #11 / m7a effects). Empty
+      # when omitted; the op signature is then monomorphic.
+      let op_tparams_r =
+        if p_at(p1, TkLbracket) {
+          parse_type_params_loop(p_skip_newlines(p_advance(p1)), [])
+        } else {
+          PTParams { p: p1, r: Some([]) }
+        }
+      match op_tparams_r.r {
+        None -> PEffectOps { p: op_tparams_r.p, r: None }
+        Some(op_tparams) -> {
+          let pp = op_tparams_r.p
+          if not p_at(pp, TkLparen) {
+            PEffectOps { p: p_error_here(pp, "expected `(` after operation name"), r: None }
+          } else {
+        let p2 = p_skip_newlines(p_advance(pp))
         let params_r = parse_fn_params(p2, [])
         match params_r.r {
           None -> PEffectOps { p: params_r.p, r: None }
@@ -3255,11 +3272,13 @@ fn parse_effect_ops(p: Parser, acc: [EffectOp]) : PEffectOps {
               match rt.r {
                 None -> PEffectOps { p: rt.p, r: None }
                 Some(ty) -> {
-                  let op = EOp(opname, params, ty, id.line, id.col)
+                  let op = EOp(opname, op_tparams, params, ty, id.line, id.col)
                   parse_effect_ops(rt.p, [op, ...acc])
                 }
               }
             }
+          }
+        }
           }
         }
       }
@@ -3991,8 +4010,9 @@ fn dump_decl(d: Decl, depth: Int) : Unit {
 
 fn dump_effect_op(op: EffectOp, depth: Int) : Unit {
   match op {
-    EOp(name, params, ret, line, col) -> {
+    EOp(name, op_tparams, params, ret, line, col) -> {
       emit_line(depth, "op \"#{name}\" @#{int_to_string(line)}:#{int_to_string(col)}")
+      op_tparams |> each((tp) => emit_line(depth + 1, "op_tparam #{tp}"))
       params |> each((pm) => dump_param(pm, depth + 1))
       dump_type(ret, depth + 1)
     }
@@ -5936,7 +5956,7 @@ fn op_qualified_names_for(eff_name: String, ops: [EffectOp], acc: [String]) : [S
   match ops {
     [] -> acc
     [o, ...rest] -> match o {
-      EOp(op_name, _, _, _, _) ->
+      EOp(op_name, _, _, _, _, _) ->
         op_qualified_names_for(eff_name, rest,
           [string_concat(eff_name, string_concat(".", op_name)), ...acc])
     }
@@ -6345,7 +6365,7 @@ fn emit_op_fn_ptr_args(params: [Param]) : String {
 
 fn emit_op_fn_ptr(eff_name: String, op: EffectOp) : String {
   match op {
-    EOp(op_name, params, _, _, _) ->
+    EOp(op_name, _, params, _, _, _) ->
       concat_all([
         "    KaiValue *(*", op_name, ")(Ev", eff_name, " *self",
         emit_op_fn_ptr_args(params),
@@ -8227,6 +8247,11 @@ fn tparam_ids_loop(tparams: [String], i: Int, acc: [Int]) : [Int] {
 
 fn tparam_ids(tparams: [String]) : [Int] = tparam_ids_loop(tparams, 0, [])
 
+# m7b #2: same as tparam_ids but starts numbering from `start` so a
+# nested set of tparams (op-level on top of effect-level) gets a
+# disjoint id range.
+fn tparam_ids_from(tparams: [String], start: Int) : [Int] = tparam_ids_loop(tparams, start, [])
+
 # Resolve a TypeExpr under a mapping from tparam name to its TyVarT id.
 # The mapping is itself an association list for now.
 type TPBind = TPB(String, Int)
@@ -8274,6 +8299,25 @@ fn mk_tpbinds_loop(tparams: [String], i: Int, acc: [TPBind]) : [TPBind] {
 }
 
 fn mk_tpbinds(tparams: [String]) : [TPBind] = mk_tpbinds_loop(tparams, 0, [])
+
+# m7b #2: same as mk_tpbinds but starts ids at `start`. Used to
+# combine effect-level and op-level tparams into a single binding
+# context with disjoint ids.
+fn mk_tpbinds_from(tparams: [String], start: Int) : [TPBind] = mk_tpbinds_loop(tparams, start, [])
+
+fn append_tpbinds(a: [TPBind], b: [TPBind]) : [TPBind] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_tpbinds(rest, b)]
+  }
+}
+
+fn append_ints(a: [Int], b: [Int]) : [Int] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_ints(rest, b)]
+  }
+}
 
 fn scheme_of_variant(type_name: String, tparams: [String], v: Variant) : TyScheme {
   match v {
@@ -8494,21 +8538,32 @@ fn fn_scheme_of_decl(d: Decl) : Option[TyScheme] {
   }
 }
 
-fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
+fn add_decls_loop(env: TyEnv, ar_acc: [OpEffArity], ds: [Decl]) : EnvWithArities {
   match ds {
-    [] -> env
+    [] -> EnvWithArities { env: env, arities: ar_acc }
     [d, ...rest] -> {
-      let env1 = match d {
+      let r = match d {
         DFn(_, fname, _, _, _, _, _, _, _) -> match fn_scheme_of_decl(d) {
-          Some(sc) -> ty_env_add(env, fname, sc)
-          None     -> env
+          Some(sc) -> EnvWithArities { env: ty_env_add(env, fname, sc), arities: ar_acc }
+          None     -> EnvWithArities { env: env, arities: ar_acc }
         }
-        DType(_, _, _, _, _, _) -> add_variants_of_decl(env, d)
-        DEffect(_, eff_name, tparams, ops, _, _) -> add_effect_op_sigs(env, eff_name, tparams, ops)
-        _ -> env
+        DType(_, _, _, _, _, _) -> EnvWithArities { env: add_variants_of_decl(env, d), arities: ar_acc }
+        DEffect(_, eff_name, tparams, ops, _, _) -> {
+          let r2 = add_effect_op_sigs(env, eff_name, tparams, ops)
+          # m7b #2: merge per-effect arities into the running accumulator.
+          EnvWithArities { env: r2.env, arities: append_op_arities(r2.arities, ar_acc) }
+        }
+        _ -> EnvWithArities { env: env, arities: ar_acc }
       }
-      add_decls_loop(env1, rest)
+      add_decls_loop(r.env, r.arities, rest)
     }
+  }
+}
+
+fn append_op_arities(a: [OpEffArity], b: [OpEffArity]) : [OpEffArity] {
+  match a {
+    [] -> b
+    [h, ...rest] -> [h, ...append_op_arities(rest, b)]
   }
 }
 
@@ -8517,35 +8572,48 @@ fn add_decls_loop(env: TyEnv, ds: [Decl]) : TyEnv {
 # op), args)`, it looks up that key and treats the call as an op
 # invocation. Per-op type generics (m7b) will replace the monomorphic
 # scheme with one that carries the op's own quantifiers.
+type EnvWithArities = { env: TyEnv, arities: [OpEffArity] }
+
 fn add_effect_op_sigs(env: TyEnv, eff_name: String, tparams: [String],
-                       ops: [EffectOp]) : TyEnv {
+                       ops: [EffectOp]) : EnvWithArities {
   let binds = mk_tpbinds(tparams)
   let ids = tparam_ids(tparams)
-  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops)
+  add_effect_op_sigs_loop(env, eff_name, binds, ids, ops, [])
 }
 
-# m7b #11: register each op of `Eff[T1, T2]` under the dotted key
-# `Eff.op` with a polymorphic scheme that quantifies over the
-# effect's type parameters. The bound vars are the `tparam_ids`,
-# substituted into every op's parameter and return types via
-# `resolve_ty_with_tparams`. Stateless effects (no tparams) yield
-# the same monomorphic scheme as before.
+# m7b #11 + m7b #2: register each op of `Eff[T1, T2]` under the
+# dotted key `Eff.op` with a polymorphic scheme that quantifies
+# over BOTH the effect's type parameters AND the op's own
+# per-op tparams (`op[U](...)` from m7b #2). Op tparam ids are
+# allocated from `next_id` so they never collide with effect
+# tparams. Stateless effects with monomorphic ops yield the same
+# monomorphic scheme as before.
 fn add_effect_op_sigs_loop(env: TyEnv, eff_name: String, binds: [TPBind],
-                            ids: [Int], ops: [EffectOp]) : TyEnv {
+                            ids: [Int], ops: [EffectOp],
+                            ar_acc: [OpEffArity]) : EnvWithArities {
   match ops {
-    [] -> env
+    [] -> EnvWithArities { env: env, arities: ar_acc }
     [op, ...rest] -> match op {
-      EOp(op_name, params, ret, _, _) -> {
-        let pts = param_tys_with_binds(params, binds)
-        let ret_ty = resolve_ty_with_tparams(ret, binds)
+      EOp(op_name, op_tparams, params, ret, _, _) -> {
+        let next_id = list_length(binds)
+        let op_binds = mk_tpbinds_from(op_tparams, next_id)
+        let op_ids   = tparam_ids_from(op_tparams, next_id)
+        let all_binds = append_tpbinds(binds, op_binds)
+        let all_ids   = append_ints(ids, op_ids)
+        let pts = param_tys_with_binds(params, all_binds)
+        let ret_ty = resolve_ty_with_tparams(ret, all_binds)
         let body_ty = TyFnT(pts, ret_ty, row_empty())
-        let sc = match ids {
+        let sc = match all_ids {
           [] -> mono(body_ty)
-          _  -> scheme(ids, body_ty)
+          _  -> scheme(all_ids, body_ty)
         }
         let key = string_concat(eff_name, string_concat(".", op_name))
         let env1 = ty_env_add(env, key, sc)
-        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest)
+        # Record only the effect-level arity per dotted key. The
+        # synth_op_call_with_scheme caller uses this to take the
+        # first N entries of `inst.fresh` as the row label's ty_args.
+        let ar1 = [OEA(key, list_length(ids)), ...ar_acc]
+        add_effect_op_sigs_loop(env1, eff_name, binds, ids, rest, ar1)
       }
     }
   }
@@ -8568,13 +8636,15 @@ fn param_tys_with_binds(params: [Param], binds: [TPBind]) : [Ty] {
   }
 }
 
-type BuiltEnv = { env: TyEnv, prelude_len: Int }
+type BuiltEnv = { env: TyEnv, prelude_len: Int, op_eff_arities: [OpEffArity] }
 
 fn build_ty_env(decls: [Decl]) : BuiltEnv {
   let e0 = ty_env_empty()
   let e1 = add_prelude_sigs(e0)
   let e2 = add_builtin_variant_sigs(e1)
-  BuiltEnv { env: add_decls_loop(e2, decls), prelude_len: list_length(e2.entries) }
+  let r = add_decls_loop(e2, [], decls)
+  BuiltEnv { env: r.env, prelude_len: list_length(e2.entries),
+             op_eff_arities: r.arities }
 }
 
 # ---- env dump (debugging) ----
@@ -9194,7 +9264,16 @@ type InferState = { file: String, env: TyEnv, prelude_len: Int, sub: Subst, recs
                     # against the right shape. None outside clauses or
                     # in stateless clauses (in which case the standard
                     # env binding is the source of truth).
-                    clause_resume: Option[ResumeBind] }
+                    clause_resume: Option[ResumeBind],
+                    # m7b #2: per-op generic schemes quantify over both
+                    # effect-level and op-level tparams; the row label
+                    # only carries the effect-level ones. This table
+                    # records, per dotted "Eff.op" key, the effect's
+                    # arity so synth_op_call_with_scheme can split
+                    # `inst.fresh` correctly. Builds during build_ty_env.
+                    op_eff_arities: [OpEffArity] }
+
+type OpEffArity = OEA(String, Int)
 
 # m7b #11l — answer type + handler-state type for the currently-walked
 # clause body of a stateful handler.
@@ -9230,27 +9309,32 @@ type InferredElems = { st: InferState, elems: [ListElem] }
 type InferredFInits = { st: InferState, fis: [FieldInit] }
 
 fn infer_state_new(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo]) : InferState =
+  infer_state_new_full(file, env, prelude_len, recs, [])
+
+fn infer_state_new_full(file: String, env: TyEnv, prelude_len: Int,
+                        recs: [RecInfo], op_eff_arities: [OpEffArity]) : InferState =
   InferState { file: file, env: env, prelude_len: prelude_len, sub: subst_empty(),
                recs: recs, errs: 0, insts: [], holes: [], row: [],
-               eff_uses: [], aliases: [], clause_resume: None }
+               eff_uses: [], aliases: [], clause_resume: None,
+               op_eff_arities: op_eff_arities }
 
 fn st_set_env(st: InferState, new_env: TyEnv) : InferState =
   InferState { file: st.file, env: new_env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_set_sub(st: InferState, new_sub: Subst) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: new_sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_bump_err(st: InferState) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs + 1, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 # m7a #4c / m7b #11i: mark that the current body has performed an op
 # of `eff` with the given type-arg instantiation. Labels with the same
@@ -9265,7 +9349,7 @@ fn st_add_label(st: InferState, lab: Label, line: Int, col: Int) : InferState {
                  row: [lab, ...st.row],
                  eff_uses: [EU(lab.eff, line, col), ...st.eff_uses],
                  aliases: st.aliases,
-                 clause_resume: st.clause_resume }
+                 clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
   }
 }
 
@@ -9369,7 +9453,7 @@ fn st_set_row(st: InferState, new_row: [Label]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: new_row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 # m7a #4e: push/pop the alias stack as we enter/leave a handle's body.
 fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
@@ -9377,7 +9461,7 @@ fn st_push_alias(st: InferState, alias: String, eff: String) : InferState =
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses,
                aliases: [AB(alias, eff), ...st.aliases],
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_pop_alias(st: InferState) : InferState {
   match st.aliases {
@@ -9386,7 +9470,7 @@ fn st_pop_alias(st: InferState) : InferState {
       InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                    recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                    row: st.row, eff_uses: st.eff_uses, aliases: rest,
-                   clause_resume: st.clause_resume }
+                   clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
   }
 }
 
@@ -9395,7 +9479,7 @@ fn st_set_clause_resume(st: InferState, rb: Option[ResumeBind]) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: rb }
+               clause_resume: rb, op_eff_arities: st.op_eff_arities }
 
 fn lookup_alias(aliases: [AliasBinding], name: String) : Option[String] {
   match aliases {
@@ -9409,13 +9493,13 @@ fn st_push_inst(st: InferState, cs: CallSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: [cs, ...st.insts], holes: st.holes,
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 fn st_push_hole(st: InferState, h: HoleSite) : InferState =
   InferState { file: st.file, env: st.env, prelude_len: st.prelude_len, sub: st.sub,
                recs: st.recs, errs: st.errs, insts: st.insts, holes: [h, ...st.holes],
                row: st.row, eff_uses: st.eff_uses, aliases: st.aliases,
-               clause_resume: st.clause_resume }
+               clause_resume: st.clause_resume, op_eff_arities: st.op_eff_arities }
 
 # m7a #8: lookup the recorded first-use line/col of an effect label.
 # Returns (-1, -1) when the effect was never tracked — that should
@@ -9557,7 +9641,8 @@ fn st_restore_entries(outer: InferState, inner: InferState) : InferState =
     row: inner.row,
     eff_uses: inner.eff_uses,
     aliases: outer.aliases,
-    clause_resume: outer.clause_resume
+    clause_resume: outer.clause_resume,
+    op_eff_arities: outer.op_eff_arities
   }
 
 # ---- parameter typing ----
@@ -10276,18 +10361,41 @@ fn synth_op_call_with_scheme(st: InferState, sc: TyScheme, args_: [Expr],
   # parametric effects (where the scheme quantifies over the effect's
   # tparams) these fresh tyvars are the row label's ty_args. For
   # stateless effects the list is empty and we add a bare-name label.
+  # m7b #2: per-op generic schemes also quantify over op-level
+  # tparams; those are NOT part of the row label's ty_args. Use the
+  # `op_eff_arities` table to take only the first N fresh ids
+  # (corresponding to the effect's tparams) for the row.
   let inst = st_instantiate_report(st, sc)
   let ra = synth_many(inst.st, args_)
   let rv = st_fresh_ty(ra.st)
   let expected = fn_ty(ra.tys, rv.ty)
   let st2 = st_unify(rv.st, inst.ty, expected, string_concat("op call ", key), line, col)
   let eff_n = dotted_prefix(key)
-  let row_args = resolve_fresh_ids(inst.fresh, st2.sub)
+  let eff_arity = lookup_op_eff_arity(st2.op_eff_arities, key)
+  let eff_fresh = take_first(inst.fresh, eff_arity)
+  let row_args = resolve_fresh_ids(eff_fresh, st2.sub)
   let lab = Label { eff: eff_n, ty_args: row_args }
   let st3 = st_add_label(st2, lab, line, col)
   let ty = apply_ty(st3.sub, rv.ty)
   let root = with_ty(mk_expr(ECall(callee_expr_for_op(key, line, col), ra.exprs), line, col), ty)
   mk_inferred(st3, ty, root)
+}
+
+fn lookup_op_eff_arity(table: [OpEffArity], key: String) : Int {
+  match table {
+    [] -> 0
+    [h, ...rest] -> match h {
+      OEA(k, n) -> if k == key { n } else { lookup_op_eff_arity(rest, key) }
+    }
+  }
+}
+
+fn take_first(xs: [Int], n: Int) : [Int] {
+  if n <= 0 { [] }
+  else { match xs {
+    [] -> []
+    [h, ...rest] -> [h, ...take_first(rest, n - 1)]
+  } }
 }
 
 # Apply the substitution to a list of fresh-tyvar ids, producing the
@@ -11185,7 +11293,8 @@ fn return_site_of(e: Expr) : Expr {
   }
 }
 
-fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: Decl, verbose: Bool) : TypedDecl {
+fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
+              op_eff_arities: [OpEffArity], d: Decl, verbose: Bool) : TypedDecl {
   match d {
     DFn(is_pub, nm, tparams, ps, opt_ret, row, body, line, col) -> {
       # m7b #12: row-variable binding context for this decl. The
@@ -11199,7 +11308,7 @@ fn infer_decl(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d: De
       # instantiating at call sites.
       let rbinds = mk_rvbinds(collect_decl_rvars(d))
       let tpbinds = mk_tpbinds(tparams)
-      let st_init = infer_state_new(file, env, prelude_len, recs)
+      let st_init = infer_state_new_full(file, env, prelude_len, recs, op_eff_arities)
       let st0 = advance_row_fresh(st_init, list_length(rbinds))
       let added = add_infer_params_with_binds(st0, ps, tpbinds, rbinds)
       let rb = synth(added.st, body)
@@ -11328,7 +11437,9 @@ fn label_to_string(l: Label) : String {
 type TypedProgram = { decls: [Decl], errs: Int, insts: [ResolvedCS],
                       holes: [ResolvedHole], prelude_len: Int }
 
-fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], ds: [Decl], verbose: Bool,
+fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo],
+                   op_eff_arities: [OpEffArity],
+                   ds: [Decl], verbose: Bool,
                    acc_decls: [Decl], acc_errs: Int, acc_insts: [ResolvedCS],
                    acc_holes: [ResolvedHole]) : TypedProgram {
   match ds {
@@ -11338,8 +11449,8 @@ fn infer_all_loop(file: String, env: TyEnv, prelude_len: Int, recs: [RecInfo], d
       prelude_len: prelude_len
     }
     [d, ...rest] -> {
-      let r = infer_decl(file, env, prelude_len, recs, d, verbose)
-      infer_all_loop(file, env, prelude_len, recs, rest, verbose,
+      let r = infer_decl(file, env, prelude_len, recs, op_eff_arities, d, verbose)
+      infer_all_loop(file, env, prelude_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
                      llvm_prepend_reverse(r.insts, acc_insts),
@@ -11367,7 +11478,8 @@ fn prepend_reverse_holes(xs: [ResolvedHole], acc: [ResolvedHole]) : [ResolvedHol
 fn infer_program(file: String, decls: [Decl], verbose: Bool) : TypedProgram {
   let built = build_ty_env(decls)
   let recs = collect_records(decls)
-  infer_all_loop(file, built.env, built.prelude_len, recs, decls, verbose, [], 0, [], [])
+  infer_all_loop(file, built.env, built.prelude_len, recs,
+                 built.op_eff_arities, decls, verbose, [], 0, [], [])
 }
 
 fn dump_infer(file: String, decls: [Decl]) : Int {
@@ -13995,34 +14107,34 @@ fn builtin_effect_names() : [String] =
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
     [
-      EOp("print",  [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
-      EOp("eprint", [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
+      EOp("print",  [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0),
+      EOp("eprint", [], [param_string_zero("s")], ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn builtin_fail_decl() : Decl =
   DEffect(false, "Fail", [],
     [
-      EOp("fail", [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
+      EOp("fail", [], [param_string_zero("msg")], ty_name_zero("Nothing"), 0, 0)
     ], 0, 0)
 
 fn builtin_stdin_decl() : Decl =
   DEffect(false, "Stdin", [],
-    [EOp("read_line", [], ty_option_string_zero(), 0, 0)], 0, 0)
+    [EOp("read_line", [], [], ty_option_string_zero(), 0, 0)], 0, 0)
 
 fn builtin_env_decl() : Decl =
   DEffect(false, "Env", [],
     [
-      EOp("args", [], ty_list_string_zero(), 0, 0),
-      EOp("var",  [param_string_zero("name")], ty_option_string_zero(), 0, 0)
+      EOp("args", [], [], ty_list_string_zero(), 0, 0),
+      EOp("var",  [], [param_string_zero("name")], ty_option_string_zero(), 0, 0)
     ], 0, 0)
 
 fn builtin_file_decl() : Decl =
   DEffect(false, "File", [],
     [
-      EOp("read_file",
+      EOp("read_file", [],
           [param_string_zero("path")],
           ty_result_string_string_zero(), 0, 0),
-      EOp("write_file",
+      EOp("write_file", [],
           [param_string_zero("path"), param_string_zero("contents")],
           ty_result_unit_string_zero(), 0, 0)
     ], 0, 0)
@@ -14034,21 +14146,21 @@ fn builtin_file_decl() : Decl =
 fn builtin_state_decl() : Decl =
   DEffect(false, "State", ["T"],
     [
-      EOp("get", [], ty_name_zero("T"), 0, 0),
-      EOp("set", [param_typed_zero("v", ty_name_zero("T"))],
+      EOp("get", [], [], ty_name_zero("T"), 0, 0),
+      EOp("set", [], [param_typed_zero("v", ty_name_zero("T"))],
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
 fn builtin_reader_decl() : Decl =
   DEffect(false, "Reader", ["T"],
     [
-      EOp("ask", [], ty_name_zero("T"), 0, 0)
+      EOp("ask", [], [], ty_name_zero("T"), 0, 0)
     ], 0, 0)
 
 fn builtin_writer_decl() : Decl =
   DEffect(false, "Writer", ["W"],
     [
-      EOp("tell", [param_typed_zero("w", ty_name_zero("W"))],
+      EOp("tell", [], [param_typed_zero("w", ty_name_zero("W"))],
           ty_name_zero("Unit"), 0, 0)
     ], 0, 0)
 
