@@ -1610,23 +1610,22 @@ page the way they are written.
     specified in `docs/stdlib-layout.md` §`loop`. **Landed.**
 13. **Polymorphic user-function signatures** — `fn name[T, S](...)`
     declares per-function type parameters that generalise across
-    call sites the same way op-level `[T]` does for #2. Today
-    `parse_fn_decl` (`stage2/compiler.kai:3069`) accepts only
-    `fn name(params) : T / row` and `fn_scheme_of_decl` builds
-    `scheme_full([], rvbind_ids(rbinds), body)` — the tparam list
-    is always empty. `resolve_ty_with_rvbinds` treats every
-    lowercase identifier in type position as a `TyCon(name, [])`
-    nominal type, not as a quantified variable. Reproducible by
-    declaring `pub fn id(x: a) : a = x` and calling `id(42)`:
-    the call site fails unification with `expected: (a) -> a`
-    vs `found: (Int) -> ?t0`. Required for any polymorphic
-    higher-order helper (Doc B's `with_reader[T, S]`,
-    `with_writer[W, S]`, future `map`, `fold`, etc.). Surfaced
-    by the 2026-04-25 attempt at #7. Independent of #11/#12 in
-    mechanism; uses the same HM machinery already wired for
-    builtin polymorphic prelude functions (`array_make`,
-    `list_append`, etc.) — the gap is at the user-fn entry point,
-    not the inferencer core. Blocker of #7. *Pending.*
+    call sites the same way op-level `[T]` does for #2. Required
+    for any polymorphic higher-order helper (Doc B's
+    `with_reader[T, S]`, `with_writer[W, S]`, future `map`, `fold`,
+    etc.). Surfaced by the 2026-04-25 attempt at #7. Implementation:
+    `DFn` extended with a `[String]` tparam slot; `parse_fn_decl`
+    accepts an optional `[T1, T2, …]` after the function name;
+    `resolve_ty_with_binds` consults a `[TPBind]` first so a name
+    matching a declared tparam resolves to `TyVarT(id)` instead of
+    `TyCon`; `fn_scheme_of_decl` generalises over both tparam_ids
+    and rvbind_ids; `infer_decl` wires tpbinds into body inference
+    via `add_infer_params_with_binds`. Same HM machinery as the
+    pre-existing builtin polymorphic prelude functions
+    (`array_make`, `list_append`, etc.); the gap was only at the
+    user-fn entry point. Lambdas with effect rows still hit #14,
+    so polymorphic helper bodies must be passed by name until #14
+    lands. **Landed.**
 14. **Lambda effect rows** — `synth_lambda`
     (`stage2/compiler.kai:9846`) builds the lambda's type as
     `fn_ty(args, ret)` with no row slot, so effects invoked
@@ -1682,10 +1681,11 @@ by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
 helper. m7b #5b (`var` → `State[T]` desugar) landed; #15, #16,
 and #17 are the three known gaps it left behind, promoted from
-the §*Known follow-ups after m7b #5b* subsection. The remaining
-m7b items are: #2 (per-op generics), #4 (`@cap` / `cap := v`
-sugar), #7 (blocked on #13 + #14), #8 (diagnostic review), #13,
-#14, #15, #16, #17.
+the §*Known follow-ups after m7b #5b* subsection. m7b #13
+(fn-level type parameters) landed; #7 still blocks on #14
+(lambda effect rows). The remaining m7b items are: #2 (per-op
+generics), #4 (`@cap` / `cap := v` sugar), #7 (blocked on #14),
+#8 (diagnostic review), #14, #15, #16, #17.
 
 ## Next steps
 
