@@ -319,6 +319,75 @@ pub fn list_zip_with(xs: [a], ys: [b], f: (a, b) -> c) : [c] {
   }
 }
 
+# Standard 3-way Int comparator. Negative when a<b, zero when
+# equal, positive when a>b. Caller never sees the magnitude — only
+# the sign matters. Used as the default comparator for list_sort.
+pub fn int_cmp(a: Int, b: Int) : Int {
+  if a < b { 0 - 1 }
+  else if a > b { 1 }
+  else { 0 }
+}
+
+# Tail-recursive merge worker. `acc` is the merged prefix in
+# reverse cons order; reversed and prepended at the call site
+# when one input is exhausted. The `cmp(hx, hy) <= 0` branch
+# (left-wins on ties) is what makes the sort stable.
+pub fn list_merge_by_loop(xs: [a], ys: [a], cmp: (a, a) -> Int, acc: [a]) : [a] {
+  match xs {
+    [] -> list_append(list_reverse(acc), ys)
+    [hx, ...tx] -> match ys {
+      [] -> list_append(list_reverse(acc), xs)
+      [hy, ...ty] -> if cmp(hx, hy) <= 0 {
+                       list_merge_by_loop(tx, ys, cmp, [hx, ...acc])
+                     } else {
+                       list_merge_by_loop(xs, ty, cmp, [hy, ...acc])
+                     }
+    }
+  }
+}
+
+# Merges two cmp-sorted lists into one cmp-sorted list. Stable
+# on ties: elements from the left input come first when their
+# keys are equal — list_sort_by relies on this for overall
+# stability.
+pub fn list_merge_by(xs: [a], ys: [a], cmp: (a, a) -> Int) : [a] =
+  list_merge_by_loop(xs, ys, cmp, [])
+
+# Stable merge sort. O(n log n) comparisons in the worst case;
+# allocates O(n) cons cells per level of recursion (the merged
+# prefixes). Empty / singleton inputs are returned as-is.
+#
+# Why merge sort, not quicksort: kaikai's `[a]` is a singly-
+# linked cons list with no O(1) random access and no in-place
+# swap, so quicksort's locality + swap advantages do not apply.
+# Merge sort matches the data structure (split + merge are both
+# pure recursion over cons), guarantees O(n log n) in the worst
+# case, and stays stable for free. The array-backed quicksort
+# in demos/quicksort.kai is a different beast — it operates on
+# the mutable `Array[T]` escape and is not the canonical stdlib
+# sort.
+#
+# The split is via list_take + list_drop on n/2 — recomputing
+# `length` per recursion is O(n) at each level, giving the
+# overall complexity an extra constant factor. Acceptable for
+# v1; the in-place / array-backed variant lands with collections
+# in m14 proper.
+pub fn list_sort_by(xs: [a], cmp: (a, a) -> Int) : [a] {
+  let n = list_length(xs)
+  if n <= 1 { xs }
+  else {
+    let mid = n / 2
+    let left = list_take(xs, mid)
+    let right = list_drop(xs, mid)
+    list_merge_by(list_sort_by(left, cmp), list_sort_by(right, cmp), cmp)
+  }
+}
+
+# Sort an Int list ascending. Stable, O(n log n). Equivalent to
+# `list_sort_by(xs, int_cmp)`; provided as a thin convenience
+# because Int sorting is the common case.
+pub fn list_sort(xs: [Int]) : [Int] = list_sort_by(xs, int_cmp)
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
