@@ -84,7 +84,13 @@ The runtime now ships always-on RC counters in `runtime.h`:
 The exit-time report is gated on the env var `KAI_TRACE_RC`. The
 silent path stays silent; the always-on tax is four counter
 increments per `kai_alloc` and two per `kai_free_value`. Negligible
-on the wall — kaic2 self-compile time is unchanged at ~2s.
+on the kaic2 self-compile (wall ~2 s, dominated by the typer + emit,
+not by alloc bookkeeping) but measurable on tight allocation-heavy
+inner loops: `bench-effects` (which alloc-pressures the effect path
+~5 times per iteration) shifts from 7.85 ns/op to 8.04 ns/op
+(+2.4 %) — the régime-fallback REGRESSION verdict pre-dates this
+change and remains the active item under Doc C §*Open questions*
+#6.
 
 Measured 2026-04-25 on Apple Silicon (`darwin 25.4.0`, `clang
 -std=c99 -O0 -g`):
@@ -254,6 +260,53 @@ pass"): reuse-in-place, drop specialisation per type, unboxing of
 regions. None of these are addressed by m5 #0-#6 above. They are
 the "full Perceus" milestone scheduled after m5 in the recommended
 ordering of `docs/stage2-design.md` §*Recommended ordering*.
+
+## Follow-ups (out-of-scope for this branch, worth pinning)
+
+Items that surfaced while landing m5 #0 + m14-pre but did not get
+their own commit. Each is small enough to stay in this list rather
+than its own design doc, but big enough that the next contributor
+should not rediscover them from scratch.
+
+1. **Runtime symbol shadowing.** User-defined `fn add(...)` /
+   `fn neg(...)` / `fn sub(...)` collide at link time with
+   `kai_add` / `kai_neg` / `kai_sub` from the runtime, because
+   the emitter mints `kai_<userfn>` without any namespace prefix
+   and the runtime helpers share the same `kai_` family. The
+   stdlib fixtures under `examples/stdlib/` worked around this
+   ad-hoc by renaming (`int_add` instead of `add`). Long-term fix
+   options: prefix user functions with `kai_user_` (breaks the
+   selfhost byte-equivalence; large change), rename runtime
+   helpers to `kairt_*` (smaller surface), or emit a static-asserted
+   reserved-name error at name resolution. None landed.
+2. **m14 nominal migration covers 16 new functions.** When m14
+   proper migrates `list_take` → `list.take` etc., the m14-pre
+   set must migrate alongside: `list_head`, `list_tail`,
+   `list_repeat`, `list_contains`, `list_count`, `list_take_while`,
+   `list_drop_while`, `list_uniq`, `list_max`, `list_min`,
+   `list_max_by`, `list_min_by`, `list_flat_map`, `list_zip_with`,
+   `list_sort`, `list_sort_by` (+ the `int_cmp` helper, possibly
+   to `core.ordering` or `math.int`). The corresponding test
+   fixtures (`examples/stdlib/list_*.kai`) need their call sites
+   updated and re-validated against `kaic2 --path stdlib` once
+   the kaic2 prelude-polymorphism issue (item 3 below) is fixed.
+3. **kaic2 typer rejects polymorphic prelude calls from foreign
+   files.** `kaic2 --prelude stdlib/core.kai` plus a fresh file
+   that calls `list_take([1,2,3], 2)` fails with
+   `expected: ([a], Int) -> [a], found: ([Int], Int) -> ?t1 / ?e0`.
+   The bug pre-dates m14-pre (existing `list_take` shows it). It
+   is the reason `test-stdlib` routes through kaic1, not kaic2;
+   the inline comment on the Makefile target documents this. m14
+   proper will need to fix it before re-validating selfhost on
+   the new `list.*` names.
+4. **Per-process double KAI_TRACE_RC report when run via bin/kai.**
+   `KAI_TRACE_RC=1 ./bin/kai run foo.kai` emits two reports
+   (kaic1 process + the user binary) because the env var is
+   inherited. Useful as a 2-for-1 for casual measurement, but
+   confusing if the reader expects one. A future polish would
+   tag each report with its pid or with a process-role string,
+   or have `bin/kai` strip the env var when forking the user
+   binary.
 
 ## References
 
