@@ -11727,6 +11727,29 @@ fn dump_mono(file: String, decls: [Decl]) : Int {
   r.errs
 }
 
+# ---- m4c — monomorphise (identity, m4c #1) ----
+#
+# Sits between `infer_program` and `emit_program*` in the pipeline.
+# Given a TypedProgram (post-inference, with `Expr.ty` populated and
+# all `ResolvedCS` known), produce the `[Decl]` shape the emitter
+# walks. m4c #1 is an identity transform: the post-mono decls are
+# the typed decls, unchanged. Selfhost stays byte-identical because
+# the emitter does not consume `Expr.ty`.
+#
+# Subsequent m4c steps replace this body with the actual specialiser:
+#   #2 — name mangling helper + `--dump-mono-out` diagnostic.
+#   #3 — emit specialised copies of polymorphic decls.
+#   #4 — rewrite call sites to mangled names.
+#   #5 — drop unreferenced generic decls.
+#
+# After m4c lands, m5 (basic Perceus) walks the post-mono `[Decl]`
+# and inserts dup / drop based on last-use analysis. The doc that
+# pins the scope honesty for this lane is `docs/perceus-basic.md`.
+
+fn monomorphise(tp: TypedProgram) : [Decl] {
+  tp.decls
+}
+
 # ---- `--holes`: typed-hole reports ----
 #
 # For each `?` / `?name` in the program, print the expected type
@@ -14325,18 +14348,22 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                 let chk = check_program(path, all_decls)
                 if chk != 0 { chk }
                 else {
-                  let ty_errs = check_infer(path, all_decls)
-                  if ty_errs != 0 { ty_errs }
+                  let typed_prog = infer_program(path, all_decls, false)
+                  if typed_prog.errs != 0 { typed_prog.errs }
                   else {
                     let hole_errs = if strict_holes { strict_holes_check(path, all_decls) } else { 0 }
                     if hole_errs != 0 { hole_errs }
                     else {
+                      # m4c #1 — identity monomorphise. Hands typed decls
+                      # to the emitter; semantics unchanged because the
+                      # emitter does not read `Expr.ty`.
+                      let mono_decls = monomorphise(typed_prog)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       let out = if use_llvm {
-                        emit_program_llvm(path, src, all_decls, test_mode)
+                        emit_program_llvm(path, src, mono_decls, test_mode)
                       } else {
-                        emit_program(path, src, all_decls, test_mode)
+                        emit_program(path, src, mono_decls, test_mode)
                       }
                       print(out)
                       0
