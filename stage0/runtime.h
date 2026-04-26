@@ -52,7 +52,8 @@ typedef enum {
     KAI_VARIANT,
     KAI_CLOSURE,
     KAI_ARRAY,
-    KAI_FIBER       /* m8 #3: Spawn / Fiber[T] handle (opaque to user code) */
+    KAI_FIBER,      /* m8 #3: Spawn / Fiber[T] handle (opaque) */
+    KAI_PID         /* m8 #7: Actor[Msg] / Pid[Msg] handle (opaque) */
 } KaiTag;
 
 typedef struct KaiValue KaiValue;
@@ -102,6 +103,14 @@ struct KaiValue {
          * value: when the value's RC drops to zero, kai_free_value
          * frees the KaiFiber and decrefs its result + thunk. */
         struct KaiFiber *fib;
+        /* m8 #7: opaque handle to a KaiMailbox. Pid values share the
+         * mailbox's lifetime through borrowed pointers — the mailbox
+         * is owned by the with_mailbox / spawn_actor helper that
+         * allocated it, not by the Pid value. RC on the Pid value
+         * is just a handle count; freeing a Pid does not free the
+         * mailbox (that happens when the with_mailbox / spawn_actor
+         * scope exits). */
+        struct KaiMailbox *mb;
     } as;
 };
 
@@ -181,6 +190,82 @@ static KaiValue *kai_fiber_value(KaiFiber *f) {
     return v;
 }
 
+/* m8 #7: mailbox runtime. A KaiMailbox is a singly-linked list of
+ * heap-allocated KaiValue messages (head = next-to-pop, tail =
+ * next-to-enqueue). Send pushes at the tail; receive pops the head.
+ * v1 is unbounded — every send succeeds, every receive on an empty
+ * mailbox is a runtime error (the inline-eager scheduler can't
+ * suspend the caller until a message arrives). Bounded mailboxes
+ * with the three overflow policies (DropOldest / DropNewest /
+ * BlockSender) land in m8 #8 once Doc B's policy enum is wired
+ * through the typer; BlockSender additionally needs the m8.x
+ * cooperative scheduler to actually suspend the sender. */
+typedef struct KaiMboxNode KaiMboxNode;
+struct KaiMboxNode {
+    KaiValue    *msg;
+    KaiMboxNode *next;
+};
+
+typedef struct KaiMailbox KaiMailbox;
+struct KaiMailbox {
+    KaiMboxNode *head;
+    KaiMboxNode *tail;
+    int          len;
+};
+
+static KaiMailbox *kai_mailbox_alloc(void) {
+    KaiMailbox *mb = (KaiMailbox *) calloc(1, sizeof(KaiMailbox));
+    if (!mb) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    return mb;
+}
+
+static void kai_mailbox_push(KaiMailbox *mb, KaiValue *msg) {
+    KaiMboxNode *node = (KaiMboxNode *) calloc(1, sizeof(KaiMboxNode));
+    if (!node) { fprintf(stderr, "kai: out of memory\n"); exit(1); }
+    node->msg  = msg;
+    node->next = NULL;
+    if (mb->tail) { mb->tail->next = node; }
+    else          { mb->head       = node; }
+    mb->tail = node;
+    mb->len++;
+}
+
+static KaiValue *kai_mailbox_pop(KaiMailbox *mb) {
+    if (!mb->head) {
+        fprintf(stderr, "kai: Actor.receive on empty mailbox (v1 inline-eager: no blocking)\n");
+        exit(1);
+    }
+    KaiMboxNode *node = mb->head;
+    mb->head = node->next;
+    if (!mb->head) { mb->tail = NULL; }
+    KaiValue *msg = node->msg;
+    free(node);
+    mb->len--;
+    return msg;
+}
+
+static void kai_mailbox_free(KaiMailbox *mb) {
+    if (!mb) return;
+    KaiMboxNode *node = mb->head;
+    while (node) {
+        KaiMboxNode *next = node->next;
+        kai_decref(node->msg);
+        free(node);
+        node = next;
+    }
+    free(mb);
+}
+
+/* m8 #7: wrap a borrowed mailbox pointer as a KAI_PID value. The
+ * mailbox itself is owned by the with_mailbox / spawn_actor scope
+ * that allocated it; Pid values are non-owning handles that just
+ * carry the address. */
+static KaiValue *kai_pid_value(KaiMailbox *mb) {
+    KaiValue *v = kai_alloc(KAI_PID);
+    v->as.mb = mb;
+    return v;
+}
+
 static void kai_free_value(KaiValue *v) {
     switch ((KaiTag) v->tag) {
         case KAI_STR:
@@ -213,6 +298,11 @@ static void kai_free_value(KaiValue *v) {
                 kai_decref(v->as.fib->result);
                 free(v->as.fib);
             }
+            break;
+        case KAI_PID:
+            /* The mailbox is owned by the with_mailbox / spawn_actor
+             * scope, NOT by the Pid value. Dropping a Pid handle
+             * does not free the mailbox. */
             break;
         default: break;
     }
@@ -432,6 +522,7 @@ static int kai_eq(KaiValue *a, KaiValue *b) {
         case KAI_CLOSURE: return 0;      /* closures are not equatable */
         case KAI_ARRAY:   return 0;      /* arrays are opaque, identity-compared */
         case KAI_FIBER:   return a->as.fib == b->as.fib;  /* identity */
+        case KAI_PID:     return a->as.mb  == b->as.mb;   /* identity */
     }
     return 0;
 }
@@ -507,6 +598,7 @@ static KaiValue *kai_to_string(KaiValue *v) {
         case KAI_CLOSURE: return kai_str("<closure>");
         case KAI_ARRAY:   return kai_str("<array>");
         case KAI_FIBER:   return kai_str("<fiber>");
+        case KAI_PID:     return kai_str("<pid>");
     }
     return kai_str("?");
 }
@@ -920,6 +1012,45 @@ static KaiValue *kai_prelude_args(void) {
     return acc;
 }
 
+/* ---------- prelude: mailbox runtime (m8 #7) ---------- */
+
+/* User code reaches the mailbox runtime through these prelude
+ * functions. They are wrapped in stdlib/actor.kai's `with_mailbox`
+ * helper, which also installs the user-facing Actor[Msg] handler.
+ * The polymorphic surface uses Nothing → TyAny so a single set of
+ * runtime entries serves every Msg type. */
+
+static KaiValue *kai_prelude_mailbox_alloc(void) {
+    return kai_pid_value(kai_mailbox_alloc());
+}
+
+static KaiValue *kai_prelude_mailbox_send(KaiValue *pid, KaiValue *msg) {
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_send: argument is not a Pid\n");
+        exit(1);
+    }
+    kai_mailbox_push(pid->as.mb, kai_incref(msg));
+    return kai_unit();
+}
+
+static KaiValue *kai_prelude_mailbox_recv(KaiValue *pid) {
+    if (!pid || pid->tag != KAI_PID || !pid->as.mb) {
+        fprintf(stderr, "kai: mailbox_recv: argument is not a Pid\n");
+        exit(1);
+    }
+    return kai_mailbox_pop(pid->as.mb);
+}
+
+/* Free the mailbox attached to a Pid. Called by `with_mailbox` when
+ * the scope exits; the Pid value itself is RC-managed independently. */
+static KaiValue *kai_prelude_mailbox_free(KaiValue *pid) {
+    if (pid && pid->tag == KAI_PID && pid->as.mb) {
+        kai_mailbox_free(pid->as.mb);
+        pid->as.mb = NULL;
+    }
+    return kai_unit();
+}
+
 /* ---------- prelude: file io ---------- */
 
 static KaiValue *kai_prelude_read_file(KaiValue *path) {
@@ -1166,6 +1297,10 @@ static KaiValue *_kai_prelude_string_contains_thunk(KaiValue *s, KaiValue **a, i
 static KaiValue *_kai_prelude_string_slice_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_string_slice(a[0], a[1], a[2]); }
 static KaiValue *_kai_prelude_char_to_int_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_char_to_int(a[0]); }
 static KaiValue *_kai_prelude_int_to_char_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_prelude_int_to_char(a[0]); }
+static KaiValue *_kai_prelude_mailbox_alloc_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) a; (void) n; return kai_prelude_mailbox_alloc(); }
+static KaiValue *_kai_prelude_mailbox_send_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_send(a[0], a[1]); }
+static KaiValue *_kai_prelude_mailbox_recv_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_recv(a[0]); }
+static KaiValue *_kai_prelude_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_prelude_mailbox_free(a[0]); }
 
 /* ---------- test harness hooks (used by --test runs) ---------- */
 

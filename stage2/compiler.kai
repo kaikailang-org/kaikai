@@ -4149,6 +4149,9 @@ fn prelude_names() : [String] {
     "list_length", "list_append", "list_reverse",
     "map", "filter", "reduce", "each",
     "array_make", "array_length", "array_get", "array_set", "array_grow",
+    # m8 #7: mailbox runtime exposed as prelude functions; user-facing
+    # API lives in stdlib/actor.kai's `with_mailbox` helper.
+    "mailbox_alloc", "mailbox_send", "mailbox_recv", "mailbox_free",
     "Some", "None", "Ok", "Err"
   ]
 }
@@ -4800,7 +4803,12 @@ fn prelude_table() : [EPrelude] {
     EP("array_length",     "kai_prelude_array_length",     1),
     EP("array_get",        "kai_prelude_array_get",        2),
     EP("array_set",        "kai_prelude_array_set",        3),
-    EP("array_grow",       "kai_prelude_array_grow",       3)
+    EP("array_grow",       "kai_prelude_array_grow",       3),
+    # m8 #7: mailbox runtime
+    EP("mailbox_alloc",    "kai_prelude_mailbox_alloc",    0),
+    EP("mailbox_send",     "kai_prelude_mailbox_send",     2),
+    EP("mailbox_recv",     "kai_prelude_mailbox_recv",     1),
+    EP("mailbox_free",     "kai_prelude_mailbox_free",     1)
   ]
 }
 
@@ -8272,7 +8280,17 @@ fn add_prelude_sigs(env: TyEnv) : TyEnv {
     TyEntry { name: "array_length", scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)])],                      TyInt)) },
     TyEntry { name: "array_get",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt],               tv(0))) },
     TyEntry { name: "array_set",    scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) },
-    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) }
+    TyEntry { name: "array_grow",   scheme: scheme([0], fn_ty([TyCon("Array", [tv(0)]), TyInt, tv(0)],        TyCon("Array", [tv(0)]))) },
+    # m8 #7: mailbox runtime — type-erased entries (Msg flows
+    # through TyAny). The polymorphic surface is in stdlib/actor.kai
+    # where `with_mailbox[Msg]` and `Actor[Msg]`'s clauses re-attach
+    # the right Msg to send/receive. mailbox_alloc returns a Pid
+    # whose Msg type is fresh at the call site (TyAny unifies with
+    # whatever the surrounding context expects).
+    TyEntry { name: "mailbox_alloc", scheme: scheme([0], fn_ty([],                                       TyCon("Pid", [tv(0)]))) },
+    TyEntry { name: "mailbox_send",  scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)]), tv(0)],           TyUnit)) },
+    TyEntry { name: "mailbox_recv",  scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  tv(0))) },
+    TyEntry { name: "mailbox_free",  scheme: scheme([0], fn_ty([TyCon("Pid", [tv(0)])],                  TyUnit)) }
   ]
   TyEnv { entries: list_append(es, env.entries), fresh: env.fresh }
 }
@@ -14226,6 +14244,10 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   # is what flags fibers for cancellation, but the Cancel handler
   # itself is the unwind target).
   let cancel_d  = inject_unconditional(existing, "Cancel", builtin_cancel_decl())
+  # m8 #7: Actor[Msg] is parametric — no runtime default handler;
+  # users always install their own (typically via stdlib/actor.kai's
+  # `with_mailbox` helper).
+  let actor_d   = inject_unconditional(existing, "Actor",  builtin_actor_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
@@ -14236,7 +14258,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
                 list_append(writer_d,
                   list_append(mutable_d,
                     list_append(spawn_d,
-                      list_append(cancel_d, decls)))))))))))
+                      list_append(cancel_d,
+                        list_append(actor_d, decls))))))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14289,7 +14312,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable", "Spawn", "Cancel", "Actor"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14402,6 +14425,31 @@ fn builtin_mutable_decl() : Decl =
            param_typed_zero("init", ty_name_zero("T"))],
           ty_named_zero("Array", [ty_name_zero("T")]),
           0, 0)
+    ], 0, 0)
+
+# m8 #7: Actor[Msg] — parameterised effect on the message type. Same
+# m7b #11 machinery as State[T] / Reader[T] / Writer[W]: the effect-
+# level tparam Msg substitutes into every op's signature. The user
+# installs an Actor[Msg] handler via `with Actor[Msg](pid_value) {
+# ... }`; the canonical wrapper `with_mailbox[Msg]` lives in
+# stdlib/actor.kai. Doc B / docs/actors.md is the surface spec.
+#
+# `self()` returns the current actor's Pid; `send(p, m)` enqueues
+# msg on p's mailbox; `receive()` dequeues from this actor's
+# mailbox. v1 receives synchronously — calling receive() on an
+# empty mailbox is a runtime error because the inline-eager
+# scheduler can't suspend. Real blocking receive lands with the m8.x
+# scheduler. Six-field EOp shape (op_tparams = [], no per-op generics
+# beyond the effect-level Msg).
+fn builtin_actor_decl() : Decl =
+  DEffect(false, "Actor", ["Msg"],
+    [
+      EOp("self", [], [], ty_named_zero("Pid", [ty_name_zero("Msg")]), 0, 0),
+      EOp("send", [],
+          [param_typed_zero("pid", ty_named_zero("Pid", [ty_name_zero("Msg")])),
+           param_typed_zero("msg", ty_name_zero("Msg"))],
+          ty_name_zero("Unit"), 0, 0),
+      EOp("receive", [], [], ty_name_zero("Msg"), 0, 0)
     ], 0, 0)
 
 # m8 #4: Cancel — single op `raise() : Nothing`. Doc B §`Cancel`.
