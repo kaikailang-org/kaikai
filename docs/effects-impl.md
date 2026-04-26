@@ -1669,6 +1669,20 @@ page the way they are written.
     cases. Surfaced by m7b #5b; details in §*Variable
     specialisation* §*Known follow-ups after m7b #5b* item 3.
     *Pending.*
+18. **Lambda free-var capture treats inner `let`s as free** —
+    the codegen pass that computes a lambda's captured environment
+    walks the body without tracking inner `let` bindings. A
+    lambda like `fn(x) { let n = x + 1; n + 1 }` (or a trailing
+    block with the same shape) emits a closure that lists `n` in
+    its captured-vars array, then the generated C references an
+    undeclared `kai_n` in the call site. Pre-existing — not a
+    regression of any specific m7b sub-task, just first noticed
+    while landing #14 because polymorphic helpers make lambda
+    bodies more interesting. The free-var collector
+    (search `collect_free_vars` / equivalent in `stage2/compiler.kai`'s
+    emit pass) needs to push a `let`'s name onto the bound-set
+    before recursing into the rest of the block, mirroring what
+    the resolver already does for `let`. *Pending.*
 
 Within each sub-milestone the ordering is dependency-driven: the
 evidence type generation (m7a #3) unblocks everything else in
@@ -1683,7 +1697,7 @@ and #17 are the three known gaps it left behind, promoted from
 the §*Known follow-ups after m7b #5b* subsection. m7b #13, #14,
 and #7 all landed in sequence after #5b. The remaining m7b
 items are: #2 (per-op generics), #4 (`@cap` / `cap := v` sugar),
-#8 (diagnostic review), #15, #16, #17.
+#8 (diagnostic review), #15, #16, #17, #18.
 
 ## Next steps
 
