@@ -63,6 +63,7 @@ the compiler is.
 | `spiral` | `array_make` + array indexing (m7b #6) + `var` cells + `while` loop (`stdlib/loop.kai`) + `++` (m7d §23) |
 | `stack` | **user-defined effect** (m7a) + handler + `var` cell |
 | `forth` | sum types with positional fields, multi-arg match on `(token, stack)`, `Fail` effect, `++` (m7d §23) |
+| `9d9l/huffman` | sum types + assoc list (Map deferred) + priority queue + recursive encode/decode + **bit ops** (m13 §16: `bit.shl`/`bit.shr`/`bit.and`/`bit.or` as intrinsics) + bit-pack/unpack |
 | `toquefama` | `Stdin` + `Console`, recursion, multi-arg match on `(guess, target)`, `todo!` (m7d §1) |
 | `blackjack` | sum types, records, hypothetical `Random` effect, `todo!` (m7d §1), `++` (m7d §23) |
 | `mini_ledger` | UoM (m12.5) + refinements + contracts (m12.6) + record update (`with`) |

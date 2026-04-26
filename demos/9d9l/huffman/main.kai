@@ -1,27 +1,30 @@
-# 9d9l #4 — Huffman compression
+# 9d9l #4 — Huffman compression with real bit-packing
 #
 # Compress / decompress files using Huffman coding. Builds the tree
-# from character frequencies, encodes with the resulting code table,
+# from character frequencies, encodes via the resulting code table,
+# packs the bit stream into bytes (8 bits per byte, MSB first), and
 # decompresses by walking the tree per bit.
 #
-# This demo emits the encoded bits as a string of '0'/'1' characters
-# (no bit packing) — the goal is the algorithm shape, not space
-# efficiency. A real implementation would pack 8 bits per byte and
-# serialise the tree alongside.
+# Acts as a probe for **m13 bit ops** (proposed-extensions.md §16):
+# `bit.shl`, `bit.shr`, `bit.and`, `bit.or` are compiler intrinsics
+# in `stdlib/core/bit.kai` that lower directly to the backend's bit
+# op. The demo flips from FAIL to PASS the moment m13 lands.
 #
 # Pending features:
 #   - `use Effect`            — m7e §25
-#   - `File.read` / `File.write` — File effect (post-m14)
+#   - `File.read_bytes` etc.  — File effect catalog (post-m14)
 #   - `++`                    — m7d §23
 #   - tuples in match         — m8.5 gate
-#   - `list.fold`             — stdlib lite (m5-stdlib lane; equivalent to existing `reduce`)
+#   - bit ops (bit.shl/bit.shr/bit.and/bit.or) — m13 (§16)
 
 use Console
 use Env
 use File
 
-# A Huffman tree is either a leaf (char + frequency) or an internal node
-# (combined frequency + two subtrees).
+import bit
+
+# A Huffman tree is either a leaf (char + frequency) or an internal
+# node (combined frequency + two subtrees).
 type Tree
   = Leaf(Int, Char)
   | Node(Int, Tree, Tree)
@@ -47,9 +50,9 @@ fn count(chars: [Char], acc: [(Char, Int)]) : [(Char, Int)] = match chars {
 # --- Priority queue as a sorted list (min-first) ---
 
 fn pq_insert(t: Tree, q: [Tree]) : [Tree] = match q {
-  []                                   -> [t]
-  [h, ...rest] if freq(t) <= freq(h)   -> [t, h, ...rest]
-  [h, ...rest]                         -> [h, ...pq_insert(t, rest)]
+  []                                 -> [t]
+  [h, ...rest] if freq(t) <= freq(h) -> [t, h, ...rest]
+  [h, ...rest]                       -> [h, ...pq_insert(t, rest)]
 }
 
 fn build(q: [Tree]) : Tree / Fail = match q {
@@ -65,47 +68,85 @@ fn from_text(text: String) : Tree / Fail = {
   build(queue)
 }
 
-# --- Encode / decode ---
+# --- Code lookup: bits as [Int] of 0/1, not String ---
 
-fn lookup(t: Tree, target: Char, code: String) : Option[String] = match t {
+fn lookup(t: Tree, target: Char, code: [Int]) : Option[[Int]] = match t {
   Leaf(_, c) if c == target -> Some(code)
   Leaf(_, _)                -> None
-  Node(_, l, r)             -> match lookup(l, target, code ++ "0") {
+  Node(_, l, r)             -> match lookup(l, target, code ++ [0]) {
     Some(s) -> Some(s)
-    None    -> lookup(r, target, code ++ "1")
+    None    -> lookup(r, target, code ++ [1])
   }
 }
 
-fn encode(t: Tree, text: String) : String / Fail = {
+fn encode_bits(t: Tree, text: String) : [Int] / Fail = {
   string.chars(text)
-    | (c) => match lookup(t, c, "") {
+    | (c) => match lookup(t, c, []) {
       Some(code) -> code
       None       -> Fail.fail("char not in tree")
     }
-    |> string.join("")
+    |> list.flatten
 }
 
-fn decode_step(root: Tree, cur: Tree, bits: [Char], acc: String) : String / Fail = match (cur, bits) {
+# --- Bit packing using m13 bit ops ---
+
+# Pack a sequence of 0/1 into bytes, MSB first. The final byte may
+# carry padding zeros on the right; the bit count is reported
+# separately so a real implementation can drop them on decode.
+fn pack_loop(bits: [Int], acc: Int, n: Int, out: [Int]) : [Int] = match bits {
+  []           -> if n == 0 { out } else { out ++ [bit.shl(acc, 8 - n)] }
+  [b, ...rest] -> {
+    let acc2 = bit.or(bit.shl(acc, 1), b)
+    if n + 1 == 8 { pack_loop(rest, 0, 0, out ++ [bit.and(acc2, 0xFF)]) }
+    else          { pack_loop(rest, acc2, n + 1, out) }
+  }
+}
+
+fn pack_bits(bits: [Int]) : [Int] = pack_loop(bits, 0, 0, [])
+
+# Unpack a byte stream back into a 0/1 sequence. `total_bits` from
+# the header is used to drop padding from the final byte.
+fn unpack_byte(byte: Int, n: Int, acc: [Int]) : [Int] =
+  if n == 0 { acc }
+  else      { unpack_byte(byte, n - 1, [bit.and(bit.shr(byte, n - 1), 1), ...acc]) }
+
+fn unpack_loop(bytes: [Int], remaining: Int, acc: [Int]) : [Int] = match bytes {
+  []           -> acc
+  [b, ...rest] -> {
+    let take = if remaining < 8 { remaining } else { 8 }
+    unpack_loop(rest, remaining - take, acc ++ list.reverse(unpack_byte(b, take, [])))
+  }
+}
+
+fn unpack_bits(bytes: [Int], total_bits: Int) : [Int] =
+  unpack_loop(bytes, total_bits, [])
+
+# --- Decode: walk the tree per bit ---
+
+fn decode_step(root: Tree, cur: Tree, bits: [Int], acc: String) : String / Fail = match (cur, bits) {
   (Leaf(_, c), [])              -> acc ++ char_to_string(c)
   (Leaf(_, c), more)            -> decode_step(root, root, more, acc ++ char_to_string(c))
-  (Node(_, l, _), [b, ...rest]) if b == '0' -> decode_step(root, l, rest, acc)
-  (Node(_, _, r), [b, ...rest]) if b == '1' -> decode_step(root, r, rest, acc)
+  (Node(_, l, _), [b, ...rest]) if b == 0 -> decode_step(root, l, rest, acc)
+  (Node(_, _, r), [b, ...rest]) if b == 1 -> decode_step(root, r, rest, acc)
   _                             -> Fail.fail("malformed bitstream")
 }
 
-fn decode(t: Tree, bits: String) : String / Fail =
-  decode_step(t, t, string.chars(bits), "")
+fn decode(t: Tree, bits: [Int]) : String / Fail =
+  decode_step(t, t, bits, "")
 
 # --- CLI driver ---
 
 fn compress(input: String, output: String) : Unit / Console + File + Fail = {
   let text = File.read(input)!
   let tree = from_text(text)
-  let bits = encode(tree, text)
-  # NOTE: A real implementation would also serialise `tree` alongside
-  # the bits so decompression can reconstruct it.
-  File.write(output, bits)!
-  println("compressed: " ++ int_to_string(string.length(bits)) ++ " bits")
+  let bits = encode_bits(tree, text)
+  let bytes = pack_bits(bits)
+  # NOTE: A real implementation also serialises `tree` and the bit
+  # count alongside `bytes` so decompression can reconstruct the
+  # input exactly (no off-by-one on padding).
+  File.write_bytes(output, bytes)!
+  println("compressed: " ++ int_to_string(list.length(bits)) ++ " bits → "
+    ++ int_to_string(list.length(bytes)) ++ " bytes")
 }
 
 fn main() = match Env.args() {
@@ -113,6 +154,6 @@ fn main() = match Env.args() {
     fail(msg, _) -> Console.eprint("error: " ++ msg)
     return(_)    -> ()
   }
-  ["-d", _, _] -> println("decode requires the serialised tree from compression — out of scope for this demo")
+  ["-d", _, _] -> println("decode requires the serialised tree + bit count from compression — out of scope for this demo")
   _            -> println("usage: huffman [-c|-d] <input> <output>")
 }
