@@ -1514,9 +1514,24 @@ page the way they are written.
 1. **Closed effect aliases** — `type Io = Console + Stdin +
    Env + File`; desugared at resolve time to the label set;
    display hint preserved per §*Row normalisation*. **Landed.**
-2. **Per-op type generics** — §*Per-op type generics*; Mutable's
-   `array_make[T]` / `array_get[T]` / `array_set[T]` migrate to
-   this form. *Pending.*
+2. **Per-op type generics** — §*Per-op type generics* and
+   §*Implementation plan (m7b)*. Splits into:
+   - **#2a — mechanism** (parser + AST + scheme + inferencer
+     hookup, no consumer migration). **Landed.** `EffectOp` now
+     carries `op_tparams: [String]`; `parse_effect_ops` accepts
+     `[T1, T2]` between op name and `(args)`; the per-op scheme
+     generalises over both effect-level and op-level tparam ids
+     (op ids start at `len(effect_tparams)` so the ranges never
+     collide); a new `op_eff_arities` side-table on `InferState`
+     lets `synth_op_call_with_scheme` keep the row label's
+     `ty_args` to the effect-level fresh ids only. Verified by
+     `m7b_2a_op_id_basic`, `m7b_2a_op_distinct_types`,
+     `m7b_2a_op_in_parametric` (op tparam stacked on a
+     parametric effect).
+   - **#2b — `Mutable` migration** (declaration + injection +
+     default handler + replacement of every prelude `array_*`
+     call site in `stage2/compiler.kai`). *Pending.*
+   - **#2c — cleanup** (audit, doc updates). *Pending.*
 3. **Trailing lambdas** — pre-resolve desugar pass
    (`docs/syntax-sugars.md` §*Trailing lambdas*). Includes
    single trailing, lambda-block as expression, double trailing.
@@ -1707,8 +1722,9 @@ and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
 capture) landed too, surfaced while exercising the polymorphic
 helpers from #14. m7b #4 (`@cap` / `cap := v` sugars) also
 landed, completing the user-facing surface of the `var` workflow.
-The remaining m7b items are: #2 (per-op generics), #8 (diagnostic
-review), #15, #16, #17.
+m7b #2a (per-op generics mechanism) landed; #2b (Mutable migration)
+and #2c (cleanup) remain. The remaining m7b items are: #2b, #2c,
+#8 (diagnostic review), #15, #16, #17.
 
 ## Next steps
 
