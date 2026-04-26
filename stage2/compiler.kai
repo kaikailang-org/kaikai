@@ -11807,25 +11807,52 @@ fn dump_mono_out(file: String, decls: [Decl]) : Int {
 
 # ---- m4c — monomorphise (identity, m4c #1) ----
 #
-# Sits between `infer_program` and `emit_program*` in the pipeline.
+# Sits between `infer_program` and `perceus_pass` in the pipeline.
 # Given a TypedProgram (post-inference, with `Expr.ty` populated and
-# all `ResolvedCS` known), produce the `[Decl]` shape the emitter
+# all `ResolvedCS` known), produce the `[Decl]` shape the next pass
 # walks. m4c #1 is an identity transform: the post-mono decls are
 # the typed decls, unchanged. Selfhost stays byte-identical because
 # the emitter does not consume `Expr.ty`.
 #
-# Subsequent m4c steps replace this body with the actual specialiser:
-#   #2 — name mangling helper + `--dump-mono-out` diagnostic.
-#   #3 — emit specialised copies of polymorphic decls.
-#   #4 — rewrite call sites to mangled names.
-#   #5 — drop unreferenced generic decls.
+# Real specialisation (per-instantiation copies of polymorphic decls,
+# call-site rewrites, dead-generic pruning) is deferred. The blocker
+# surfaced under m4c #3: `clause_fn_name(line, col, op)` mints C
+# symbols by source position alone, so two copies of a body that
+# contains an `EHandle` produce identical clause symbols and the C
+# linker rejects the binary. Fixing it is a real retrofit (~1-2 days,
+# touches the clause-collection plumbing) and only pays off once
+# unboxing / drop specialisation / reuse-in-place arrive — the
+# "basic Perceus" pass below operates on uniform-boxed values and
+# does not require specialised bodies.
 #
-# After m4c lands, m5 (basic Perceus) walks the post-mono `[Decl]`
-# and inserts dup / drop based on last-use analysis. The doc that
-# pins the scope honesty for this lane is `docs/perceus-basic.md`.
+# When the time comes, the four sub-steps still apply: mangling
+# helper (`mangle_name` in this file already), specialised-copy
+# emission (with fn-name-aware clause symbols), call-site rewrite,
+# generic prune. Until then `monomorphise` stays identity and
+# `--dump-mono-out` documents what specialisation WOULD do.
 
 fn monomorphise(tp: TypedProgram) : [Decl] {
   tp.decls
+}
+
+# ---- m5 — basic Perceus (m5 #1, walker scaffold) ----
+#
+# Walks the post-mono `[Decl]` and (eventually) inserts `kai_dup` /
+# `kai_decref` calls at non-last / last-use positions per the Koka
+# Perceus paper. m5 #1 wires the slot; the body is identity. m5 #2
+# computes per-binding last-use positions; m5 #3 emits drops at
+# end-of-scope; m5 #4 emits dups at non-last uses; m5 #5 measures.
+#
+# Operates on values, not types. Under uniform boxing every
+# `KaiValue *` has the same RC shape, so a single drop/dup discipline
+# applies across instantiations — the m4c retrofit blocking real
+# monomorphisation does not block this pass.
+#
+# Reads the source AST as the IR. The emitter consumes whatever this
+# function returns; selfhost convergence remains the gate.
+
+fn perceus_pass(decls: [Decl]) : [Decl] {
+  decls
 }
 
 # ---- `--holes`: typed-hole reports ----
@@ -14441,15 +14468,18 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                     if hole_errs != 0 { hole_errs }
                     else {
                       # m4c #1 — identity monomorphise. Hands typed decls
-                      # to the emitter; semantics unchanged because the
+                      # to the next pass; semantics unchanged because the
                       # emitter does not read `Expr.ty`.
                       let mono_decls = monomorphise(typed_prog)
+                      # m5 #1 — basic Perceus walker (identity).
+                      # m5 #2-#4 fill in last-use analysis + dup/drop.
+                      let perceus_decls = perceus_pass(mono_decls)
                       let test_mode = match mode { MTest -> true _ -> false }
                       let use_llvm = match mode { MEmitLlvm -> true _ -> false }
                       let out = if use_llvm {
-                        emit_program_llvm(path, src, mono_decls, test_mode)
+                        emit_program_llvm(path, src, perceus_decls, test_mode)
                       } else {
-                        emit_program(path, src, mono_decls, test_mode)
+                        emit_program(path, src, perceus_decls, test_mode)
                       }
                       print(out)
                       0
