@@ -1332,6 +1332,41 @@ static KaiValue *kai_default_file_write_file(void *self, KaiValue *path,
     return kai_cont_resume(k, kai_prelude_write_file(path, contents));
 }
 
+/* m7b #2b: default Mutable handler — wraps the prelude `array_*`
+ * helpers and resumes with the result. Doc B §`Mutable` *Default
+ * handler* says the trivial wrapping default is installed for any
+ * main row that mentions Mutable. The op signatures here mirror
+ * the prelude's Array[T] return shape (see compiler.kai
+ * builtin_mutable_decl for the divergence note from Doc B). */
+static KaiValue *kai_default_mutable_array_make(void *self, KaiValue *n,
+                                                 KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_array_make(n, init));
+}
+
+static KaiValue *kai_default_mutable_array_length(void *self, KaiValue *a, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_array_length(a));
+}
+
+static KaiValue *kai_default_mutable_array_get(void *self, KaiValue *a,
+                                                KaiValue *i, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_array_get(a, i));
+}
+
+static KaiValue *kai_default_mutable_array_set(void *self, KaiValue *a,
+                                                KaiValue *i, KaiValue *v, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_array_set(a, i, v));
+}
+
+static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
+                                                 KaiValue *n, KaiValue *init, KaiCont *k) {
+    (void) self;
+    return kai_cont_resume(k, kai_prelude_array_grow(a, n, init));
+}
+
 typedef struct KaiEvidence KaiEvidence;
 struct KaiEvidence {
     KaiEvidence *parent;

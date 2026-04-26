@@ -4544,7 +4544,8 @@ fn builtin_effect_arities_filtered(known: [EffArity]) : [EffArity] {
   let all = [
     EA("Console", 0), EA("Fail", 0), EA("Stdin", 0),
     EA("Env", 0), EA("File", 0),
-    EA("State", 1), EA("Reader", 1), EA("Writer", 1)
+    EA("State", 1), EA("Reader", 1), EA("Writer", 1),
+    EA("Mutable", 0)
   ]
   filter_unknown_arities(all, known)
 }
@@ -6666,20 +6667,40 @@ fn default_file_setup() : String =
     "    kai_evidence_push(&_kai_default_node_file, \"File\", &_kai_default_ev_file);\n"
   ])
 
+# m7b #2b: default Mutable handler — wraps the prelude `array_*`
+# runtime functions with clauses that resume with the result. Each
+# slot is initialised to the matching `kai_default_mutable_*`
+# trampoline (defined in stage0/runtime.h).
+fn default_mutable_setup() : String =
+  concat_all([
+    "    static EvMutable _kai_default_ev_mutable;\n",
+    "    static KaiEvidence _kai_default_node_mutable;\n",
+    "    _kai_default_ev_mutable.handler_id = kai_fresh_handler_id();\n",
+    "    _kai_default_ev_mutable.array_make   = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_make;\n",
+    "    _kai_default_ev_mutable.array_length = (KaiValue *(*)(EvMutable *, KaiValue *, KaiCont *)) &kai_default_mutable_array_length;\n",
+    "    _kai_default_ev_mutable.array_get    = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_get;\n",
+    "    _kai_default_ev_mutable.array_set    = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_set;\n",
+    "    _kai_default_ev_mutable.array_grow   = (KaiValue *(*)(EvMutable *, KaiValue *, KaiValue *, KaiValue *, KaiCont *)) &kai_default_mutable_array_grow;\n",
+    "    kai_evidence_push(&_kai_default_node_mutable, \"Mutable\", &_kai_default_ev_mutable);\n"
+  ])
+
 # m7a #7: assemble the full setup block for the builtins listed in
-# `main`'s row, push order Console → Fail → Stdin → Env → File.
+# `main`'s row, push order Console → Fail → Stdin → Env → File →
+# Mutable. Mutable goes last so it pops first (LIFO).
 fn default_setups_for(main_row: [String]) : String =
   concat_all([
     if list_has(main_row, "Console") { default_console_setup() } else { "" },
     if list_has(main_row, "Fail")    { default_fail_setup() }    else { "" },
     if list_has(main_row, "Stdin")   { default_stdin_setup() }   else { "" },
     if list_has(main_row, "Env")     { default_env_setup() }     else { "" },
-    if list_has(main_row, "File")    { default_file_setup() }    else { "" }
+    if list_has(main_row, "File")    { default_file_setup() }    else { "" },
+    if list_has(main_row, "Mutable") { default_mutable_setup() } else { "" }
   ])
 
 # Pops in reverse-push order so the evidence stack drains LIFO.
 fn default_pops_for(main_row: [String]) : String =
   concat_all([
+    if list_has(main_row, "Mutable") { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "File")    { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Env")     { "    kai_evidence_pop();\n" } else { "" },
     if list_has(main_row, "Stdin")   { "    kai_evidence_pop();\n" } else { "" },
@@ -14042,6 +14063,14 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
   let state_d   = inject_unconditional(existing, "State",  builtin_state_decl())
   let reader_d  = inject_unconditional(existing, "Reader", builtin_reader_decl())
   let writer_d  = inject_unconditional(existing, "Writer", builtin_writer_decl())
+  # m7b #2b: `Mutable` has a runtime default handler (the prelude
+  # `kai_prelude_array_*` functions wrapped in clauses). Inject the
+  # decl unconditionally so user code that intercepts mutation via
+  # `handle ... with Mutable { ... }` (a body that absorbs the row
+  # before main sees it) still resolves `Mutable.array_*` ops. The
+  # default-handler setup is gated separately on `main`'s row in
+  # `default_setups_for`.
+  let mutable_d = inject_unconditional(existing, "Mutable", builtin_mutable_decl())
   list_append(console_d,
     list_append(fail_d,
       list_append(stdin_d,
@@ -14049,7 +14078,8 @@ fn inject_builtin_effects(decls: [Decl]) : [Decl] = {
           list_append(file_d,
             list_append(state_d,
               list_append(reader_d,
-                list_append(writer_d, decls))))))))
+                list_append(writer_d,
+                  list_append(mutable_d, decls)))))))))
 }
 
 fn inject_one(main_row: [String], existing: [String],
@@ -14102,7 +14132,7 @@ fn param_typed_zero(name: String, ty: TypeExpr) : Param =
 # these as effect names whether or not the file already declared
 # them via `effect`.
 fn builtin_effect_names() : [String] =
-  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer"]
+  ["Console", "Fail", "Stdin", "Env", "File", "State", "Reader", "Writer", "Mutable"]
 
 fn builtin_console_decl() : Decl =
   DEffect(false, "Console", [],
@@ -14162,6 +14192,59 @@ fn builtin_writer_decl() : Decl =
     [
       EOp("tell", [], [param_typed_zero("w", ty_name_zero("W"))],
           ty_name_zero("Unit"), 0, 0)
+    ], 0, 0)
+
+# m7b #2b: `Mutable` effect — Doc B §`Mutable`. Per-op generics
+# (#2a) make this declarable: each array op carries its own `[T]`,
+# so a single handler instance serves every element type. The
+# default handler (default_mutable_setup) wraps the prelude
+# `kai_prelude_array_*` runtime functions and resumes.
+#
+# Divergence from Doc B: Doc B specifies
+#   array_set[T](a, i, v) : Unit
+# but stage 2's prelude `array_set` returns Array[T] (in-place
+# mutation + return) so internal `xs = array_set(xs, i, v)` chains
+# work. To keep stage 2's existing self-host code typing without
+# rewriting every call site, the Mutable op signatures here mirror
+# the prelude shape (Array[T] return). A future #2c can revisit
+# this and migrate the compiler's internal callers if Doc B's Unit
+# shape proves more idiomatic at the user surface.
+#
+# `ref_*` ops are deferred — kaikai has no surface `Ref[T]` type
+# today (Doc B's Mutable.ref_* depends on it).
+fn builtin_mutable_decl() : Decl =
+  DEffect(false, "Mutable", [],
+    [
+      EOp("array_make", ["T"],
+          [Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 },
+           param_typed_zero("init", ty_name_zero("T"))],
+          ty_named_zero("Array", [ty_name_zero("T")]),
+          0, 0),
+      EOp("array_length", ["T"],
+          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")]))],
+          ty_name_zero("Int"),
+          0, 0),
+      EOp("array_get", ["T"],
+          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+           Param { pname: "i", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 }],
+          ty_name_zero("T"),
+          0, 0),
+      EOp("array_set", ["T"],
+          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+           Param { pname: "i", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 },
+           param_typed_zero("v", ty_name_zero("T"))],
+          ty_named_zero("Array", [ty_name_zero("T")]),
+          0, 0),
+      EOp("array_grow", ["T"],
+          [param_typed_zero("a", ty_named_zero("Array", [ty_name_zero("T")])),
+           Param { pname: "n", ptype: Some(ty_name_zero("Int")),
+                   pline: 0, pcol: 0 },
+           param_typed_zero("init", ty_name_zero("T"))],
+          ty_named_zero("Array", [ty_name_zero("T")]),
+          0, 0)
     ], 0, 0)
 
 fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [String], src: String, prelude_decls: [Decl]) : Int {
