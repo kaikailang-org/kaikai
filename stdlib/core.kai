@@ -167,6 +167,49 @@ pub fn list_contains(xs: [a], x: a) : Bool {
   }
 }
 
+# Returns the longest prefix of `xs` whose elements all satisfy
+# `p`. As soon as `p(h)` is false the recursion stops and the
+# already-matched prefix is returned. Empty list yields `[]`.
+# `p` is invoked at most `length(prefix) + 1` times — once per
+# accepted element plus once on the first rejection (if any).
+pub fn list_take_while(xs: [a], p: (a) -> Bool) : [a] {
+  match xs {
+    [] -> []
+    [h, ...t] -> if p(h) { [h, ...list_take_while(t, p)] } else { [] }
+  }
+}
+
+# Returns `xs` with its longest `p`-satisfying prefix removed.
+# Mirrors `list_take_while`: the two together split `xs` into
+# (prefix, rest) without scanning the tail past the first
+# rejection. Once `p(h)` is false the rest of `xs` (including `h`)
+# is returned as-is, sharing structure with the input.
+pub fn list_drop_while(xs: [a], p: (a) -> Bool) : [a] {
+  match xs {
+    [] -> []
+    [h, ...t] -> if p(h) { list_drop_while(t, p) } else { xs }
+  }
+}
+
+# Tail-recursive worker for list_uniq. `seen` is the accumulator
+# of already-emitted elements (in reverse order); `out` is the
+# accumulator of the deduplicated prefix (also reverse). Both are
+# reversed at the call site.
+pub fn list_uniq_loop(xs: [Int], seen: [Int], out: [Int]) : [Int] {
+  match xs {
+    [] -> list_reverse(out)
+    [h, ...t] -> if list_contains(seen, h) { list_uniq_loop(t, seen, out) }
+                 else { list_uniq_loop(t, [h, ...seen], [h, ...out]) }
+  }
+}
+
+# Returns `xs` with subsequent duplicates removed, preserving
+# first-occurrence order. O(n²) worst case (linear membership
+# check per element); the Int-only signature keeps v1 small —
+# the polymorphic / Map-backed variants land with collections.map
+# in m14 proper.
+pub fn list_uniq(xs: [Int]) : [Int] = list_uniq_loop(xs, [], [])
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
