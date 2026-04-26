@@ -1,0 +1,44 @@
+# m14-pre #3 — smoke test for list_max, list_min, list_max_by,
+# list_min_by. The *_by tests check stability on ties (first-wins)
+# by mapping list elements to a coarser key.
+
+fn opt_int_str(o: Option[Int]) : String {
+  match o {
+    None -> "none"
+    Some(x) -> int_to_string(x)
+  }
+}
+
+fn opt_str_str(o: Option[String]) : String {
+  match o {
+    None -> "none"
+    Some(x) -> x
+  }
+}
+
+fn key_len(s: String) : Int = string_length(s)
+
+fn main() {
+  # list_max
+  println(opt_int_str(list_max([])))
+  println(opt_int_str(list_max([7])))
+  println(opt_int_str(list_max([3, 1, 9, 4, 1, 5, 9, 2, 6])))
+  println(opt_int_str(list_max([0 - 5, 0 - 1, 0 - 8])))      # negatives only
+
+  # list_min
+  println(opt_int_str(list_min([])))
+  println(opt_int_str(list_min([7])))
+  println(opt_int_str(list_min([3, 1, 9, 4, 1, 5, 9, 2, 6])))
+  println(opt_int_str(list_min([0 - 5, 0 - 1, 0 - 8])))
+
+  # list_max_by — key returns string length; tie on length 4 must
+  # pick the first ("dogs") over later 4-letter strings ("kiwi").
+  println(opt_str_str(list_max_by([], key_len)))
+  println(opt_str_str(list_max_by(["a", "bb", "ccc"], key_len)))
+  println(opt_str_str(list_max_by(["dogs", "ant", "kiwi", "x"], key_len)))
+
+  # list_min_by — same fixture, smallest-by-len; tie on 1 picks first.
+  println(opt_str_str(list_min_by([], key_len)))
+  println(opt_str_str(list_min_by(["dogs", "ant", "kiwi", "x"], key_len)))
+  println(opt_str_str(list_min_by(["aa", "bb", "cc"], key_len)))   # all tie
+}

@@ -210,6 +210,88 @@ pub fn list_uniq_loop(xs: [Int], seen: [Int], out: [Int]) : [Int] {
 # in m14 proper.
 pub fn list_uniq(xs: [Int]) : [Int] = list_uniq_loop(xs, [], [])
 
+# Tail-recursive worker for list_max. `best` is the running
+# maximum; `xs` is the unscanned tail.
+pub fn list_max_loop(xs: [Int], best: Int) : Int {
+  match xs {
+    [] -> best
+    [h, ...t] -> if h > best { list_max_loop(t, h) }
+                 else        { list_max_loop(t, best) }
+  }
+}
+
+# Returns `Some(largest)` over `xs`, `None` for `[]`. Total
+# (no panic on empty); the caller decides what to do with `None`.
+# Int-only for v1 — see list_max_by for the by-key variant.
+pub fn list_max(xs: [Int]) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_max_loop(t, h))
+  }
+}
+
+# Tail-recursive worker for list_min.
+pub fn list_min_loop(xs: [Int], best: Int) : Int {
+  match xs {
+    [] -> best
+    [h, ...t] -> if h < best { list_min_loop(t, h) }
+                 else        { list_min_loop(t, best) }
+  }
+}
+
+# Returns `Some(smallest)` over `xs`, `None` for `[]`.
+pub fn list_min(xs: [Int]) : Option[Int] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_min_loop(t, h))
+  }
+}
+
+# Tail-recursive worker for list_max_by. Carries both the
+# running best element and its already-evaluated key, so `key`
+# is invoked exactly once per element of the original list.
+pub fn list_max_by_loop(xs: [a], key: (a) -> Int, best: a, best_k: Int) : a {
+  match xs {
+    [] -> best
+    [h, ...t] -> {
+      let k = key(h)
+      if k > best_k { list_max_by_loop(t, key, h, k) }
+      else          { list_max_by_loop(t, key, best, best_k) }
+    }
+  }
+}
+
+# Returns `Some(elem)` whose `key(elem)` is largest, `None` for
+# `[]`. Stable on ties: the *first* element with the maximal key
+# wins. `key` is invoked exactly once per element.
+pub fn list_max_by(xs: [a], key: (a) -> Int) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_max_by_loop(t, key, h, key(h)))
+  }
+}
+
+# Tail-recursive worker for list_min_by.
+pub fn list_min_by_loop(xs: [a], key: (a) -> Int, best: a, best_k: Int) : a {
+  match xs {
+    [] -> best
+    [h, ...t] -> {
+      let k = key(h)
+      if k < best_k { list_min_by_loop(t, key, h, k) }
+      else          { list_min_by_loop(t, key, best, best_k) }
+    }
+  }
+}
+
+# Returns `Some(elem)` whose `key(elem)` is smallest, `None` for
+# `[]`. Stable on ties: first-wins.
+pub fn list_min_by(xs: [a], key: (a) -> Int) : Option[a] {
+  match xs {
+    [] -> None
+    [h, ...t] -> Some(list_min_by_loop(t, key, h, key(h)))
+  }
+}
+
 # ---- String ----
 
 pub fn string_starts_with(s: String, prefix: String) : Bool {
