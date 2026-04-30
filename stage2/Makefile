@@ -493,6 +493,30 @@ test-stdlib: $(TARGET) build
 	    && echo "stdlib OK $$name" \
 	    || { echo "stdlib DIFF $$name"; diff ../examples/stdlib/$$name.out.expected build/stdlib-$$name.out; exit 1; }; \
 	done
+	@# m13: assert bit ops lowered as compiler intrinsics. The emitted
+	@# C must contain each raw operator inline next to `_a->as.i`, and
+	@# must NOT reference any `kai_bit_*` runtime helper (we never
+	@# declared one — a leak would be an emit-pass miss).
+	@if grep -q 'kai_bit_' build/stdlib-bits_basic.c; then \
+	  echo "stdlib FAIL bits_basic (intrinsic leaked as kai_bit_* call)"; \
+	  grep 'kai_bit_' build/stdlib-bits_basic.c; \
+	  exit 1; \
+	fi
+	@grep -F -q '_a->as.i << _b' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (<< not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i >> _b' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (>> not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i & _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (& not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i | _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (| not inlined)"; exit 1; }
+	@grep -F -q '_a->as.i ^ _b'  build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (^ not inlined)"; exit 1; }
+	@grep -F -q '~ _a->as.i'     build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (~ not inlined)"; exit 1; }
+	@grep -F -q '__builtin_popcountll' build/stdlib-bits_basic.c \
+	  || { echo "stdlib FAIL bits_basic (popcount not inlined)"; exit 1; }
+	@echo "stdlib OK bits_basic intrinsic-lowered"
 # Typed holes (M10): every example under examples/holes/ must
 # (a) produce a --holes report with at least one "type hole" entry,
 # (b) produce a valid --holes-json array,
@@ -1100,6 +1124,21 @@ test-effects: $(TARGET) build
 	  diff -q $$exp build/s2-$$name.out > /dev/null \
 	    && echo "effects OK $$name (trap_exit=1: linked peer DONE/CANCELLED delivers Normal/Crashed string to mailbox)" \
 	    || { echo "effects FAIL $$name (trap-exit output mismatch)"; diff $$exp build/s2-$$name.out; exit 1; }; \
+	done; \
+	for f in ../examples/effects/m8_spawn_per_op_generics.kai; do \
+	  name=$$(basename $$f .kai); \
+	  ./$(TARGET) $$f > build/s2-$$name.c 2> build/s2-$$name.err \
+	    || { echo "effects FAIL $$name (kaic2 errored)"; cat build/s2-$$name.err; exit 1; }; \
+	  $(CC) $(CFLAGS) -I ../stage0 build/s2-$$name.c -o build/s2-$$name \
+	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
+	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
+	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
+	  grep -q "^41$$" build/s2-$$name.out \
+	    && grep -q "^100$$" build/s2-$$name.out \
+	    && grep -q "^7$$" build/s2-$$name.out \
+	    && grep -q "^cancelled$$" build/s2-$$name.out \
+	    && echo "effects OK $$name (per-op [T] flows through Spawn.spawn / await / select / cancel)" \
+	    || { echo "effects FAIL $$name (wrong output)"; cat build/s2-$$name.out; exit 1; }; \
 	done; \
 	for f in ../examples/effects/m8_4_cancel_uncaught.kai; do \
 	  name=$$(basename $$f .kai); \
