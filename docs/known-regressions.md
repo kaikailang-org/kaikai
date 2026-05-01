@@ -534,8 +534,35 @@ and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ## R5 — `demos/euler4` segfaults on Linux runtime; passes on macOS
 
-**Status**: **FIXED** 2026-04-30 — runtime constructor bumps
-`RLIMIT_STACK` at startup (`stage0/runtime.h:
+**Status**: **FULLY RESOLVED** 2026-04-30 — proper TCO landed
+in the C-emit path (issue #37). The interim `RLIMIT_STACK`
+runtime bump (PR #36) has been removed; both pieces of context
+are kept below for posterity.
+
+**Final fix (issue #37)**: the C emitter rewrites every
+self-tail-call into a `goto`-loop with parameter rebinding.
+A new `tcrec_rewrite_decls` pass between unboxing and
+Perceus replaces the callee `EVar` of every tail-position
+self-call with a sentinel
+(`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`); the C
+backend then emits a rebind+goto block instead of a
+`kai_<sym>(...)` call, with `_kai_<c_sym>_entry:;` planted
+before the enclosing `return ({ ... });`. Every kaikai
+self-tail-recursive fn now compiles to constant C-stack
+space, so `demos/build/euler4-bin` runs with `ulimit -s 256`
+on macOS (and Linux CI no longer needs the runtime bump).
+
+**Why the runtime bump came first**: the runtime
+`kai_runtime_bump_stack_rlimit` constructor unblocked CI in
+~30 lines and shipped same-day. The proper fix touches
+`emit_call_expr`, `emit_fn_body`, the run pipeline, and every
+fixture's expected C — appropriate for its own lane (which
+became issue #37 / this branch).
+
+---
+
+**Interim fix (PR #36, removed by issue #37)** — runtime
+constructor bumps `RLIMIT_STACK` at startup (`stage0/runtime.h:
 kai_runtime_bump_stack_rlimit`). Root cause was none of the
 three ranked hypotheses below; surfaced as H4 during local
 repro on the Ubuntu CI box.

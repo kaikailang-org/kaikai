@@ -9,6 +9,49 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
 
 ## [Unreleased]
 
+### Added
+
+- **TCO via emitter goto-loop rewrite (issue #37 — fully
+  closes R5).** A new `tcrec_rewrite_decls` pass between
+  unboxing and Perceus identifies every self-recursive call
+  in tail position and rewrites the callee `EVar` into a
+  pipe-encoded sentinel
+  (`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`). The C
+  backend recognises the sentinel and emits a rebind+goto
+  block instead of a normal `kai_<sym>(...)` call, with the
+  matching `_kai_<c_sym>_entry:;` label planted before the
+  enclosing `return ({ ... });`. Net result: every kaikai
+  self-tail-recursive fn now compiles to constant C-stack
+  space; the `call kai_search` → `jmp kai_search` flip that
+  R5 (issue #34) papered over with an `RLIMIT_STACK` bump
+  now happens at the source-to-C boundary instead.
+  - Per-call-site dropmask: a parameter is dropped in the
+    goto block when (i) `LUBlocked`, (ii) `LUAt` with
+    multi-use, or (iii) `LUAt` with single-use *and* that
+    single read does not appear in the args of this call
+    site. The third case covers the `list.nth(xs, i)` shape
+    where `xs` is consumed by an enclosing match
+    scrutinee whose `kai_decref(_scr)` the goto skips.
+  - Conservative bail-out: fns with any `LUUnused` parameter
+    keep the normal-call shape (the wrap's *entry* drops
+    would re-fire on each iteration and free dangling
+    pointers; entry-drop hoisting above the label is a
+    follow-up).
+  - LLVM backend currently emits a normal call when it sees
+    the sentinel; TCO via the LLVM `tail` marker is a
+    separate lane (issue #37 non-goals).
+
+### Removed
+
+- The `__attribute__((constructor)) kai_runtime_bump_stack_rlimit`
+  added in PR #36 for R5. The proper TCO landed in this
+  lane, so the band-aid is no longer needed:
+  `demos/build/euler4-bin` runs to completion under
+  `ulimit -s 256` on macOS, and the expected ~1 M-deep
+  `search` recursion now uses O(1) C-stack.
+  `<sys/resource.h>` is dropped from `stage0/runtime.h`
+  along with the constructor.
+
 ## [0.21.0] — 2026-04-30 (Unboxing Phase 2 — Tier 2.5 close, ~2.5× C reference on inner numeric loop)
 
 ### Added

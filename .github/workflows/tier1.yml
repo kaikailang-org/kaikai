@@ -33,11 +33,13 @@ jobs:
       # Pin CC=clang so the runner uses the same compiler family
       # as the macOS dev environment (clang). R5 (the euler4
       # main-thread stack overflow that was previously gated by
-      # `BASELINE=23`) was fixed by a runtime constructor in
-      # `stage0/runtime.h` that bumps RLIMIT_STACK at startup;
-      # CI now reads the same `demos/baseline.txt = 24` as
-      # local mac. CHANGELOG entry under [Unreleased] has the
-      # root cause + fix.
+      # `BASELINE=23`) was fully resolved by issue #37: the
+      # emitter rewrites every self-tail-call into a goto-loop
+      # at the C-emit boundary, so deep self-recursion now uses
+      # O(1) C-stack and does not depend on `RLIMIT_STACK` (the
+      # PR #36 runtime constructor was the interim fix and has
+      # been removed). CI reads `demos/baseline.txt = 24` like
+      # local mac.
       - name: tier0 (selfhost byte-identical + demos baseline)
         run: make CC=clang tier0
 
