@@ -24137,11 +24137,12 @@ fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], args: [Expr],
   match params {
     [] -> acc
     [p, ...rest] -> {
+      # DEBUG: replace tcrec_args_have_evar with false to bisect
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
         LUAt(_, _, _) ->
           if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 { true }
-          else { not tcrec_args_have_evar(args, p.pname) }
+          else { false }
         LUUnused(_) -> false
       }
       let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
@@ -24332,8 +24333,8 @@ fn tcrec_rewrite_kind(k: ExprKind, line: Int, col: Int, nm: String, arity: Int,
     ECall(f, xs) -> match f.kind {
       EVar(callee) ->
         if callee == nm and not list_has(scope, nm) and list_length(xs) == arity {
-          # DEBUG: skip dropmask computation, use 0
-          let sentinel = tcrec_make_sentinel(c_sym_str, 0, pnames)
+          let dropmask = tcrec_compute_site_dropmask(params, uses, xs, 0, 0)
+          let sentinel = tcrec_make_sentinel(c_sym_str, dropmask, pnames)
           ECall(
             Expr { kind: EVar(sentinel), line: f.line, col: f.col,
                    ty: f.ty, mode: f.mode },
