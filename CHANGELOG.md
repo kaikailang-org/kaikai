@@ -25,21 +25,33 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
   space; the `call kai_search` → `jmp kai_search` flip that
   R5 (issue #34) papered over with an `RLIMIT_STACK` bump
   now happens at the source-to-C boundary instead.
-  - Per-call-site dropmask: a parameter is dropped in the
-    goto block when (i) `LUBlocked`, (ii) `LUAt` with
-    multi-use, or (iii) `LUAt` with single-use *and* that
-    single read does not appear in the args of this call
-    site. The third case covers the `list.nth(xs, i)` shape
-    where `xs` is consumed by an enclosing match
-    scrutinee whose `kai_decref(_scr)` the goto skips.
-  - Conservative bail-out: fns with any `LUUnused` parameter
-    keep the normal-call shape (the wrap's *entry* drops
-    would re-fire on each iteration and free dangling
-    pointers; entry-drop hoisting above the label is a
-    follow-up).
-  - LLVM backend currently emits a normal call when it sees
-    the sentinel; TCO via the LLVM `tail` marker is a
-    separate lane (issue #37 non-goals).
+  - Conservative dropmask: a parameter is dropped in the
+    goto block when (i) `LUBlocked` or (ii) `LUAt` with
+    multi-use — exactly the criteria
+    `pcs_collect_exit_drops` uses, so the goto-path drops
+    match the wrap's exit drops byte-for-byte. Single-use
+    `LUAt` is *not* dropped: the read transfers ownership
+    and a goto-block drop after that transfer would
+    double-free.
+  - Known leak: in `list.nth(xs, i)`-shape fns the
+    single-use param (`xs`) is consumed by an enclosing
+    match scrutinee, and the goto skips that match's
+    `kai_decref(_scr)`. One cons cell leaks per goto
+    iteration. A more precise dropmask that distinguishes
+    "consumed in args" from "consumed elsewhere" was
+    bisected to a glibc-tcache abort during stage 2's
+    Linux selfhost (the precise scanner walked the args
+    AST and triggered a refcount imbalance somewhere in
+    stage 1's emit of recursive list traversal). The
+    precise version is parked as a follow-up to issue #37.
+  - Conservative bail-out: fns with any `LUUnused`
+    parameter keep the normal-call shape (the wrap's
+    *entry* drops would re-fire on each iteration and
+    free dangling pointers; entry-drop hoisting above the
+    label is a follow-up).
+  - LLVM backend currently emits a normal call when it
+    sees the sentinel; TCO via the LLVM `tail` marker is
+    a separate lane (issue #37 non-goals).
 
 ### Notes
 
