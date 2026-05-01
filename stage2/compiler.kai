@@ -32216,8 +32216,8 @@ fn compile_source(path: String, mode: Mode, strict_holes: Bool, search_paths: [S
                       # a normal call when it sees the sentinel;
                       # TCO via the LLVM `tail` marker is a
                       # separate lane (issue #37 non-goals).
-                      let pre_perceus_decls = if use_llvm { unboxed_decls }
-                                              else { tcrec_rewrite_decls(unboxed_decls) }
+                      # DEBUG: disable tcrec rewrite to isolate CI failure
+                      let pre_perceus_decls = unboxed_decls
                       # m5 #1 — basic Perceus walker (identity).
                       # m5 #2-#4 fill in last-use analysis + dup/drop.
                       let perceus_decls = perceus_pass(pre_perceus_decls)
