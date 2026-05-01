@@ -24078,8 +24078,19 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] = map(decls, tcrec_rewrite_decl)
 
 fn tcrec_rewrite_decl(d: Decl) : Decl {
-  # DEBUG: full no-op to isolate CI heap corruption
-  d
+  # DEBUG: detect tail-self-calls + compute uses, but skip body rewrite
+  match d {
+    DFn(_, name, _, params, _, _, body, _, _, _) -> {
+      let arity = list_length(params)
+      if not tcrec_has_tail_self_call(body, name, arity) { d }
+      else {
+        let pnames = map(params, (p) => p.pname)
+        let _uses = pcs_collect_uses_expr(body, pnames, false, [])
+        d
+      }
+    }
+    _ -> d
+  }
 }
 
 fn tcrec_any_unused(params: [Param], uses: [Use]) : Bool {
