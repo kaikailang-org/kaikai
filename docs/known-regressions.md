@@ -534,23 +534,41 @@ and `m8_fiber_discard_yields.kai` covers the discard + yield shape.)
 
 ## R5 — `demos/euler4` segfaults on Linux runtime; passes on macOS
 
-**Status**: **FULLY RESOLVED** 2026-04-30 — proper TCO landed
-in the C-emit path (issue #37). The interim `RLIMIT_STACK`
-runtime bump (PR #36) has been removed; both pieces of context
-are kept below for posterity.
+**Status**: **RESOLVED for emitted programs** 2026-04-30 (issue
+#37) — proper TCO landed in the C-emit path. The interim
+`RLIMIT_STACK` runtime bump from PR #36 is *retained* until
+the rewrite is mirrored into `stage1/compiler.kai`, because
+the bootstrap chain (kaic0 → kaic1 → kaic2) does not yet
+benefit from the rewrite (see "Why the runtime bump stays
+on" below).
 
-**Final fix (issue #37)**: the C emitter rewrites every
-self-tail-call into a `goto`-loop with parameter rebinding.
-A new `tcrec_rewrite_decls` pass between unboxing and
-Perceus replaces the callee `EVar` of every tail-position
-self-call with a sentinel
+**Final fix for emitted programs (issue #37)**: the C emitter
+rewrites every self-tail-call into a `goto`-loop with
+parameter rebinding. A new `tcrec_rewrite_decls` pass
+between unboxing and Perceus replaces the callee `EVar` of
+every tail-position self-call with a sentinel
 (`__kai_tcrec|<c_sym>|<dropmask>|<p0>|<p1>|...`); the C
 backend then emits a rebind+goto block instead of a
 `kai_<sym>(...)` call, with `_kai_<c_sym>_entry:;` planted
 before the enclosing `return ({ ... });`. Every kaikai
-self-tail-recursive fn now compiles to constant C-stack
-space, so `demos/build/euler4-bin` runs with `ulimit -s 256`
-on macOS (and Linux CI no longer needs the runtime bump).
+self-tail-recursive fn in **kaic2-compiled** code now uses
+constant C-stack space, so `demos/build/euler4-bin` runs
+with `ulimit -s 256` on macOS.
+
+**Why the runtime bump stays on**: the rewrite lives in
+`stage2/compiler.kai`, so the *programs kaic2 emits* get
+TCO. But the kaic2 binary itself was emitted by kaic1
+(stage 1), which still uses the recursive emit shape. When
+kaic2 runs over `compiler.kai` (~33 k tokens), its
+internal `lex_loop` recurses ~33 k times — fits in macOS's
+default but blows Linux's 8 MiB main-thread stack and
+trips glibc's tcache integrity check ("malloc(): unaligned
+tcache chunk detected"). Mirroring the rewrite into
+`stage1/compiler.kai` (and auditing `stage0/emit.c`) is
+the proper closure; until that follow-up lands, keeping
+the constructor means the bootstrap chain works on Linux
+without depending on `ulimit -s` from the user. The
+comment in `stage0/runtime.h` calls this out explicitly.
 
 **Why the runtime bump came first**: the runtime
 `kai_runtime_bump_stack_rlimit` constructor unblocked CI in

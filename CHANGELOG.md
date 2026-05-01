@@ -41,16 +41,23 @@ prior to 1.0.0 minor versions may break backwards compatibility (see CLAUDE.md
     the sentinel; TCO via the LLVM `tail` marker is a
     separate lane (issue #37 non-goals).
 
-### Removed
+### Notes
 
-- The `__attribute__((constructor)) kai_runtime_bump_stack_rlimit`
-  added in PR #36 for R5. The proper TCO landed in this
-  lane, so the band-aid is no longer needed:
-  `demos/build/euler4-bin` runs to completion under
-  `ulimit -s 256` on macOS, and the expected ~1 M-deep
-  `search` recursion now uses O(1) C-stack.
-  `<sys/resource.h>` is dropped from `stage0/runtime.h`
-  along with the constructor.
+- `kai_runtime_bump_stack_rlimit` (the PR #36 R5 band-aid) is
+  *retained* even though the kaic2 emit now produces O(1)-stack
+  goto-loops for self-tail-calls. Reason: the rewrite lives in
+  `stage2/compiler.kai`, so the *programs kaic2 compiles*
+  (demos, kaic2's selfhost output) get TCO, but the bootstrap
+  chain `kaic0 → kaic1 → kaic2` is built by stage 0 / stage 1,
+  whose emit still uses recursive C calls. When kaic2 runs
+  over `compiler.kai` (~33 k tokens), its internal `lex_loop`
+  recurses ~33 k times, blowing Linux's default 8 MiB
+  main-thread stack. The proper closure is to mirror the
+  rewrite into `stage1/compiler.kai` (and audit
+  `stage0/emit.c`); once that lands, the constructor +
+  `<sys/resource.h>` come out for good. Tracked as a
+  follow-up to issue #37; the comment in
+  `stage0/runtime.h` calls this out explicitly.
 
 ## [0.21.0] — 2026-04-30 (Unboxing Phase 2 — Tier 2.5 close, ~2.5× C reference on inner numeric loop)
 
