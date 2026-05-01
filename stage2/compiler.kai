@@ -24137,12 +24137,11 @@ fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], args: [Expr],
   match params {
     [] -> acc
     [p, ...rest] -> {
-      # DEBUG: replace tcrec_args_have_evar with false to bisect
       let drop = match last_use_for(p.pname, uses) {
         LUBlocked(_) -> true
         LUAt(_, _, _) ->
           if pcs_count_non_lam_uses(p.pname, uses, 0) >= 2 { true }
-          else { false }
+          else { not tcrec_args_have_evar(args, p.pname) }
         LUUnused(_) -> false
       }
       let acc1 = if drop { acc + tcrec_pow2(i) } else { acc }
@@ -24156,12 +24155,8 @@ fn tcrec_compute_site_dropmask(params: [Param], uses: [Use], args: [Expr],
 # tree means the arg expression reads p (and, if count(p)==1,
 # consumes it on evaluation).
 fn tcrec_args_have_evar(args: [Expr], p: String) : Bool {
-  match args {
-    [] -> false
-    [a, ...rest] ->
-      if tcrec_expr_has_evar(a, p) { true }
-      else { tcrec_args_have_evar(rest, p) }
-  }
+  # DEBUG: stub body — always return false. Calls call site preserved.
+  false
 }
 
 fn tcrec_expr_has_evar(e: Expr, p: String) : Bool =
