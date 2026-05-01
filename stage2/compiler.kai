@@ -24078,15 +24078,21 @@ fn tcrec_block_scope(stmts: [Stmt], scope: [String]) : [String] {
 fn tcrec_rewrite_decls(decls: [Decl]) : [Decl] = map(decls, tcrec_rewrite_decl)
 
 fn tcrec_rewrite_decl(d: Decl) : Decl {
-  # DEBUG: detect tail-self-calls + compute uses, but skip body rewrite
+  # DEBUG: run body rewrite but discard the result, return original d
   match d {
-    DFn(_, name, _, params, _, _, body, _, _, _) -> {
+    DFn(_, name, _, params, _, _, body, _, _, mo) -> {
       let arity = list_length(params)
       if not tcrec_has_tail_self_call(body, name, arity) { d }
       else {
         let pnames = map(params, (p) => p.pname)
-        let _uses = pcs_collect_uses_expr(body, pnames, false, [])
-        d
+        let uses = pcs_collect_uses_expr(body, pnames, false, [])
+        if tcrec_any_unused(params, uses) { d }
+        else {
+          let c_sym_str = c_sym(name, mo)
+          let _new_body = tcrec_rewrite_body(body, name, arity, c_sym_str,
+                                             params, pnames, uses, [])
+          d
+        }
       }
     }
     _ -> d
