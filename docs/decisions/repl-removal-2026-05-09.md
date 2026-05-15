@@ -20,7 +20,7 @@ v1.0 REPL:
   cache. A real REPL needs incremental typing + linking, which the
   current pipeline (`lex → parse → resolve → infer → monomorph →
   perceus → lower`) is not designed to support without significant
-  rework. See `docs/lane-experience-kai-repl-watch.md` for the
+  rework. See an internal lane report for the
   prototype's own write-up of the limitation.
 - **Effect handlers do not survive across evaluations.** The
   v1.0-quality REPL described in `docs/stage2-design.md §m17`
@@ -54,7 +54,7 @@ provides the closest "evaluate on every save" approximation.
 - `docs/design.md`, `docs/stage2-design.md` are annotated with
   "post-1.0 per #406" callouts so the historical aspiration stays
   visible without misleading new readers.
-- `docs/lane-experience-kai-repl-watch.md` is left intact as the
+- the internal lane report is preserved as the
   post-mortem of the prototype lane.
 - The package manager lane (#405) inherits a cleaner driver to
   extend.
