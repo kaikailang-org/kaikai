@@ -1,0 +1,20 @@
+# m7b #17 — `let cap = ...` inside a `with Eff as cap { ... }`
+# body shadows the outer alias. Pre-#17 the rewriter would still
+# treat `cap.foo` as `Eff.foo` (Reader.value here, which doesn't
+# exist), making the test reach the resolver as a type error.
+# Post-#17 the inner let removes `cap` from the alias map and
+# `cap.value` resolves as a record field access on MyCell.
+
+type MyCell = { value: Int }
+
+fn main() : Int {
+  let r = handle {
+    let cap = MyCell { value: 42 }
+    cap.value
+  } with Reader[Int](100) as cap {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  assert r == 42
+  0
+}

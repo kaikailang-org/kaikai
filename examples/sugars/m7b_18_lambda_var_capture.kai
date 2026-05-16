@@ -1,0 +1,18 @@
+# m7b #18 — `var` bindings inside a lambda body. The pre-resolve
+# `var` desugar (m7b #5b) lowers to a State[T] handler with a
+# capability binding, so the lambda's free-var collector must
+# treat the introduced name as bound, not captured. Pre-fix the
+# desugared `let cap = ...` shadowed nothing in fv_stmts and the
+# capability name leaked into the lambda's capture array.
+
+fn main() : Int {
+  let f = () => {
+    var counter = 0
+    counter.set(counter.get() + 1)
+    counter.set(counter.get() + 1)
+    counter.get()
+  }
+  let r = f()
+  assert r == 2
+  0
+}

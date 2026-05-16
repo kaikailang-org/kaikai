@@ -1,0 +1,16 @@
+# m7b #5b — `var n = 0` desugars to `handle ... with State[Int](0)
+# as n { ... }`. Without the m7b #4 `@n` / `n := v` sugars, the user
+# spells reads as `n.get()` and writes as `n.set(v)` — those resolve
+# through the alias `n -> State` inside the body. The unannotated form
+# infers `Int` from the init expression's type (Doc B §`State[T]`
+# *Syntax note*).
+
+fn main() : Int {
+  var n = 0
+  assert n.get() == 0
+  n.set(42)
+  assert n.get() == 42
+  n.set(n.get() + 1)
+  assert n.get() == 43
+  0
+}
