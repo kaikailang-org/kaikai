@@ -1,0 +1,389 @@
+# stdlib/collections/map.kai — AVL-tree-backed Map[k, v].
+#
+# v1 (issue #128): the carrier is a height-balanced binary search
+# tree. Lookup, insert, and remove are all `O(log n)`. The previous
+# association-list carrier scaled linearly and was flagged in
+# `docs/proposed-extensions.md` §6 as "abysmal at scale" — the
+# canonical motivating consumer is `ahu`'s Registry (named-actor
+# lookup) where N grows past the dozens.
+#
+# AVL was picked over red-black for v1 because the rebalancing
+# logic stays compact in pure-functional kaikai (one height field
+# per node, four rotation cases) and the constant factor on lookup
+# is slightly tighter than RB. HAMTs are deferred to v2 — they want
+# a `Hashable` protocol that does not exist yet.
+#
+# Conventions:
+#   - **Iteration order is by key**, not by insertion order. The
+#     v0 carrier preserved insertion order; that contract changed
+#     when the tree carrier shipped (issue #128). `keys`, `values`,
+#     and `to_pairs` produce keys in ascending order under the
+#     runtime's `<` operator.
+#   - Key equality is structural via `==` (kaikai's deep-equals
+#     runtime helper). Key ordering is the runtime's `<` operator,
+#     which today defines a total order on `Int`, `Real`, `Char`,
+#     and `String`. Records and sum types as keys panic at runtime
+#     on the first comparison; lift them to a primitive key
+#     manually until v2 introduces an `Ord` protocol.
+#   - Functions are pure — every operation returns a fresh `Map`.
+#     The tree shares structure between revisions where possible
+#     (rotations rebuild only the spine to the inserted/removed
+#     leaf), so the per-op allocation cost stays `O(log n)`.
+#
+# Public surface (m14 follow-up, issue #613): the qualified-call
+# form is canonical (`map.put(m, k, v)`); flat-prefix aliases
+# (`map_put`, `map_get`, …) are retained for the tongariki edition
+# per `docs/editions.md` stability discipline and are scheduled to
+# drop at the Orongo edition boundary.
+#
+# Qualified canonical (16 pub fns):
+#
+#   pub fn empty[k, v]() : Map[k, v]
+#   pub fn size[k, v](m: Map[k, v]) : Int
+#   pub fn is_empty[k, v](m: Map[k, v]) : Bool
+#   pub fn get[k, v](m: Map[k, v], key: k) : Option[v]
+#   pub fn contains[k, v](m: Map[k, v], key: k) : Bool
+#   pub fn put[k, v](m: Map[k, v], key: k, value: v) : Map[k, v]
+#   pub fn remove[k, v](m: Map[k, v], key: k) : Map[k, v]
+#   pub fn keys[k, v](m: Map[k, v]) : [k]
+#   pub fn values[k, v](m: Map[k, v]) : [v]
+#   pub fn to_pairs[k, v](m: Map[k, v]) : [Pair[k, v]]
+#   pub fn from_pairs[k, v](ps: [Pair[k, v]]) : Map[k, v]
+#   pub fn update[k, v](m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v]
+#   pub fn fold[k, v, a, e](m: Map[k, v], init: a, f: (a, Pair[k, v]) -> a / e) : a / e
+#   pub fn merge[k, v](m1: Map[k, v], m2: Map[k, v]) : Map[k, v]  -- m1 keys win
+#   pub fn filter[k, v, e](m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e
+#   pub fn transform_values[k, v, w, e](m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e
+#
+# Pipe convention (issue #594): `Map[k, v]` participates in `|`,
+# `||`, `|?` through the canonical `map`, `flat_map`, `filter`
+# exports — elements are `Pair[k, v]`. `filter` is shared with the
+# round-out surface above.
+#
+#   pub fn map[k, v, w, e](m: Map[k, v], f: (Pair[k, v]) -> Pair[k, w] / e)
+#       : Map[k, w] / e
+#   pub fn flat_map[k, v, k2, v2, e](m: Map[k, v], f: (Pair[k, v]) -> Map[k2, v2] / e)
+#       : Map[k2, v2] / e
+#
+# `transform_values` (values-only) is distinct from `map`
+# (pair-based, pipe-canonical). The name avoids the ugly
+# `map.map_values(m, f)` qualified call.
+#
+# Legacy flat-prefix aliases (tongariki only; dropped at Orongo):
+#
+#   pub fn map_empty, map_size, map_is_empty, map_get, map_contains,
+#   pub fn map_put, map_remove, map_to_pairs, map_keys, map_values,
+#   pub fn map_from_pairs
+#
+# The read-side indexing sugar `m[key]` lowers to `map_get(m, key)`
+# at the typer (see `docs/syntax-sugars.md` §4). The alias keeps
+# that lowering byte-identical post-rename. The write-side
+# `m[key] := v` is **rejected** in v1 with a typed error pointing
+# at `map_put`; the v2 design lands alongside the HAMT carrier.
+
+# ---- Carrier -----------------------------------------------------
+#
+# `Tree[k, v]` is the AVL node. The `Int` payload on `TNode` is the
+# subtree height (1 for leaves) used by the rebalancer; recomputing
+# it from the children would be `O(n)` per insert. `Map[k, v]` is
+# the public wrapper so existing call sites that destructure the
+# record (none in tree-stage stdlib, but tests have done it before)
+# fail with a clear field error rather than a silent type mismatch.
+
+type Tree[k, v]
+  = TEmpty
+  | TNode(k, v, Int, Tree[k, v], Tree[k, v])
+
+pub type Map[k, v] = { root: Tree[k, v] }
+
+# ---- Tree primitives --------------------------------------------
+
+fn tree_height(t: Tree[k, v]) : Int = match t {
+  TEmpty               -> 0
+  TNode(_, _, h, _, _) -> h
+}
+
+fn tree_node(key: k, value: v, l: Tree[k, v], r: Tree[k, v]) : Tree[k, v] = {
+  let lh = tree_height(l)
+  let rh = tree_height(r)
+  let h  = if lh > rh { lh + 1 } else { rh + 1 }
+  TNode(key, value, h, l, r)
+}
+
+fn tree_balance_factor(t: Tree[k, v]) : Int = match t {
+  TEmpty               -> 0
+  TNode(_, _, _, l, r) -> tree_height(l) - tree_height(r)
+}
+
+# Right rotation:
+#       y                 x
+#      / \               / \
+#     x   T3   ---->   T1   y
+#    / \                   / \
+#   T1  T2                T2  T3
+#
+# `t` must be a TNode whose left child is also a TNode; the TEmpty
+# arms are unreachable on well-formed input but we keep them so
+# the match is exhaustive without panics.
+fn tree_rotate_right(t: Tree[k, v]) : Tree[k, v] = match t {
+  TNode(yk, yv, _, lt, t3) -> match lt {
+    TNode(xk, xv, _, t1, t2) -> tree_node(xk, xv, t1, tree_node(yk, yv, t2, t3))
+    TEmpty                   -> t
+  }
+  TEmpty -> t
+}
+
+fn tree_rotate_left(t: Tree[k, v]) : Tree[k, v] = match t {
+  TNode(xk, xv, _, t1, rt) -> match rt {
+    TNode(yk, yv, _, t2, t3) -> tree_node(yk, yv, tree_node(xk, xv, t1, t2), t3)
+    TEmpty                   -> t
+  }
+  TEmpty -> t
+}
+
+# Rebalance one node after an insert/remove on a child rebalanced
+# the spine below us. Four cases: LL, LR, RR, RL.
+fn tree_balance(t: Tree[k, v]) : Tree[k, v] = match t {
+  TEmpty -> t
+  TNode(nk, nv, _, l, r) -> {
+    let bf = tree_height(l) - tree_height(r)
+    if bf > 1 {
+      if tree_balance_factor(l) < 0 {
+        tree_rotate_right(tree_node(nk, nv, tree_rotate_left(l), r))
+      } else {
+        tree_rotate_right(tree_node(nk, nv, l, r))
+      }
+    } else if 0 - bf > 1 {
+      if tree_balance_factor(r) > 0 {
+        tree_rotate_left(tree_node(nk, nv, l, tree_rotate_right(r)))
+      } else {
+        tree_rotate_left(tree_node(nk, nv, l, r))
+      }
+    } else {
+      tree_node(nk, nv, l, r)
+    }
+  }
+}
+
+fn tree_size(t: Tree[k, v]) : Int = match t {
+  TEmpty               -> 0
+  TNode(_, _, _, l, r) -> 1 + tree_size(l) + tree_size(r)
+}
+
+fn tree_get(t: Tree[k, v], key: k) : Option[v] = match t {
+  TEmpty -> None
+  TNode(nk, nv, _, l, r) ->
+    if key == nk      { Some(nv) }
+    else if key < nk  { tree_get(l, key) }
+    else              { tree_get(r, key) }
+}
+
+fn tree_insert(t: Tree[k, v], key: k, value: v) : Tree[k, v] = match t {
+  TEmpty -> TNode(key, value, 1, TEmpty, TEmpty)
+  TNode(nk, nv, _, l, r) ->
+    if key == nk      { tree_node(nk, value, l, r) }
+    else if key < nk  { tree_balance(tree_node(nk, nv, tree_insert(l, key, value), r)) }
+    else              { tree_balance(tree_node(nk, nv, l, tree_insert(r, key, value))) }
+}
+
+# Min key/value of a non-empty subtree. `None` only on TEmpty; the
+# callers that consume this guard against that themselves.
+fn tree_min_pair(t: Tree[k, v]) : Option[Pair[k, v]] = match t {
+  TEmpty -> None
+  TNode(nk, nv, _, l, _) -> match l {
+    TEmpty -> Some(Pair { fst: nk, snd: nv })
+    _      -> tree_min_pair(l)
+  }
+}
+
+fn tree_remove_min(t: Tree[k, v]) : Tree[k, v] = match t {
+  TEmpty -> TEmpty
+  TNode(nk, nv, _, l, r) -> match l {
+    TEmpty -> r
+    _      -> tree_balance(tree_node(nk, nv, tree_remove_min(l), r))
+  }
+}
+
+fn tree_remove(t: Tree[k, v], key: k) : Tree[k, v] = match t {
+  TEmpty -> TEmpty
+  TNode(nk, nv, _, l, r) ->
+    if key < nk      { tree_balance(tree_node(nk, nv, tree_remove(l, key), r)) }
+    else if key > nk { tree_balance(tree_node(nk, nv, l, tree_remove(r, key))) }
+    else {
+      match l {
+        TEmpty -> r
+        _      -> match r {
+          TEmpty -> l
+          _      -> match tree_min_pair(r) {
+            Some(mp) -> tree_balance(tree_node(mp.fst, mp.snd, l, tree_remove_min(r)))
+            None     -> l
+          }
+        }
+      }
+    }
+}
+
+# In-order traversal — keys come out in ascending order. The
+# accumulator is the suffix that follows the current subtree's
+# emission, which keeps the recursion tail-shaped on the right
+# spine. Recursion on the left subtree is not tail-shaped but its
+# depth is bounded by the AVL height (~1.44·log₂(n)).
+fn tree_to_pairs_acc(t: Tree[k, v], acc: [Pair[k, v]]) : [Pair[k, v]] = match t {
+  TEmpty -> acc
+  TNode(nk, nv, _, l, r) ->
+    tree_to_pairs_acc(l, [Pair { fst: nk, snd: nv }, ...tree_to_pairs_acc(r, acc)])
+}
+
+# In-order fold over the tree. `f` sees pairs in ascending key
+# order. The accumulator threads through left subtree, then the
+# current node, then the right subtree. Effect row `e` flows out
+# so callers can fold with side-effecting `f` (e.g. logging).
+fn tree_fold(t: Tree[k, v], acc: a, f: (a, Pair[k, v]) -> a / e) : a / e = match t {
+  TEmpty -> acc
+  TNode(nk, nv, _, l, r) -> {
+    let left_done  = tree_fold(l, acc, f)
+    let with_self  = f(left_done, Pair { fst: nk, snd: nv })
+    tree_fold(r, with_self, f)
+  }
+}
+
+# ---- Public surface (qualified canonical) -----------------------
+
+pub fn empty() : Map[k, v] = Map { root: TEmpty }
+
+pub fn size(m: Map[k, v]) : Int = tree_size(m.root)
+
+pub fn is_empty(m: Map[k, v]) : Bool = match m.root {
+  TEmpty -> true
+  _      -> false
+}
+
+pub fn get(m: Map[k, v], key: k) : Option[v] =
+  tree_get(m.root, key)
+
+pub fn contains(m: Map[k, v], key: k) : Bool = match get(m, key) {
+  Some(_) -> true
+  None    -> false
+}
+
+pub fn put(m: Map[k, v], key: k, value: v) : Map[k, v] =
+  Map { root: tree_insert(m.root, key, value) }
+
+pub fn remove(m: Map[k, v], key: k) : Map[k, v] =
+  Map { root: tree_remove(m.root, key) }
+
+pub fn to_pairs(m: Map[k, v]) : [Pair[k, v]] =
+  tree_to_pairs_acc(m.root, [])
+
+pub fn keys(m: Map[k, v]) : [k] =
+  list.map(to_pairs(m), (p) => p.fst)
+
+pub fn values(m: Map[k, v]) : [v] =
+  list.map(to_pairs(m), (p) => p.snd)
+
+# Fold left, applying `put` once per pair so duplicate keys in
+# the input collapse to the last occurrence (standard semantics).
+fn from_pairs_loop(ps: [Pair[k, v]], acc: Map[k, v]) : Map[k, v] = match ps {
+  []           -> acc
+  [p, ...rest] -> from_pairs_loop(rest, put(acc, p.fst, p.snd))
+}
+
+pub fn from_pairs(ps: [Pair[k, v]]) : Map[k, v] =
+  from_pairs_loop(ps, empty())
+
+# ---- Round-out (issue #613) -------------------------------------
+
+# `update(m, key, default, f)`: when `key` is present, replaces its
+# value with `f(old)`; when absent, inserts `default`. One tree
+# walk via `get` + `put`; `f` is invoked at most once.
+pub fn update(m: Map[k, v], key: k, default: v, f: (v) -> v) : Map[k, v] =
+  match get(m, key) {
+    Some(old) -> put(m, key, f(old))
+    None      -> put(m, key, default)
+  }
+
+# Left-biased in-order fold over the map. Pairs are visited in
+# ascending key order; `f` is invoked exactly `size(m)` times.
+# Effects in `f` flow out via `e`.
+pub fn fold(m: Map[k, v], init: a, f: (a, Pair[k, v]) -> a / e) : a / e =
+  tree_fold(m.root, init, f)
+
+# Left-biased merge: keys present in `m1` win on conflict. `m2`
+# pairs are folded into `m1` with a `put` that overwrites only
+# when the key is absent in `m1`. O((n1 + n2) log n1) — one
+# `contains` + `put` per pair of `m2`.
+pub fn merge(m1: Map[k, v], m2: Map[k, v]) : Map[k, v] =
+  fold(m2, m1, (acc, p) => if contains(acc, p.fst) { acc } else { put(acc, p.fst, p.snd) })
+
+# Keeps the pairs of `m` for which `p` returns true. Element shape
+# is `Pair[k, v]` (consistent with `fold` and the pipe-convention
+# exports below). `p` is invoked exactly `size(m)` times.
+pub fn filter(m: Map[k, v], p: (Pair[k, v]) -> Bool / e) : Map[k, v] / e =
+  fold(m, empty(), (acc, pr) => if p(pr) { put(acc, pr.fst, pr.snd) } else { acc })
+
+# Transforms each value through `f`, keeping keys unchanged. The
+# result type `Map[k, w]` may differ from the input value type.
+# Named `transform_values` rather than `map_values` because the
+# qualified call site reads `map.transform_values(m, f)` — the
+# 0-arg form `map.values(m) : [v]` already owns the `values`
+# name, and `map.map` is reserved for the pipe-canonical
+# pair-shaped transform below.
+pub fn transform_values(m: Map[k, v], f: (v) -> w / e) : Map[k, w] / e =
+  fold(m, empty(), (acc, p) => put(acc, p.fst, f(p.snd)))
+
+# ---- Pipe convention exports (issue #594) -----------------------
+#
+# `Map[k, v]` participates in `|`, `||`, `|?` post-#594 by
+# exporting `map`, `flat_map`, `filter` with the canonical
+# convention signatures. Elements are `Pair[k, v]` (consistent
+# with Elixir's `Enum.map(map, fn {k, v} -> … end)`). `filter` is
+# shared with the round-out section above; only `map` and
+# `flat_map` are introduced here.
+
+# Pair-shaped element transform: each pair becomes a new pair,
+# possibly with a different value type. Duplicate output keys
+# collapse to the last occurrence by `put` semantics.
+pub fn map(m: Map[k, v], f: (Pair[k, v]) -> Pair[k, w] / e) : Map[k, w] / e =
+  fold(m, empty(), (acc, p) => {
+    let q = f(p)
+    put(acc, q.fst, q.snd)
+  })
+
+# Pair-shaped flat-map: each input pair produces a sub-map; the
+# sub-maps are folded together with `merge` semantics (earlier
+# sub-maps' keys win on conflict, consistent with `merge`).
+pub fn flat_map(m: Map[k, v], f: (Pair[k, v]) -> Map[k2, v2] / e) : Map[k2, v2] / e =
+  fold(m, empty(), (acc, p) => merge(acc, f(p)))
+
+# ---- Legacy flat-prefix aliases (tongariki; drop at Orongo) -----
+#
+# Every alias is a one-liner delegating to the qualified
+# canonical above. The aliases preserve selfhost byte-identicality
+# (the only stage2 call site is the textual `"map_get"` callee
+# name synthesised by the indexing-sugar lowering, which keeps
+# resolving as long as `map_get` remains a pub fn) and every
+# user-side call site in `examples/`, `demos/`, `tests/`,
+# `stdlib/-self`. Scheduled to drop at the Orongo edition
+# boundary per `docs/editions.md` stability discipline.
+
+pub fn map_empty() : Map[k, v] = empty()
+
+pub fn map_size(m: Map[k, v]) : Int = size(m)
+
+pub fn map_is_empty(m: Map[k, v]) : Bool = is_empty(m)
+
+pub fn map_get(m: Map[k, v], key: k) : Option[v] = get(m, key)
+
+pub fn map_contains(m: Map[k, v], key: k) : Bool = contains(m, key)
+
+pub fn map_put(m: Map[k, v], key: k, value: v) : Map[k, v] = put(m, key, value)
+
+pub fn map_remove(m: Map[k, v], key: k) : Map[k, v] = remove(m, key)
+
+pub fn map_to_pairs(m: Map[k, v]) : [Pair[k, v]] = to_pairs(m)
+
+pub fn map_keys(m: Map[k, v]) : [k] = keys(m)
+
+pub fn map_values(m: Map[k, v]) : [v] = values(m)
+
+pub fn map_from_pairs(ps: [Pair[k, v]]) : Map[k, v] = from_pairs(ps)

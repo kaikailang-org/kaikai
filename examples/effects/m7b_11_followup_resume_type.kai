@@ -1,0 +1,12 @@
+# m7b #11l — resume's argument types are checked against the op's
+# answer type (resolved through the handler's instantiation) and the
+# handler-state type. `State.get` under `with State[Int](0)` has
+# answer type `Int`; passing a `String` here is rejected.
+
+fn main() : Int = handle {
+  State.get()
+} with State[Int](0) {
+  get(resume)    -> resume("not int", 5)
+  set(v, resume) -> resume((), v)
+  return(x)      -> x
+}
