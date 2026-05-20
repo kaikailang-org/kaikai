@@ -1,0 +1,67 @@
+# Compilados y binarios del bootstrap (los checked-in scripts en bin/ no
+# se ignoran; sólo los ejecutables generados).
+kaic0
+kaic1
+kaic2
+
+# Auto-built package manager helper (rebuilt by bin/kai on first
+# use or when tools/kai-pkg/main.kai changes). Issue #405.
+tools/kai-pkg/kai-pkg
+
+# Auto-built language server (rebuilt by bin/kai on first use or
+# when tools/kai-lsp/main.kai changes). Issue #447.
+tools/kai-lsp/kai-lsp
+
+# Generated bare repos for example fixtures; regenerate with
+# tests/fixtures/git-fixtures/setup.sh (issue #405).
+tests/fixtures/git-fixtures/*.bare/
+
+# Rendered manifests (templates are checked in; the rendered file
+# carries machine-absolute paths, regenerate with
+# examples/packages/render-fixtures.sh).
+examples/packages/simple_dep/kai.toml
+examples/packages/simple_dep/kai.lock
+examples/packages/transitive/kai.toml
+examples/packages/transitive/kai.lock
+examples/packages/lockfile_reproducibility/kai.toml
+examples/packages/lockfile_reproducibility/kai.lock
+
+# Issue #658 — package-aware build fixtures emit binaries named
+# after the package; ignore them so a local verification run does
+# not dirty the worktree.
+examples/packages/build_hello/build_hello
+examples/packages/build_entry_override/build_entry_override
+examples/packages/build_sub_package/build_sub_package_parent
+examples/packages/build_sub_package/sub/sub_pkg
+examples/packages/build_module_qualified/build_module_qualified
+
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Salida intermedia del compilador
+*.kai.c
+build/
+out/
+
+# L0 LLVM static prep: vendored LLVM source + build tree. The repo
+# never commits LLVM sources; `make llvm-fetch` populates this on
+# demand from llvm.org releases (see top-level Makefile).
+stage0/third_party/llvm/
+stage0/third_party/llvm-*.tar.xz
+
+# Tarballs y staging del release builder (scripts/build-release.sh).
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# Artefactos Claude Code locales
+.claude/
+
+# Sistema
+.DS_Store
