@@ -1,0 +1,1517 @@
+import fs.file
+import os.process
+
+# tools/kai-lsp/main.kai — Language Server v1 (hover-only).
+#
+# Issue #447. Idiomatic kaikai implementation of an LSP server
+# speaking JSON-RPC over stdio. Per-request the server spawns a
+# `kaic2 --library-mode` subprocess against a tempfile derived from
+# the latest in-memory text and parses the resulting JSON output.
+#
+# Surface in this lane:
+#
+#   * initialize / initialized / shutdown / exit lifecycle
+#   * textDocument/didOpen / didChange (Full) / didClose
+#   * textDocument/hover (returns inferred type for the cursor node)
+#
+# Not in this lane: goto-def (op planned via probe `def L:C`),
+# diagnostics push (publishDiagnostics from `--diags-json`),
+# semantic tokens, completion. See docs/lsp.md for the roadmap.
+#
+# Structure: one file for v1 (~600 lines). Sections, in order:
+#   - JSON helpers (mini-encoder, mini-extractor)
+#   - JSON-RPC framing (read / write Content-Length frames)
+#   - Server state (open documents map)
+#   - Compiler probe (subprocess wrapper around kaic2 --library-mode)
+#   - Method dispatch (initialize, didOpen, hover, ...)
+#   - Main loop
+#
+# Modularisation into sibling .kai files was the original plan;
+# rolled back to a single file because the kai-pkg-style package
+# layout for tools/ binaries requires per-tool kai.toml + module
+# imports, and inter-module imports between `pub fn` and `pub type`
+# work fine but add per-call qualification overhead the loop reads
+# better without. The file is sectioned and short enough to track.
+
+# ============================================================
+# Section 1 — JSON helpers
+# ============================================================
+
+# Minimal JSON encoder for the response shapes we emit. We never
+# need to round-trip arbitrary user JSON — LSP responses have a
+# small finite set of shapes (Hover, InitializeResult, an error
+# envelope, a null result, ...) that we hand-build out of these
+# primitives.
+
+fn json_str(s: String) : String =
+  string_concat("\"", string_concat(json_escape(s), "\""))
+
+fn json_escape(s: String) : String =
+  json_escape_loop(s, 0, string_length(s), "")
+
+fn json_escape_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n {
+    acc
+  } else {
+    let code = string_byte_at_int(s, i)
+    let esc = json_escape_byte(code)
+    json_escape_loop(s, i + 1, n, string_concat(acc, esc))
+  }
+}
+
+fn json_escape_byte(code: Int) : String {
+  if code == 34 {            # "
+    "\\\""
+  } else if code == 92 {     # \
+    "\\\\"
+  } else if code == 10 {     # \n
+    "\\n"
+  } else if code == 13 {     # \r
+    "\\r"
+  } else if code == 9 {      # \t
+    "\\t"
+  } else if code == 8 {      # \b
+    "\\b"
+  } else if code == 12 {     # \f
+    "\\f"
+  } else if code < 32 {
+    # Other control chars: \u00XX (LSP spec mandates UTF-16 escape).
+    string_concat("\\u00", hex_byte(code))
+  } else {
+    int_to_byte_string(code)
+  }
+}
+
+fn hex_byte(n: Int) : String {
+  let hi = n / 16
+  let lo = n - (hi * 16)
+  string_concat(hex_nibble(hi), hex_nibble(lo))
+}
+
+fn hex_nibble(n: Int) : String {
+  if n < 10 {
+    int_to_string(n)
+  } else if n == 10 { "a" }
+  else if n == 11 { "b" }
+  else if n == 12 { "c" }
+  else if n == 13 { "d" }
+  else if n == 14 { "e" }
+  else { "f" }
+}
+
+fn json_num(n: Int) : String = int_to_string(n)
+
+fn json_bool(b: Bool) : String = if b { "true" } else { "false" }
+
+fn json_null() : String = "null"
+
+# Build a JSON object from a list of (key, value) pairs. Values are
+# already-encoded JSON fragments.
+fn json_obj(pairs: [(String, String)]) : String =
+  string_concat("{",
+    string_concat(json_obj_pairs(pairs, true, ""), "}"))
+
+fn json_obj_pairs(pairs: [(String, String)], first: Bool, acc: String) : String {
+  match pairs {
+    [] -> acc
+    [(k, v), ...rest] -> {
+      let sep = if first { "" } else { "," }
+      let entry = string_concat(sep, string_concat(json_str(k), string_concat(":", v)))
+      json_obj_pairs(rest, false, string_concat(acc, entry))
+    }
+  }
+}
+
+# Mini-extractor: pull the first `"type": "..."` value out of the
+# library-mode JSON payload. We don't need a full JSON parser for
+# v1 — the format is deterministic and we only need one field per
+# probe. Returns None when the field is absent.
+fn extract_first_type(blob: String) : Option[String] =
+  extract_first_string_field(blob, "\"type\": \"")
+
+fn extract_first_string_field(blob: String, marker: String) : Option[String] {
+  let i = string_index_of(blob, marker)
+  if i < 0 {
+    None
+  } else {
+    let start = i + string_length(marker)
+    let n = string_length(blob)
+    extract_string_at(blob, start, n, "")
+  }
+}
+
+fn extract_string_at(blob: String, i: Int, n: Int, acc: String) : Option[String] {
+  if i >= n {
+    None
+  } else {
+    let code = string_byte_at_int(blob, i)
+    if code == 34 {   # closing quote
+      Some(acc)
+    } else if code == 92 {  # backslash escape
+      if i + 1 >= n { None }
+      else {
+        let nx = string_byte_at_int(blob, i + 1)
+        let decoded = json_decode_escape(nx)
+        if decoded == 0 - 1 {
+          # Unsupported escape (\uXXXX et al.) — copy literal.
+          extract_string_at(blob, i + 2, n, string_concat(acc, int_to_byte_string(nx)))
+        } else {
+          extract_string_at(blob, i + 2, n, string_concat(acc, int_to_byte_string(decoded)))
+        }
+      }
+    } else {
+      extract_string_at(blob, i + 1, n, string_concat(acc, int_to_byte_string(code)))
+    }
+  }
+}
+
+# Map JSON simple escapes (after the leading backslash) to their
+# byte value. Returns -1 for unknown escapes (e.g. \uXXXX), letting
+# the caller pass through. v1 does not decode \uXXXX — LSP clients
+# encode source text as JSON strings and \u escapes are limited
+# to control characters and surrogate pairs we'd reject anyway.
+fn json_decode_escape(b: Int) : Int {
+  if b == 110 { 10 }        # n -> LF
+  else if b == 114 { 13 }   # r -> CR
+  else if b == 116 { 9 }    # t -> TAB
+  else if b == 98 { 8 }     # b -> BS
+  else if b == 102 { 12 }   # f -> FF
+  else if b == 34 { 34 }    # " -> "
+  else if b == 92 { 92 }    # \ -> \
+  else if b == 47 { 47 }    # / -> /
+  else { 0 - 1 }            # unknown
+}
+
+# Simple substring search (KMP would be overkill at our scale).
+fn string_index_of(haystack: String, needle: String) : Int {
+  let hn = string_length(haystack)
+  let nn = string_length(needle)
+  if nn == 0 { 0 }
+  else if nn > hn { -1 }
+  else { string_index_of_loop(haystack, needle, 0, hn - nn + 1, nn) }
+}
+
+fn string_index_of_loop(h: String, n: String, i: Int, last: Int, nn: Int) : Int {
+  if i >= last { -1 }
+  else if string_match_at(h, i, n, 0, nn) { i }
+  else { string_index_of_loop(h, n, i + 1, last, nn) }
+}
+
+fn string_match_at(h: String, hi: Int, n: String, ni: Int, nn: Int) : Bool {
+  if ni >= nn { true }
+  else if string_byte_at_int(h, hi) != string_byte_at_int(n, ni) { false }
+  else { string_match_at(h, hi + 1, n, ni + 1, nn) }
+}
+
+# Extract a numeric JSON integer field (used to parse Content-Length).
+fn extract_int_field(blob: String, marker: String) : Option[Int] {
+  let i = string_index_of(blob, marker)
+  if i < 0 {
+    None
+  } else {
+    let start = i + string_length(marker)
+    let n = string_length(blob)
+    extract_int_at(blob, start, n, 0, false)
+  }
+}
+
+fn extract_int_at(blob: String, i: Int, n: Int, acc: Int, started: Bool) : Option[Int] {
+  if i >= n {
+    if started { Some(acc) } else { None }
+  } else {
+    let code = string_byte_at_int(blob, i)
+    if code >= 48 and code <= 57 {  # digit
+      extract_int_at(blob, i + 1, n, (acc * 10) + (code - 48), true)
+    } else if started {
+      Some(acc)
+    } else if code == 32 or code == 9 {  # leading whitespace
+      extract_int_at(blob, i + 1, n, acc, false)
+    } else {
+      None
+    }
+  }
+}
+
+# ============================================================
+# Section 2 — JSON-RPC framing over stdio
+# ============================================================
+
+# Read one JSON-RPC message from stdin. Returns None on EOF.
+# Frame: `Content-Length: N\r\n[other-headers]\r\n\r\n<body>` where
+# the body is exactly N bytes.
+fn read_message() : Option[String] / Stdin =
+  match read_headers("") {
+    None -> None
+    Some(headers) -> {
+      match extract_int_field(headers, "Content-Length:") {
+        None -> None
+        Some(len) -> Some(Stdin.read_bytes(len))
+      }
+    }
+  }
+
+# Read bytes one at a time looking for the `\r\n\r\n` separator
+# that ends the header block. Returns the full headers (without
+# the trailing CRLFCRLF). Returns None when stdin closes mid-frame.
+fn read_headers(acc: String) : Option[String] / Stdin {
+  if string_ends_with(acc, "\r\n\r\n") {
+    Some(acc)
+  } else {
+    let chunk = Stdin.read_bytes(1)
+    if string_length(chunk) == 0 {
+      None
+    } else {
+      read_headers(string_concat(acc, chunk))
+    }
+  }
+}
+
+fn string_ends_with(s: String, suffix: String) : Bool {
+  let sn = string_length(s)
+  let xn = string_length(suffix)
+  if xn > sn { false }
+  else { string_match_at(s, sn - xn, suffix, 0, xn) }
+}
+
+# Write one JSON-RPC frame to stdout. Body is JSON; we frame it
+# with `Content-Length: N\r\n\r\n<body>` and rely on the builtin
+# `write_stdout` (issue #447 — issue body in stdlib-roadmap) to
+# emit the bytes verbatim without a trailing newline. `print` would
+# break strict clients by appending '\n' after the body.
+fn write_message(body: String) : Unit / Stdout = {
+  let n = string_length(body)
+  let header = string_concat("Content-Length: ",
+    string_concat(int_to_string(n), "\r\n\r\n"))
+  write_stdout(string_concat(header, body))
+}
+
+# ============================================================
+# Section 3 — Server state
+# ============================================================
+
+# Open documents: list of (uri, text) pairs. Simple linear list;
+# we expect a handful of files per session.
+type DocStore = DS([(String, String)])
+
+fn store_empty() : DocStore = DS([])
+
+fn store_put(s: DocStore, uri: String, text: String) : DocStore =
+  match s {
+    DS(pairs) -> DS(store_put_loop(pairs, uri, text, []))
+  }
+
+fn store_put_loop(pairs: [(String, String)], uri: String, text: String,
+                  acc: [(String, String)]) : [(String, String)] {
+  match pairs {
+    [] -> cons_reverse(acc, [(uri, text)])
+    [(u, t), ...rest] -> {
+      if u == uri {
+        cons_reverse(acc, lcons((uri, text), rest))
+      } else {
+        store_put_loop(rest, uri, text, lcons((u, t), acc))
+      }
+    }
+  }
+}
+
+fn store_get(s: DocStore, uri: String) : Option[String] =
+  match s {
+    DS(pairs) -> store_get_loop(pairs, uri)
+  }
+
+fn store_get_loop(pairs: [(String, String)], uri: String) : Option[String] {
+  match pairs {
+    [] -> None
+    [(u, t), ...rest] -> if u == uri { Some(t) } else { store_get_loop(rest, uri) }
+  }
+}
+
+fn store_remove(s: DocStore, uri: String) : DocStore =
+  match s {
+    DS(pairs) -> DS(store_remove_loop(pairs, uri, []))
+  }
+
+fn store_remove_loop(pairs: [(String, String)], uri: String,
+                     acc: [(String, String)]) : [(String, String)] {
+  match pairs {
+    [] -> list_reverse(acc)
+    [(u, t), ...rest] -> {
+      if u == uri { cons_reverse(acc, rest) }
+      else { store_remove_loop(rest, uri, lcons((u, t), acc)) }
+    }
+  }
+}
+
+# Small list helpers — kept local to keep import surface minimal.
+fn lcons[a](x: a, xs: [a]) : [a] = [x, ...xs]
+
+fn cons_reverse[a](acc: [a], tail: [a]) : [a] =
+  cons_reverse_loop(acc, tail)
+
+fn cons_reverse_loop[a](acc: [a], tail: [a]) : [a] {
+  match acc {
+    [] -> tail
+    [x, ...rest] -> cons_reverse_loop(rest, [x, ...tail])
+  }
+}
+
+# ============================================================
+# Section 4 — Compiler probe (subprocess wrapper)
+# ============================================================
+
+# Resolve `kaic2` binary path. Strategy: look in env KAILSP_KAIC2,
+# else fall back to `kaic2` on PATH (works for `brew install kaikai`).
+# The wrapper script bin/kai sets KAILSP_KAIC2 to the absolute path
+# of the matching `kaic2` companion.
+fn resolve_kaic2() : String / Env = {
+  match Env.var("KAILSP_KAIC2") {
+    Some(p) -> p
+    None    -> "kaic2"
+  }
+}
+
+# Run a probe against the current text. Writes `text` plus a single
+# `# @probe type L:C` line into a tempfile, spawns
+# `sh -c "<kaic2> --library-mode <tmp> > <out>"`, waits, reads
+# the output JSON, and extracts the first `"type"` string.
+#
+# Returns None when the compilation fails (which library-mode
+# treats as best-effort partial typing). Errors in process plumbing
+# also fold to None so the LSP never crashes the client.
+fn probe_type(kaic2: String, text: String, line: Int, col: Int)
+  : Option[String] / File + Process =
+  match probe_run(kaic2, text, "type", line, col) {
+    None -> None
+    Some(blob) -> extract_first_type(blob)
+  }
+
+# Goto-definition probe. Returns (file, line, col) of the
+# identifier's defining decl, or None when the cursor is not on a
+# resolved name. Cross-file definitions resolve only when both
+# files were typed in the same compile; in v1 the LSP types just
+# the current file, so cross-file goto-def is best-effort.
+fn probe_def(kaic2: String, text: String, line: Int, col: Int)
+  : Option[(String, Int, Int)] / File + Process =
+  match probe_run(kaic2, text, "def", line, col) {
+    None -> None
+    Some(blob) -> extract_def_loc(blob)
+  }
+
+# Shared runner for both probes. Writes `text` plus a single
+# `# @probe <kind> L:C` line to a tempfile, spawns
+# `kaic2 --library-mode`, captures stdout via shell redirect, and
+# returns the raw JSON. All probe-specific decoding lives in the
+# callers.
+fn probe_run(kaic2: String, text: String, kind: String, line: Int, col: Int)
+  : Option[String] / File + Process = {
+  let tag = string_concat(kind,
+    string_concat("-",
+      string_concat(int_to_string(line), string_concat("_", int_to_string(col)))))
+  let tmp = tempfile_path(string_concat("src-", tag))
+  let out = tempfile_path(string_concat("out-", tag))
+  let probe = string_concat("\n# @probe ",
+    string_concat(kind,
+      string_concat(" ",
+        string_concat(int_to_string(line),
+          string_concat(":", string_concat(int_to_string(col), "\n"))))))
+  match File.write_file(tmp, string_concat(text, probe)) {
+    Err(_) -> None
+    Ok(_)  -> {
+      let cmd = string_concat(shell_escape(kaic2),
+        string_concat(" --library-mode ",
+          string_concat(shell_escape(tmp),
+            string_concat(" > ",
+              string_concat(shell_escape(out), " 2>/dev/null")))))
+      let child = process.start("/bin/sh", ["-c", cmd])
+      match process.wait(child) {
+        Err(_) -> None
+        Ok(_)  -> {
+          match File.read_file(out) {
+            Err(_) -> None
+            Ok(blob) -> Some(blob)
+          }
+        }
+      }
+    }
+  }
+}
+
+# Decode the `def` probe response: extract {file, line, col} from
+# the first `"def": { ... }` object in the payload. None when the
+# probe returned no definition (cursor not on a resolved name).
+fn extract_def_loc(blob: String) : Option[(String, Int, Int)] {
+  let m = "\"def\": {"
+  let i = string_index_of(blob, m)
+  if i < 0 {
+    None
+  } else {
+    let start = i + string_length(m)
+    let n = string_length(blob)
+    # Constrain the search to the substring between `{` and the
+    # matching `}` so we don't accidentally grab fields from a
+    # sibling object further down the JSON.
+    let close = find_matching_brace(blob, start, n)
+    if close < 0 {
+      None
+    } else {
+      let sub = string_slice(blob, start, close - start)
+      let file_opt =
+        match extract_first_string_field(sub, "\"file\":\"") {
+          Some(f) -> Some(f)
+          None    -> extract_first_string_field(sub, "\"file\": \"")
+        }
+      let line_opt = extract_int_field(sub, "\"line\":")
+      let col_opt = extract_int_field(sub, "\"col\":")
+      match (file_opt, line_opt, col_opt) {
+        (Some(f), Some(l), Some(c)) -> Some((f, l, c))
+        _ -> None
+      }
+    }
+  }
+}
+
+# Brace-matcher for the `def` payload. Starts after the opening
+# `{` (caller passes `i` past the brace) and walks until a balanced
+# `}` is found. Returns the index OF the closing brace, or -1 if
+# the JSON is truncated. v1 ignores strings — kaic2's library-mode
+# output never embeds `{` inside string values, so naive counting
+# is safe.
+fn find_matching_brace(s: String, i: Int, n: Int) : Int =
+  brace_loop(s, i, n, 1)
+
+fn brace_loop(s: String, i: Int, n: Int, depth: Int) : Int {
+  if i >= n { 0 - 1 }
+  else if depth == 0 { i }
+  else {
+    let c = string_byte_at_int(s, i)
+    if c == 123 { brace_loop(s, i + 1, n, depth + 1) }      # {
+    else if c == 125 { brace_loop(s, i + 1, n, depth - 1) }  # }
+    else { brace_loop(s, i + 1, n, depth) }
+  }
+}
+
+fn shell_escape(s: String) : String =
+  string_concat("'", string_concat(shell_escape_quotes(s, 0, string_length(s), ""), "'"))
+
+fn shell_escape_quotes(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    let code = string_byte_at_int(s, i)
+    let chunk =
+      if code == 39 { "'\\''" }   # single quote
+      else { int_to_byte_string(code) }
+    shell_escape_quotes(s, i + 1, n, string_concat(acc, chunk))
+  }
+}
+
+# Tempfile path. Each LSP session generates a unique tag from a
+# counter threaded by the caller; here we use a per-request fresh
+# tag built from the request line/col so collisions are impossible
+# within a single hover.
+fn tempfile_path(tag: String) : String =
+  string_concat("/tmp/kai-lsp-", string_concat(tag, ".kai"))
+
+# ============================================================
+# Section 5 — Method dispatch
+# ============================================================
+
+# Server state during dispatch: docs + shutdown flag.
+type ServerState = SS(DocStore, Bool)
+
+fn ss_init() : ServerState = SS(store_empty(), false)
+
+fn ss_docs(s: ServerState) : DocStore =
+  match s { SS(d, _) -> d }
+
+fn ss_shutdown(s: ServerState) : Bool =
+  match s { SS(_, sd) -> sd }
+
+fn ss_with_docs(s: ServerState, d: DocStore) : ServerState =
+  match s { SS(_, sd) -> SS(d, sd) }
+
+fn ss_set_shutdown(s: ServerState) : ServerState =
+  match s { SS(d, _) -> SS(d, true) }
+
+# Dispatch one incoming message. Returns the (possibly mutated)
+# server state plus an optional response body to write back.
+fn dispatch(state: ServerState, kaic2: String, msg: String)
+  : (ServerState, Option[String]) / File + Process = {
+  let method_opt = extract_first_string_field(msg, "\"method\":\"")
+  let method_opt2 =
+    match method_opt {
+      Some(m) -> Some(m)
+      None    -> extract_first_string_field(msg, "\"method\": \"")
+    }
+  let id_opt = extract_int_field(msg, "\"id\":")
+  match method_opt2 {
+    None -> (state, None)
+    Some(method) -> {
+      if method == "initialize" {
+        (state, Some(reply_initialize(id_opt)))
+      } else if method == "initialized" {
+        (state, None)
+      } else if method == "shutdown" {
+        (ss_set_shutdown(state), Some(reply_null(id_opt)))
+      } else if method == "exit" {
+        # Caller handles the actual exit on shutdown_seen.
+        (state, None)
+      } else if method == "textDocument/didOpen" {
+        handle_did_open(state, kaic2, msg)
+      } else if method == "textDocument/didChange" {
+        handle_did_change(state, kaic2, msg)
+      } else if method == "textDocument/didClose" {
+        (handle_did_close(state, msg), None)
+      } else if method == "textDocument/hover" {
+        let body = handle_hover(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/definition" {
+        let body = handle_definition(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/documentSymbol" {
+        let body = handle_document_symbol(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/completion" {
+        let body = handle_completion(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else if method == "textDocument/signatureHelp" {
+        let body = handle_signature_help(state, kaic2, msg, id_opt)
+        (state, Some(body))
+      } else {
+        # Unknown method — return empty result for requests, ignore
+        # notifications.
+        match id_opt {
+          Some(_) -> (state, Some(reply_null(id_opt)))
+          None    -> (state, None)
+        }
+      }
+    }
+  }
+}
+
+fn reply_initialize(id: Option[Int]) : String = {
+  let completion_options = json_obj([
+    ("triggerCharacters", "[\".\"]"),
+    ("resolveProvider", json_bool(false))
+  ])
+  let sighelp_options = json_obj([
+    ("triggerCharacters", "[\"(\", \",\"]"),
+    ("retriggerCharacters", "[\",\"]")
+  ])
+  let caps = json_obj([
+    ("textDocumentSync", json_num(1)),     # 1 = Full sync
+    ("hoverProvider", json_bool(true)),
+    ("definitionProvider", json_bool(true)),
+    ("documentSymbolProvider", json_bool(true)),
+    ("completionProvider", completion_options),
+    ("signatureHelpProvider", sighelp_options)
+  ])
+  let info = json_obj([
+    ("name", json_str("kai-lsp")),
+    ("version", json_str("0.3.0"))
+  ])
+  let result = json_obj([
+    ("capabilities", caps),
+    ("serverInfo", info)
+  ])
+  envelope_result(id, result)
+}
+
+fn reply_null(id: Option[Int]) : String =
+  envelope_result(id, json_null())
+
+fn envelope_result(id: Option[Int], result: String) : String = {
+  let id_field = match id {
+    Some(n) -> json_num(n)
+    None    -> json_null()
+  }
+  json_obj([
+    ("jsonrpc", json_str("2.0")),
+    ("id", id_field),
+    ("result", result)
+  ])
+}
+
+fn handle_did_open(state: ServerState, kaic2: String, msg: String)
+  : (ServerState, Option[String]) / File + Process = {
+  match parse_uri_and_text(msg) {
+    None -> (state, None)
+    Some((uri, text)) -> {
+      let new_state = ss_with_docs(state, store_put(ss_docs(state), uri, text))
+      let notif = publish_diagnostics_notification(kaic2, uri, text)
+      (new_state, Some(notif))
+    }
+  }
+}
+
+fn handle_did_change(state: ServerState, kaic2: String, msg: String)
+  : (ServerState, Option[String]) / File + Process = {
+  match extract_uri(msg) {
+    None -> (state, None)
+    Some(uri) -> {
+      match extract_change_text(msg) {
+        None -> (state, None)
+        Some(text) -> {
+          let new_state = ss_with_docs(state, store_put(ss_docs(state), uri, text))
+          let notif = publish_diagnostics_notification(kaic2, uri, text)
+          (new_state, Some(notif))
+        }
+      }
+    }
+  }
+}
+
+# Run --diags-json AND --holes-json against the current text and
+# build a textDocument/publishDiagnostics notification body. Empty
+# diagnostics arrays clear previously-published markers — required
+# semantics per the LSP spec, and how editors un-highlight a line
+# once the user fixes the error.
+#
+# Holes get severity=Warning (2) because they don't prevent
+# compilation today (the binary panics at runtime if reached). The
+# diagnostic message carries the inferred type so the user sees
+# *what* to fill in without leaving the editor.
+fn publish_diagnostics_notification(kaic2: String, uri: String, text: String)
+  : String / File + Process = {
+  let diags_json = run_diags_json(kaic2, text)
+  let diags_arr = decode_diagnostics(diags_json)
+  let holes_json = run_holes_json(kaic2, text)
+  let holes_arr = decode_hole_diagnostics(holes_json)
+  let combined = combine_diag_arrays(diags_arr, holes_arr)
+  let params = json_obj([
+    ("uri", json_str(uri)),
+    ("diagnostics", combined)
+  ])
+  json_obj([
+    ("jsonrpc", json_str("2.0")),
+    ("method", json_str("textDocument/publishDiagnostics")),
+    ("params", params)
+  ])
+}
+
+# Concatenate two JSON array strings of the shape "[...]". Skipping
+# the parse round-trip keeps this O(n) and lets us reuse the
+# already-encoded entries from both producers.
+fn combine_diag_arrays(a: String, b: String) : String = {
+  let an = string_length(a)
+  let bn = string_length(b)
+  # Both inputs are guaranteed to be "[" + body + "]" by their
+  # producers. Slice off the brackets and rejoin.
+  let a_body = if an < 2 { "" } else { string_slice(a, 1, an - 2) }
+  let b_body = if bn < 2 { "" } else { string_slice(b, 1, bn - 2) }
+  let sep =
+    if string_length(a_body) > 0 and string_length(b_body) > 0 { "," }
+    else { "" }
+  string_concat("[", string_concat(a_body, string_concat(sep, string_concat(b_body, "]"))))
+}
+
+# Spawn `kaic2 --holes-json <tmp>` and parse the result into an
+# LSP-compatible warning-Diagnostic array. Each hole becomes one
+# entry with severity=2 (Warning) and a message of the form
+#   unfilled hole [?name] : <expected_type>
+# carrying the same info the runtime panic now reports (kaikai
+# v0.77.1), so the editor surface matches the compile-time and
+# runtime experience.
+fn run_holes_json(kaic2: String, text: String) : String / File + Process = {
+  let tmp = tempfile_path("holes-src")
+  let out = tempfile_path("holes-out")
+  match File.write_file(tmp, text) {
+    Err(_) -> "[]"
+    Ok(_)  -> {
+      let cmd = string_concat(shell_escape(kaic2),
+        string_concat(" --holes-json ",
+          string_concat(shell_escape(tmp),
+            string_concat(" > ",
+              string_concat(shell_escape(out), " 2>/dev/null")))))
+      let child = process.start("/bin/sh", ["-c", cmd])
+      match process.wait(child) {
+        Err(_) -> "[]"
+        Ok(_)  -> {
+          match File.read_file(out) {
+            Err(_) -> "[]"
+            Ok(blob) -> blob
+          }
+        }
+      }
+    }
+  }
+}
+
+# The holes-json payload is a top-level JSON array of objects.
+# Each object has at least:
+#   {"line": N, "col": N, "name": "..." | null, "expected_type": "..."}
+# (`in_scope` and `message` exist too but are not used here — the
+# scope would balloon the diagnostic message past usable size; the
+# user can run `kai build --holes-json` to inspect it in full.)
+fn decode_hole_diagnostics(blob: String) : String =
+  string_concat("[", string_concat(decode_holes_loop(blob, 0, ""), "]"))
+
+fn decode_holes_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_hole_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_hole(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_holes_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+# Each hole object starts with `{"file":` per the kaic2 emitter.
+fn find_hole_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"file\": \"", start)
+  let b = string_index_of_from(blob, "{\"file\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn extract_hole_name(entry: String) : Option[String] = {
+  # Find the literal `"name":` marker that introduces the hole's
+  # own name field (the *first* one in the entry; `in_scope`
+  # objects appear later).
+  let marker = "\"name\":"
+  let i = string_index_of(entry, marker)
+  if i < 0 {
+    None
+  } else {
+    let n = string_length(entry)
+    let after = i + string_length(marker)
+    let p = skip_ws(entry, after, n)
+    if p >= n { None }
+    else {
+      let c = string_byte_at_int(entry, p)
+      if c == 110 { None }     # 'n' → null
+      else if c == 34 {        # '"' → string
+        # Reuse the standard string extractor starting at p+1.
+        extract_string_at(entry, p + 1, n, "")
+      } else { None }
+    }
+  }
+}
+
+fn decode_one_hole(entry: String) : String = {
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  # Holes can be anonymous (`name: null`) or named (`name: "foo"`).
+  # We have to look at what follows the literal `"name":` marker — if
+  # the next non-whitespace byte is `n` (start of `null`), the hole
+  # is anonymous. Otherwise it's a quoted string. Without this guard
+  # the loose `extract_first_string_field("\"name\": \"")` walks
+  # past `name: null` and matches the next `"name"` it finds — which
+  # for hole entries is the first `in_scope` element's name. The
+  # symptom is anonymous holes mis-labelled with a stray binding name.
+  let name_opt = extract_hole_name(entry)
+  let ty =
+    match extract_first_string_field(entry, "\"expected_type\": \"") {
+      Some(t) -> t
+      None    -> match extract_first_string_field(entry, "\"expected_type\":\"") {
+        Some(t) -> t
+        None    -> "?"
+      }
+    }
+  let label = match name_opt {
+    None    -> "?"
+    Some(n) -> string_concat("?", n)
+  }
+  let msg = string_concat("unfilled hole ",
+    string_concat(label, string_concat(": expected ", ty)))
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  # Underline the hole's single `?` glyph plus the optional name.
+  let span = match name_opt {
+    None    -> 1
+    Some(n) -> 1 + string_length(n)
+  }
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0 + span))]))
+  ])
+  json_obj([
+    ("range", range),
+    ("severity", json_num(2)),  # Warning
+    ("source", json_str("kaikai")),
+    ("message", json_str(msg))
+  ])
+}
+
+# Spawn `kaic2 --diags-json <tmp>` and return the JSON blob (or
+# "{}" when the spawn / read fails — empty diagnostics is the safe
+# fallback for the LSP).
+fn run_diags_json(kaic2: String, text: String) : String / File + Process = {
+  let tmp = tempfile_path("diags-src")
+  let out = tempfile_path("diags-out")
+  match File.write_file(tmp, text) {
+    Err(_) -> "{}"
+    Ok(_)  -> {
+      let cmd = string_concat(shell_escape(kaic2),
+        string_concat(" --diags-json ",
+          string_concat(shell_escape(tmp),
+            string_concat(" > ",
+              string_concat(shell_escape(out), " 2>/dev/null")))))
+      let child = process.start("/bin/sh", ["-c", cmd])
+      match process.wait(child) {
+        Err(_) -> "{}"
+        Ok(_)  -> {
+          match File.read_file(out) {
+            Err(_) -> "{}"
+            Ok(blob) -> blob
+          }
+        }
+      }
+    }
+  }
+}
+
+# Walk the diagnostics array and re-emit each entry as an LSP
+# Diagnostic. The library-mode payload looks like:
+#   {"diagnostics": [{"severity": "error", "file": ..., "line": N,
+#                     "col": N, "message": "...", "related": [...]}]}
+# LSP wants:
+#   {range:{start:{line,character},end:{line,character}}, severity, message}
+# Severity 1 = Error, 2 = Warning, 3 = Information, 4 = Hint.
+fn decode_diagnostics(blob: String) : String =
+  string_concat("[", string_concat(decode_diagnostics_loop(blob, 0, ""), "]"))
+
+fn decode_diagnostics_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_diag_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_diagnostic(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_diagnostics_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+# Decode a single diagnostic JSON fragment (already isolated to a
+# `{ ... }` substring containing the diagnostic). Returns the LSP
+# Diagnostic shape as an encoded JSON object.
+fn decode_one_diagnostic(entry: String) : String = {
+  let sev_str =
+    match extract_first_string_field(entry, "\"severity\": \"") {
+      Some(s) -> s
+      None    -> match extract_first_string_field(entry, "\"severity\":\"") {
+        Some(s) -> s
+        None    -> "error"
+      }
+    }
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  let msg =
+    match extract_first_string_field(entry, "\"message\": \"") {
+      Some(m) -> m
+      None    -> match extract_first_string_field(entry, "\"message\":\"") {
+        Some(m) -> m
+        None    -> ""
+      }
+    }
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0 + 1))]))
+  ])
+  let sev_code =
+    if sev_str == "error" { 1 }
+    else if sev_str == "warning" { 2 }
+    else if sev_str == "info" { 3 }
+    else { 4 }
+  json_obj([
+    ("range", range),
+    ("severity", json_num(sev_code)),
+    ("source", json_str("kaikai")),
+    ("message", json_str(msg))
+  ])
+}
+
+# Search for `needle` starting at `start`. Returns -1 when not
+# found. Avoids re-slicing the haystack on each call.
+fn string_index_of_from(haystack: String, needle: String, start: Int) : Int {
+  let hn = string_length(haystack)
+  let nn = string_length(needle)
+  if nn == 0 { start }
+  else if start + nn > hn { 0 - 1 }
+  else { string_index_of_loop(haystack, needle, start, hn - nn + 1, nn) }
+}
+
+fn handle_did_close(state: ServerState, msg: String) : ServerState / File = {
+  match extract_uri(msg) {
+    None -> state
+    Some(uri) -> ss_with_docs(state, store_remove(ss_docs(state), uri))
+  }
+}
+
+fn handle_hover(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              # LSP uses 0-indexed line/col; kaikai uses 1-indexed.
+              let res = probe_type(kaic2, text, l + 1, c + 1)
+              hover_reply(id, res)
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn handle_definition(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              let res = probe_def(kaic2, text, l + 1, c + 1)
+              definition_reply(id, uri, res)
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+# Build a Location response. The LSP shape is either a single
+# Location or Location[]. v1 returns a single-element array — most
+# clients accept both and the array form simplifies the future
+# disambiguation case (e.g. ambiguous protocol impls).
+fn definition_reply(id: Option[Int], uri: String,
+                    loc: Option[(String, Int, Int)]) : String {
+  match loc {
+    None -> reply_null(id)
+    Some((file, line, col)) -> {
+      # kaic2 returns 1-indexed line/col; LSP uses 0-indexed.
+      let l0 = line - 1
+      let c0 = col - 1
+      # Map the definition's file. If the probe reported the same
+      # tempfile we generated for the probe, swap it back for the
+      # caller's URI so the editor opens the user's buffer, not
+      # /tmp/kai-lsp-src-*.
+      let mapped_uri =
+        if string_starts_with(file, "/tmp/kai-lsp-src-") { uri }
+        else { string_concat("file://", file) }
+      let range = json_obj([
+        ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+        ("end",   json_obj([("line", json_num(l0)), ("character", json_num(c0))]))
+      ])
+      let location = json_obj([
+        ("uri", json_str(mapped_uri)),
+        ("range", range)
+      ])
+      # LSP allows `Location | Location[] | null`. We return the
+      # array form so future multi-target results don't require a
+      # protocol break.
+      let arr = string_concat("[", string_concat(location, "]"))
+      envelope_result(id, arr)
+    }
+  }
+}
+
+fn string_starts_with(s: String, prefix: String) : Bool {
+  let sn = string_length(s)
+  let pn = string_length(prefix)
+  if pn > sn { false }
+  else { string_match_at(s, 0, prefix, 0, pn) }
+}
+
+fn handle_document_symbol(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          # Symbols probe ignores line/col — pin them to 1:1.
+          match probe_run(kaic2, text, "symbols", 1, 1) {
+            None -> reply_null(id)
+            Some(blob) -> {
+              let syms = decode_document_symbols(blob)
+              envelope_result(id, syms)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Decode the `symbols` probe payload into an LSP DocumentSymbol[]
+# response. The library-mode shape is:
+#   "symbols": [{"kind": "Function", "name": "...", "line": N, "col": N}, ...]
+# LSP wants:
+#   [{name, kind:int, range:{start,end}, selectionRange:{start,end}}]
+fn decode_document_symbols(blob: String) : String = {
+  # Skip past the probe wrapper `"symbols": [` and only decode the
+  # entries inside that array, so we don't accidentally match the
+  # outer `{"kind": "symbols", ...}` probe entry as a document
+  # symbol of its own.
+  let m = "\"symbols\": ["
+  let s0 = string_index_of(blob, m)
+  let start = if s0 < 0 { 0 } else { s0 + string_length(m) }
+  string_concat("[", string_concat(decode_symbols_loop(blob, start, ""), "]"))
+}
+
+fn decode_symbols_loop(blob: String, start: Int, acc: String) : String {
+  # Accept both compact (`{"kind":`) and pretty (`{"kind": `) JSON.
+  let i = match find_symbol_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 {
+    acc
+  } else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 {
+      acc
+    } else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_symbol(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_symbols_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+fn find_symbol_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"kind\": \"", start)
+  let b = string_index_of_from(blob, "{\"kind\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn find_diag_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"severity\": \"", start)
+  let b = string_index_of_from(blob, "{\"severity\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn decode_one_symbol(entry: String) : String = {
+  let kind_str =
+    match extract_first_string_field(entry, "\"kind\": \"") {
+      Some(k) -> k
+      None    -> match extract_first_string_field(entry, "\"kind\":\"") {
+        Some(k) -> k
+        None    -> "Function"
+      }
+    }
+  let name =
+    match extract_first_string_field(entry, "\"name\": \"") {
+      Some(n) -> n
+      None    -> match extract_first_string_field(entry, "\"name\":\"") {
+        Some(n) -> n
+        None    -> "<anon>"
+      }
+    }
+  let line1 = match extract_int_field(entry, "\"line\":") { Some(n) -> n  None -> 1 }
+  let col1  = match extract_int_field(entry, "\"col\":")  { Some(n) -> n  None -> 1 }
+  let l0 = line1 - 1
+  let c0 = col1 - 1
+  let kind_code = symbol_kind_code(kind_str)
+  let range = json_obj([
+    ("start", json_obj([("line", json_num(l0)), ("character", json_num(c0))])),
+    ("end",   json_obj([("line", json_num(l0)),
+                         ("character", json_num(c0 + string_length(name)))]))
+  ])
+  json_obj([
+    ("name", json_str(name)),
+    ("kind", json_num(kind_code)),
+    ("range", range),
+    ("selectionRange", range)
+  ])
+}
+
+# Map LSP SymbolKind strings (kaic2 surface) to LSP wire integers.
+# Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+fn symbol_kind_code(k: String) : Int {
+  if k == "Function"  { 12 }
+  else if k == "Method"    { 6 }
+  else if k == "Class"     { 5 }
+  else if k == "Interface" { 11 }
+  else if k == "Constant"  { 14 }
+  else if k == "Variable"  { 13 }
+  else if k == "Enum"      { 10 }
+  else if k == "Struct"    { 23 }
+  else { 12 }  # default to Function
+}
+
+# ----- completion -----
+#
+# textDocument/completion handler. Sends a `# @probe complete L:C`
+# to kaic2, parses the resulting candidates, and returns them as
+# CompletionItem[]. We do NOT filter by prefix server-side: the
+# editor's fuzzy matcher handles that.
+fn handle_completion(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              match probe_run(kaic2, text, "complete", l + 1, c + 1) {
+                None -> reply_null(id)
+                Some(blob) -> {
+                  let items = decode_completions(blob)
+                  envelope_result(id, items)
+                }
+              }
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_completions(blob: String) : String = {
+  let m = "\"completions\": ["
+  let s0 = string_index_of(blob, m)
+  let start = if s0 < 0 { 0 } else { s0 + string_length(m) }
+  string_concat("[", string_concat(decode_completions_loop(blob, start, ""), "]"))
+}
+
+fn decode_completions_loop(blob: String, start: Int, acc: String) : String {
+  let i = match find_completion_entry(blob, start) {
+    Some(p) -> p
+    None    -> 0 - 1
+  }
+  if i < 0 { acc }
+  else {
+    let close = find_matching_brace(blob, i + 1, string_length(blob))
+    if close < 0 { acc }
+    else {
+      let entry = string_slice(blob, i, (close + 1) - i)
+      let one = decode_one_completion(entry)
+      let sep = if string_length(acc) == 0 { "" } else { "," }
+      decode_completions_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+    }
+  }
+}
+
+fn find_completion_entry(blob: String, start: Int) : Option[Int] {
+  let a = string_index_of_from(blob, "{\"kind\": \"", start)
+  let b = string_index_of_from(blob, "{\"kind\":\"", start)
+  match (a >= 0, b >= 0) {
+    (true, true)  -> if a < b { Some(a) } else { Some(b) }
+    (true, false) -> Some(a)
+    (false, true) -> Some(b)
+    _ -> None
+  }
+}
+
+fn decode_one_completion(entry: String) : String = {
+  let kind_str =
+    match extract_first_string_field(entry, "\"kind\": \"") {
+      Some(k) -> k
+      None    -> match extract_first_string_field(entry, "\"kind\":\"") {
+        Some(k) -> k
+        None    -> "Function"
+      }
+    }
+  let name =
+    match extract_first_string_field(entry, "\"name\": \"") {
+      Some(n) -> n
+      None    -> match extract_first_string_field(entry, "\"name\":\"") {
+        Some(n) -> n
+        None    -> ""
+      }
+    }
+  let detail =
+    match extract_first_string_field(entry, "\"detail\": \"") {
+      Some(d) -> d
+      None    -> match extract_first_string_field(entry, "\"detail\":\"") {
+        Some(d) -> d
+        None    -> ""
+      }
+    }
+  let kind_code = completion_kind_code(kind_str)
+  json_obj([
+    ("label", json_str(name)),
+    ("kind", json_num(kind_code)),
+    ("detail", json_str(detail)),
+    ("insertText", json_str(name))
+  ])
+}
+
+# Map our kind strings to LSP CompletionItemKind wire integers.
+# Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#completionItemKind
+fn completion_kind_code(k: String) : Int {
+  if k == "Function"      { 3 }
+  else if k == "Method"   { 2 }
+  else if k == "Class"    { 7 }
+  else if k == "Interface" { 8 }
+  else if k == "Constant" { 21 }
+  else if k == "Variable" { 6 }
+  else if k == "Keyword"  { 14 }
+  else if k == "Module"   { 9 }
+  else if k == "Enum"     { 13 }
+  else if k == "Struct"   { 22 }
+  else { 3 }   # default Function
+}
+
+# ----- signatureHelp -----
+#
+# textDocument/signatureHelp handler. Sends a `# @probe sig L:C`
+# and reads back the callee's name + inferred type. Returns
+# SignatureHelp with a single signature.
+fn handle_signature_help(state: ServerState, kaic2: String, msg: String, id: Option[Int])
+  : String / File + Process = {
+  match extract_uri(msg) {
+    None -> reply_null(id)
+    Some(uri) -> {
+      match store_get(ss_docs(state), uri) {
+        None -> reply_null(id)
+        Some(text) -> {
+          let line0 = extract_int_for_key(msg, "\"line\":")
+          let col0 = extract_int_for_key(msg, "\"character\":")
+          match (line0, col0) {
+            (Some(l), Some(c)) -> {
+              match probe_run(kaic2, text, "sig", l + 1, c + 1) {
+                None -> reply_null(id)
+                Some(blob) -> {
+                  let body = decode_signature_help(blob)
+                  envelope_result(id, body)
+                }
+              }
+            }
+            _ -> reply_null(id)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn decode_signature_help(blob: String) : String = {
+  let m = "\"signature\": "
+  let i = string_index_of(blob, m)
+  if i < 0 {
+    json_null()
+  } else {
+    let after = i + string_length(m)
+    let n = string_length(blob)
+    # Either `null` or an object `{...}`. Peek the first non-space.
+    let p = skip_ws(blob, after, n)
+    if p >= n { json_null() }
+    else {
+      let c = string_byte_at_int(blob, p)
+      if c == 110 { json_null() }   # 'n' of null
+      else {
+        # Object: extract name + type fields and wrap as SignatureHelp.
+        let close = find_matching_brace(blob, p + 1, n)
+        if close < 0 { json_null() }
+        else {
+          let entry = string_slice(blob, p, (close + 1) - p)
+          let name =
+            match extract_first_string_field(entry, "\"name\": \"") {
+              Some(n) -> n
+              None    -> ""
+            }
+          let ty =
+            match extract_first_string_field(entry, "\"type\": \"") {
+              Some(t) -> t
+              None    -> ""
+            }
+          let label = if string_length(ty) == 0 { name }
+                      else { string_concat(name, string_concat(" : ", ty)) }
+          let signature = json_obj([
+            ("label", json_str(label)),
+            ("documentation", json_str(""))
+          ])
+          let arr = string_concat("[", string_concat(signature, "]"))
+          json_obj([
+            ("signatures", arr),
+            ("activeSignature", json_num(0)),
+            ("activeParameter", json_num(0))
+          ])
+        }
+      }
+    }
+  }
+}
+
+fn skip_ws(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    let c = string_byte_at_int(s, i)
+    if c == 32 or c == 9 or c == 10 or c == 13 { skip_ws(s, i + 1, n) }
+    else { i }
+  }
+}
+
+fn hover_reply(id: Option[Int], type_opt: Option[String]) : String {
+  match type_opt {
+    None -> reply_null(id)
+    Some(ty) -> {
+      let contents = json_obj([
+        ("kind", json_str("markdown")),
+        ("value", json_str(string_concat("```kaikai\n",
+          string_concat(ty, "\n```"))))
+      ])
+      let hover = json_obj([
+        ("contents", contents)
+      ])
+      envelope_result(id, hover)
+    }
+  }
+}
+
+# Param extractors — narrow shape-aware probes against the raw JSON
+# string. Sufficient because the LSP request shapes are stable.
+
+# Normalize an LSP `file://` URI to its real-path form so that
+# didOpen/hover/definition lookups match even when the client sends
+# slightly different spellings of the same file. macOS's /tmp is the
+# canonical example: didOpen may arrive with `file:///private/tmp/x`
+# while a follow-up hover sends `file:///tmp/x` (the symlinked form
+# Neovim's `expand('%:p')` produces). Both must resolve to the same
+# DocStore key.
+#
+# We pull the path out, call `abspath` (which wraps `realpath(3)` —
+# resolves symlinks, dedups slashes), and rebuild the URI. Non-file
+# URIs pass through untouched.
+fn normalize_uri(uri: String) : String / File = {
+  let prefix = "file://"
+  let pn = string_length(prefix)
+  let un = string_length(uri)
+  if un < pn { uri }
+  else if not string_match_at(uri, 0, prefix, 0, pn) { uri }
+  else {
+    let path = string_slice(uri, pn, un - pn)
+    let resolved = abspath(path)
+    string_concat(prefix, resolved)
+  }
+}
+
+fn extract_uri(msg: String) : Option[String] / File =
+  match extract_first_string_field(msg, "\"uri\":\"") {
+    Some(u) -> Some(normalize_uri(u))
+    None    -> match extract_first_string_field(msg, "\"uri\": \"") {
+      Some(u) -> Some(normalize_uri(u))
+      None    -> None
+    }
+  }
+
+fn parse_uri_and_text(msg: String) : Option[(String, String)] / File = {
+  match extract_uri(msg) {
+    None -> None
+    Some(uri) -> {
+      match extract_doc_text(msg) {
+        None -> None
+        Some(text) -> Some((uri, text))
+      }
+    }
+  }
+}
+
+# For didOpen: params.textDocument.text
+fn extract_doc_text(msg: String) : Option[String] =
+  match extract_first_string_field(msg, "\"text\":\"") {
+    Some(t) -> Some(t)
+    None    -> extract_first_string_field(msg, "\"text\": \"")
+  }
+
+# For didChange: params.contentChanges[0].text — same surface as
+# doc text in Full sync mode.
+fn extract_change_text(msg: String) : Option[String] = extract_doc_text(msg)
+
+fn extract_int_for_key(msg: String, marker: String) : Option[Int] =
+  extract_int_field(msg, marker)
+
+# ============================================================
+# Section 6 — Main loop
+# ============================================================
+
+fn serve() : Unit / Stdin + Stdout + Stderr + File + Process + Env = {
+  let kaic2 = resolve_kaic2()
+  serve_loop(ss_init(), kaic2)
+}
+
+fn serve_loop(state: ServerState, kaic2: String)
+  : Unit / Stdin + Stdout + Stderr + File + Process = {
+  match read_message() {
+    None -> {
+      # EOF on stdin — client closed the pipe.
+      if ss_shutdown(state) { () } else { () }
+    }
+    Some(msg) -> {
+      let (new_state, reply_opt) = dispatch(state, kaic2, msg)
+      match reply_opt {
+        Some(body) -> write_message(body)
+        None       -> ()
+      }
+      # `exit` notification terminates the loop when shutdown was
+      # already seen; otherwise the EOF path handles termination.
+      let method_opt =
+        match extract_first_string_field(msg, "\"method\":\"") {
+          Some(m) -> Some(m)
+          None    -> extract_first_string_field(msg, "\"method\": \"")
+        }
+      let should_exit =
+        match method_opt {
+          Some(m) -> m == "exit"
+          None    -> false
+        }
+      if should_exit {
+        ()
+      } else {
+        serve_loop(new_state, kaic2)
+      }
+    }
+  }
+}
+
+fn main() : Unit / Stdin + Stdout + Stderr + File + Process + Env = serve()
