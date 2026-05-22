@@ -1,0 +1,158 @@
+# 9d9l #2 — Weather (https://github.com/lnds/9d9l/tree/master/desafio2)
+#
+# Fetches current weather for several cities from wttr.in (a free,
+# no-API-key wrapper around the WeatherUnderground feed —
+# https://github.com/chubin/wttr.in), parses the JSON response,
+# sorts the results by current temperature high-to-low, and prints
+# them in the line shape the upstream README asks for:
+#
+#   <City>  max: <tmax>  min: <tmin>  actual: <tactual>  <condition>
+#
+# Upstream takes the cities on the command line; this port mirrors
+# that with `args.argv()` and falls back to a four-city default
+# when invoked with no arguments so the demo stays usable under
+# `make -C demos verify`. The network call is real — the Hanga
+# Roa reactor (R2 NetTcp, #630, 2026-05-16) parks the fiber on
+# every socket read so the OS thread never blocks.
+#
+# All the JSON drilling lives in stdlib/encoding/json.kai
+# (`json.get`, `json.at`, `json.as_string`, `json.as_int`,
+# `json.as_real`, `json.as_bool`). The chunked-transfer-encoding
+# unwrap lives in stdlib/net/http.kai (`dechunk_body`) and runs
+# inside `parse_response` whenever the server sends
+# `Transfer-Encoding: chunked` — wttr.in does. The demo just
+# composes those helpers.
+
+import net.http
+import encoding.json
+import os.args
+import spawn
+
+type Report = {
+  city:     String,
+  temp:     Real,
+  temp_max: Real,
+  temp_min: Real,
+  desc:     String,
+}
+
+# wttr.in's `?format=j1` returns numeric temperatures as integer-
+# valued JStr (`"27"`, `"-3"`). Convert via `string.to_int`; fall
+# back to 0 when the field is missing or unparseable.
+fn temp_of(v: JsonValue) : Real = match json.as_string(v) {
+  Some(s) -> match string.to_int(s) {
+    Some(n) -> int_to_real(n)
+    None    -> 0.0
+  }
+  None    -> match json.as_real(v) {
+    Some(r) -> r
+    None    -> 0.0
+  }
+}
+
+fn string_or_empty(v: JsonValue) : String = match json.as_string(v) {
+  Some(s) -> s
+  None    -> ""
+}
+
+# Replace ASCII spaces with `%20`. wttr.in rejects raw spaces in
+# the path component; this is enough URL-encoding for city names.
+fn url_encode_loop(s: String, i: Int, n: Int, acc: String) : String =
+  if i >= n { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> if c == ' ' { url_encode_loop(s, i + 1, n, string_concat(acc, "%20")) }
+               else        { url_encode_loop(s, i + 1, n, string_concat(acc, string.slice(s, i, 1))) }
+  } }
+
+fn url_encode(s: String) : String = url_encode_loop(s, 0, string.length(s), "")
+
+fn fetch_report(city: String) : Report / NetTcp + Cancel = {
+  let url = string_concat_all(["http://wttr.in/", url_encode(city), "?format=j1"])
+  let resp = http.get(url)
+  let root = match json_decode(resp.body) {
+    Some(j) -> j
+    None    -> JNull
+  }
+  # wttr.in shape: root.current_condition[0].temp_C / weatherDesc[0].value
+  #                root.weather[0].mintempC / maxtempC
+  let current = json.at(json.get(root, "current_condition"), 0)
+  let today   = json.at(json.get(root, "weather"), 0)
+  let w0      = json.at(json.get(current, "weatherDesc"), 0)
+  Report {
+    city:     city,
+    temp:     temp_of(json.get(current, "temp_C")),
+    temp_max: temp_of(json.get(today,   "maxtempC")),
+    temp_min: temp_of(json.get(today,   "mintempC")),
+    desc:     string_or_empty(json.get(w0, "value")),
+  }
+}
+
+fn fetch_each(cs: [String]) : [Report] / NetTcp + Cancel = match cs {
+  []           -> []
+  [c, ...rest] -> [fetch_report(c), ...fetch_each(rest)]
+}
+
+# Parallel variant: one fiber per city, joined by the nursery. The
+# Hanga Roa R2 reactor parks each fiber on its socket `recv`, so
+# wall-time drops from sum(per-city latency) to max(per-city
+# latency). Spawn / await stay inline inside the nursery block
+# because the cap `n` is brand-scoped — every `n.spawn(...)` /
+# `n.await(...)` carries the brand of THIS nursery, and the
+# brand-mismatch checker rejects calls that leak the cap into a
+# helper fn (docs/structured-concurrency.md §*Type system*).
+#
+# A 16 MiB fiber stack is the working size for this demo:
+#   KAI_FIBER_STACK_SIZE=16777216 ./weather -p
+# The default 64 KiB overflows while parsing wttr.in's ~40 KB JSON
+# (json_decode is recursive). For a parser-cost-sensitive lane the
+# right fix is an iterative JSON parser in stdlib — out of scope
+# here; the env-var override is the documented escape hatch.
+fn fetch_parallel(cs: [String]) : [Report] / Spawn + NetTcp + Cancel =
+  nursery { n ->
+    # Phase 1 — open one fiber per city.
+    let fibers = list.map(cs, (c) => n.spawn(() => fetch_report(c)))
+    # Phase 2 — await each fiber in declaration order. The nursery
+    # guarantees every spawned fiber completes (or is cancelled
+    # cooperatively) before the block returns.
+    list.map(fibers, (f) => n.await(f))
+  }
+
+# Descending sort by `.temp`: list.sort_by takes (a, b) -> Int with
+# the usual negative-means-a-first convention, so to sort descending
+# we flip the operands.
+fn cmp_by_temp_desc(a: Report, b: Report) : Int =
+  if a.temp > b.temp { -1 }
+  else if a.temp < b.temp { 1 }
+  else { 0 }
+
+fn render(r: Report) : String =
+  string_concat_all([
+    r.city, "  max: ", real_to_string(r.temp_max),
+    "  min: ", real_to_string(r.temp_min),
+    "  actual: ", real_to_string(r.temp),
+    "  ", r.desc,
+  ])
+
+fn print_reports(rs: [Report]) : Unit / Stdout = match rs {
+  []           -> ()
+  [r, ...rest] -> {
+    Stdout.print(render(r))
+    print_reports(rest)
+  }
+}
+
+fn main() : Int / NetTcp + Spawn + Cancel + Env + Stdout = {
+  let argv = args.argv()
+  let parallel = list.contains(argv, "-p")
+  let cities0 = list.filter(argv, (a) => a != "-p")
+  let cities = match cities0 {
+    [] -> ["Berlin", "Santiago", "Boston", "Madrid"]
+    _  -> cities0
+  }
+  let reports = if parallel { fetch_parallel(cities) }
+                else        { fetch_each(cities) }
+  let sorted  = list.sort_by(reports, cmp_by_temp_desc)
+  print_reports(sorted)
+  0
+}

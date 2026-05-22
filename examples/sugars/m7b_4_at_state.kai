@@ -1,0 +1,15 @@
+# m7b #4 — `@cap` reads a State capability and `cap := v` writes
+# it. Doc B §`Syntax note: capability read/write sugar` rule 1
+# (`@` only on State.get / Reader.ask) and rule 2 (`:=` only on
+# State.set). The `var` desugar (m7b #5b) is the typical context;
+# without these sugars, the same code reads as
+# `counter.set(counter.get() + 1)`.
+
+fn main() : Int {
+  var counter = 0
+  counter := @counter + 1
+  counter := @counter + 1
+  counter := @counter + 1
+  assert @counter == 3
+  0
+}
