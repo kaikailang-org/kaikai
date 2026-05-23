@@ -1,0 +1,82 @@
+# vs Scala — typed effects without monad transformers
+#
+# Scala's effect story (ZIO, Cats Effect) tracks effects in types but
+# composes them via monad transformers or environment ZIO[R, E, A]. A
+# function that reads a Config, writes Logs, talks to a DB, and may
+# fail ends up as `EitherT[StateT[IO, S, ...], E, A]` (transformer
+# stack) or `ZIO[Config & Log & DB, AppError, A]` (environment).
+# Either way the type is heavy and the syntax requires `for` blocks
+# with `<-` — far from regular Scala.
+#
+# kaikai: a row of effects in the signature. Body reads as ordinary
+# code. Handlers compose horizontally, no transformer stacking.
+#
+# === Scala 3 with ZIO equivalent (~20 lines) ===
+#
+#   def transfer(from: AccountId, to: AccountId, amount: Money): ZIO[Log & DB & Clock, TransferError, Receipt] =
+#     for {
+#       _    <- Log.info(s"transfer $from -> $to: $amount")
+#       src  <- DB.fetch(from)
+#       dst  <- DB.fetch(to)
+#       _    <- if (src.balance < amount) ZIO.fail(InsufficientFunds) else ZIO.unit
+#       now  <- Clock.now
+#       _    <- DB.update(src.copy(balance = src.balance - amount))
+#       _    <- DB.update(dst.copy(balance = dst.balance + amount))
+#     } yield Receipt(from, to, amount, now)
+#
+# === kaikai equivalent (target syntax) ===
+
+type Account = { id: String, balance: Int where >= 0 }
+type Receipt = { from: String, to: String, amount: Int }
+
+effect Logger {
+  info(msg: String) : Unit
+}
+
+effect DB {
+  fetch(id: String) : Result[String, Account]
+  update(acc: Account) : Result[String, Unit]
+}
+
+fn transfer(from: String, to: String, amount: Int) : Result[String, Receipt] / Logger + DB
+  requires amount > 0
+{
+  Logger.info("transfer " ++ from ++ " -> " ++ to ++ ": " ++ int_to_string(amount))
+  let src = DB.fetch(from)!
+  let dst = DB.fetch(to)!
+  if src.balance < amount { Err("insufficient funds") }
+  else {
+    let _ = DB.update(Account { ...src, balance: src.balance - amount })!
+    let _ = DB.update(Account { ...dst, balance: dst.balance + amount })!
+    Ok(Receipt { from: from, to: to, amount: amount })
+  }
+}
+
+# A row of effects in the signature — no monad transformer stack,
+# no for-comprehension. Handlers compose horizontally below.
+fn main() : Int / Stdout = {
+  let r = handle {
+    handle {
+      transfer("alice", "bob", 30)
+    } with DB {
+      fetch(id, resume) -> if id == "alice" {
+        resume(Ok(Account { id: "alice", balance: 100 }))
+      } else if id == "bob" {
+        resume(Ok(Account { id: "bob", balance: 50 }))
+      } else {
+        resume(Err("no account"))
+      }
+      update(acc, resume) -> resume(Ok(()))
+    }
+  } with Logger {
+    info(msg, resume) -> {
+      Stdout.print("[log] " ++ msg)
+      resume(())
+    }
+  }
+  match r {
+    Ok(rcpt) -> Stdout.print("ok: " ++ int_to_string(rcpt.amount))
+    Err(msg) -> Stdout.print("err: " ++ msg)
+  }
+  0
+}

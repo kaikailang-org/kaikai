@@ -1,0 +1,348 @@
+# core.result — Result helpers in kaikai-minimal.
+#
+# Module-relative surface (m14): callers spell these as
+# `result.is_ok`, `result.map`, etc. After issue #235 the typer
+# narrows bare-name candidates by first-arg type, so `result.map`,
+# `option.map`, and `list.map` co-exist as bare exports without
+# colliding — every legacy `result_*` alias retired in the same
+# lane.
+#
+# `Ok` / `Err` remain the right way to *construct* a `Result`.
+
+pub fn is_ok(r: Result[e, a]) : Bool {
+  match r {
+    Ok(_) -> true
+    Err(_) -> false
+  }
+}
+
+pub fn is_err(r: Result[e, a]) : Bool {
+  match r {
+    Err(_) -> true
+    Ok(_) -> false
+  }
+}
+
+pub fn map(r: Result[e, a], f: (a) -> b) : Result[e, b] {
+  match r {
+    Ok(x) -> Ok(f(x))
+    Err(e) -> Err(e)
+  }
+}
+
+pub fn and_then(r: Result[e, a], f: (a) -> Result[e, b]) : Result[e, b] {
+  match r {
+    Ok(x) -> f(x)
+    Err(e) -> Err(e)
+  }
+}
+
+pub fn unwrap_or(r: Result[e, a], dflt: a) : a {
+  match r {
+    Ok(x) -> x
+    Err(_) -> dflt
+  }
+}
+
+pub fn map_err(r: Result[e, a], f: (e) -> e2) : Result[e2, a] {
+  match r {
+    Ok(x) -> Ok(x)
+    Err(e) -> Err(f(e))
+  }
+}
+
+pub fn or_else(r: Result[e, a], f: (e) -> Result[e2, a]) : Result[e2, a] {
+  match r {
+    Ok(x) -> Ok(x)
+    Err(e) -> f(e)
+  }
+}
+
+pub fn unwrap_or_else(r: Result[e, a], f: (e) -> a) : a {
+  match r {
+    Ok(x) -> x
+    Err(e) -> f(e)
+  }
+}
+
+pub fn ok(r: Result[e, a]) : Option[a] {
+  match r {
+    Ok(x) -> Some(x)
+    Err(_) -> None
+  }
+}
+
+pub fn err(r: Result[e, a]) : Option[e] {
+  match r {
+    Ok(_) -> None
+    Err(e) -> Some(e)
+  }
+}
+
+# Result[e, Option[a]] -> Option[Result[e, a]]:
+#   Ok(Some(x)) -> Some(Ok(x))
+#   Ok(None)    -> None
+#   Err(e)      -> Some(Err(e))
+pub fn transpose(r: Result[e, Option[a]]) : Option[Result[e, a]] {
+  match r {
+    Ok(inner) -> match inner {
+      Some(x) -> Some(Ok(x))
+      None -> None
+    }
+    Err(e) -> Some(Err(e))
+  }
+}
+
+# Short-circuits on first Err. [] -> Ok([]).
+pub fn collect(rs: [Result[e, a]]) : Result[e, [a]] {
+  match rs {
+    [] -> Ok([])
+    [h, ...t] -> match h {
+      Err(e) -> Err(e)
+      Ok(x) -> match collect(t) {
+        Err(e) -> Err(e)
+        Ok(xs) -> Ok([x, ...xs])
+      }
+    }
+  }
+}
+
+# Intrinsic tests (issue #170 phase 1a). Run with
+# `KAI_NO_STDLIB=1 bin/kai test stdlib/core/result.kai` — the
+# `KAI_NO_STDLIB=1` is required so that bin/kai doesn't auto-load
+# result.kai *as a prelude* and then again as the test source,
+# which would compile the test blocks twice. The path-gated
+# `tier1-stdlib-core` workflow runs them via the
+# `test-stdlib-core-intrinsic` make target.
+#
+# Tests below use bare names. Issue #235 closes the receiver-type
+# narrowing gap: bare `map`, `unwrap_or`, etc. resolve to result's
+# scheme when the first arg is `Result[_, _]` even though
+# option.kai re-exports the same bare names.
+test "is_ok / is_err on Ok" {
+  let r : Result[String, Int] = Ok(7)
+  assert is_ok(r) == true
+  assert is_err(r) == false
+}
+
+test "is_ok / is_err on Err" {
+  let r : Result[String, Int] = Err("boom")
+  assert is_ok(r) == false
+  assert is_err(r) == true
+}
+
+test "map on Ok applies the function" {
+  let r : Result[String, Int] = Ok(3)
+  let mapped = result.map(r, (x) => x + 1)
+  match mapped {
+    Ok(v)  -> { assert v == 4 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "map on Err leaves the error untouched (bottom)" {
+  let r : Result[String, Int] = Err("nope")
+  let mapped = result.map(r, (x) => x + 1)
+  match mapped {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "nope" }
+  }
+}
+
+test "unwrap_or returns inner on Ok, default on Err" {
+  let ok  : Result[String, Int] = Ok(42)
+  let err : Result[String, Int] = Err("oops")
+  assert result.unwrap_or(ok, 0) == 42
+  assert result.unwrap_or(err, 99) == 99
+}
+
+test "and_then chains and propagates Err mid-chain" {
+  let r1 : Result[String, Int] = Ok(2)
+  let chained = result.and_then(r1, (x) => Ok(x * 10))
+  match chained {
+    Ok(v)  -> { assert v == 20 }
+    Err(_) -> { assert false }
+  }
+  # bottom in middle of chain
+  let r2 : Result[String, Int] = Ok(2)
+  let stopped = result.and_then(r2, (x) => Err("stop"))
+  match stopped {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "stop" }
+  }
+  # bottom at start of chain
+  let r3 : Result[String, Int] = Err("upstream")
+  let propagated = result.and_then(r3, (x) => Ok(x * 10))
+  match propagated {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "upstream" }
+  }
+}
+
+test "map_err leaves Ok untouched" {
+  let r : Result[String, Int] = Ok(5)
+  let mapped = map_err(r, (e) => string_length(e))
+  match mapped {
+    Ok(v)  -> { assert v == 5 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "map_err transforms Err payload" {
+  let r : Result[String, Int] = Err("boom")
+  let mapped = map_err(r, (e) => string_length(e))
+  match mapped {
+    Ok(_)  -> { assert false }
+    Err(n) -> { assert n == 4 }
+  }
+}
+
+test "map_err identity on Ok" {
+  let r : Result[String, Int] = Ok(7)
+  let mapped = map_err(r, (e) => e)
+  match mapped {
+    Ok(v)  -> { assert v == 7 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "or_else passes Ok through" {
+  let r : Result[String, Int] = Ok(3)
+  let chained = result.or_else(r, (e) => Ok(99))
+  match chained {
+    Ok(v)  -> { assert v == 3 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "or_else recovers via Ok" {
+  let r : Result[String, Int] = Err("bad")
+  let chained = result.or_else(r, (e) => Ok(42))
+  match chained {
+    Ok(v)  -> { assert v == 42 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "or_else can re-fail with new error type" {
+  let r : Result[String, Int] = Err("first")
+  let chained : Result[Int, Int] = result.or_else(r, (e) => Err(string_length(e)))
+  match chained {
+    Ok(_)  -> { assert false }
+    Err(n) -> { assert n == 5 }
+  }
+}
+
+test "unwrap_or_else returns inner on Ok" {
+  let ok : Result[String, Int] = Ok(42)
+  assert result.unwrap_or_else(ok, (e) => 0) == 42
+}
+
+test "unwrap_or_else applies recovery on Err" {
+  let err : Result[String, Int] = Err("xyz")
+  assert result.unwrap_or_else(err, (e) => string_length(e)) == 3
+}
+
+test "unwrap_or_else does not call f on Ok" {
+  # If f were called it would return 0; Ok branch returns 7.
+  let ok : Result[String, Int] = Ok(7)
+  assert result.unwrap_or_else(ok, (e) => 0) == 7
+}
+
+test "ok extracts value as Some" {
+  let r : Result[String, Int] = Ok(11)
+  match ok(r) {
+    Some(v) -> { assert v == 11 }
+    None    -> { assert false }
+  }
+}
+
+test "ok on Err returns None" {
+  let r : Result[String, Int] = Err("nope")
+  assert is_none(ok(r)) == true
+}
+
+test "err extracts error as Some" {
+  let r : Result[String, Int] = Err("boom")
+  match err(r) {
+    Some(e) -> { assert e == "boom" }
+    None    -> { assert false }
+  }
+}
+
+test "err on Ok returns None" {
+  let r : Result[String, Int] = Ok(1)
+  assert is_none(err(r)) == true
+}
+
+test "ok and err are disjoint" {
+  let okv : Result[String, Int] = Ok(5)
+  let errv : Result[String, Int] = Err("e")
+  assert is_some(ok(okv))  == true
+  assert is_none(err(okv)) == true
+  assert is_none(ok(errv)) == true
+  assert is_some(err(errv)) == true
+}
+
+test "transpose Ok(Some(x)) -> Some(Ok(x))" {
+  let r : Result[String, Option[Int]] = Ok(Some(7))
+  match transpose(r) {
+    Some(inner) -> match inner {
+      Ok(v)  -> { assert v == 7 }
+      Err(_) -> { assert false }
+    }
+    None -> { assert false }
+  }
+}
+
+test "transpose Ok(None) -> None" {
+  let r : Result[String, Option[Int]] = Ok(None)
+  assert is_none(transpose(r)) == true
+}
+
+test "transpose Err(e) -> Some(Err(e))" {
+  let r : Result[String, Option[Int]] = Err("boom")
+  match transpose(r) {
+    Some(inner) -> match inner {
+      Ok(_)  -> { assert false }
+      Err(e) -> { assert e == "boom" }
+    }
+    None -> { assert false }
+  }
+}
+
+test "collect on empty list yields Ok([])" {
+  # Bare `collect` collides with option.collect under #219; call
+  # the surviving flat alias here.
+  let rs : [Result[String, Int]] = []
+  match result.collect(rs) {
+    Ok(xs) -> { assert is_empty(xs) == true }
+    Err(_) -> { assert false }
+  }
+}
+
+test "collect on all-Ok list yields Ok of values" {
+  let rs : [Result[String, Int]] = [Ok(1), Ok(2), Ok(3)]
+  match result.collect(rs) {
+    Ok(xs) -> {
+      assert sum(xs) == 6
+      match xs {
+        [a, b, c] -> {
+          assert a == 1
+          assert b == 2
+          assert c == 3
+        }
+        _ -> { assert false }
+      }
+    }
+    Err(_) -> { assert false }
+  }
+}
+
+test "collect short-circuits on first Err" {
+  let rs : [Result[String, Int]] = [Ok(1), Ok(2), Err("stop"), Ok(3)]
+  match result.collect(rs) {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "stop" }
+  }
+}
