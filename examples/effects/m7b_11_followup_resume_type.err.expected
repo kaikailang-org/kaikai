@@ -1,0 +1,3 @@
+type mismatch in resume answer
+expected: Int
+found:    String

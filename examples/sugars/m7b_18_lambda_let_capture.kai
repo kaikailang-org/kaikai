@@ -1,0 +1,17 @@
+# m7b #18 — pin the free-var collector's handling of inner `let`
+# bindings inside a lambda body. Pre-fix, the codegen treated `n`
+# as a captured free var: it emitted
+# `kai_closure(..., (KaiValue *[]){kai_n})` at the construction
+# site (where no `kai_n` exists yet), and the C compiler rejected
+# the file. Post-fix, `n` is recognised as bound by the inner
+# `let` and stays out of the capture set.
+
+fn main() : Int {
+  let f = (x) => {
+    let n = x + 1
+    n + 1
+  }
+  let r = f(40)
+  assert r == 42
+  0
+}

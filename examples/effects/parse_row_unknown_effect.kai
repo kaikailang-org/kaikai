@@ -1,0 +1,10 @@
+# m7a #3c negative test — a row mentions an effect that was never
+# declared. Compilation must fail with a clear "unknown effect"
+# diagnostic, even though the rest of the program is well-formed.
+#
+# Tested in test-effects (Makefile) by asserting the diagnostic
+# fires and includes the offending name.
+
+fn f() : Int / Unknown { 0 }
+
+fn main() : Int { f() }

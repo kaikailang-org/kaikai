@@ -1,0 +1,15 @@
+# m7b #4 — `@cap` on a Reader-bound alias: parser desugars to
+# `cap.get()`, the inferencer's alias path then remaps `get` → `ask`
+# so the right op is dispatched. Pins Doc B §`Syntax note:
+# capability read/write sugar` rule 1 second branch.
+
+fn main() : Int {
+  let r = handle {
+    @env + 1
+  } with Reader[Int](42) as env {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  assert r == 43
+  0
+}

@@ -1,0 +1,87 @@
+# vs Java — domain model with refinement types, UoM, and contracts
+#
+# Java's verbose-by-design idioms for a bank account: a class with
+# private fields, getters/setters, BigDecimal for money, a Currency
+# enum, defensive copying, Optional returns, checked exceptions for
+# insufficient-funds. The invariant "balance is non-negative in USD"
+# lives in the method bodies, validated at runtime, scattered across
+# every mutation site.
+#
+# kaikai: `Money<USD> where >= 0` lives in the type. `requires` and
+# `ensures` clauses prove (where possible) or runtime-assert (where
+# not) the contract for every operation. The auditor reads 4 signatures
+# instead of 50 method bodies.
+#
+# === Java equivalent (~50 lines, condensed) ===
+#
+#   public final class Account {
+#       private final String id;
+#       private final BigDecimal balance;
+#       private final Currency currency;
+#       private final int transactions;
+#       public Account(String id, BigDecimal balance, Currency currency, int n) {
+#           if (balance.signum() < 0) throw new IllegalStateException("negative");
+#           if (currency != Currency.getInstance("USD")) throw new IllegalArgumentException("currency");
+#           this.id = id; this.balance = balance; this.currency = currency; this.transactions = n;
+#       }
+#       public Account deposit(BigDecimal amount) {
+#           if (amount.signum() <= 0) throw new IllegalArgumentException("non-positive");
+#           return new Account(id, balance.add(amount), currency, transactions + 1);
+#       }
+#       public Account withdraw(BigDecimal amount) throws InsufficientFundsException {
+#           if (amount.signum() <= 0) throw new IllegalArgumentException("non-positive");
+#           if (balance.compareTo(amount) < 0) throw new InsufficientFundsException();
+#           return new Account(id, balance.subtract(amount), currency, transactions + 1);
+#       }
+#       // ... getters, equals, hashCode, toString
+#   }
+#
+# === kaikai equivalent (target syntax) ===
+
+type Account = {
+  id:           String,
+  balance:      Int where >= 0,
+  transactions: Int where >= 0,
+}
+
+fn deposit(acc: Account, amount: Int) : Account
+  requires amount > 0
+  ensures  result.balance == acc.balance + amount
+  ensures  result.transactions == acc.transactions + 1
+{
+  Account { ...acc,
+    balance:      acc.balance + amount,
+    transactions: acc.transactions + 1,
+  }
+}
+
+fn withdraw(acc: Account, amount: Int) : Result[String, Account]
+  requires amount > 0
+{
+  if acc.balance < amount { Err("insufficient funds") }
+  else {
+    Ok(Account { ...acc,
+      balance:      acc.balance - amount,
+      transactions: acc.transactions + 1,
+    })
+  }
+}
+
+fn main() : Int / Stdout = {
+  let acc = Account {
+    id:           "acc_eduardo",
+    balance:      100,
+    transactions: 0,
+  }
+  let after_deposit = deposit(acc, 50)
+  let after_with    = match withdraw(after_deposit, 30) {
+    Ok(a)    -> a
+    Err(msg) -> {
+      Stdout.print("error: " ++ msg)
+      after_deposit
+    }
+  }
+  Stdout.print("balance: #{after_with.balance}")
+  Stdout.print("txs: #{after_with.transactions}")
+  0
+}
