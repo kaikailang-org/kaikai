@@ -1,0 +1,224 @@
+# tier1-backend-parity skip list (issue #575).
+#
+# Format: <relative-path>:<marker>:<one-line-reason>
+#   where <marker> is either an open tracking issue number (a real
+#   parity bug — the skip is the bookmark, the issue is the work) or a
+#   stable category tag for entries that are not bugs:
+#     - exempt-nondet  — diverges by design (scheduler / RNG / clock);
+#       will not converge, must NOT block Orongo.
+#   The harness (tools/test-backend-parity.sh) keys only on the
+#   `^<path>:` prefix, so the marker field is documentation, not parsed.
+#
+# This file is split into three labelled sections:
+#   1. parity bugs (#622/#618)  — must empty before Orongo (1.0).
+#   2. parity-exempt: nondet    — divergence is the fixture's contract.
+#   3. harness categorization (#626/#357) — negative tests, aspirational
+#      demos, library files, infra the harness does not provide. NOT
+#      parity bugs; a separate suite-categorization concern.
+# When a bug-issue closes, the closing lane removes its line and re-runs
+# tools/test-backend-parity.sh to confirm parity is restored.
+#
+# For fixtures that are intentionally backend-specific by design, the
+# inline `// skip-backend-parity: <reason>` annotation on the fixture's
+# first line would also work — but `//` is not a valid kaikai comment
+# (kaikai uses `#`), so for `.kai` fixtures the exemption lives here.
+
+# ============================================================
+# === parity bugs (must empty before Orongo) ===
+# #622 — LLVM backend comprehensive parity divergence audit
+# ============================================================
+# Fixtures where C builds + runs cleanly but LLVM diverges by a real
+# bug (segv, wrong exit code, wrong stdout). C is the maturity oracle;
+# every line here is a site where the production LLVM backend is wrong
+# and the C reference is right. The umbrella issue indexes these;
+# sub-issues spawn per root-cause cluster. This section MUST be empty
+# before the Orongo (1.0) edition ships.
+#
+# Resolved + removed by prior parity lanes (do NOT re-add):
+#   - llvm-parity-A (#618): json_basic, json_surrogate_decode,
+#     json_surrogate_encode — `\xNN` escape decoding in the emitter.
+#   - llvm-parity-B (#558): issue_558, m7a_7_default_file,
+#     m7a_7_default_stdin, m7a_7_default_env, os_env_mutate,
+#     stdin_read_bytes — AST-driven default-handler install at main.
+#   - llvm-parity-D / #706: reuse_record_basic, trace_prefix, the TCO
+#     segvs. trace_basic + poker_dealer pass today and are unskipped
+#     by the llvm-parity-cleanup lane (were stale, not bugs).
+
+# m8_4_cancel_caught: RESOLVED (parity lane, refs #622). The LLVM
+# `handle` lowering omitted the m7a #6e setjmp/longjmp landing pad, so
+# a clause that discards `resume` (Cancel.raise() forces it) could not
+# unwind out of the body — the tail ran to completion (prints "never
+# reached", returns 99) instead of yielding the clause value 42. The
+# fix emits the setjmp pad in `llvm_emit_handle`, installs via
+# `kaix_evidence_push_with_jmp`, and longjmps from the op site on a
+# discard (`llvm_emit_op_dispatch`), mirroring emit_c.kai. The discard
+# + body-result slots are `volatile` (C99 §7.13.2.1 mirror). Both
+# backends now print 42, no "never reached". Coverage: this fixture +
+# cancel_discard_minimal (single-frame) + cancel_discard_nested
+# (three-frame unwind, ASAN guard). Removed from the skip list.
+
+# m8_fiber_stack_overflow: RESOLVED (#718). The LLVM backend now emits
+# scalar (unboxed) function signatures for UFns — `define i64
+# @kai_deep(i64 %kair_n)`, mirroring C's `int64_t kai_deep(int64_t)` —
+# instead of boxed `%KaiValue* @kai_deep(%KaiValue*)` with a `kaix_int`
+# heap box per op. The body lowers fully raw (the EIf/EBlock-tail raw
+# arms in `llvm_emit_kind_raw` were the missing piece), so each frame
+# is now as small as C's and 50k frames hold in the 64 KiB private
+# fiber stack on BOTH backends. Sibling of #706 (LLVM-TCO): both were
+# the LLVM emitter dropping a C-path codegen optimization. emit_llvm
+# consumes `UFnSig` from fnreg (no analysis change); selfhost stays
+# byte-identical (kaic2b.c == kaic2c.c) and selfhost-llvm deterministic
+# (s1.ll == s2.ll). Coverage: this fixture (unskipped) +
+# examples/perceus/scalar_fn_sig_deep_recursion.kai. This was the LAST
+# line in the #622 parity-bugs section — it is now empty, so #622 can
+# close alongside #718 for Orongo (1.0).
+
+# ============================================================
+# === parity-exempt: non-determinism (will not converge by design) ===
+# ============================================================
+# These diverge by DESIGN — a scheduler, RNG seed, or wall-clock
+# property surfaces in stdout. Per Go/Erlang precedent, forcing
+# byte-exact stdout across two backends here turns an implementation
+# property into a spec one. They are NOT parity bugs and do NOT block
+# Orongo. The inline `// skip-backend-parity` annotation is not used
+# because `//` is not a valid kaikai comment (kaikai uses `#`) and the
+# annotation must be on the fixture's first line, which would break the
+# parse — so the exemption lives here instead.
+
+# #706 closed the TCO segv (both backends run the 1M-insert loop to
+# completion). The ONLY remaining divergence is the `elapsed: N.NNNs`
+# wall-clock line — verified identical modulo that line by the
+# llvm-parity-cleanup lane. Timestamp nondeterminism, exempt.
+examples/perceus/rb_tree_bench.kai:exempt-nondet:`elapsed:` wall-clock timestamp differs; identical otherwise (verified)
+
+# Both backends correctly trip the fiber guard page and exit 139 with the
+# `kai: fiber stack overflow at <ptr>` diagnostic. The ONLY divergence is
+# the `<ptr>` — a raw stack address printed by the SIGSEGV handler, which
+# is a runtime memory address and cannot match byte-for-byte across two
+# backends (or even two runs). Exit code and message text both match.
+# (Surfaced when the fixture was hardened against the -O2 kaic2 flip so the
+# recursion actually trips the guard page under optimisation.)
+examples/effects/m8_fiber_stack_overflow.kai:exempt-nondet:`<ptr>` in the guard-page diagnostic is a raw stack address; exit 139 + message text match
+
+# The default Random handler (runtime.h `_kai_pcg32_ensure_seeded`)
+# seeds PCG32 from `time(NULL)` — one seed per wall-clock SECOND. The
+# parity harness compiles + runs the C build, then the LLVM build, a few
+# seconds apart, so the two draws use different seeds and the shuffled
+# deck diverges. Verified time-seeded, not a backend bug: two runs of
+# the SAME backend across a >1s gap also diverge, and within one second
+# both backends agree. Both fixtures shuffle a deck via `Random`/shuffle
+# and print the cards, so the divergence is the deck, not the codegen.
+# (Will converge to a real parity check once SecureRandom-based seeding
+# or a fixed test seed lands; until then the draw is the contract.)
+demos/blackjack/main.kai:exempt-nondet:time-seeded Random shuffle; deck differs by seed-per-second, not by backend (verified)
+demos/poker_dealer/main.kai:exempt-nondet:time-seeded Random shuffle; deck differs by seed-per-second, not by backend (verified)
+
+# The Log default handler stamps each line with the current wall-clock
+# time (`[YYYY-MM-DDTHH:MM:SSZ]`). The C and LLVM builds run seconds
+# apart, so the timestamp prefix differs; the message bodies are
+# byte-identical (verified modulo the `T..Z` field). Clock nondet, exempt.
+examples/effects/issue_141_log_default.kai:exempt-nondet:`[..Z]` timestamp prefix differs by run time; message bodies identical (verified)
+
+# ============================================================
+# === harness categorization (#626 / #357) — not parity bugs ===
+# #626 — Fixture-categorisation: negative tests in positive dirs
+# ============================================================
+# A separate concern from backend parity: these are suite-membership
+# issues (negative tests in positive dirs, aspirational demos, library
+# files, infra the harness does not provide). They would FAIL on BOTH
+# backends identically; nothing here is an LLVM↔C divergence. Kept here
+# only because this harness walks the same dirs.
+#
+# Fixtures designed to reject at compile time but living in positive
+# dirs (gated by hand-rolled stage2/Makefile loops, not by
+# .err.expected siblings). Migrating to examples/negative/ or adding
+# a sibling .err.expected will let this harness auto-skip them.
+
+examples/effects/ffi_extern_c_basic.kai:626:negative test gated by stage2/Makefile loop, no .err.expected
+examples/effects/ffi_pub_axiom_cross_module/main.kai:626:negative test, no .err.expected
+examples/effects/foreign_prelude.kai:626:negative test, no .err.expected
+examples/effects/foreign_prelude_lib.kai:626:library file, not a standalone entry point
+examples/effects/handle_bad_no_with.kai:626:negative test, no .err.expected
+examples/effects/handle_unknown_clause.kai:626:negative test, gated by stage2/Makefile grep
+examples/effects/issue_78_runtime_name_shadow.kai:626:negative test, no .err.expected
+examples/effects/m7a_6f_resume_arg_type.kai:626:negative test, no .err.expected
+examples/effects/m7a_8_diag_effect_not_handled.kai:626:negative test, no .err.expected
+examples/effects/m7b_1_alias_cycle.kai:626:negative test, no .err.expected
+examples/effects/m7b_1_alias_non_effect.kai:626:negative test, no .err.expected
+examples/effects/m7b_12_row_var_two_vars.kai:626:negative test (row var syntax), no .err.expected
+examples/effects/m7b_12_row_var_uppercase.kai:626:negative test (row var syntax), no .err.expected
+examples/effects/m7b_12_row_var_var_first.kai:626:negative test (row var syntax), no .err.expected
+examples/effects/m8_spawn_row_mismatch.kai:626:negative test, no .err.expected
+examples/effects/m8x_7_recursive_sum_no_breach.kai:626:negative test, no .err.expected
+examples/effects/op_call_unknown_op.kai:626:negative test, no .err.expected
+examples/effects/op_call_wrong_arg.kai:626:negative test, no .err.expected
+examples/effects/parse_effect_bad_no_ret.kai:626:parse error fixture, no .err.expected
+examples/effects/parse_row_unknown_effect.kai:626:negative test, no .err.expected
+examples/effects/row_mismatch_higher_order.kai:626:negative test, no .err.expected
+examples/effects/row_op_call_undeclared.kai:626:negative test, no .err.expected
+examples/effects/row_pure_to_effectful.kai:626:negative test, no .err.expected
+examples/perceus/gap3_tail_rebuild_record.kai:626:bug-shape repro, builds today only on a future fix lane
+examples/perceus/issue_82_leak_audit.kai:626:builds only when the issue #82 fix lands
+examples/perceus/passthrough_record_let.kai:626:bug-shape repro, builds only on a future fix lane
+examples/perceus/rb_tree.kai:626:library file (no main), only the bench wrapper has main
+examples/perceus/reuse_variant_basic.kai:626:bug-shape repro, builds only on a future fix lane
+examples/quickstart/02_fizzbuzz.kai:626:effect-row check rejects today; documents what kaikai 1.0 will accept
+examples/quickstart/05_concurrent.kai:626:concurrency demo, builds only when scheduler ops shipped
+# Package-mode fixtures: not buildable in this file-mode harness (which
+# cannot resolve manifest deps). Their C<->LLVM parity IS verified —
+# in package mode — by tools/test-packages.sh's `run_parity` pass. Not
+# a coverage gap; a harness-axis split (file-mode here, package-mode
+# there). See both scripts' headers (decided 2026-05-27).
+examples/packages/simple_dep/main.kai:626:package-mode fixture; C<->LLVM parity covered by test-packages.sh run_parity
+examples/packages/transitive/main.kai:626:package-mode fixture; C<->LLVM parity covered by test-packages.sh run_parity
+examples/packages/auto_install/main.kai:626:package-mode fixture (git dep); C<->LLVM parity covered by test-packages.sh run_parity (parity-auto_install)
+
+# Fixture-rot: references renamed module surface (env -> Env, process -> Process,
+# duration_lt missing). Both backends correctly reject; not a parity bug.
+examples/stdlib/os_basic.kai:626:fixture predates env->Env case-rename; needs update or delete
+examples/stdlib/os_process_basic.kai:626:fixture predates process->Process case-rename; needs update or delete
+examples/stdlib/time_clock_default.kai:626:references missing duration_lt; needs update or delete
+
+# Prelude-only fixtures: not standalone entry points. Loaded via the
+# dedicated test-prelude-qualified-call target with --prelude, not by
+# default kaic2 invocation.
+examples/stdlib/qualified_call_in_prelude.kai:626:designed to run via --prelude only; not a standalone entry point
+examples/stdlib/qualified_call_in_prelude_lib.kai:626:library file with no main; loaded via --prelude only
+
+# Other stdlib fixtures requiring infrastructure not provided by the harness.
+examples/stdlib/bench_basic.kai:626:bench harness fixture; not a standalone entry point
+examples/stdlib/bench_median_mad.kai:626:bench harness fixture; not a standalone entry point
+examples/stdlib/check_basic.kai:626:property-check harness fixture; not a standalone entry point
+examples/stdlib/check_shrinking.kai:626:property-check harness fixture; not a standalone entry point
+examples/stdlib/http_client_basic.kai:626:requires localhost server not started by the harness
+examples/stdlib/http_redirect_follow_basic.kai:357:requires --prelude stdlib/net/http.kai which the harness does not provide
+examples/stdlib/http_redirect_policy_custom.kai:357:requires --prelude stdlib/net/http.kai which the harness does not provide
+examples/stdlib/http_redirect_too_many.kai:357:requires --prelude stdlib/net/http.kai which the harness does not provide
+examples/stdlib/issue_219_typer_modcall.kai:626:typer-only smoke; needs --prelude flag the harness does not provide
+examples/stdlib/issue_219_typer_modcall_lib.kai:626:library file, not a standalone entry point
+
+# ============================================================
+# #618 — RESOLVED 2026-05-26 (llvm-parity-A)
+# ============================================================
+# The LLVM emitter dropped `\xNN` hex escapes in string literals:
+# `json_byte_table()` in stdlib/encoding/json.kai is a `"\x01..\xff"`
+# literal that `json_utf8_encode` slices into, so every JSON-decoded
+# codepoint was corrupted under LLVM. Fixed in emit_llvm.kai
+# `llvm_encode_body_loop` by decoding `\xNN` (advance cursor by 4).
+# Removed: json_surrogate_decode, json_surrogate_encode (#618) and
+# json_basic (#622) — all now byte-identical on C and LLVM.
+
+# ============================================================
+# #626 — Aspirational demos (documented as "FAIL until <feature> lands")
+# ============================================================
+demos/9d9l/huffman/main.kai:626:aspirational; FAIL until m13 bit-ops land (per fixture docstring)
+demos/9d9l/vectores/main.kai:626:aspirational; FAIL until pending features land
+demos/9d9l/weather/main.kai:626:aspirational; FAIL until pending features land
+demos/vs/elixir/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/go/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/java/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/kotlin/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/python/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/ruby/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/rust/main.kai:626:vs-language comparison demo, FAIL until features land
+demos/vs/scala/main.kai:626:vs-language comparison demo, FAIL until features land

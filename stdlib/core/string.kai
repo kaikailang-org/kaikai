@@ -1,0 +1,449 @@
+# core.string — string helpers in kaikai-minimal.
+#
+# Wrappers around the compiler-provided string builtins
+# (string_length, string_concat, string_slice, char_at, …).
+#
+# Naming convention (m14 phase 2 — 2026-05-04): definitions live
+# under bare names so qualified callers reach them as
+# `string.trim(s)`. The flat `string_*` aliases retired in this
+# phase (issue #203) after every consumer in `examples/`,
+# `demos/`, and `stdlib/` migrated to the qualified surface.
+#
+# Stage 0's PRELUDE table (`stage0/emit.c`) keeps the flat
+# `string_*` names for the runtime primitives (`string_length`,
+# `string_concat`, `string_slice`, `string_to_int`, etc.); those
+# are NOT stdlib exports — they live below the user-facing
+# language and are the actual C primitives this module wraps.
+# Issue #332 closed the m14 phase 2 gap by adding three public
+# wrappers (`length`, `slice`, `to_int`) below; the flat names
+# remain accessible via the PRELUDE table for bootstrap code
+# that runs before `core/string.kai` is loaded.
+#
+# `string.concat(a: String, b: String)` was deferred during #332
+# /#334 because adding it surfaced a pre-existing resolver gap:
+# a bare-name `concat([])` call inside `core/list.kai` should
+# resolve to that file's local `pub fn concat(xss: [[a]])`, but
+# once `string.concat` also exists in the prelude the resolver
+# picked the wrong candidate. #335 fixed file-local precedence
+# for bare-name lookup inside test/bench/check bodies; #336
+# (this change) re-introduces the wrapper now that the resolver
+# distinguishes the two `concat` schemes. External callers with
+# both modules in scope qualify the call (`string.concat(...)`
+# vs `list.concat(...)`).
+#
+# Cross-file dependency: `string_trim_left_loop` and
+# `string_trim_right_loop` call `is_space` from `core/char.kai`.
+# Load order is fine because the resolver collects all prelude
+# decls before resolving names, but the dependency is real and
+# should not be broken. We use the bare name (not `char.is_space`)
+# because both files can be the test-stdlib-core-intrinsic target;
+# when `char.kai` is target it is not in the module table, but its
+# bare exports are still in scope when loaded as prelude.
+
+# Thin wrappers over runtime primitives — see module comment for
+# the seam. `slice(s, from, len)` mirrors the primitive's
+# `(start, length)` shape (NOT end-exclusive). `to_int` returns
+# `Option[Int]` because the primitive returns `Some/None` on
+# parse success / failure (no panic). `concat(a, b)` shares the
+# bare name with `list.concat(xss)`; #335's resolver fix makes
+# the file-local candidate win for callers inside `core/list.kai`
+# and external callers must qualify (`string.concat` /
+# `list.concat`) when both are in scope.
+# `CharIndex` pairs a Unicode codepoint with the byte offset at which it
+# begins in the buffer — the element type of `char_indices` (issue #744).
+# A nominal record rather than a sugared `(Int, Char)` tuple: `.off`/`.cp`
+# read clearer than `.fst`/`.snd` at the call sites #745 `display_width`
+# and TUI consumers build on.
+pub type CharIndex = { off: Int, cp: Char }
+
+# `length(s)` is the byte count (O(1)) — the cheap substrate length,
+# matching the byte-indexed `slice`/`char_at` family it sits with. For
+# the Unicode codepoint count use `char_count`; `byte_length` is an
+# explicit synonym of this when the unit needs to be unambiguous at a
+# call site (issue #744).
+pub fn length(s: String) : Int = string_length(s)
+pub fn slice(s: String, from: Int, len: Int) : String = string_slice(s, from, len)
+pub fn to_int(s: String) : Option[Int] = string_to_int(s)
+pub fn concat(a: String, b: String) : String = string_concat(a, b)
+
+pub fn starts_with(s: String, prefix: String) : Bool {
+  let pl = string_length(prefix)
+  if pl > string_length(s) { false }
+  else { string_slice(s, 0, pl) == prefix }
+}
+
+pub fn ends_with(s: String, suffix: String) : Bool {
+  let sl = string_length(s)
+  let xl = string_length(suffix)
+  if xl > sl { false }
+  else { string_slice(s, sl - xl, xl) == suffix }
+}
+
+# `drop_prefix` / `drop_suffix` (issue #632) return `Option[String]`
+# rather than the bare string so callers fuse the membership check
+# with the slice. The shape matches `to_int`, `log2`, `div_mod`:
+# `Some(rest)` when the prefix/suffix is present, `None` otherwise.
+# Rust's `str::strip_prefix` is the direct precedent.
+pub fn drop_prefix(s: String, prefix: String) : Option[String] {
+  if starts_with(s, prefix) {
+    let pl = string_length(prefix)
+    Some(string_slice(s, pl, string_length(s) - pl))
+  } else {
+    None
+  }
+}
+
+pub fn drop_suffix(s: String, suffix: String) : Option[String] {
+  if ends_with(s, suffix) {
+    let sl = string_length(s)
+    Some(string_slice(s, 0, sl - string_length(suffix)))
+  } else {
+    None
+  }
+}
+
+fn string_trim_left_loop(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_trim_left_loop(s, i + 1, n)
+                 } else { i }
+      None -> i
+    }
+  }
+}
+
+fn string_trim_right_loop(s: String, i: Int) : Int {
+  if i <= 0 { 0 }
+  else {
+    match char_at(s, i - 1) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_trim_right_loop(s, i - 1)
+                 } else { i }
+      None -> i
+    }
+  }
+}
+
+pub fn trim(s: String) : String {
+  let n = string_length(s)
+  let lo = string_trim_left_loop(s, 0, n)
+  let hi = string_trim_right_loop(s, n)
+  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+}
+
+# `string.repeat` is the canonical module surface. After issue #235
+# the typer narrows bare-name candidates by first-arg type, so the
+# self-recursive `repeat(s, n - 1)` resolves to this scheme even
+# when `list.repeat` and `loop.repeat` share the bare name.
+pub fn repeat(s: String, n: Int) : String {
+  if n <= 0 { "" }
+  else { string_concat(s, repeat(s, n - 1)) }
+}
+
+pub fn join(xs: [String], sep: String) : String {
+  match xs {
+    [] -> ""
+    [x] -> x
+    [x, ...rest] -> string_concat(x, string_concat(sep, join(rest, sep)))
+  }
+}
+
+# --- issue #338: surface expansion (partial) -------------------------
+# Seven helpers below address the gap noted in #338 without
+# introducing new bare-name collisions across `core/*`.
+#
+# Five originally proposed helpers (`index_of`, `to_upper`,
+# `to_lower`, `is_empty`, `reverse`) are deliberately *not* in this
+# lane. Each collides with an existing core export under the same
+# bare name (`list.index_of`, `char.to_upper`/`to_lower`,
+# `list.is_empty`, `list.reverse`); `--include-prelude-tests` walks
+# every prelude's intrinsic test block, where bare-name resolution
+# at runtime cannot distinguish the colliding schemes (the typer's
+# first-arg-type narrowing per #235 stops resolving across modules
+# in that mode). Per the issue's "Notes for the implementer", such
+# collisions block the lane — they are deferred to #396 (after the
+# resolver fix lands, mirroring the #335 → #336 sequencing).
+#
+# Helpers shipped here are byte-indexed and ASCII-aware where it
+# matters. `pad_left`/`pad_right` count bytes, not Unicode code
+# points (kaikai strings are byte-indexed today).
+
+# `split(s, sep)` returns the list of pieces produced by cutting `s`
+# at every non-overlapping occurrence of `sep`. An empty separator
+# panics — the runtime's `string_split` would otherwise return the
+# whole string in a single-element list, which masks the caller's
+# bug. Trailing/leading empty pieces are preserved (`split(",a,",
+# ",")` → `["", "a", ""]`).
+pub fn split(s: String, sep: String) : [String] {
+  if string_length(sep) == 0 { panic("string.split: separator is empty") }
+  else { string_split(s, sep) }
+}
+
+# `replace(s, from, to)` rewrites every non-overlapping occurrence
+# of `from` with `to`. Replacing an empty `from` is a no-op (would
+# otherwise spin forever inserting `to` between every byte).
+pub fn replace(s: String, from: String, to: String) : String {
+  if string_length(from) == 0 { s }
+  else { string.join(string.split(s, from), to) }
+}
+
+# `pad_left(s, width, fill)` left-pads `s` with `fill` so the result
+# has at least `width` *bytes* (not Unicode code points — kaikai
+# strings are byte-indexed). When `length(s) >= width` the input is
+# returned unchanged.
+fn string_pad_loop(fill: String, k: Int, acc: String) : String {
+  if k <= 0 { acc }
+  else { string_pad_loop(fill, k - 1, string_concat(acc, fill)) }
+}
+
+pub fn pad_left(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(string_pad_loop("#{fill}", width - n, ""), s) }
+}
+
+pub fn pad_right(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(s, string_pad_loop("#{fill}", width - n, "")) }
+}
+
+# `lines(s)` splits on `'\n'` and drops a trailing empty entry when
+# `s` ends with a newline (so `"a\nb\n"` and `"a\nb"` both yield
+# `["a", "b"]`). Empty interior lines are preserved. `lines("")` is
+# the empty list — matches Python `"".splitlines()` and Rust
+# `"".lines()`, both of which yield no lines for an empty input.
+fn lines_drop_trailing_empty(xs: [String]) : [String] {
+  match xs {
+    [] -> []
+    [""] -> []
+    [x] -> [x]
+    [x, ...rest] -> [x, ...lines_drop_trailing_empty(rest)]
+  }
+}
+
+pub fn lines(s: String) : [String] = lines_drop_trailing_empty(string_split(s, "\n"))
+
+# `bytes(s)` returns the list of bytes in `s` as `Char`s, one element
+# per byte. The list preserves source order. A multibyte UTF-8 sequence
+# is split into its constituent bytes (so `bytes("á")` is two elements:
+# 0xC3, 0xA1). This is the byte-level view; for Unicode codepoints use
+# `chars`. (Issue #744: this is the former `chars`, renamed to stop the
+# name lying about what it returns.)
+fn string_bytes_loop(s: String, i: Int, acc: [Char]) : [Char] {
+  if i < 0 { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> string_bytes_loop(s, i - 1, [c, ...acc])
+      None    -> string_bytes_loop(s, i - 1, acc)
+    }
+  }
+}
+
+pub fn bytes(s: String) : [Char] = string_bytes_loop(s, string_length(s) - 1, [])
+
+# `chars(s)` returns the list of Unicode codepoints in `s`, decoding
+# the UTF-8 buffer. `chars("áé▸")` is three elements (0xE1, 0xE9,
+# 0x25B8), unlike `bytes` which would give seven. This is the
+# codepoint-level view a TUI/i18n consumer wants (issue #744). O(n) and
+# materialized — kaikai has no lazy sequence type yet, matching Python 3
+# `list(s)`. For just the count without building the list use
+# `char_count`; for codepoints with their byte offsets use `char_indices`.
+fn string_chars_loop(s: String, off: Int, n: Int) : [Char] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [int_to_char(cp), ...string_chars_loop(s, off + step, n)]
+  }
+}
+
+pub fn chars(s: String) : [Char] = string_chars_loop(s, 0, string_length(s))
+
+# `char_count(s)` is the number of Unicode codepoints in `s` — the
+# honest codepoint length, distinct from `length`/`byte_length` (bytes).
+# Walks the buffer without materializing a list (issue #744).
+fn string_char_count_loop(s: String, off: Int, n: Int, acc: Int) : Int {
+  if off >= n { acc }
+  else {
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    string_char_count_loop(s, off + step, n, acc + 1)
+  }
+}
+
+pub fn char_count(s: String) : Int = string_char_count_loop(s, 0, string_length(s), 0)
+
+# `byte_length(s)` is the explicit byte count — a synonym of `length`,
+# spelled to make the unit unambiguous at the call site next to
+# `char_count` (issue #744).
+pub fn byte_length(s: String) : Int = string_length(s)
+
+# `char_indices(s)` pairs each codepoint with the byte offset at which
+# it begins: `char_indices("á!")` is `[{off:0, cp:0xE1}, {off:2, cp:0x21}]`
+# (the `!` starts at byte 2 because `á` is two UTF-8 bytes). For consumers
+# that need both the codepoint and where it sits in the byte buffer in a
+# single pass (issue #744; the shape #745 `display_width` builds on).
+fn string_char_indices_loop(s: String, off: Int, n: Int) : [CharIndex] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [CharIndex { off: off, cp: int_to_char(cp) }, ...string_char_indices_loop(s, off + step, n)]
+  }
+}
+
+pub fn char_indices(s: String) : [CharIndex] = string_char_indices_loop(s, 0, string_length(s))
+
+# `is_blank(s)` is `true` for the empty string and for any string
+# whose bytes are all whitespace per the same rule used by `trim`
+# (`is_space(c) or c == '\n' or c == '\r' or c == '\t'`).
+fn string_is_blank_loop(s: String, i: Int, n: Int) : Bool {
+  if i >= n { true }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_is_blank_loop(s, i + 1, n)
+                 } else { false }
+      None -> true
+    }
+  }
+}
+
+pub fn is_blank(s: String) : Bool = string_is_blank_loop(s, 0, string_length(s))
+
+# Intrinsic tests (issue #170 phase 1b). Run with
+# `KAI_NO_STDLIB=1 bin/kai test stdlib/core/string.kai` — same
+# rationale as option/result: KAI_NO_STDLIB=1 prevents bin/kai from
+# auto-loading this module as a prelude and then again as the test
+# source, which would compile the test blocks twice.
+test "starts_with — prefix match, miss, full string, empty" {
+  assert starts_with("hello world", "hello") == true
+  assert starts_with("hello world", "world") == false
+  assert starts_with("abc", "abc") == true
+  assert starts_with("abc", "abcd") == false
+  assert starts_with("abc", "") == true
+}
+
+test "ends_with — suffix match, miss, empty suffix" {
+  assert ends_with("hello world", "world") == true
+  assert ends_with("hello world", "hello") == false
+  assert ends_with("abc", "abc") == true
+  assert ends_with("abc", "") == true
+  assert ends_with("a", "ab") == false
+}
+
+test "trim — leading/trailing whitespace, all-space, empty" {
+  assert trim("  hello  ") == "hello"
+  assert trim("\thello\n") == "hello"
+  assert trim("hello") == "hello"
+  assert trim("   ") == ""
+  assert trim("") == ""
+}
+
+test "repeat — zero, one, many, negative" {
+  assert string.repeat("ab", 0) == ""
+  assert string.repeat("ab", 1) == "ab"
+  assert string.repeat("ab", 3) == "ababab"
+  assert string.repeat("ab", -5) == ""
+  assert string.repeat("", 4) == ""
+}
+
+test "join — empty list, singleton, multi, empty separator" {
+  assert join([], ",") == ""
+  assert join(["a"], ",") == "a"
+  assert join(["a", "b", "c"], ",") == "a,b,c"
+  assert join(["a", "b"], "") == "ab"
+  assert join(["x", "y", "z"], " - ") == "x - y - z"
+}
+
+test "split — separator hits, leading/trailing/empty/no-match" {
+  assert split("a,b,c", ",") == ["a", "b", "c"]
+  assert split(",a,", ",") == ["", "a", ""]
+  assert split("hello", ",") == ["hello"]
+  assert split("", ",") == [""]
+  assert split("a::b::c", "::") == ["a", "b", "c"]
+}
+
+test "replace — multiple hits, no-op, empty from, into-empty" {
+  assert replace("hello world", "o", "0") == "hell0 w0rld"
+  assert replace("aaa", "a", "bb") == "bbbbbb"
+  assert replace("hello", "x", "y") == "hello"
+  assert replace("hello", "", "x") == "hello"
+  assert replace("a,b,c", ",", "") == "abc"
+}
+
+test "pad_left — short, exact, longer, empty input" {
+  assert pad_left("42", 5, '0') == "00042"
+  assert pad_left("hello", 5, ' ') == "hello"
+  assert pad_left("hello", 3, ' ') == "hello"
+  assert pad_left("", 3, '*') == "***"
+  assert pad_left("x", 4, '-') == "---x"
+}
+
+test "pad_right — short, exact, longer, empty input" {
+  assert pad_right("42", 5, '0') == "42000"
+  assert pad_right("hello", 5, ' ') == "hello"
+  assert pad_right("hello", 3, ' ') == "hello"
+  assert pad_right("", 3, '*') == "***"
+  assert pad_right("x", 4, '-') == "x---"
+}
+
+test "lines — basic, trailing newline, embedded blanks, empty" {
+  assert lines("a\nb\nc") == ["a", "b", "c"]
+  assert lines("a\nb\nc\n") == ["a", "b", "c"]
+  assert lines("a\n\nb") == ["a", "", "b"]
+  assert lines("") == []
+  assert lines("hello") == ["hello"]
+}
+
+test "chars — empty, single, multi (ASCII: byte == codepoint)" {
+  assert chars("") == []
+  assert chars("a") == ['a']
+  assert chars("abc") == ['a', 'b', 'c']
+  assert chars("ab\n") == ['a', 'b', '\n']
+}
+
+test "bytes — byte-level view, multibyte splits into bytes" {
+  assert bytes("") == []
+  assert bytes("abc") == ['a', 'b', 'c']
+  # "á" is 0xC3 0xA1 in UTF-8 — two bytes, two elements.
+  assert bytes("á") == [int_to_char(195), int_to_char(161)]
+}
+
+test "chars — codepoint-level view, multibyte decodes to one codepoint" {
+  # "áé▸" is 7 bytes, 3 codepoints (issue #744): á=0xE1, é=0xE9, ▸=0x25B8.
+  assert chars("áé▸") == [int_to_char(225), int_to_char(233), int_to_char(9656)]
+}
+
+test "char_count / byte_length — codepoints vs bytes" {
+  assert char_count("") == 0
+  assert char_count("abc") == 3
+  assert char_count("áé▸") == 3
+  assert byte_length("áé▸") == 7
+  # `length` is the bare-name synonym of `byte_length`, but spelled bare
+  # it collides with `list.length` under `--include-prelude-tests` (both
+  # export `length`), and the list impl's `match` over a String is
+  # non-exhaustive at runtime. Use the underlying primitive so the
+  # intrinsic test is unambiguous in every load mode.
+  assert string_length("áé▸") == 7
+}
+
+test "char_indices — codepoint with its starting byte offset" {
+  # "á!" — á at byte 0 (2 bytes), '!' at byte 2.
+  assert char_indices("á!") ==
+    [CharIndex { off: 0, cp: int_to_char(225) },
+     CharIndex { off: 2, cp: int_to_char(33) }]
+}
+
+test "is_blank — empty/spaces/tabs/newlines true; with content false" {
+  assert is_blank("") == true
+  assert is_blank("   ") == true
+  assert is_blank("\t\n\r ") == true
+  assert is_blank("a") == false
+  assert is_blank("  a  ") == false
+}
