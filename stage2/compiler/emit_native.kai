@@ -1,0 +1,150 @@
+# compiler/emit_native.kai — KIR → in-process libLLVM backend, the
+# orchestration layer (KIR Lane 1, docs/kir-design.md §7.2).
+#
+# `build_native_object` consumes a `KProgram` and constructs the LLVM
+# module IN MEMORY by calling the libLLVM C API (via the raw-prelude
+# prims in `native_prims.kai` / `runtime.h`), runs verify + codegen, and
+# emits a native object file — one process, no `.ll` text, no `clang`.
+# The driver then links that object against the effects runtime to
+# produce the executable.
+#
+# Native is opt-in this lane (`KAI_BACKEND=native` / `--emit=native`); the
+# C-text backend stays the default + bootstrap + the differential oracle
+# every construct is validated against. The flip to native-default is
+# Lane 1.5.
+#
+# This file is the orchestration: cache the LLVM types, declare every
+# user function up front (so a call can forward-reference a fn defined
+# later), walk each `KFn` (the per-fn walk lives in `emit_native_fn` /
+# `emit_native_ops` / `emit_native_term`), emit the runtime-entry hooks,
+# and — IFF every node lowered (`e.ok`) — verify + emit the object. A
+# node the current subset does not cover flips `e.ok` false (a loud
+# `nemit_unsupported`), and `build_native_object` returns non-zero rather
+# than emit a half-built module (the parity gate, not "no panic", is what
+# proves correctness).
+#
+# Subset 1 (this lane): the pure walk — arithmetic / let / calls /
+# control flow / ctors / match / proj / RC / TCO — validated against
+# C-direct by exit code + stdout. Effects (perform / install / resume),
+# TRMC, and explicit tail calls are later subsets; they abort loudly.
+
+import compiler.util
+import compiler.ast
+import compiler.kir
+import compiler.native_prims
+import compiler.emit_native_fn
+import compiler.emit_native_ops
+import compiler.emit_native_term
+import compiler.emit_native_def
+
+# Build the LLVM module for `kp` in memory and emit it as an object at
+# `out_path`. Returns 0 on success, non-zero on a verify / codegen
+# failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
+# `--emit=native`.
+pub fn build_native_object(kp: KProgram, out_path: String) : Int / Console = {
+  let m = llvm_module_new("kai_native")
+  # ALL backend state (module, builder, types, fn, reg/block tables) lives
+  # in the C-side `ctx` reached through this opaque Handle — no handle
+  # ever enters a kaikai record/list (would RC-corrupt under kaic1).
+  let ctx = native_ctx_new(m)
+  # Declare every user fn first (forward references), then walk each.
+  # `kp.handlers` threads the effect handler decls so a `KInstall`/
+  # `KPerform` resolves its op→clause-thunk map (effects subset 2a).
+  nemit_declare_fns(ctx, kp.fns)
+  # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one
+  # per installed default so `nemit_perform` resolves the op's field index
+  # for the builtin-dispatch path (the op fn-ptr itself is loaded at runtime
+  # from the Ev `kai_main_install_defaults` pushed). User handlers come
+  # first so a user `handle` shadows a same-effect default in scope.
+  let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.defaults))
+  nemit_walk_fns(ctx, kp.fns, all_handlers)
+  # Every named fn also gets a `_kai_<sym>_thunk` forwarder so it can be
+  # passed as a first-class value (a `KClosure` over a named fn references
+  # this symbol). The KIR does NOT model these — they are synthetic, like
+  # the C-direct emitter's `emit_fn_thunk`.
+  nemit_fn_thunks(ctx, kp.fns)
+  native_build_runtime_hooks(ctx, kp.defaults)
+  if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
+  else {
+    eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
+    1
+  }
+}
+
+# Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
+# front so a call/install site resolves the symbol even when the definition
+# comes later in the list. (Lambda thunks declare lazily at their use.)
+fn nemit_declare_fns(ctx: Handle, fns: [KFn]) : Unit = match fns {
+  [] -> ()
+  [f, ...rest] -> match f.kind {
+    KFnNormal -> {
+      # Bind the declaration handle in a `let` (the handle-binder
+      # exclusion) — NOT a discarded statement. A bare
+      # `llvm_get_or_declare_fn(...)` leaves the returned `Function*` handle
+      # in statement position, where the type-blind kaic1 Perceus
+      # `kai_decref`s the unused value, dereferencing the raw LLVM pointer
+      # and clobbering the just-declared function's object (its type-id
+      # flipped Function->ConstantVector, crashing the AsmPrinter). The
+      # `let _d = <handle-fn>` form keeps it out of Perceus.
+      let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(f.sym), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+      nemit_declare_fns(ctx, rest)
+    }
+    # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
+    # its address) before its own definition is walked, so forward-declare
+    # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
+    KFnClause -> {
+      let _c = nemit_declare_clause(ctx, f.sym, f.params)
+      nemit_declare_fns(ctx, rest)
+    }
+    _ -> nemit_declare_fns(ctx, rest)
+  }
+}
+
+# Walk each fn (imperative over `ctx`; an uncovered node flips `ctx.ok`).
+fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl]) : Unit / Console = match fns {
+  [] -> ()
+  [f, ...rest] -> { nemit_fn(ctx, f, handlers); nemit_walk_fns(ctx, rest, handlers) }
+}
+
+# The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls around
+# `kai_main`: `kai_main_install_defaults`, `kai_main_teardown_defaults`,
+# `_kai_proto_init_llvm`.
+#
+# `install_defaults` / `teardown_defaults` carry REAL bodies now (effects
+# subset 2c): one push/pop per default in `kp.defaults` (main's row ∩ the
+# builtin install order ++ user effects with a `default { }` block, in
+# install order). With an empty `defaults` they emit just `ret void`, so a
+# pure (effect-free) program is byte-equivalent to the old no-op. The
+# C-direct oracle builds the same two functions from `default_setups_for` /
+# `default_pops_for`.
+#
+# `_kai_proto_init_llvm` stays an empty `void ()`: native protocol dispatch
+# is not observable in this subset (a later lane fills it).
+fn native_build_runtime_hooks(ctx: Handle, defaults: [KDefault]) : Unit / Console = {
+  nemit_build_install_defaults(ctx, defaults)
+  nemit_build_teardown_defaults(ctx, defaults)
+  let m = native_ctx_m(ctx)
+  native_build_void_noop(m, llvm_fn_type_0(llvm_void_type(m)), "_kai_proto_init_llvm")
+}
+
+# Define one empty `void name()` — a single block returning void.
+fn native_build_void_noop(m: Handle, void_fn_ty: Handle, name: String) : Unit = {
+  let func = llvm_add_function(m, name, void_fn_ty)
+  let entry = llvm_append_block(m, func, "entry")
+  let b = llvm_builder_new(m)
+  llvm_position_at_end(b, entry)
+  llvm_build_ret_void(b)
+}
+
+# Derive the object-file path from the source path: `foo.kai` -> `foo.o`.
+# A path not ending in `.kai` just gets `.o` appended. The `bin/kai`
+# wrapper (or the test harness) links this object against the effects
+# runtime to the final executable.
+pub fn native_object_path(src_path: String) : String = {
+  let n = string_length(src_path)
+  if n > 4 and string_slice(src_path, n - 4, 4) == ".kai" {
+    cat2(string_slice(src_path, 0, n - 4), ".o")
+  } else {
+    cat2(src_path, ".o")
+  }
+}

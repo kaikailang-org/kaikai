@@ -1,0 +1,117 @@
+# benchmarks/hashmap/hashmap_vs_map.kai — mutable HashMap vs AVL Map.
+#
+# Issue #374: compare the mutable hash table `HashMap` against the
+# ordered AVL `Map` across N = 100, 1K, 10K, 100K, and document the
+# crossover.
+#
+# Run with:
+#
+#   bin/kai run benchmarks/hashmap/hashmap_vs_map.kai
+#
+# This is a `main` + `Clock` timing program, NOT a `kai bench` fixture:
+# `kai bench` currently segfaults on any block body carrying the
+# `Mutable` effect (a trivial `Mutable.ref_make` body crashes it too),
+# so the HashMap blocks cannot run under the bench harness. That is a
+# pre-existing bench/effect-runtime bug, unrelated to this carrier —
+# documented in docs/lane-experience-issue-374.md. We time with the
+# monotonic clock instead, which works fine under `Mutable`.
+#
+# Two workloads, identical between the structures:
+#   build      — N puts from empty (HashMap mutates in place + resizes;
+#                Map threads a fresh value per put).
+#   lookup     — N gets over a pre-built map.
+#
+# Keys are `Int`.
+
+import collections.map
+import collections.hashmap
+import time
+
+# ---- AVL Map (pure) ----------------------------------------------
+
+fn build_map(i: Int, n: Int, m: Map[Int, Int]) : Map[Int, Int] =
+  if i >= n { m } else { build_map(i + 1, n, map.put(m, i, i * 2)) }
+
+fn lookup_map(m: Map[Int, Int], i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc }
+  else {
+    let v = match map.get(m, i) { Some(x) -> x  None -> 0 }
+    lookup_map(m, i + 1, n, acc + v)
+  }
+
+# ---- mutable HashMap ---------------------------------------------
+
+fn build_hashmap(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
+  if i >= n { () } else { hashmap.put(m, i, i * 2); build_hashmap(m, i + 1, n) }
+
+fn lookup_hashmap(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
+  if i >= n { acc }
+  else {
+    let v = match hashmap.get(m, i) { Some(x) -> x  None -> 0 }
+    lookup_hashmap(m, i + 1, n, acc + v)
+  }
+
+# ---- timing ------------------------------------------------------
+
+fn elapsed_ms(a: Instant, b: Instant) : Int =
+  ((b.secs - a.secs) * 1000000000 + (b.nanos - a.nanos)) / 1000000
+
+fn bench_n(n: Int) : Unit / Stdout + Mutable + Clock = {
+  # Map build
+  let tm0 = Clock.monotonic_now()
+  let bm = build_map(0, n, map.empty())
+  let tm1 = Clock.monotonic_now()
+  let rm = lookup_map(bm, 0, n, 0)
+  let tm2 = Clock.monotonic_now()
+  # HashMap build
+  let hm = hashmap.empty()
+  let th0 = Clock.monotonic_now()
+  build_hashmap(hm, 0, n)
+  let th1 = Clock.monotonic_now()
+  let rh = lookup_hashmap(hm, 0, n, 0)
+  let th2 = Clock.monotonic_now()
+  let line = "N=" ++ int_to_string(n) ++
+    "  | map build " ++ int_to_string(elapsed_ms(tm0, tm1)) ++ "ms lookup " ++ int_to_string(elapsed_ms(tm1, tm2)) ++ "ms" ++
+    "  | hashmap build " ++ int_to_string(elapsed_ms(th0, th1)) ++ "ms lookup " ++ int_to_string(elapsed_ms(th1, th2)) ++ "ms" ++
+    "  (checksums " ++ int_to_string(rm) ++ "/" ++ int_to_string(rh) ++ ")"
+  Stdout.print(line)
+}
+
+# Hammer lookups: REPS gets cycling over keys 0..N-1 on a pre-built
+# map, so the pure walk cost dominates (build excluded from timing).
+fn hammer_map(m: Map[Int, Int], i: Int, reps: Int, n: Int, acc: Int) : Int =
+  if i >= reps { acc }
+  else {
+    let v = match map.get(m, i % n) { Some(x) -> x  None -> 0 }
+    hammer_map(m, i + 1, reps, n, acc + v)
+  }
+fn hammer_hashmap(m: HashMap[Int, Int], i: Int, reps: Int, n: Int, acc: Int) : Int / Mutable =
+  if i >= reps { acc }
+  else {
+    let v = match hashmap.get(m, i % n) { Some(x) -> x  None -> 0 }
+    hammer_hashmap(m, i + 1, reps, n, acc + v)
+  }
+
+fn lookup_bench(n: Int, reps: Int) : Unit / Stdout + Mutable + Clock = {
+  let bm = build_map(0, n, map.empty())
+  let hm = hashmap.empty()
+  build_hashmap(hm, 0, n)
+  let tm0 = Clock.monotonic_now()
+  let rm = hammer_map(bm, 0, reps, n, 0)
+  let tm1 = Clock.monotonic_now()
+  let rh = hammer_hashmap(hm, 0, reps, n, 0)
+  let tm2 = Clock.monotonic_now()
+  let line = "lookup-hammer N=" ++ int_to_string(n) ++ " reps=" ++ int_to_string(reps) ++
+    "  | map " ++ int_to_string(elapsed_ms(tm0, tm1)) ++ "ms" ++
+    "  | hashmap " ++ int_to_string(elapsed_ms(tm1, tm2)) ++ "ms" ++
+    "  (checksums " ++ int_to_string(rm) ++ "/" ++ int_to_string(rh) ++ ")"
+  Stdout.print(line)
+}
+
+fn main() : Unit / Stdout + Mutable + Clock = {
+  bench_n(100)
+  bench_n(1000)
+  bench_n(10000)
+  bench_n(100000)
+  lookup_bench(10000, 1000000)
+}

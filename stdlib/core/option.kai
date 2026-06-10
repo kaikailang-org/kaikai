@@ -1,0 +1,395 @@
+#[doc("""
+core.option — Option helpers in kaikai-minimal.
+
+Exports use bare module-relative names; callers spell them as
+`option.is_some(o)`, `option.map(o, f)`, etc. The variant constructors
+`Some` / `None` remain the way to *construct* an `Option`. Migration
+landed in m14 phase 3 (issue #203 phase 3); the receiver-type-driven
+bare-name + UFCS dispatch landed with issue #235.
+
+Surviving flat alias: `opt_or`. Bare `or` is a reserved keyword;
+the alias survives until the keyword reservation relaxes.
+""")]
+
+#[doc("True when the option holds a value (`Some`).")]
+pub fn is_some(o: Option[a]) : Bool {
+  match o {
+    Some(_) -> true
+    None -> false
+  }
+}
+
+#[doc("True when the option is empty (`None`).")]
+pub fn is_none(o: Option[a]) : Bool {
+  match o {
+    None -> true
+    _ -> false
+  }
+}
+
+#[doc("Applies `f` to the contained value, propagating `None` unchanged.")]
+pub fn map(o: Option[a], f: (a) -> b) : Option[b] {
+  match o {
+    None -> None
+    Some(x) -> Some(f(x))
+  }
+}
+
+#[doc("Returns the contained value, or `dflt` when `None`.")]
+pub fn unwrap_or(o: Option[a], dflt: a) : a {
+  match o {
+    None -> dflt
+    Some(x) -> x
+  }
+}
+
+#[doc("Chains an `Option`-returning function, short-circuiting on `None`.")]
+pub fn and_then(o: Option[a], f: (a) -> Option[b]) : Option[b] {
+  match o {
+    None -> None
+    Some(x) -> f(x)
+  }
+}
+
+#[doc("`or` is a reserved keyword; alias stays as `opt_or`.")]
+pub fn opt_or(o: Option[a], dflt: Option[a]) : Option[a] {
+  match o {
+    Some(x) -> Some(x)
+    None -> dflt
+  }
+}
+
+#[doc("Returns the option when `Some`, otherwise the result of calling `f`.")]
+pub fn or_else(o: Option[a], f: () -> Option[a]) : Option[a] {
+  match o {
+    Some(x) -> Some(x)
+    None -> f()
+  }
+}
+
+#[doc("Returns the contained value, or the result of `f` when `None`.")]
+pub fn unwrap_or_else(o: Option[a], f: () -> a) : a {
+  match o {
+    Some(x) -> x
+    None -> f()
+  }
+}
+
+#[doc("Converts to `Result`: `Some(x)` becomes `Ok(x)`, `None` becomes `Err(err)`.")]
+pub fn ok_or(o: Option[a], err: e) : Result[e, a] {
+  match o {
+    Some(x) -> Ok(x)
+    None -> Err(err)
+  }
+}
+
+#[doc("Converts to `Result`, computing the `Err` value lazily via `f` when `None`.")]
+pub fn ok_or_else(o: Option[a], f: () -> e) : Result[e, a] {
+  match o {
+    Some(x) -> Ok(x)
+    None -> Err(f())
+  }
+}
+
+#[doc("Keeps the value when `pred` holds, otherwise yields `None`.")]
+pub fn filter(o: Option[a], pred: (a) -> Bool) : Option[a] {
+  match o {
+    None -> None
+    Some(x) -> if pred(x) { Some(x) } else { None }
+  }
+}
+
+#[doc("Pairs two options into `Some(Pair)`, or `None` if either is `None`.")]
+pub fn zip(a: Option[a], b: Option[b]) : Option[Pair[a, b]] {
+  match a {
+    None -> None
+    Some(x) -> match b {
+      None -> None
+      Some(y) -> Some(Pair { fst: x, snd: y })
+    }
+  }
+}
+
+#[doc("Short-circuits on first None. [] -> Some([]).")]
+pub fn collect(os: [Option[a]]) : Option[[a]] {
+  match os {
+    [] -> Some([])
+    [h, ...t] -> match h {
+      None -> None
+      Some(x) -> match collect(t) {
+        None -> None
+        Some(xs) -> Some([x, ...xs])
+      }
+    }
+  }
+}
+
+#[doc("""
+Returns the first Some in the list, or None if all are None. The list is
+fully constructed before this is called, so every element is evaluated
+eagerly — for lazy short-circuit between two candidates use `or_else` with
+a thunk instead. Intended for N-way pure fallbacks where the cost of the
+extra evaluations is negligible.
+""")]
+pub fn first_some(os: [Option[a]]) : Option[a] {
+  match os {
+    [] -> None
+    [h, ...t] -> match h {
+      Some(_) -> h
+      None -> first_some(t)
+    }
+  }
+}
+
+# Intrinsic tests (issue #170 phase 1a). Run with
+# `KAI_NO_STDLIB=1 bin/kai test stdlib/core/option.kai` — the
+# `KAI_NO_STDLIB=1` is required so that bin/kai doesn't auto-load
+# option.kai *as a prelude* and then again as the test source,
+# which would compile the test blocks twice. The path-gated
+# `tier1-stdlib-core` workflow runs them via the
+# `test-stdlib-core-intrinsic` make target.
+test "is_some / is_none on Some" {
+  assert is_some(Some(7)) == true
+  assert is_none(Some(7)) == false
+}
+
+test "is_some / is_none on None" {
+  assert is_some(None) == false
+  assert is_none(None) == true
+}
+
+# Issue #230 regression: a test target must be able to qualify its
+# own exports via the file's basename. Pre-fix: rqc rewrote
+# `option.is_some` to `EField(EVar("option"), ...)` because the
+# target file was absent from the module table, and the typer
+# rejected with `undefined name 'option'`. Post-fix: rqc emits
+# `EModCall("option", "is_some")` and the typer resolves via the
+# qualified `option::is_some` key registered in `add_decls_loop`
+# (PR #229) — the target's DFns are tagged the same way prelude
+# DFns are, except `main` (so the C harness's `kai_main()` link
+# survives).
+test "issue #230 — qualified self-reference resolves" {
+  assert option.is_some(option.map(Some(3), (x) => x + 1)) == true
+  assert option.is_none(option.map(None, (x: Int) => x + 1)) == true
+}
+
+test "map on Some applies the function" {
+  let r = option.map(Some(3), (x) => x + 1)
+  match r {
+    Some(v) -> { assert v == 4 }
+    None    -> { assert false }
+  }
+}
+
+test "map on None propagates None (bottom)" {
+  let r : Option[Int] = option.map(None, (x) => x + 1)
+  assert is_none(r) == true
+}
+
+test "unwrap_or returns inner on Some, default on None" {
+  assert option.unwrap_or(Some(42), 0) == 42
+  assert option.unwrap_or(None, 99) == 99
+}
+
+test "and_then chains and propagates None mid-chain" {
+  let r1 = option.and_then(Some(2), (x) => Some(x * 10))
+  match r1 {
+    Some(v) -> { assert v == 20 }
+    None    -> { assert false }
+  }
+  # bottom in middle of chain
+  let r2 : Option[Int] = option.and_then(Some(2), (x) => None)
+  assert is_none(r2) == true
+  # bottom at start of chain
+  let r3 : Option[Int] = option.and_then(None, (x) => Some(x * 10))
+  assert is_none(r3) == true
+}
+
+test "or returns first Some" {
+  let a : Option[Int] = Some(1)
+  let b : Option[Int] = Some(2)
+  match opt_or(a, b) {
+    Some(v) -> { assert v == 1 }
+    None    -> { assert false }
+  }
+}
+
+test "or falls back to second on None" {
+  let a : Option[Int] = None
+  let b : Option[Int] = Some(2)
+  match opt_or(a, b) {
+    Some(v) -> { assert v == 2 }
+    None    -> { assert false }
+  }
+}
+
+test "or None+None stays None" {
+  let a : Option[Int] = None
+  let b : Option[Int] = None
+  assert is_none(opt_or(a, b)) == true
+}
+
+test "or_else does not call f on Some" {
+  let a : Option[Int] = Some(7)
+  match option.or_else(a, () => Some(0)) {
+    Some(v) -> { assert v == 7 }
+    None    -> { assert false }
+  }
+}
+
+test "or_else invokes f on None" {
+  let a : Option[Int] = None
+  match option.or_else(a, () => Some(99)) {
+    Some(v) -> { assert v == 99 }
+    None    -> { assert false }
+  }
+}
+
+test "or_else can chain to None" {
+  let a : Option[Int] = None
+  assert is_none(option.or_else(a, () => None)) == true
+}
+
+test "unwrap_or_else returns inner on Some" {
+  assert option.unwrap_or_else(Some(42), () => 0) == 42
+}
+
+test "unwrap_or_else invokes f on None" {
+  let n : Option[Int] = None
+  assert option.unwrap_or_else(n, () => 99) == 99
+}
+
+test "unwrap_or_else does not call f on Some" {
+  # f would return -1; Some path returns 5.
+  assert option.unwrap_or_else(Some(5), () => 0 - 1) == 5
+}
+
+test "ok_or maps Some to Ok" {
+  let r : Result[String, Int] = ok_or(Some(7), "missing")
+  match r {
+    Ok(v)  -> { assert v == 7 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "ok_or maps None to Err(err)" {
+  let n : Option[Int] = None
+  let r : Result[String, Int] = ok_or(n, "missing")
+  match r {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "missing" }
+  }
+}
+
+test "ok_or_else lazy-supplies the error" {
+  let n : Option[Int] = None
+  let r : Result[String, Int] = ok_or_else(n, () => "lazy")
+  match r {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "lazy" }
+  }
+}
+
+test "ok_or_else does not call f on Some" {
+  let r : Result[String, Int] = ok_or_else(Some(3), () => "x")
+  match r {
+    Ok(v)  -> { assert v == 3 }
+    Err(_) -> { assert false }
+  }
+}
+
+test "filter keeps value when predicate is true" {
+  match option.filter(Some(4), (x) => x > 2) {
+    Some(v) -> { assert v == 4 }
+    None    -> { assert false }
+  }
+}
+
+test "filter drops value when predicate is false" {
+  let r : Option[Int] = option.filter(Some(1), (x) => x > 2)
+  assert is_none(r) == true
+}
+
+test "filter on None stays None" {
+  let n : Option[Int] = None
+  assert is_none(option.filter(n, (x) => true)) == true
+}
+
+test "zip Some+Some -> Some(Pair)" {
+  match option.zip(Some(1), Some("a")) {
+    Some(p) -> {
+      assert p.fst == 1
+      assert p.snd == "a"
+    }
+    None -> { assert false }
+  }
+}
+
+test "zip with first None -> None" {
+  let a : Option[Int] = None
+  let b : Option[String] = Some("a")
+  assert is_none(option.zip(a, b)) == true
+}
+
+test "zip with second None -> None" {
+  let a : Option[Int] = Some(1)
+  let b : Option[String] = None
+  assert is_none(option.zip(a, b)) == true
+}
+
+test "collect on empty list yields Some([])" {
+  let os : [Option[Int]] = []
+  match option.collect(os) {
+    Some(xs) -> { assert is_empty(xs) == true }
+    None     -> { assert false }
+  }
+}
+
+test "collect on all-Some yields Some of values" {
+  let os : [Option[Int]] = [Some(1), Some(2), Some(3)]
+  match option.collect(os) {
+    Some(xs) -> {
+      assert sum(xs) == 6
+      match xs {
+        [a, b, c] -> {
+          assert a == 1
+          assert b == 2
+          assert c == 3
+        }
+        _ -> { assert false }
+      }
+    }
+    None -> { assert false }
+  }
+}
+
+test "collect short-circuits on first None" {
+  let os : [Option[Int]] = [Some(1), Some(2), None, Some(3)]
+  assert is_none(option.collect(os)) == true
+}
+
+test "first_some returns first Some" {
+  let os : [Option[Int]] = [None, Some(2), Some(3)]
+  match option.first_some(os) {
+    Some(v) -> { assert v == 2 }
+    None    -> { assert false }
+  }
+}
+
+test "first_some on all-None yields None" {
+  let os : [Option[Int]] = [None, None, None]
+  assert is_none(option.first_some(os)) == true
+}
+
+test "first_some on empty list yields None" {
+  let os : [Option[Int]] = []
+  assert is_none(option.first_some(os)) == true
+}
+
+test "first_some with leading Some short-circuits semantically" {
+  let os : [Option[Int]] = [Some(1), Some(2), Some(3)]
+  match option.first_some(os) {
+    Some(v) -> { assert v == 1 }
+    None    -> { assert false }
+  }
+}

@@ -1,0 +1,2165 @@
+#!/bin/sh
+# kai — stage 2 compiler driver.
+#
+# Subcommands:
+#   kai build <file.kai> [-o <out>]   compile to a native binary
+#   kai run   <file.kai> [args...]    compile and execute; forward args
+#   kai test  <file.kai>              compile with --test and run
+#   kai bench [--iters N] <file.kai>  compile with --bench and run
+#   kai check <file.kai>              compile with --prop-check and run
+#                                      (property-based tests, issue #44)
+#   kai help                          show this help
+#   kai --version                     print version
+#
+# The driver wraps kaic2 + cc. It auto-builds stages 0/1/2 on first
+# use if their binaries are missing. Paths resolve relative to this
+# script's own location, so the script works from any working
+# directory.
+#
+# Auto-loaded core modules — the Hanga Roa "core" set. Anything else
+# under stdlib/ requires explicit `import` from user code.
+#
+#   stdlib/core/*.kai      sorted alphabetically (char before string
+#                          because string_trim_*_loop calls
+#                          ch_is_space). Includes complex.kai so the
+#                          `2.5i` imaginary literal and Complex
+#                          arithmetic work without an import.
+#   stdlib/protocols.kai   Show/Eq/Ord/Hash/Serialize/BinSerialize.
+#   stdlib/effects.kai     Stdin/Stdout/Stderr/File/Env/Console.
+#   stdlib/array.kai       Array[T] helpers; Array itself is a runtime
+#                          primitive.
+#
+# Everything else (decimal, money, math/int, math/real, regexp,
+# collections/*, encoding/*, crypto/*, random*, fx, uuid, path) is
+# opt-in via `import <name>` — see docs/stdlib-layout.md §*Core vs.
+# opt-in*.
+
+set -eu
+
+# kaic1/kaic2 lex their input recursively (lex_loop is not TCO'd in
+# stage 0's C output). On ~10 k-line sources the default 8 MB thread
+# stack overflows. Bump to 32 MB; ignore failure on shells/systems
+# that reject it.
+ulimit -s 32768 2>/dev/null || true
+
+# Resolve script path portably (macOS lacks GNU readlink -f).
+SCRIPT="$0"
+case "$SCRIPT" in
+  /*) ;;
+  *)  SCRIPT="$(pwd)/$SCRIPT" ;;
+esac
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Layout detection — dev checkout vs installed tarball.
+#
+# Dev checkout: $ROOT contains stage0/, stage1/, stage2/ source dirs and
+# stdlib/ at the top level. Used during development from a git clone.
+#
+# Installed: $ROOT contains libexec/kaikai/kaic2 (the binary), share/kaikai/
+# stdlib (sources), and share/kaikai/include/runtime.h. Used after a release
+# tarball is extracted to a prefix like /usr/local or ~/.local.
+#
+# KAI_STDLIB and KAI_INCLUDE env vars override the resolved paths if set
+# (useful for running an installed kai against an experimental stdlib copy).
+if [ -d "$ROOT/stage0" ] && [ -d "$ROOT/stdlib" ]; then
+  KAIC0="$ROOT/stage0/kaic0"
+  KAIC1="$ROOT/stage1/kaic1"
+  KAIC2="$ROOT/stage2/kaic2"
+  RUNTIME_INC="$ROOT/stage0"
+  # The C backend (kaic2-emitted C) requires stage 2's Koka-style
+  # runtime.h (tagged Int, kai_intf, reuse-token). It must resolve
+  # BEFORE stage0/runtime.h, which is the old heap-everything runtime
+  # kept only for the stage0/stage1 bootstrap chain and the LLVM
+  # backend's runtime_llvm.c. See the C-backend compile line below.
+  RUNTIME_INC_C="$ROOT/stage2"
+  STDLIB_ROOT="$ROOT/stdlib"
+  KAI_LAYOUT="dev"
+elif [ -x "$ROOT/libexec/kaikai/kaic2" ] && [ -d "$ROOT/share/kaikai/stdlib" ]; then
+  KAIC0=""   # not shipped — only needed for the bootstrap chain
+  KAIC1=""   # not shipped — only needed for the bootstrap chain
+  KAIC2="$ROOT/libexec/kaikai/kaic2"
+  RUNTIME_INC="$ROOT/share/kaikai/include"
+  # Installed layout ships a single runtime.h (the stage 2 one) under
+  # share/kaikai/include, so the C-backend include dir is the same.
+  RUNTIME_INC_C="$ROOT/share/kaikai/include"
+  STDLIB_ROOT="$ROOT/share/kaikai/stdlib"
+  KAI_LAYOUT="installed"
+else
+  echo "kai: error: cannot find kaikai installation under $ROOT" >&2
+  echo "  expected dev layout (stage0/, stdlib/) or installed layout (libexec/kaikai/, share/kaikai/)" >&2
+  exit 2
+fi
+
+# Allow overriding the discovered locations. KAI_INCLUDE points at a
+# directory holding the stage 2 runtime.h, so it drives the C-backend
+# include dir too (and falls through to RUNTIME_INC for the LLVM path,
+# which also needs runtime_llvm.c next to it).
+STDLIB_ROOT="${KAI_STDLIB:-$STDLIB_ROOT}"
+RUNTIME_INC="${KAI_INCLUDE:-$RUNTIME_INC}"
+RUNTIME_INC_C="${KAI_INCLUDE:-$RUNTIME_INC_C}"
+
+# `kai info` reference pages. Dev layout reads docs/info from the
+# source checkout; installed layout reads share/kaikai/info from the
+# release tarball. KAIKAI_INFO_PATH overrides both.
+if [ "$KAI_LAYOUT" = "installed" ]; then
+  INFO_DIR="$ROOT/share/kaikai/info"
+else
+  INFO_DIR="$ROOT/docs/info"
+fi
+INFO_DIR="${KAIKAI_INFO_PATH:-$INFO_DIR}"
+
+# Export the resolved stdlib root so kaic1/kaic2 see the installed
+# location at runtime. The compile-time `KAI_STDLIB_PATH` macro is
+# set by stage{1,2}/Makefile to `$(abspath ../stdlib)` — an absolute
+# path that points at the build host's checkout, not the install
+# layout. After `brew install` or `tar -xf <release>` the macro path
+# does not exist; kaic2 reads `KAIKAI_STDLIB_PATH` first and falls
+# back to the macro only when the env is unset, so this export is
+# what makes installed kaikai self-consistent.
+export KAIKAI_STDLIB_PATH="$STDLIB_ROOT"
+
+# Package manager helper (issue #405). The driver shells out to a
+# kaikai-compiled CLI for kai.toml read/write, dependency
+# resolution, and the user-facing init/install/show commands. Dev
+# layout: source at tools/kai-pkg/main.kai, binary auto-built next
+# to it. Installed layout: prebuilt at libexec/kaikai/kai-pkg.
+if [ "$KAI_LAYOUT" = "installed" ]; then
+  KAIPKG_SRC=""
+  KAIPKG_BIN="$ROOT/libexec/kaikai/kai-pkg"
+else
+  KAIPKG_SRC="$ROOT/tools/kai-pkg/main.kai"
+  KAIPKG_BIN="$ROOT/tools/kai-pkg/kai-pkg"
+fi
+
+# Language Server (issue #447). Same pattern as kai-pkg: source at
+# tools/kai-lsp/main.kai, binary auto-built next to it for dev.
+if [ "$KAI_LAYOUT" = "installed" ]; then
+  KAILSP_SRC=""
+  KAILSP_BIN="$ROOT/libexec/kaikai/kai-lsp"
+else
+  KAILSP_SRC="$ROOT/tools/kai-lsp/main.kai"
+  KAILSP_BIN="$ROOT/tools/kai-lsp/kai-lsp"
+fi
+
+CC="${CC:-cc}"
+CFLAGS="${CFLAGS:--std=c99 -Wno-unused-function -Wno-unused-variable -O2}"
+
+# LLVM backend (L1 of LLVM-direct refactor — issue #DoD6). The driver
+# shells out to an external `clang` to compile the .ll emitted by
+# `kaic2 --emit=llvm`, linking against stage0/runtime_llvm.c. A static
+# libLLVM link is L3 future work; L1 keeps the dependency external and
+# entirely opt-in via `--backend=llvm`.
+CLANG="${CLANG:-clang}"
+CLANGFLAGS="${CLANGFLAGS:--w -O2}"
+
+# Resolve the LLVM-path runtime shim. Dev checkout lives next to the C
+# runtime under stage0/; installed layout would ship it next to
+# runtime.h under share/kaikai/include/. Empty when neither exists —
+# the build path errors out clearly.
+if [ -f "$RUNTIME_INC/runtime_llvm.c" ]; then
+  RUNTIME_LLVM_C="$RUNTIME_INC/runtime_llvm.c"
+elif [ -f "$ROOT/stage0/runtime_llvm.c" ]; then
+  RUNTIME_LLVM_C="$ROOT/stage0/runtime_llvm.c"
+else
+  RUNTIME_LLVM_C=""
+fi
+
+die() {
+  echo "kai: error: $*" >&2
+  exit 2
+}
+
+# $1 = path that was not found; $2 = subcommand name (build/run/test)
+die_file_not_found() {
+  echo "kai: error: file '$1' not found." >&2
+  echo "Try 'kai $2 --help' for usage." >&2
+  exit 2
+}
+
+read_version() {
+  if [ -f "$ROOT/VERSION" ]; then
+    cat "$ROOT/VERSION"
+  elif [ -f "$ROOT/share/kaikai/VERSION" ]; then
+    cat "$ROOT/share/kaikai/VERSION"
+  else
+    echo "unknown"
+  fi
+}
+
+read_baseline() {
+  if [ -f "$ROOT/demos/baseline.txt" ]; then
+    cat "$ROOT/demos/baseline.txt"
+  elif [ -f "$ROOT/share/kaikai/demos/baseline.txt" ]; then
+    cat "$ROOT/share/kaikai/demos/baseline.txt"
+  else
+    echo "?"
+  fi
+}
+
+ensure_built() {
+  # Installed layout ships a prebuilt kaic2 — bootstrap chain is not needed.
+  if [ "$KAI_LAYOUT" = "installed" ]; then
+    if [ ! -x "$KAIC2" ]; then
+      die "kaic2 binary missing at $KAIC2 — installation is corrupt"
+    fi
+    return 0
+  fi
+  if [ ! -x "$KAIC0" ]; then
+    (cd "$ROOT/stage0" && make kaic0) >&2
+  fi
+  if [ ! -x "$KAIC1" ]; then
+    (cd "$ROOT/stage1" && make kaic1) >&2
+  fi
+  if [ ! -x "$KAIC2" ]; then
+    (cd "$ROOT/stage2" && make kaic2) >&2
+  fi
+}
+
+# Build a helper tool ($2 source -> $3 binary, $1 a human label)
+# atomically and under a lock, so concurrent `kai` invocations sharing
+# the same checkout (e.g. the parity harness fan-out, 16 workers) never
+# observe a half-linked binary. Without this, worker B reaches the
+# execute site while worker A is mid-`cc -o`, and the partial file
+# fails with "Permission denied" / "Text file busy" (tier1-backend-parity
+# flake). Two guards: (1) compile to a per-PID temp then `mv` (atomic
+# rename on the same filesystem) so every reader sees a complete binary
+# or none; (2) a `mkdir` lock (atomic create) serialises the build so
+# losers wait for the winner instead of racing a second `cc` to the
+# same path.
+build_helper_tool() {
+  label="$1"; src="$2"; bin="$3"
+  if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+    ensure_built
+    lock="$bin.lock"
+    # Spin briefly for the lock. The winner builds; losers re-check the
+    # predicate after it clears (the build may have satisfied it).
+    waited=0
+    while ! mkdir "$lock" 2>/dev/null; do
+      # If the lock is stale (>120s) reclaim it; otherwise wait.
+      if [ "$waited" -ge 120 ]; then
+        rm -rf "$lock" 2>/dev/null
+        continue
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      # Another worker may have finished the build while we waited.
+      if [ -x "$bin" ] && [ ! "$src" -nt "$bin" ]; then
+        return 0
+      fi
+    done
+    # We hold the lock. Re-check under it (someone may have built between
+    # our predicate test and acquiring the lock).
+    if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+      echo "kai: building $label ..." >&2
+      tmp_bin="$bin.tmp.$$"
+      if "$0" build "$src" -o "$tmp_bin" >&2; then
+        mv -f "$tmp_bin" "$bin"
+      else
+        rm -f "$tmp_bin"
+        rmdir "$lock" 2>/dev/null
+        die "failed to build $label from $src"
+      fi
+    fi
+    rmdir "$lock" 2>/dev/null
+  fi
+}
+
+# Build tools/kai-pkg on first use; idempotent. Installed layout
+# ships the binary, so we only re-check existence.
+ensure_kaipkg() {
+  if [ "$KAI_LAYOUT" = "installed" ]; then
+    if [ ! -x "$KAIPKG_BIN" ]; then
+      die "kai-pkg binary missing at $KAIPKG_BIN — installation is corrupt"
+    fi
+    return 0
+  fi
+  build_helper_tool "tools/kai-pkg" "$KAIPKG_SRC" "$KAIPKG_BIN"
+}
+
+# Build tools/kai-lsp on first use; idempotent. Same shape as
+# ensure_kaipkg.
+ensure_kailsp() {
+  if [ "$KAI_LAYOUT" = "installed" ]; then
+    if [ ! -x "$KAILSP_BIN" ]; then
+      die "kai-lsp binary missing at $KAILSP_BIN — installation is corrupt"
+    fi
+    return 0
+  fi
+  build_helper_tool "tools/kai-lsp" "$KAILSP_SRC" "$KAILSP_BIN"
+}
+
+# Resolve the cache root for package downloads. Precedence:
+#   1. $KAIKAI_CACHE     — explicit override (CI / sandboxes).
+#   2. $XDG_CACHE_HOME   — Linux convention.
+#   3. ~/Library/Caches  — macOS convention.
+#   4. ~/.cache          — fallback.
+# Sub-path is always `kai/pkg`. Issue #405.
+resolve_cache_root() {
+  if [ -n "${KAIKAI_CACHE:-}" ]; then
+    printf '%s' "$KAIKAI_CACHE"
+    return 0
+  fi
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    printf '%s/kai/pkg' "$XDG_CACHE_HOME"
+    return 0
+  fi
+  case "$(uname -s)" in
+    Darwin) printf '%s/Library/Caches/kai/pkg' "$HOME" ;;
+    *)      printf '%s/.cache/kai/pkg' "$HOME" ;;
+  esac
+}
+
+# Walk up from $1 looking for a kai.toml. Echoes the directory
+# containing the manifest, or empty if none found before /.
+find_manifest_dir() {
+  d="$1"
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -f "$d/kai.toml" ]; then
+      printf '%s' "$d"
+      return 0
+    fi
+    d="$(dirname "$d")"
+  done
+}
+
+# Read the package name from `name = "..."` in kai.toml. Empty on
+# missing manifest, missing field, or unreadable file. Used by
+# `kai build` to pick a sensible default output binary name when
+# the user did not pass -o (Go-style: the package name, not the
+# entry-point filename).
+manifest_package_name() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  awk '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    /^[[:space:]]*\[package\]/ { in_root = 1; next }
+    NR == 1 || in_root || /^[^[]/ {
+      if (in_root || NR <= 30) {
+        if ($0 ~ /^[[:space:]]*name[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/) {
+          gsub(/^[^"]*"/, "", $0); gsub(/".*$/, "", $0); print; exit
+        }
+      }
+    }
+  ' "$manifest_dir/kai.toml"
+}
+
+# Issue #658: read the `entry = "..."` field from kai.toml as an
+# explicit override of the conventional `main.kai` entry point.
+# Empty manifest dir, missing manifest, or missing field all fall
+# back to `main.kai`. Mirrors Cargo's `[[bin]] path =` shape: when
+# a package wants to keep sources under `src/` (e.g. `src/main.kai`)
+# the manifest declares it and the driver respects it from every
+# entry-aware subcommand.
+manifest_entry_field() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf 'main.kai'
+    return 0
+  fi
+  entry="$(awk '
+    /^[[:space:]]*\[/ { in_root = 0 }
+    /^[[:space:]]*\[package\]/ { in_root = 1; next }
+    NR == 1 || in_root || /^[^[]/ {
+      if (in_root || NR <= 30) {
+        if ($0 ~ /^[[:space:]]*entry[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/) {
+          gsub(/^[^"]*"/, "", $0); gsub(/".*$/, "", $0); print; exit
+        }
+      }
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$entry" ]; then
+    printf 'main.kai'
+  else
+    printf '%s' "$entry"
+  fi
+}
+
+# Emit `--path <abs>` flags for the manifest's own root plus each
+# dep in $1/kai.toml. Resolves relative local-path deps against $1;
+# git deps come from the lockfile's cache field. Silent if no
+# manifest.
+#
+# The manifest dir itself comes first so that `import <pkgname>.X`
+# from files in sibling dirs (examples/, tests/, …) resolves
+# against the package's own root without requiring a self-dependency
+# entry in kai.toml. kaic2 probes `dir_of(root_path)` before any
+# `--path` (stage2/compiler.kai find_module_file), so this addition
+# only affects lookups that the src_dir couldn't satisfy. Issue #567.
+#
+# Auto-installs on first compile when the manifest declares deps
+# but kai.lock is missing or any pinned cache dir is gone.
+manifest_path_flags() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  printf -- '--path %s ' "$manifest_dir"
+  # Issue #658: also expose the manifest's parent directory so that
+  # `import <pkgname>.<module>` resolves under it. kaic2's
+  # `module_to_path` already turns dotted paths into directory
+  # paths (`a.b -> a/b.kai`); we just need the parent visible as a
+  # search root for the package's own short name. Bare `import
+  # <module>` keeps working because the manifest dir itself is
+  # still the first search path.
+  parent_dir="$(dirname "$manifest_dir")"
+  if [ -n "$parent_dir" ] && [ "$parent_dir" != "$manifest_dir" ] && [ -d "$parent_dir" ]; then
+    printf -- '--path %s ' "$parent_dir"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  # If the manifest references git deps and either kai.lock is
+  # missing or any pinned cache dir vanished, auto-install before
+  # emitting paths. This makes `kai run app.kai` work the first
+  # time without an explicit `kai install` step.
+  if needs_auto_install "$manifest_dir" "$cache_root"; then
+    ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" install ) >&2
+  fi
+  # `kai-pkg paths` emits one `<name>\t<path>` line per resolved dep.
+  # Resolve each path relative to the manifest dir, absolute-ising it
+  # so kaic2's --path resolver does not depend on the user's cwd.
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" paths ) | while IFS="$(printf '\t')" read -r name dep_path; do
+    [ -n "$dep_path" ] || continue
+    case "$dep_path" in
+      /*) abs="$dep_path" ;;
+      *)  abs="$(cd "$manifest_dir" && cd "$dep_path" 2>/dev/null && pwd)" ;;
+    esac
+    [ -n "$abs" ] && printf -- '--path %s ' "$abs"
+  done
+}
+
+# Issue #603: known editions accepted by the compiler. Kept in sync
+# with stage2/compiler.kai's known_editions(). Adding an edition
+# means flipping both lists.
+KNOWN_EDITIONS="tongariki hanga-roa"
+
+# Issue #637: validate an edition value against KNOWN_EDITIONS and
+# die with a typed driver-level diagnostic when it is unknown.
+# Failing early in the driver avoids the cascading linker error the
+# user would otherwise see (ahu's `anga-roa` typo against the
+# 0.67 enforcement turn-up was the motivator).
+validate_edition() {
+  candidate="$1"
+  source="$2"   # human-readable source path (e.g. "kai.toml" or "EDITION")
+  for e in $KNOWN_EDITIONS; do
+    if [ "$candidate" = "$e" ]; then return 0; fi
+  done
+  printf 'kai: error: unknown edition %s in %s\n' "\"$candidate\"" "$source" >&2
+  printf '  known editions: %s\n' "$KNOWN_EDITIONS" >&2
+  printf '  hint: check the spelling, or update kaikai if you expect this edition to exist.\n' >&2
+  exit 1
+}
+
+# Issue #603: emit `--edition <name>` based on the consumer's
+# kai.toml `edition = "..."` field. Falls back to the repo-level
+# EDITION file (read_edition) when no manifest exists or the field
+# is absent. The compiler validates the value and gates feature
+# branches (e.g. #594 pipe convention dispatch) on edition >=
+# hanga-roa. Awk parsing mirrors manifest_unstable_flags — kaikai's
+# TOML never quotes key/table names.
+manifest_edition_flag() {
+  manifest_dir="$1"
+  default_ed="$(read_edition)"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf -- '--edition %s' "$default_ed"
+    return 0
+  fi
+  ed="$(awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*edition[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print n
+      exit
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$ed" ]; then
+    ed="$default_ed"
+  else
+    validate_edition "$ed" "$manifest_dir/kai.toml"
+  fi
+  printf -- '--edition %s' "$ed"
+}
+
+# Read the edition for cache-partitioning purposes. Same resolution
+# as manifest_edition_flag but emits only the bare value (no flag
+# prefix), and silently falls back to the repo EDITION when the
+# manifest is absent or lacks the field.
+manifest_edition_value() {
+  manifest_dir="$1"
+  default_ed="$(read_edition)"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    printf '%s' "$default_ed"
+    return 0
+  fi
+  ed="$(awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*edition[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print n
+      exit
+    }
+  ' "$manifest_dir/kai.toml")"
+  if [ -z "$ed" ]; then ed="$default_ed"; fi
+  printf '%s' "$ed"
+}
+
+# Issue #602: emit `--package-name <name>` if the manifest declares
+# one, and `--unstable-optin <pkg>` for every `<pkg> = true` entry
+# under `[unstable]`. The compiler uses these to suppress the
+# `#unstable` warning for opted-in upstream packages and for the
+# consumer's self-imports. Silent when no manifest exists. Parsing
+# is intentionally simple — awk on raw TOML — because kaikai's
+# manifest format never quotes table or key names. A leading `#`
+# comment after the value is tolerated.
+manifest_unstable_flags() {
+  manifest_dir="$1"
+  if [ -z "$manifest_dir" ] || [ ! -f "$manifest_dir/kai.toml" ]; then
+    return 0
+  fi
+  # Consumer package name (top-level `name = "..."` outside any table).
+  awk '
+    /^\[/ { in_root = 0; next }
+    NR == 1 { in_root = 1 }
+    in_root && /^[[:space:]]*name[[:space:]]*=/ {
+      n = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", n)
+      sub(/".*/, "", n)
+      print "--package-name " n
+      exit
+    }
+  ' "$manifest_dir/kai.toml"
+  # `[unstable]` table entries: `<pkg> = true` → `--unstable-optin <pkg>`.
+  awk '
+    /^\[unstable\][[:space:]]*$/ { in_section = 1; next }
+    /^\[/                       { in_section = 0; next }
+    in_section && /^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*[[:space:]]*=[[:space:]]*true/ {
+      k = $1
+      sub(/[[:space:]]*=.*/, "", k)
+      print "--unstable-optin " k
+    }
+  ' "$manifest_dir/kai.toml"
+}
+
+# Returns 0 (true) if the manifest needs `kai install` to run
+# before paths are usable. Heuristics:
+#   - manifest mentions `[dependencies]` AND kai.lock is missing.
+#   - kai.lock exists but at least one git dep's cache dir is gone.
+needs_auto_install() {
+  manifest_dir="$1"
+  cache_root="$2"
+  has_deps="$(grep -c '^\[dependencies\]' "$manifest_dir/kai.toml" 2>/dev/null || echo 0)"
+  if [ "$has_deps" = "0" ]; then return 1; fi
+  # Local-path-only manifests don't need a lock.
+  if ! grep -q 'source[[:space:]]*=' "$manifest_dir/kai.toml" 2>/dev/null \
+       && ! grep -qE '"[^"]*@[^"]*"' "$manifest_dir/kai.toml" 2>/dev/null; then
+    return 1
+  fi
+  if [ ! -f "$manifest_dir/kai.lock" ]; then return 0; fi
+  # Walk the lock for missing cache dirs (lock keeps source + sha;
+  # cache dir derives from cache_root + slug + sha — issue #421).
+  awk -v root="$cache_root" '
+    /^source =/ { gsub(/"/, "", $3); s=$3 }
+    /^sha =/    { gsub(/"/, "", $3); h=$3
+                  # mirror slug logic: strip protocol prefix, leading /, replace bad chars with _
+                  gsub(/^https?:\/\//, "", s); gsub(/^ssh:\/\//, "", s); gsub(/^file:\/\//, "", s)
+                  gsub(/^\//, "", s)
+                  gsub(/[^A-Za-z0-9_./-]/, "_", s)
+                  gsub(/[^A-Za-z0-9_.-]/, "_", h)
+                  print root "/" s "/" h
+                  s=""; h="" }
+  ' "$manifest_dir/kai.lock" | while read -r dir; do
+    [ -d "$dir/.git" ] || { echo missing; break; }
+  done | grep -q missing && return 0
+  return 1
+}
+
+usage() {
+  v="$(read_version)"
+  cat <<EOF
+ _      _ _      _
+| |____(_) |____(_)    kaikai $v
+| / / _\` | / / _\` |    a statically typed functional language
+|_\\_\\__,_|_\\_\\__,_|    effects | fibers | protocols
+
+usage: kai <command> [args...]
+
+Commands:
+  build [<spec>] [-o <out>]     Compile a kaikai package or file. With no
+                                <spec> the cwd package's entry point is used.
+  run   [<spec>] [args...]      Build and execute; forwards remaining args.
+  test  [<spec>|./...]          Compile with --test and run. './...' walks
+                                every kai.toml under cwd.
+  bench [--iters N] [<spec>]    Compile with --bench and run.
+  check [<spec>]                Compile with --prop-check and run property
+                                blocks (issue #44).
+  fmt   [<spec>] [--check]      Pretty-print kaikai source canonically.
+  watch [<spec>]                Recompile + run on every save (live demo).
+  init  <name>                  Create a kai.toml manifest in the cwd.
+  add   <source>[@<ref>]        Fetch a dep and append it to kai.toml.
+  install                       Resolve dependencies (git fetch + lock).
+  update [<name>]               Re-fetch deps; refresh kai.lock.
+  show                          Print the parsed kai.toml.
+  lsp                           Language Server (JSON-RPC over stdio).
+  info [<topic>] [--json]       Reference pages (man/info style). Run
+                                'kai info' for the topic list, or
+                                'kai info syntax' for the one-page
+                                cheat sheet of forms kaikai has.
+  help                          Show this help.
+  --version                     Print version and demo baseline.
+
+A <spec> is one of: a path to a .kai file (legacy file mode), '.' or
+omitted (the current directory's package, read from kai.toml), or
+'./<sub>' where <sub> is a directory carrying its own kai.toml.
+
+Run 'kai <command> --help' for command-specific options.
+
+Environment:
+  CC               C compiler to invoke (default: cc).
+  CFLAGS           Extra flags passed to CC.
+  CLANG            clang binary used by --backend=llvm (default: clang).
+  CLANGFLAGS       Extra flags passed to clang on --backend=llvm
+                   (default: -w -O2).
+  KAI_BACKEND      Default backend (c|native|llvm) for `kai build` /
+                   `kai run` when --backend is not passed. Overridden by
+                   --backend; defaults to `c` (the portable C-text path,
+                   supported across the whole corpus). `native` is the
+                   in-process libLLVM backend (no clang, no .ll text) —
+                   wired and opt-in, but not yet the default (Lane 1.5
+                   parity is incomplete). `llvm` is the legacy LLVM-text
+                   path (emits .ll, links with clang).
+  KAI_STDLIB       Override the stdlib root directory (default: auto-detected
+                   from the script's location — share/kaikai/stdlib if installed,
+                   stdlib/ if running from a dev checkout).
+  KAI_INCLUDE      Override the runtime.h include directory (default: auto-
+                   detected — share/kaikai/include if installed, stage0/ if dev).
+
+See README.md and docs/ for the language reference.
+Project home: https://kaikai-lang.org
+EOF
+}
+
+usage_build() {
+  cat <<EOF
+usage: kai build [<spec>] [-o <out>] [--backend=<c|native|llvm>]
+       kai build --holes [<spec>]
+       kai build --holes-json [<spec>]
+       kai build --diags-json [<spec>]
+       kai build --effects-json [<spec>]
+       kai build --effect-holes-json [<spec>]
+       kai build --library-mode [<spec>]
+
+Compile a kaikai package or file to a native binary. <spec> is one
+of:
+  <file>.kai       legacy file mode (unchanged from earlier versions).
+  '.' or omitted   the package rooted at the cwd; kai.toml supplies
+                   the package name (used as the binary name) and
+                   optional 'entry = "..."' override of the default
+                   main.kai entry point.
+  './<sub>'        a sub-package — <sub> must carry its own kai.toml;
+                   the binary lands inside that sub-directory.
+
+The default backend is \`c\` (portable C linked with cc) — supported
+across the whole corpus, the bootstrap path and the parity oracle.
+
+\`--backend=native\` selects the in-process libLLVM backend
+(docs/kir-design.md §7.2): it lowers to KIR, builds the LLVM module via
+the C API in one process, and emits a native object — no \`.ll\` text,
+no \`clang\` subprocess. It is the project's intended default destination,
+but is opt-in until its corpus parity is complete (Lane 1.5). A kaic2
+built without libLLVM rejects it with an actionable error; build it with
+\`make -C stage2 KAI_LLVM=1\`.
+
+\`--backend=llvm\` selects the legacy LLVM-TEXT path: it emits \`.ll\` via
+\`kaic2 --emit=llvm\` and links it with clang against
+stage0/runtime_llvm.c (kept for the C<->LLVM-text parity gate; not the
+in-process native path).
+
+Options:
+  -o <out>             Output binary path (default: basename of input
+                       without .kai).
+  --backend=<c|native|llvm>
+                       Codegen backend (default: c). \`native\` is the
+                       in-process libLLVM path (opt-in until Lane 1.5
+                       parity completes). KAI_BACKEND env var overrides
+                       the default; this flag overrides both.
+  --holes              Report every typed hole (\`?\` / \`?name\`) with
+                       expected type, in-scope bindings, and candidate
+                       fillers, then exit. No binary is produced. See
+                       docs/typed-holes.md.
+  --holes-json         Same as --holes, but emits the stable JSON
+                       schema documented in docs/typed-holes.md (LLM
+                       integration point).
+  --diags-json         Emit collected structured diagnostics (errors +
+                       notes) as a JSON object matching the LSP
+                       Diagnostic shape. Only the m11 templates T1-T5
+                       are migrated; older sites still print to stderr.
+                       Used by \`kai lsp\` to drive
+                       textDocument/publishDiagnostics.
+  --effects-json       Emit per-function effect-row info as JSON:
+                       declared row, inferred row, handlers in scope.
+                       Used by tooling that wants effect coverage.
+  --effect-holes-json  Emit row-variable hole resolutions (\`/ ?\` or
+                       \`/ ?e\` in a row tail) as JSON, listing the
+                       effects the typer inferred for each hole.
+  --library-mode       Run lex / parse / resolve / infer and answer
+                       \`# @probe <kind> L:C\` comments embedded in the
+                       source. Probe kinds: type, def, enc, complete,
+                       sig, symbols. Used by \`kai lsp\` to back hover /
+                       goto-def / completion / signature help.
+  -h, --help           Show this help.
+
+Examples:
+  kai build                                 # cwd package (reads kai.toml)
+  kai build .                               # equivalent explicit form
+  kai build ./sub                           # sibling sub-package
+  kai build hello.kai                       # produces ./hello (C backend)
+  kai build src/app.kai -o build/app        # produces ./build/app
+  kai build --backend=native hello.kai      # produces ./hello via in-process libLLVM
+  kai build --backend=llvm hello.kai        # produces ./hello via clang (LLVM text)
+  kai build --holes draft.kai               # human-readable hole report
+  kai build --holes-json draft.kai          # machine-readable hole report
+  kai build --diags-json draft.kai          # structured diagnostics (JSON)
+  kai build --library-mode draft.kai        # answer @probe queries (JSON)
+
+The compiler auto-loads the core stdlib modules (stdlib/core, protocols,
+effects, array). Everything else under stdlib/ requires an explicit
+`import`.
+EOF
+}
+
+usage_run() {
+  cat <<EOF
+usage: kai run [--backend=<c|native|llvm>] [<spec>] [args...]
+
+Compile and immediately execute a kaikai program. <spec> follows the
+same rules as \`kai build\` (a .kai file, '.', '<sub>', or omitted for
+the cwd package). Any arguments after the spec are forwarded to the
+compiled binary. Backend selection follows the same rule as
+\`kai build\`: --backend > KAI_BACKEND > default (\`c\`). \`native\` (the
+in-process libLLVM path) is opt-in until Lane 1.5 parity completes.
+
+Options:
+  --backend=<c|native|llvm>
+                       Codegen backend (default: c). \`native\` is the
+                       in-process libLLVM path (opt-in). KAI_BACKEND env
+                       var overrides the default; this flag overrides both.
+  -h, --help           Show this help.
+
+Examples:
+  kai run                                   # cwd package
+  kai run .                                 # equivalent explicit form
+  kai run ./sub                             # sub-package binary
+  kai run examples/minimal/hello.kai
+  kai run demos/fizzbuzz/fizzbuzz.kai 30
+  kai run app.kai --user alice --port 8080
+  kai run --backend=llvm examples/minimal/hello.kai
+
+The temporary binary is removed after the program exits.
+EOF
+}
+
+usage_test() {
+  cat <<EOF
+usage: kai test [options] [<spec>|./...]
+
+Compile a kaikai source with --test enabled and run the test binary.
+<spec> follows the same rules as \`kai build\` (a .kai file, '.', a
+'./<sub>' sub-package, or omitted for the cwd package). The special
+spec './...' walks the cwd subtree and runs \`kai test\` for every
+directory that carries its own kai.toml — exit code is the OR of
+every sub-run, so CI fails the moment any package's tests do.
+
+The compiler emits a main that runs every 'test "..." { ... }' block
+defined in the entry point and reports the result. When the package
+also has a sibling 'tests/' directory, every '*.kai' file under it
+is compiled and run as its own test binary (in addition to the
+entry). The aggregate exit code is the OR of every run.
+
+Tests defined inside the auto-loaded core stdlib modules are dropped
+at load time (issue #318) so the count reflects only the user's tests.
+
+Options:
+  -h, --help                Show this help.
+  --include-prelude-tests   Also run test blocks defined inside the
+                            auto-loaded core stdlib modules (legacy).
+
+Examples:
+  kai test                                   # cwd package (+ tests/)
+  kai test ./...                             # every package under cwd
+  kai test stage2/tests/test_lex.kai
+  kai test demos/poker/poker.kai
+  kai test --include-prelude-tests demos/poker/poker.kai
+EOF
+}
+
+usage_bench() {
+  cat <<EOF
+usage: kai bench [--iters N] <file.kai>
+
+Compile a kaikai source with --bench enabled and run the bench binary.
+The compiler emits a main that runs every 'bench "..." { ... }' block
+under clock_gettime(CLOCK_MONOTONIC). For each block the runner does
+KAI_BENCH_WARMUP untimed iterations followed by KAI_BENCH_ITERS timed
+iterations, then prints:
+
+  <name>: <N> iter / median <X> ns / MAD <Y> ns / mean <Z> ns / range [<lo>, <hi>]
+
+Iteration count precedence: --iters CLI flag > KAI_BENCH_ITERS env var
+> compiled-in default (1000). Warmup is controlled by KAI_BENCH_WARMUP
+(default 50).
+
+Options:
+  --iters N    Run N timed iterations per block (overrides
+               KAI_BENCH_ITERS for this invocation).
+  -h, --help   Show this help.
+
+Examples:
+  kai bench examples/stdlib/bench_basic.kai
+  kai bench --iters 5000 examples/stdlib/bench_basic.kai
+  KAI_BENCH_WARMUP=100 kai bench examples/stdlib/bench_basic.kai
+EOF
+}
+
+usage_check() {
+  cat <<EOF
+usage: kai check <file.kai>
+
+Compile a kaikai source with --prop-check enabled and run the
+property-check binary. The compiler emits a main that runs every
+'check "..." [with p: T, ...] { body }' block KAI_CHECK_ITERS times
+(default 100), generating fresh random values for the with-clause
+params on each iteration via the runtime arbitrary[T] helpers.
+
+Per-block output:
+  <desc>: 100 iter, OK
+  <desc>: counterexample at iter <N>: p=<v>, q=<v>, ...
+
+Followed by a 'P/T checks passed' summary; exit 1 if any block
+recorded a counterexample.
+
+check v1 (issue #44): supported with-clause types are Int, Bool,
+Char, String, and lists of those primitives. Other types raise a
+panic at runtime. Shrinking is deferred to v1.x; protocol-based
+generators (impl Arbitrary for T) defer to v2 post-protocol
+maturity.
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai check examples/stdlib/check_basic.kai
+EOF
+}
+
+usage_watch() {
+  cat <<EOF
+usage: kai watch <file.kai> [args...]
+
+Watch a kaikai source file and recompile + run it on every save.
+Useful for live demos: edit in one pane, see output in the other.
+
+Behavior:
+  - On entry, the file is compiled and run once.
+  - On each save, the screen prints a timestamped header followed by
+    the compile result. Build errors keep the watch loop alive.
+  - Press Ctrl+C to exit.
+
+Backend:
+  - If fswatch is on PATH, kai uses it (one event per save).
+  - Otherwise, kai falls back to a 500 ms mtime poll. Install
+    fswatch (brew install fswatch) for lower latency.
+
+Options:
+  -h, --help   Show this help.
+
+Examples:
+  kai watch demo.kai
+  kai watch examples/minimal/hello.kai
+EOF
+}
+
+usage_fmt() {
+  cat <<EOF
+usage: kai fmt <file.kai>            # rewrite file in place
+       kai fmt --check <file.kai>    # exit 0 if formatted, 1 if not
+       kai fmt --stdin               # read stdin -> formatted to stdout
+
+Pretty-print kaikai source canonically. The formatter is gofmt-style:
+no options, single output, idempotent.
+
+Tongariki MVP scope: imports, simple fns, type decls, tests, and the
+base expression / pattern / type grammar (see CHANGELOG for the exact
+list). Files using effects, handlers, protocols, impls, units, dim
+types, refinements, axioms, generic fn / type parameters, var, or
+parametric effect rows are refused with an explicit error.
+
+Options:
+  --check      Do not modify the file. Exit 0 if already formatted; 1
+               otherwise. Print the formatted output to stdout when
+               different.
+  --stdin      Read kaikai source from stdin; write formatted source
+               to stdout. The file form (kai fmt <file>) rewrites the
+               file in place; this form is for editor integrations.
+  -h, --help   Show this help.
+
+Examples:
+  kai fmt stage2/compiler.kai
+  kai fmt --check src/foo.kai && echo OK
+  cat src/foo.kai | kai fmt --stdin > /tmp/foo-fmt.kai
+EOF
+}
+
+read_edition() {
+  if [ -f "$ROOT/EDITION" ]; then
+    cat "$ROOT/EDITION"
+  elif [ -f "$ROOT/share/kaikai/EDITION" ]; then
+    cat "$ROOT/share/kaikai/EDITION"
+  else
+    echo "unknown"
+  fi
+}
+
+print_version() {
+  v="$(read_version)"
+  edition="$(read_edition)"
+  baseline="$(read_baseline)"
+  cat <<EOF
+kaikai $v - $edition (stage 2, self-hosted)
+demos baseline: $baseline
+home:           https://kaikai-lang.org
+EOF
+}
+
+# Resolve the active backend. Precedence (highest first):
+#   1. Caller-supplied value (the --backend CLI flag, already parsed).
+#   2. $KAI_BACKEND environment variable (c|llvm|native).
+#   3. Hard-coded default: `c`.
+#
+# `c` is the portable C-text backend — the bootstrap path and the parity
+# oracle, the one supported across the whole corpus. It is the default.
+#
+# `native` is the in-process libLLVM backend (the project's intended
+# default destination, docs/kir-design.md §7.2): it builds the LLVM
+# module via the C API in one process and emits a native object — no
+# `.ll` text, no `clang`. It is wired and reachable via `--backend=native`
+# / `KAI_BACKEND=native`, but is NOT yet the default: Lane 1.5 measured
+# native-vs-C parity at 250/167/96 over the corpus (~60%), so the flip
+# does NOT proceed until the backend reaches full parity. A kaic2 built
+# without libLLVM rejects `native` with an actionable error
+# (compile_to_binary) — it never silently downgrades to C.
+#
+# `llvm` is the legacy LLVM-TEXT backend (emits `.ll`, links with clang);
+# kept reachable for the C<->LLVM-text parity gate (#575).
+#
+# Stages 0/1 are bootstrapped with the system cc and never see this logic.
+resolve_backend() {
+  cli_choice="$1"
+  if [ -n "$cli_choice" ]; then
+    printf '%s' "$cli_choice"
+    return 0
+  fi
+  if [ -n "${KAI_BACKEND:-}" ]; then
+    case "$KAI_BACKEND" in
+      c|llvm|native) printf '%s' "$KAI_BACKEND"; return 0 ;;
+      *) die "KAI_BACKEND must be 'c', 'llvm', or 'native' (got: $KAI_BACKEND)" ;;
+    esac
+  fi
+  # Default stays `c` until the native backend reaches full corpus
+  # parity (Lane 1.5 is BLOCKED on parity — see docs/kir-design.md).
+  printf 'c'
+}
+
+# Detect that `clang` is available before trying to invoke it. Honours
+# the $CLANG override; called only on the LLVM build path.
+ensure_clang() {
+  if command -v "$CLANG" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "kai: error: --backend=llvm requires clang in PATH (or set CLANG env var)" >&2
+  echo "       falling back to C backend not implemented yet" >&2
+  exit 2
+}
+
+compile_to_binary() {
+  # Two leading flags carry the backend across the wrapper boundary.
+  # `--backend <c|native|llvm>` is consumed here, never forwarded to
+  # kaic2. `kai build` / `kai run` always pass an explicit `--backend`
+  # resolved through resolve_backend() (default: `c` — the native flip
+  # is BLOCKED on corpus parity, Lane 1.5). The dev-loop subcommands
+  # (`kai test` / `bench` / `check` / watch) call without `--backend`
+  # and so use this `c` fallback directly. The native backend is wired
+  # and reachable here via `--backend=native`; it becomes the default
+  # only once Lane 1.5 parity completes.
+  backend="c"
+  while [ "${1:-}" = "--backend" ]; do
+    shift
+    backend="$1"
+    shift
+  done
+  src="$1"; tmp="$2"; out="$3"; sub="$4"; shift 4
+  [ -f "$src" ] || die_file_not_found "$src" "$sub"
+  ensure_built
+  # shellcheck disable=SC2086
+  # KAI_TRACE_RC unset for the compiler invocation: we want the trace
+  # to come from the user's compiled program, not from kaic2 itself.
+  # Without this the wrapper's compile step and the child binary both
+  # fire their RC reports, doubling the output. Note: a real `unset`
+  # is required — `KAI_TRACE_RC= cmd` only sets the var to the empty
+  # string, but the runtime gates the report on `getenv() != NULL`,
+  # which is still true for an empty value (issue #81).
+  # Auto-add the entry file's own directory to the module search path so
+  # `kai run main.kai` finds sibling modules (issue #233). kaic2 already
+  # tries `dir_of(root_path)` before the --path entries internally
+  # (see stage2/compiler.kai expand_imports / find_module_file), so this
+  # is defense-in-depth: it makes the contract explicit at the driver
+  # level and survives any future change to that internal first-try.
+  # `dirname` works for both absolute and relative `$src`. We then
+  # `cd … && pwd` to resolve to absolute so the path passed to kaic2 is
+  # unambiguous regardless of CWD — a relative `.` from a bare
+  # `hello.kai` would otherwise alias the user's CWD and conflict with
+  # the resolver's CWD-relative lookup (issue #237).
+  src_dir="$(cd "$(dirname "$src")" && pwd)"
+  # Walk up from src_dir looking for kai.toml; if found, emit
+  # `--path <abs>` flags for each local-path dependency. Silent and
+  # zero-cost when no manifest exists (issue #405).
+  manifest_dir="$(find_manifest_dir "$src_dir")"
+  pkg_path_flags=""
+  unstable_flags=""
+  edition_flag="$(manifest_edition_flag "$manifest_dir")"
+  if [ -n "$manifest_dir" ]; then
+    pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
+    unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
+  fi
+  if [ "$backend" = "native" ]; then
+    # KIR Lane 1.5: the in-process libLLVM native backend is the default.
+    # `kaic2 --emit=native` lowers to KIR, builds the LLVM module via the
+    # C API IN MEMORY, and writes a native OBJECT — no `.ll` text, no
+    # `clang` subprocess. We then link that object against the effects
+    # runtime shim (runtime_llvm.c) with `cc`. The native backend needs
+    # no clang at runtime: libLLVM is linked INTO kaic2 (statically in a
+    # release), so the user needs neither clang nor a system LLVM.
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      die "native backend: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
+    fi
+    # kaic2 derives the object path from the SOURCE path (foo.kai ->
+    # foo.o), so compiling the user's file in place would drop a `.o`
+    # into their tree (and race the parity fan-out / break a read-only
+    # checkout). Compile a copy under $tmp instead, and point the module
+    # resolver back at the real source dir with --path so relative
+    # imports still resolve. (bin/kai already passes --path "$src_dir"
+    # on every backend; here it is load-bearing because the entry file
+    # itself moved to $tmp.)
+    src_base="$(basename "$src")"
+    cp "$src" "$tmp/$src_base"
+    obj="$tmp/${src_base%.kai}.o"
+    nerr="$tmp/native.err"
+    # shellcheck disable=SC2086
+    if ! (unset KAI_TRACE_RC; "$KAIC2" --emit=native --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$tmp/$src_base") >/dev/null 2>"$nerr"; then
+      # Distinguish "this kaic2 has no native backend" (actionable: the
+      # build was C-only) from a real compile error in the user program.
+      # The C-only stub aborts with a known sentinel string; anything
+      # else is the user's compile error and propagates verbatim. We do
+      # NOT silently fall back to the C backend — that would mask a real
+      # native codegen failure as success (the rejected hot-fallback).
+      if grep -q "not built into this compiler" "$nerr" 2>/dev/null; then
+        echo "kai: error: the native backend is not built into this kaic2." >&2
+        echo "       Rebuild with 'make -C stage2 KAI_LLVM=1 kaic2', or pass --backend=c." >&2
+        cat "$nerr" >&2
+        exit 2
+      fi
+      cat "$nerr" >&2
+      exit 1
+    fi
+    if [ ! -f "$obj" ]; then
+      die "native backend: no object produced (expected $obj)"
+    fi
+    # shellcheck disable=SC2086
+    # Same runtime-include precedence as the C / LLVM-text paths: the
+    # shim's `#include "runtime.h"` must bind to stage2's Koka runtime
+    # (tagged Int, slab, reuse-token), so $RUNTIME_INC_C leads.
+    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$obj" "$RUNTIME_LLVM_C" -o "$out" -lm
+  elif [ "$backend" = "llvm" ]; then
+    ensure_clang
+    if [ -z "$RUNTIME_LLVM_C" ]; then
+      die "--backend=llvm: cannot locate runtime_llvm.c (looked under $RUNTIME_INC and $ROOT/stage0)"
+    fi
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=llvm --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/out.ll"
+    # shellcheck disable=SC2086
+    # `-w` matches stage2/Makefile's test-llvm rule: kaic2's emitted
+    # IR triggers benign clang warnings (unused parameter on shim
+    # signatures, type-tag bitcasts) that we silence to keep the
+    # driver output clean. `-lm` parity with the C path (issue #343).
+    #
+    # llvm-c-parity lane: the shim (runtime_llvm.c) `#include "runtime.h"`
+    # must bind to stage2's Koka runtime (tagged Int, slab, reuse-token),
+    # exactly as the C backend resolves it. `-I "$RUNTIME_INC_C"` (stage2
+    # in dev, the unified include dir when installed) therefore comes
+    # FIRST; `-I "$RUNTIME_INC"` (stage0 in dev) trails so the shim still
+    # finds any header stage2 lacks. Without this the LLVM path would link
+    # the heap-everything stage0 runtime and lose Int tagging + slab.
+    $CLANG $CLANGFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$tmp/out.ll" "$RUNTIME_LLVM_C" -o "$out" -lm
+  elif [ "${KAI_MODULAR:-0}" = "1" ]; then
+    # Issue #748: separate compilation. kaic2 emits a marker-delimited
+    # stream of per-module `.c` files + two shared headers
+    # (kai_types.h, kai_decls.h). We split the stream into files, compile
+    # each `.c` to its own `.o`, and link the `.o` files. Each module is
+    # its own translation unit with its own C symbol space; cross-module
+    # calls resolve at link time through the shared kai_decls.h
+    # prototypes. Opt-in via KAI_MODULAR=1 while the path is validated;
+    # the default C path below stays single-TU (and selfhost-identical).
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --emit=c-modular --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/modular.stream"
+    moddir="$tmp/mod"
+    mkdir -p "$moddir"
+    # Split the stream on the column-0 `//KAIFILE:<nonce>::<name>`
+    # markers. Line 1 is `//KAIDELIM:<nonce>`; we read the nonce from it
+    # so the awk match is exact and cannot fire on emitted C. Each marker
+    # opens a new output file under $moddir.
+    nonce="$(sed -n '1s/^\/\/KAIDELIM://p' "$tmp/modular.stream")"
+    if [ -z "$nonce" ]; then
+      die "internal: --emit=c-modular produced no //KAIDELIM marker"
+    fi
+    # While splitting, drop the leading `static ` from every emitted
+    # top-level definition/prototype so cross-module symbols get EXTERNAL
+    # linkage (separate compilation: a `static` symbol is invisible
+    # across `.o` files). The strip is anchored to column 0 AND gated on
+    # a closed whitelist of emitted return types (KaiValue *, int64_t,
+    # double, int, uint32_t) so it never touches runtime.h's intentional
+    # statics (those live in runtime.h, not this stream) nor a `static`
+    # local variable inside a body (always indented). Names are uniquely
+    # mangled, so external linkage cannot clash between two emitted
+    # symbols (that was the #748 mangling fix).
+    awk -v dir="$moddir" -v pfx="//KAIFILE:$nonce::" '
+      index($0, pfx) == 1 { fn = substr($0, length(pfx) + 1); out = dir "/" fn; next }
+      out {
+        if ($0 ~ /^static (KaiValue \*|int64_t |double |int |uint32_t )/) {
+          sub(/^static /, "", $0)
+        }
+        print > out
+      }
+    ' "$tmp/modular.stream"
+    # Copy the runtime header next to the generated sources so the
+    # emitted `#include "runtime.h"` resolves without an -I race against
+    # a stale system copy. (kai_types.h includes runtime.h by name.)
+    cp "$RUNTIME_INC_C/runtime.h" "$moddir/runtime.h" 2>/dev/null || true
+    # Compile each generated .c to its own .o, then link.
+    objs=""
+    for cfile in "$moddir"/*.c; do
+      ofile="${cfile%.c}.o"
+      # shellcheck disable=SC2086
+      $CC $CFLAGS -I "$moddir" -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" -c "$cfile" -o "$ofile" \
+        || die "modular compile failed for $(basename "$cfile")"
+      objs="$objs $ofile"
+    done
+    # shellcheck disable=SC2086
+    $CC $CFLAGS $objs -o "$out" -lm \
+      || die "modular link failed"
+  else
+    # shellcheck disable=SC2086
+    (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$@" "$src") > "$tmp/out.c"
+    # shellcheck disable=SC2086
+    # `-lm` (issue #343): math/real libm bindings (sqrt, sin, log, …)
+    # are unresolved on Linux glibc without an explicit link line.
+    # macOS libSystem already exposes them, so the flag is a no-op.
+    #
+    # `-I "$RUNTIME_INC_C"` comes FIRST so the emitted `#include
+    # "runtime.h"` resolves to stage 2's Koka-style runtime (tagged Int,
+    # kai_intf, reuse-token). `-I "$RUNTIME_INC"` (stage0) stays as a
+    # fallback for the bootstrap-only header set; in dev layout these
+    # differ, in installed layout they are the same dir.
+    $CC $CFLAGS -I "$RUNTIME_INC_C" -I "$RUNTIME_INC" "$tmp/out.c" -o "$out" -lm
+  fi
+}
+
+# If the user did not name an input file, try to infer one from the
+# current directory:
+#
+#   1. If `./main.kai` exists, use it. This mirrors `go run .` —
+#      the convention for package layouts is a single `main.kai`
+#      entry-point next to `kai.toml`.
+#   2. Otherwise, if the cwd has exactly one `.kai` file at the top
+#      level, use it. Useful for tiny single-file scripts.
+#
+# Both branches print the inferred path to stderr so the user sees
+# what got picked. Returns the path on stdout when found; empty
+# string when no inference is possible (caller falls back to the
+# old "missing input file" diagnostic).
+# Issue #658: resolve a package spec — `.`, `./sub`, a relative
+# `*.kai` file path, or empty (meaning the cwd) — into a concrete
+# entry-point file path. Sub-package mode (`./sub`) requires the
+# target directory to carry its own kai.toml; plain subdirectories
+# of the current package are not separately buildable. `./...`
+# (transitive test discovery) is handled by a dedicated walker in
+# cmd_test, not here. File-path arguments (`foo.kai`) pass through
+# unchanged so existing invocations keep working.
+#
+# Manifest-aware entry resolution: when the resolved directory has
+# a kai.toml, the entry point is `manifest_entry_field` (default
+# `main.kai`). The function dies with a clear diagnostic when an
+# explicit `entry = "..."` points at a file that does not exist.
+#
+# Emits nothing (returning success) when the spec is empty AND no
+# manifest exists AND the legacy single-`.kai`-file heuristic does
+# not fire — callers detect this with `[ -n "$src" ]` and surface
+# their own usage error.
+resolve_package_spec() {
+  spec="${1:-}"
+  # The status verb is supplied by the caller so non-build subcommands
+  # (e.g. `kai fmt`) do not announce "building". Defaults to "building"
+  # for build/run/test/check/bench, which all compile.
+  action="${2:-building}"
+  case "$spec" in
+    ""|".")
+      target_dir="$(pwd)"
+      manifest_dir_inf="$(find_manifest_dir "$target_dir")"
+      if [ -n "$manifest_dir_inf" ] && [ "$manifest_dir_inf" = "$target_dir" ]; then
+        entry_rel="$(manifest_entry_field "$manifest_dir_inf")"
+        entry_path="$manifest_dir_inf/$entry_rel"
+        if [ ! -f "$entry_path" ]; then
+          die "kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
+        fi
+        pkg_name_inf="$(manifest_package_name "$manifest_dir_inf")"
+        if [ -n "$pkg_name_inf" ]; then
+          echo "kai: $action package '$pkg_name_inf' (entry point: $entry_rel)" >&2
+        else
+          echo "kai: using $entry_rel as entry point" >&2
+        fi
+        printf '%s' "$entry_path"
+        return 0
+      fi
+      infer_entry_point_legacy
+      return $?
+      ;;
+    ./*)
+      sub_path="${spec#./}"
+      sub_path="${sub_path%/}"
+      [ -d "$sub_path" ] || die "$spec is not a directory"
+      if [ ! -f "$sub_path/kai.toml" ]; then
+        die "$spec has no kai.toml — sub-packages must declare their own manifest"
+      fi
+      entry_rel="$(manifest_entry_field "$sub_path")"
+      entry_path="$sub_path/$entry_rel"
+      if [ ! -f "$entry_path" ]; then
+        die "$sub_path/kai.toml declares entry = '$entry_rel' but $entry_path does not exist"
+      fi
+      pkg_name_inf="$(manifest_package_name "$sub_path")"
+      if [ -n "$pkg_name_inf" ]; then
+        echo "kai: $action package '$pkg_name_inf' (entry point: $entry_path)" >&2
+      else
+        echo "kai: using $entry_path as entry point" >&2
+      fi
+      printf '%s' "$entry_path"
+      ;;
+    *.kai)
+      printf '%s' "$spec"
+      ;;
+    *)
+      die "expected a .kai file, '.', or './<sub-package>' (got: $spec)"
+      ;;
+  esac
+}
+
+# Legacy entry-point heuristic preserved for cwds without a
+# kai.toml. Picks ./main.kai if it exists, otherwise the lone .kai
+# file at depth 1. Emits nothing when neither rule matches; the
+# caller surfaces its own usage error so the message stays subcommand
+# specific (`see 'kai build --help'`).
+infer_entry_point_legacy() {
+  if [ -f "./main.kai" ]; then
+    echo "kai: using ./main.kai as entry point" >&2
+    printf './main.kai'
+    return 0
+  fi
+  candidate=""
+  count=0
+  for f in ./*.kai; do
+    [ -f "$f" ] || continue
+    candidate="$f"
+    count=$((count + 1))
+  done
+  if [ "$count" = "1" ]; then
+    echo "kai: using $candidate as entry point (only .kai file in cwd)" >&2
+    printf '%s' "$candidate"
+    return 0
+  fi
+  printf ''
+}
+
+# Backwards-compatible alias retained for any caller that still
+# reaches for the old name. New code paths funnel through
+# resolve_package_spec.
+infer_entry_point() {
+  resolve_package_spec ""
+}
+
+# Run kaic2 in a non-binary-producing reporting mode (`--holes`,
+# `--holes-json`, `--diags-json`, `--effects-json`,
+# `--effect-holes-json`, `--library-mode`). The compiler's report
+# is the entire output of this invocation — no binary is produced.
+# Uses the same `--path` flags as a normal build so the report's
+# in-scope entries match what the user actually sees at compile
+# time.
+run_report_mode() {
+  src="$1"; flag="$2"
+  [ -f "$src" ] || die_file_not_found "$src" "build"
+  ensure_built
+  src_dir="$(cd "$(dirname "$src")" && pwd)"
+  manifest_dir="$(find_manifest_dir "$src_dir")"
+  edition_flag="$(manifest_edition_flag "$manifest_dir")"
+  pkg_path_flags=""
+  unstable_flags=""
+  if [ -n "$manifest_dir" ]; then
+    pkg_path_flags="$(manifest_path_flags "$manifest_dir")"
+    unstable_flags="$(manifest_unstable_flags "$manifest_dir")"
+  fi
+  # shellcheck disable=SC2086
+  (unset KAI_TRACE_RC; "$KAIC2" --path "$STDLIB_ROOT" --path "$src_dir" $pkg_path_flags $unstable_flags $edition_flag "$flag" "$src")
+}
+
+# Back-compat alias — older internal call sites referenced this name.
+report_holes() { run_report_mode "$@"; }
+
+cmd_build() {
+  src=""; out=""; report_mode=""; backend_cli=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) shift; [ $# -gt 0 ] || die "-o needs an argument"; out="$1"; shift ;;
+      -h|--help) usage_build; return 0 ;;
+      # Reporting modes — mutually exclusive, no binary produced.
+      # All of these run the compiler through lex / parse / resolve /
+      # infer and emit a JSON or text report, then exit. They are
+      # intended for tooling (LSP, agents, linters) that needs the
+      # typed-AST view without paying for codegen.
+      --holes)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes"; shift ;;
+      --holes-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--holes-json"; shift ;;
+      --diags-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--diags-json"; shift ;;
+      --effects-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--effects-json"; shift ;;
+      --effect-holes-json)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--effect-holes-json"; shift ;;
+      --library-mode)
+        [ -z "$report_mode" ] || die "report-mode flags are mutually exclusive"
+        report_mode="--library-mode"; shift ;;
+      --backend=*)
+        backend_cli="${1#--backend=}"; shift
+        case "$backend_cli" in
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
+        esac ;;
+      --backend)
+        shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
+        backend_cli="$1"; shift
+        case "$backend_cli" in
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
+        esac ;;
+      -*) die "unknown flag: $1 (see 'kai build --help')" ;;
+      *) [ -z "$src" ] || die "only one input supported"; src="$1"; shift ;;
+    esac
+  done
+  src="$(resolve_package_spec "$src")"
+  [ -n "$src" ] || die "missing input file (see 'kai build --help')"
+  backend="$(resolve_backend "$backend_cli")"
+  if [ -n "$report_mode" ]; then
+    [ -z "$out" ] || die "$report_mode does not produce a binary; drop -o <out>"
+    # Report modes run the typer only — backend selection is irrelevant.
+    [ -z "$backend_cli" ] || die "$report_mode is independent of --backend; drop the flag"
+    run_report_mode "$src" "$report_mode"
+    return $?
+  fi
+  if [ -z "$out" ]; then
+    # Default output name: prefer the package name from kai.toml
+    # over the entry-point's basename, so a package laid out as
+    # `notes/{kai.toml,main.kai,...}` builds to `./notes` not
+    # `./main`. Mirrors `go build` which uses the module name.
+    # Issue #658: when the src lives under a sub-package (its
+    # manifest dir differs from cwd), the binary goes into that
+    # sub-package dir rather than the cwd. This both matches
+    # `go build ./sub` placement and avoids the path collision
+    # where `./sub` is already a directory.
+    src_dir_abs="$(cd "$(dirname "$src")" && pwd)"
+    manifest_dir_for_out="$(find_manifest_dir "$src_dir_abs")"
+    pkg_name="$(manifest_package_name "$manifest_dir_for_out")"
+    if [ -n "$pkg_name" ]; then
+      bin_name="$pkg_name"
+    else
+      bin_name="$(basename "$src" .kai)"
+    fi
+    cwd_abs="$(pwd)"
+    if [ -n "$manifest_dir_for_out" ] && [ "$manifest_dir_for_out" != "$cwd_abs" ]; then
+      out="$manifest_dir_for_out/$bin_name"
+    else
+      out="$bin_name"
+    fi
+  fi
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  compile_to_binary --backend "$backend" "$src" "$tmp" "$out" "build"
+}
+
+cmd_run() {
+  backend_cli=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_run; return 0 ;;
+      --backend=*)
+        backend_cli="${1#--backend=}"; shift
+        case "$backend_cli" in
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
+        esac ;;
+      --backend)
+        shift; [ $# -gt 0 ] || die "--backend needs an argument (c|llvm)"
+        backend_cli="$1"; shift
+        case "$backend_cli" in
+          c|llvm|native) ;;
+          *) die "--backend must be 'c', 'llvm', or 'native' (got: $backend_cli)" ;;
+        esac ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  case "${1:-}" in
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai run --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
+        [ -n "$src" ] || die "missing input file (see 'kai run --help')" ;;
+    *)  src="$1"; shift ;;
+  esac
+  backend="$(resolve_backend "$backend_cli")"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)"
+  compile_to_binary --backend "$backend" "$src" "$tmp" "$bin" "run"
+  "$bin" "$@"
+}
+
+# Issue #658: `kai test ./...` walks the cwd subtree and runs
+# `kai test` for every directory that carries its own kai.toml.
+# Aggregate status is the OR of every sub-run's exit code, so CI
+# fails the moment any package's tests do. Packages are visited in
+# `find`'s default order (lexicographic per level), keeping output
+# stable across runs. Directories without a kai.toml are skipped
+# silently — they are not separately buildable.
+run_tests_recursively() {
+  extra_flags="$1"
+  cwd_abs="$(pwd)"
+  # `find -print` rather than `-print0` keeps the loop portable
+  # across BSD/GNU `find`; package directory names cannot contain
+  # newlines in practice (kai-pkg rejects them at init time).
+  manifests="$(find . -name kai.toml -type f 2>/dev/null | sort)"
+  if [ -z "$manifests" ]; then
+    echo "kai: no kai.toml found under $cwd_abs" >&2
+    return 1
+  fi
+  # The body loop runs in a subshell under POSIX sh (piped from
+  # printf), so counter state must materialise on disk to survive
+  # the loop boundary. Two tiny tally files do the job without
+  # pulling in a temp dir lifecycle.
+  fail_marker="$(mktemp -t kai-test-rec-fail.XXXXXX)"
+  count_marker="$(mktemp -t kai-test-rec-count.XXXXXX)"
+  trap 'rm -f "$fail_marker" "$count_marker"' RETURN 2>/dev/null || true
+  : > "$fail_marker"
+  printf '0' > "$count_marker"
+  printf '%s\n' "$manifests" | while IFS= read -r manifest; do
+    pkg_dir="$(dirname "$manifest")"
+    pkg_name_inf="$(manifest_package_name "$pkg_dir")"
+    if [ -n "$pkg_name_inf" ]; then
+      label="$pkg_name_inf ($pkg_dir)"
+    else
+      label="$pkg_dir"
+    fi
+    entry_rel="$(manifest_entry_field "$pkg_dir")"
+    entry_path="$pkg_dir/$entry_rel"
+    if [ ! -f "$entry_path" ]; then
+      printf '== kai test SKIP %s (no %s)\n' "$label" "$entry_rel" >&2
+      continue
+    fi
+    printf '== kai test %s\n' "$label" >&2
+    # shellcheck disable=SC2086
+    if ( cd "$pkg_dir" && "$SCRIPT" test $extra_flags ); then
+      :
+    else
+      printf 'fail' > "$fail_marker"
+      printf '== FAIL %s\n' "$label" >&2
+    fi
+    cur="$(cat "$count_marker")"
+    printf '%d' "$((cur + 1))" > "$count_marker"
+  done
+  count="$(cat "$count_marker" 2>/dev/null || echo 0)"
+  failed=""
+  [ -s "$fail_marker" ] && failed=1
+  rm -f "$fail_marker" "$count_marker"
+  if [ "$count" = 0 ]; then
+    echo "kai: no buildable packages found under $cwd_abs" >&2
+    return 1
+  fi
+  if [ -n "$failed" ]; then
+    return 1
+  fi
+  printf 'kai: all package tests passed (%d package(s))\n' "$count" >&2
+  return 0
+}
+
+cmd_test() {
+  # Issue #318: parse `--include-prelude-tests` here so we can forward
+  # it to kaic2 alongside the implicit `--test`. Any non-flag argument
+  # is the source file; everything else gets passed straight through.
+  extra_flags=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_test; return 0 ;;
+      --include-prelude-tests) extra_flags="$extra_flags --include-prelude-tests"; shift ;;
+      --) shift; break ;;
+      -*) extra_flags="$extra_flags $1"; shift ;;
+      *) break ;;
+    esac
+  done
+  case "${1:-}" in
+    "./..."|"...") shift
+        run_tests_recursively "$extra_flags"
+        return $? ;;
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
+        [ -n "$src" ] || die "missing input file (see 'kai test --help')" ;;
+    *)  src="$1"; shift ;;
+  esac
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)-t"
+  # shellcheck disable=SC2086
+  compile_to_binary "$src" "$tmp" "$bin" "test" --test $extra_flags
+
+  # Tests-dir auto-discovery: when the resolved entry sits next to a
+  # `tests/` sibling directory containing `*.kai` files (the
+  # convention introduced by issue #569 / `sibling_examples_tests`),
+  # compile and run each test file in addition to the entry. Imports
+  # in those files resolve to the package's own modules via sibling
+  # resolution. The aggregate exit code is the OR of every run, so
+  # any failing test file fails `kai test .` overall.
+  entry_dir="$(dirname "$src")"
+  tests_dir="$entry_dir/tests"
+  entry_status=0
+  "$bin" || entry_status=$?
+  if [ ! -d "$tests_dir" ]; then
+    return $entry_status
+  fi
+  test_files=""
+  for tf in "$tests_dir"/*.kai; do
+    [ -f "$tf" ] || continue
+    test_files="$test_files $tf"
+  done
+  if [ -z "$test_files" ]; then
+    return $entry_status
+  fi
+  agg_status=$entry_status
+  # shellcheck disable=SC2086
+  for tf in $test_files; do
+    tbin="$tmp/$(basename "$tf" .kai)-t"
+    printf '== kai test %s\n' "$tf" >&2
+    # shellcheck disable=SC2086
+    compile_to_binary "$tf" "$tmp" "$tbin" "test" --test $extra_flags
+    "$tbin" || agg_status=$?
+  done
+  return $agg_status
+}
+
+cmd_bench() {
+  iters_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_bench; return 0 ;;
+      --iters)
+        [ $# -ge 2 ] || die "--iters requires a value (see 'kai bench --help')"
+        iters_override="$2"; shift 2 ;;
+      --iters=*) iters_override="${1#--iters=}"; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1 (see 'kai bench --help')" ;;
+      *) break ;;
+    esac
+  done
+  case "${1:-}" in
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
+        [ -n "$src" ] || die "missing input file (see 'kai bench --help')" ;;
+    *)  src="$1"; shift ;;
+  esac
+  if [ -n "$iters_override" ]; then
+    case "$iters_override" in
+      ''|*[!0-9]*) die "--iters value must be a positive integer (got: $iters_override)" ;;
+    esac
+    [ "$iters_override" -gt 0 ] || die "--iters value must be a positive integer (got: $iters_override)"
+  fi
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)-b"
+  compile_to_binary "$src" "$tmp" "$bin" "bench" --bench
+  if [ -n "$iters_override" ]; then
+    KAI_BENCH_ITERS="$iters_override" "$bin"
+  else
+    "$bin"
+  fi
+}
+
+cmd_check() {
+  case "${1:-}" in
+    -h|--help) usage_check; return 0 ;;
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
+        [ -n "$src" ] || die "missing input file (see 'kai check --help')" ;;
+    *)  src="$1"; shift ;;
+  esac
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  bin="$tmp/$(basename "$src" .kai)-c"
+  compile_to_binary "$src" "$tmp" "$bin" "check" --prop-check
+  "$bin"
+}
+
+# kai fmt — pretty-print kaikai source canonically.
+#
+# Three input modes:
+#   kai fmt <file>             -> rewrite <file> in place
+#   kai fmt --check <file>     -> exit 1 if <file> would change, else 0;
+#                                  print formatted text to stdout when
+#                                  different (matches `gofmt -l` spirit
+#                                  but with the diff in the body).
+#   kai fmt --stdin            -> read stdin, write formatted to stdout.
+#
+# The formatter is implemented as a `kaic2 --fmt` (or `--fmt-check`)
+# subcommand. fmt runs at the source-text level and never resolves
+# names, so the core-stdlib auto-load is irrelevant here.
+cmd_fmt() {
+  src=""; mode_check=""; stdin_mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_fmt; return 0 ;;
+      --check)   mode_check=1; shift ;;
+      --stdin)   stdin_mode=1; shift ;;
+      -*)        die "unknown flag: $1 (see 'kai fmt --help')" ;;
+      *)         [ -z "$src" ] || die "only one input file supported"
+                 src="$1"; shift ;;
+    esac
+  done
+  ensure_built
+
+  if [ -n "$stdin_mode" ]; then
+    [ -z "$src" ] || die "--stdin takes no file argument"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT INT TERM
+    cat > "$tmp/in.kai"
+    "$KAIC2" --fmt "$tmp/in.kai"
+    return $?
+  fi
+
+  if [ -z "$src" ]; then
+    src="$(resolve_package_spec "" "formatting")"
+  else
+    case "$src" in
+      .|./*) src="$(resolve_package_spec "$src" "formatting")" ;;
+    esac
+  fi
+  [ -n "$src" ] || die "missing input file (see 'kai fmt --help')"
+  [ -f "$src" ] || die_file_not_found "$src" "fmt"
+
+  if [ -n "$mode_check" ]; then
+    "$KAIC2" --fmt-check "$src"
+    return $?
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  if "$KAIC2" --fmt "$src" > "$tmp/out.kai"; then
+    # Only write back when the formatted text differs (avoids touching
+    # the file mtime on a no-op).
+    if ! cmp -s "$src" "$tmp/out.kai"; then
+      cat "$tmp/out.kai" > "$src"
+    fi
+  else
+    cat "$tmp/out.kai" >&2 2>/dev/null || true
+    return 1
+  fi
+}
+
+# kai watch — recompile + run on every save.
+#
+# Two backends:
+#   1. fswatch -o "$src"   → one line per change event (lowest latency).
+#   2. mtime poll (500 ms) → portable fallback when fswatch is absent.
+#
+# The compile/run cycle runs once immediately on entry so the audience
+# sees output before they touch the file. Build failures do not exit
+# the loop — the watcher keeps running so the next save retries.
+file_mtime() {
+  if stat -f %m "$1" 2>/dev/null; then
+    return 0
+  fi
+  stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+watch_run_once() {
+  src="$1"; tmp="$2"
+  bin="$tmp/$(basename "$src" .kai)"
+  ts="$(date '+%H:%M:%S')"
+  if compile_to_binary "$src" "$tmp" "$bin" "watch" 2>"$tmp/err"; then
+    printf '\n[%s] Build OK\n' "$ts"
+    "$bin" || printf '\n[%s] Program exited with status %d\n' "$ts" "$?"
+  else
+    printf '\n[%s] Build FAILED\n' "$ts"
+    cat "$tmp/err" >&2
+  fi
+}
+
+cmd_watch() {
+  case "${1:-}" in
+    -h|--help) usage_watch; return 0 ;;
+    "") src="$(resolve_package_spec "")"
+        [ -n "$src" ] || die "missing input file (see 'kai watch --help')" ;;
+    .|./*)
+        src="$(resolve_package_spec "$1")"; shift
+        [ -n "$src" ] || die "missing input file (see 'kai watch --help')" ;;
+    *)  src="$1"; shift ;;
+  esac
+  [ -f "$src" ] || die_file_not_found "$src" "watch"
+  abs_src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  printf 'kaikai watch — recompiling on every save\n'
+  printf 'Watching: %s\n' "$abs_src"
+  if command -v fswatch >/dev/null 2>&1; then
+    printf '(backend: fswatch)\n'
+  else
+    printf '(backend: mtime poll @ 500ms — install fswatch for lower latency)\n'
+  fi
+
+  watch_run_once "$abs_src" "$tmp"
+
+  if command -v fswatch >/dev/null 2>&1; then
+    fswatch -o "$abs_src" | while read -r _; do
+      watch_run_once "$abs_src" "$tmp"
+    done
+  else
+    last="$(file_mtime "$abs_src")"
+    while :; do
+      sleep 0.5 2>/dev/null || sleep 1
+      cur="$(file_mtime "$abs_src")"
+      if [ "$cur" != "$last" ]; then
+        last="$cur"
+        watch_run_once "$abs_src" "$tmp"
+      fi
+    done
+  fi
+}
+
+# Package manager commands (issue #405). All shell out to
+# tools/kai-pkg, which is auto-built on first use via ensure_kaipkg.
+cmd_init() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai init <name>
+
+Write a stub kai.toml in the current directory with the given
+package name and version 0.1.0. Errors out if kai.toml already
+exists.
+EOF
+      return 0 ;;
+    "") die "missing package name (see 'kai init --help')" ;;
+  esac
+  if [ -f kai.toml ]; then
+    die "kai.toml already exists in $(pwd)"
+  fi
+  ensure_kaipkg
+  "$KAIPKG_BIN" init "$@"
+}
+
+cmd_install() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai install
+
+Read kai.toml in the current directory (or the nearest ancestor)
+and resolve dependencies. v1: local-path deps are reported as
+resolved; git deps are deferred to a follow-up release.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" install )
+}
+
+cmd_add() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai add <source>[@<ref>]
+
+Fetch a dependency, add it to kai.toml, and update kai.lock.
+
+Source forms:
+  github.com/owner/repo@v1.0      shorthand (string-form)
+  github.com/owner/repo           ref defaults to HEAD/main
+  ../local-thing                  local path override
+
+Examples:
+  kai add github.com/lnds/manutara@v0.1
+  kai add github.com/lnds/kohau
+
+Cache: \$KAIKAI_CACHE or ~/.cache/kai/pkg/.
+EOF
+      return 0 ;;
+    "") die "missing source argument (see 'kai add --help')" ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" add "$@" )
+}
+
+cmd_update() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai update [<name>]
+
+Re-fetch the named dependency (or all of them if no name given)
+and refresh kai.lock with the latest commit on the declared ref.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" update "$@" )
+}
+
+cmd_show_pkg() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai show
+
+Read kai.toml in the current directory (or the nearest ancestor)
+and print its parsed contents.
+EOF
+      return 0 ;;
+  esac
+  manifest_dir="$(find_manifest_dir "$(pwd)")"
+  if [ -z "$manifest_dir" ]; then
+    die "no kai.toml found in $(pwd) or any parent directory"
+  fi
+  ensure_kaipkg
+  cache_root="$(resolve_cache_root)"
+  mkdir -p "$cache_root"
+  ( cd "$manifest_dir" && KAIKAI_CACHE_ROOT="$cache_root" "$KAIPKG_BIN" show )
+}
+
+cmd_lsp() {
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai lsp
+
+Run the Language Server. Speaks LSP JSON-RPC over stdio (issue
+#447). Editors should spawn this as their language server for
+kaikai sources. v1 surface:
+
+  initialize / initialized / shutdown / exit
+  textDocument/didOpen, didChange, didClose (Full sync)
+  textDocument/hover
+
+Each hover spawns a kaic2 --library-mode subprocess; expect 5-15 ms
+latency on macOS. See docs/lsp.md for editor configuration.
+
+Environment:
+  KAILSP_KAIC2     Override the kaic2 binary path used for probes.
+EOF
+      return 0 ;;
+  esac
+  ensure_built
+  ensure_kailsp
+  # Inform kai-lsp where the matching kaic2 lives, unless the user
+  # overrode it. The library-mode subprocess must speak the same
+  # AST the user authored against.
+  if [ -z "${KAILSP_KAIC2:-}" ]; then
+    export KAILSP_KAIC2="$KAIC2"
+  fi
+  exec "$KAILSP_BIN" "$@"
+}
+
+cmd_info() {
+  # kai info                    list topics
+  # kai info <topic>            print topic page
+  # kai info <topic> --json     same content as structured JSON
+  # kai info --list             topic names only, one per line
+  # kai info -k <keyword>       search topic names + NAME lines
+  # kai info -h | --help        usage
+
+  if [ ! -d "$INFO_DIR" ]; then
+    echo "kai: error: info pages not found at $INFO_DIR" >&2
+    echo "  set KAIKAI_INFO_PATH to override the lookup path." >&2
+    exit 2
+  fi
+
+  case "${1:-}" in
+    -h|--help)
+      cat <<EOF
+usage: kai info                    List available topics.
+       kai info <topic>            Show the topic page (man/info style).
+       kai info <topic> --json     Same content, structured JSON output.
+       kai info --list             Topic names only, one per line.
+       kai info -k <keyword>       Search topic names and NAME lines.
+
+Topics live in $INFO_DIR (override with KAIKAI_INFO_PATH).
+
+For language semantics and ecosystem, this is the entry point. The
+quickref of every form kaikai actually has is at:
+
+  kai info syntax
+EOF
+      return 0 ;;
+    --list)
+      ls "$INFO_DIR" 2>/dev/null | sed -n 's/\.md$//p' | sort
+      return 0 ;;
+    -k)
+      shift
+      kw="${1:-}"
+      if [ -z "$kw" ]; then
+        echo "kai: error: -k requires a keyword" >&2
+        exit 2
+      fi
+      # Search topic names and the page's tagline (first non-empty,
+      # non-heading line after the `# title` H1).
+      found=0
+      for f in "$INFO_DIR"/*.md; do
+        [ -f "$f" ] || continue
+        topic="$(basename "$f" .md)"
+        name_line="$(awk '/^# /{h1=1; next} h1 && NF && !/^#/{print; exit}' "$f")"
+        if echo "$topic $name_line" | grep -i -q -- "$kw"; then
+          printf '%-12s %s\n' "$topic" "$name_line"
+          found=1
+        fi
+      done
+      [ "$found" = 1 ] || { echo "no topics matched '$kw'" >&2; exit 1; }
+      return 0 ;;
+    "")
+      echo "kai info — language reference, organized by topic."
+      echo
+      echo "Topics:"
+      ls "$INFO_DIR" 2>/dev/null | sed -n 's/\.md$//p' | sort | while read -r t; do
+        name_line="$(awk '/^# /{h1=1; next} h1 && NF && !/^#/{print; exit}' "$INFO_DIR/$t.md")"
+        printf '  %-12s %s\n' "$t" "$name_line"
+      done
+      echo
+      echo "Usage:"
+      echo "  kai info <topic>          Show topic page"
+      echo "  kai info <topic> --json   Structured JSON"
+      echo "  kai info --list           Topic names only"
+      echo "  kai info -k <keyword>     Search"
+      return 0 ;;
+  esac
+
+  topic="$1"
+  shift
+
+  # Issue #681: `builtins` is a dynamic topic — the doc tree comes from
+  # the `#[doc(...)]` attributes in the auto-loaded core module set
+  # (stdlib source), extracted by the compiler, not from a static .md
+  # page. JSON is the canonical Phase 1 surface; the plain form prints
+  # a per-module synopsis (module, item counts) derived from the same
+  # dump.
+  if [ "$topic" = "builtins" ]; then
+    ensure_built
+    case "${1:-}" in
+      --json)
+        exec "$KAIC2" --builtins-doc-json ;;
+      *)
+        echo "# builtins"
+        echo
+        echo "Doc attributes of the auto-loaded core module set"
+        echo "(core/* + math/numeric + math/complex + effects + protocols + array)."
+        echo
+        "$KAIC2" --builtins-doc-json | awk '
+          {
+            n = split($0, parts, /"module": "/)
+            for (i = 2; i <= n; i++) {
+              mod = parts[i]; sub(/".*/, "", mod)
+              items = parts[i]; cnt = gsub(/"kind": /, "", items)
+              # count documented items in this module slice only
+              docs = parts[i]; dcnt = gsub(/"doc": "/, "", docs)
+              printf "  %-16s %3d items, %3d documented\n", mod, cnt, dcnt
+            }
+          }'
+        echo
+        echo "Full doc text: kai info builtins --json"
+        exit 0 ;;
+    esac
+  fi
+
+  page="$INFO_DIR/$topic.md"
+  if [ ! -f "$page" ]; then
+    echo "kai: error: no info page for '$topic'" >&2
+    echo "  run 'kai info' to list available topics." >&2
+    exit 1
+  fi
+
+  case "${1:-}" in
+    --json)
+      # Convert the page to JSON. Sections are H2 markdown headers
+      # (`## Section name`). The H1 (`# topic`) is the page title and
+      # is exposed as `"title"`; the first non-empty line after the H1
+      # before any H2 is the tagline (exposed as `"tagline"`). Body of
+      # each section is everything until the next H2 or EOF.
+      awk -v topic="$topic" '
+        function json_escape(s,    out, i, c, code) {
+          out = ""
+          for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            code = ord[c]
+            if (c == "\\")      out = out "\\\\"
+            else if (c == "\"") out = out "\\\""
+            else if (c == "\t") out = out "\\t"
+            else if (c == "\n") out = out "\\n"
+            else if (c == "\r") out = out "\\r"
+            else if (code < 32) out = out sprintf("\\u%04x", code)
+            else                out = out c
+          }
+          return out
+        }
+        BEGIN {
+          for (i = 0; i < 128; i++) ord[sprintf("%c", i)] = i
+          title = ""
+          tagline = ""
+          sec = ""
+          buf = ""
+          first = 1
+          in_preamble = 0
+          sections_started = 0
+        }
+        # H1: the page title.
+        /^# / {
+          title = substr($0, 3)
+          in_preamble = 1
+          next
+        }
+        # H2: a section header.
+        /^## / {
+          if (sec != "") {
+            sub(/\n+$/, "", buf)
+            if (!sections_started) {
+              printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
+              sections_started = 1
+            }
+            if (!first) printf ","
+            first = 0
+            printf "\n    \"%s\": \"%s\"", json_escape(sec), json_escape(buf)
+          }
+          sec = substr($0, 4)
+          buf = ""
+          in_preamble = 0
+          next
+        }
+        {
+          if (in_preamble) {
+            # Collect first non-empty line as tagline.
+            if (tagline == "" && NF > 0) {
+              tagline = $0
+            }
+          } else if (sec != "") {
+            buf = buf $0 "\n"
+          }
+        }
+        {
+          if (sec != "") {
+            buf = buf $0 "\n"
+          }
+        }
+        END {
+          if (sec != "") {
+            sub(/\n+$/, "", buf)
+            if (!sections_started) {
+              printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
+              sections_started = 1
+            }
+            if (!first) printf ","
+            first = 0
+            printf "\n    \"%s\": \"%s\"", json_escape(sec), json_escape(buf)
+          } else if (!sections_started) {
+            printf "{\n  \"topic\": \"%s\",\n  \"title\": \"%s\",\n  \"tagline\": \"%s\",\n  \"sections\": {", topic, json_escape(title), json_escape(tagline)
+            sections_started = 1
+          }
+          printf "\n  }\n}\n"
+        }
+      ' "$page"
+      return 0 ;;
+    "")
+      cat "$page"
+      return 0 ;;
+    *)
+      echo "kai: error: unknown flag for 'kai info $topic': $1" >&2
+      echo "  try '--json' or no flag." >&2
+      exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  build)     shift; cmd_build "$@" ;;
+  run)       shift; cmd_run   "$@" ;;
+  test)      shift; cmd_test  "$@" ;;
+  bench)     shift; cmd_bench "$@" ;;
+  check)     shift; cmd_check "$@" ;;
+  fmt)       shift; cmd_fmt   "$@" ;;
+  watch)     shift; cmd_watch "$@" ;;
+  init)      shift; cmd_init    "$@" ;;
+  install)   shift; cmd_install "$@" ;;
+  add)       shift; cmd_add     "$@" ;;
+  update)    shift; cmd_update  "$@" ;;
+  show)      shift; cmd_show_pkg "$@" ;;
+  lsp)       shift; cmd_lsp     "$@" ;;
+  info)      shift; cmd_info    "$@" ;;
+  help|-h|--help) usage ;;
+  --version|-V) print_version ;;
+  "")        usage >&2; exit 2 ;;
+  *)         echo "kai: error: unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac

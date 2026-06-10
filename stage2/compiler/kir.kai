@@ -1,0 +1,257 @@
+# compiler/kir.kai — KIR node set (types only).
+#
+# KIR (kaikai Intermediate Representation) is the single typed lowering
+# between the post-perceus AST and the two target translators
+# (KIR→C, KIR→LLVM). Design: `docs/kir-design.md`. This file is Lane 0,
+# the types-only foundation; `kir_lower.kai` builds KIR from the AST and
+# the per-target translators consume it.
+#
+# Abstraction level (design §3): ANF (A-Normal Form) over named virtual
+# registers, with explicit basic blocks, but NO SSA and NO materialised
+# CFG edges. Every non-trivial subexpression is named (`KLet`); control
+# flow is a list of blocks each ending in one terminator; successors are
+# named by the terminator, not held in an edge list.
+#
+# The two structural promotions this file encodes (design §2, §4.7):
+#
+#   1. The TCO/TRMC sentinels — today pipe-encoded strings planted as the
+#      callee (`__kai_tcrec|<sym>|<dropmask>|<p0>|...`,
+#      `__kai_trmc|<sym>|<holeslot>|<cname>|<dropmask>|<p0>|...`) and
+#      decoded separately by each backend (`tcrec_split_pipe` /
+#      `es_tcrec_split_pipe`) — become typed terminators
+#      (`KTcrecGoto` / `KTrmcStep` / `KTrmcApply`). No string parser survives.
+#
+#   2. Perceus marks — today magic-name `ECall(EVar("__perceus_dup"), …)`
+#      indistinguishable from a real call until each backend compares the
+#      callee string — become first-class `KRCOp` statements ordered in the
+#      block's statement list (design §4.7). Order is list position; the
+#      translator prints in order with zero reconstruction. `borrow` is not
+#      a node: it is the `KBorrow` mode of a `KParam` plus the absence of a
+#      drop at the match exit.
+#
+# Position metadata (design §7, Risk 7): every KIR node that lowers from
+# an AST node carries an optional `pos: KPos` so panic / contract messages
+# stay byte-identical and DWARF emission (#500) keeps its source spans.
+# It is metadata threaded alongside, never a node in the ~28-node match.
+
+# --- Position metadata (Risk 7) ----------------------------------------
+
+# Source position lowered from the originating AST node's line/col.
+# `KNoPos` marks a synthetic node the lowering minted (e.g. an ANF
+# temporary's binder) with no single source span.
+pub type KPos = KNoPos | KAt(Int, Int)
+
+# --- Slots: the field/param/return representation (design §4.1, §4.6) ---
+
+# A slot's runtime representation. `SInt64` makes i64-inline (kind-1 Int
+# variant slots, #747/#741) a first-class repr decided once in the
+# lowering, so neither translator re-derives unboxability and the
+# runtime-mint-i64 vs emitter-read-ptr desync (the #741/#747 class) is
+# structurally impossible (design §4.6). `SInt32` is the raw `i32`
+# variant-tag word a `KTagOf` reads (matching the runtime's `variant_tag`
+# field width): a `KSwitch` scrutinee MUST carry this slot so the native
+# backend lowers a real LLVM `switch` over an integer, never a `ptr`.
+# Deciding the tag's repr in the lowering — not re-derived by a backend
+# from the op — keeps KSlot the single source of truth for a register's
+# type (asu review: the op never types the register, the slot does).
+pub type KSlot = SBoxed | SInt64 | SReal | SBool | SInt32
+
+# A parameter's ownership mode. `KBorrow` replaces the `__perceus_borrow`
+# wrap: borrow becomes a structural property of the param (no drop at the
+# match exit), not a node the translator must recognise (design §4.7).
+pub type KMode = KOwn | KBorrow
+
+# --- Atoms: values an op may take (strict ANF — ops take only atoms) ----
+
+# design §4.5. `KVar` names a virtual register (a `KLet` binder or a
+# param); the rest are immediates. Atoms are leaves of the node match.
+pub type KVal
+  = KVar(String)
+  | KIntV(Int)
+  | KRealV(Real)
+  | KBoolV(Bool)
+  | KCharV(Char)
+  | KStrV(String)           # raw source span (includes quotes), as the AST carries it
+  | KUnitV
+
+# --- Constructor field initialisers (design §4.6) ----------------------
+
+# How one constructor slot is initialised. The AST-level `ValueMode`
+# string dies here: boxed vs i64-inline is the slot-init variant, decided
+# once in AST→KIR from `CtorIntSlots` + `mode`. C emits `{.i64 = v}` for
+# `SIInt64`; LLVM emits the i64 store. Neither translator re-derives it.
+pub type KSlotInit = SIBoxed(KVal) | SIInt64(KVal) | SIReal(KVal)
+
+# One record-literal field: its name + the value atom. The translator
+# emits the parallel value/name buffers `kai_record` consumes.
+pub type KFieldInit = KFI(String, KVal)
+
+# --- Ops: the RHS of a binding; all operands are atoms (design §4.4) ----
+
+pub type KOp
+  = KCall(String, [KVal])                       # direct call to a known fn (symbol resolved)
+  | KCallIndirect(KVal, [KVal])                 # closure / function value
+  | KPrim(String, [KVal])                       # inline builtins (+, -, ==, kai_intf, ...)
+  | KCon(String, Int, [KSlotInit])              # constructor: ctor name, tag, slot inits
+  | KRecord([KFieldInit])                       # record literal: (field name, value) pairs
+  | KConReuse(KVal, String, Int, [KSlotInit])   # reuse-in-place: donor, ctor, tag, inits (ex __perceus_reuse_*)
+  | KProj(KVal, Int)                            # read slot i of a value (= kai_variant_at)
+  | KTagOf(KVal)                                # read the variant tag (scrutinee for KSwitch)
+  | KClosure(String, Int, [KVal])               # thunk sym + arity + precomputed captures (what fv_* resolves today)
+  | KPerform(String, String, [KVal])            # invoke an effect op: effect, op, args (raises to handler)
+  | KSetjmp(String)                             # set a handler landing pad; yields i32 (0 = body path, !=0 = longjmp return)
+  | KLitOp(KVal)                                 # a bare atom as an op RHS (e.g. `let t = 3`)
+
+# --- Perceus RC ops (design §4.7) — first-class, NOT annotations --------
+
+# `KDropReuse` produces a reuse token (named by the binder of its `KRC`
+# statement); `KConReuse` consumes that token's donor. The two sit in the
+# same block, linked by the donor atom (design §4.7 arg 4, Risk 4).
+# `KFreeToken` releases a token no `KConReuse` consumed in scope.
+pub type KRCOp
+  = KDup(KVal)               # incref — ex __perceus_dup
+  | KDrop(KVal)              # decref — ex __perceus_drop / kai_decref
+  | KDropReuse(KVal)         # uniqueness-conditional decref producing a reuse token (donor atom)
+  | KFreeToken(KVal)         # release an unused reuse token
+
+# --- Statements: ordered, inside a block (design §4.3) ------------------
+
+# `pos` is the source span this statement lowered from (Risk 7). RC ops
+# carry their own position via the enclosing statement.
+pub type KStmt
+  = KLet(String, KSlot, KOp, KPos)   # bind an op result into a fresh register
+  | KDo(KOp, KPos)                   # effectful op, result discarded
+  | KRC(KRCOp, KPos)                 # explicit Perceus op
+  | KStore(String, KVal, KPos)       # slot mutation (TCO/TRMC loop assigns, Array writes / Mutable)
+  # Effect handler frame markers (design §4.7 effects). `KInstall` pushes
+  # the evidence for `eff` (handler decl `sym`, optional state `init` /
+  # `as`-alias) before the handle body runs; `KPop` pops it on the normal
+  # exit path. They are EXPLICIT markers (not folded into one opaque node)
+  # so the setjmp split lives as an ordinary `KCondBr` both backends read
+  # identically (asu review — the frontier-bug the KIR exists to kill).
+  | KInstall(String, String, Option[KVal], Option[String], KPos)
+  | KPop(String, KPos)               # pop the evidence for `eff`
+
+# --- Terminators: end a block, name successors (design §4.2) ------------
+
+# A re-loop assignment for the TCO/TRMC goto: write `KVal` into param slot
+# `idx` before the back-edge. The dropmask (on the terminator) carries
+# which old params drop INSIDE the re-loop.
+pub type KAssign = KAsg(Int, KVal)
+
+# Note vs design §4.2: the single `KTrmcGoto` is split into `KTrmcStep`
+# (the modulo-cons site, `__kai_trmc|...`) and `KTrmcApply` (the terminal
+# leaf plug, `__kai_trmc_apply`, surfaced by emit_c.kai:1991). Both are
+# real sentinels today; one terminator each keeps the translator's match
+# exhaustive without a malformed-string fallback.
+pub type KTerm
+  = KRet(KVal, KPos)
+  | KBr(String, KPos)                                  # unconditional branch to a label
+  | KCondBr(KVal, String, String, KPos)                # cond, then-label, else-label
+  | KSwitch(KVal, [KCase], String, KPos)               # switch on a tag atom, cases, default label
+  | KTailCall(String, [KVal], KPos)                    # non-recursive tail call
+  | KTcrecGoto(String, [KAssign], Int, KPos)           # ex __kai_tcrec: loop label, reloop assigns, dropmask
+  | KTrmcStep(String, Int, String, Int, [KVal], [KAssign], KPos)
+                                                       # ex __kai_trmc: loop label, hole slot, cname, dropmask,
+                                                       # head_vals (non-hole ctor args, build the cell),
+                                                       # assigns (loop-param rebinds from the self-call's args).
+                                                       # The self-call is NEVER lowered as a value — it is the
+                                                       # back-edge, mirroring KTcrecGoto. See lower_trmc_step.
+  | KTrmcApply(KVal, KPos)                             # ex __kai_trmc_apply: plug leaf into open cctx hole
+  | KResume(KVal, KVal, Bool, KPos)                    # cont, arg, tail? — one-shot resume (ex resume → kai_cont_resume)
+  | KResume2(KVal, KVal, KVal, Bool, KPos)             # 2-arg resume(v, new_state) for stateful handlers
+  | KUnreachable(KPos)
+
+pub type KCase = KC(Int, String)   # tag value → target label
+
+# --- Blocks and functions (design §4.1, §4.2) --------------------------
+
+# A basic block: a label, an ordered statement list, one terminator.
+# `region_id` is the arena the block allocates into (None = default
+# allocator). Regions stay program-level metadata + this id, NOT a
+# first-class node, mirroring that perceus is region-unaware (design §4.7
+# closing note, issue #120).
+pub type KBlock = { label: String, stmts: [KStmt], term: KTerm,
+                    region_id: Option[Int] }
+
+# How a function is called, a structural property of the symbol (NOT a
+# prologue the backend re-recognises). A normal fn takes its params
+# directly; a lambda and a clause take the thunk ABI `(self, args, n[, k])`
+# and read params/captures/evidence/resume by index. The per-kind print
+# rule materialises the frame; the block bodies are identical in shape
+# across kinds (asu review: calling convention = proc metadata).
+pub type KFnKind = KFnNormal | KFnLambda | KFnClause
+
+# Where a param's value comes from under the thunk ABI. `PDirect(i)` is
+# the ordinary i-th argument (also used by lambda/clause `args[i]`);
+# `PCapture(i)` reads the i-th closure capture from `self`; `PEvidence(i)`
+# reads a handler-evidence field; `PResume` is the one-shot continuation a
+# clause receives. The index is resolved ONCE in the lowering (from
+# `LamInfo.caps` / the clause shape) so no backend re-derives it (§5).
+pub type KParamOrigin = PDirect(Int) | PCapture(Int) | PEvidence(Int) | PResume
+
+# `self` / `args` / `n` are artefacts of the thunk convention the `kind`
+# print-rule emits — never KIR params or atoms. `resume` IS a param
+# (`PResume`): the clause body uses it, so it must enter Perceus's use
+# analysis to stay one-shot.
+pub type KParam = { name: String, slot: KSlot, mode: KMode, origin: KParamOrigin }
+
+# A lowered function: resolved symbol, calling kind, params, return slot,
+# the block list (entry block first). The `kind` tells the backend which
+# frame ABI to emit; `KFnClause` subsumes the old `is_handler_thunk`.
+# `stateful` carries the handler-clause statefulness the typer already
+# computed (`ClauseInfo.stateful`): a stateful clause reads/writes a
+# handler `state` slot (free name `state`/`log`, 2-arg `resume`). It
+# applies to `KFnClause` only; `KFnNormal`/`KFnLambda` always set `false`.
+# Propagating it here means the native backend reads it off the KFn
+# instead of re-deriving it from the AST (mirror of emit_c/emit_llvm,
+# which still read `ClauseInfo.stateful` directly since they emit from
+# the AST, not the KIR).
+pub type KFn = { sym: String, kind: KFnKind, params: [KParam], ret: KSlot,
+                 blocks: [KBlock], region_id: Option[Int], stateful: Bool }
+
+# --- Type declarations (design §4.1) -----------------------------------
+
+pub type KCtor = { name: String, tag: Int, slots: [KSlot] }
+pub type KField = { fname: String, fslot: KSlot }
+
+pub type KTypeDecl
+  = KSumT(String, [KCtor])
+  | KRecordT(String, [KField])
+
+# A program-level region descriptor (arena). Carried as metadata; the
+# translator consults `region_id` on KFn/KBlock to pick the allocator.
+pub type KRegion = KRgn(Int, String)   # region id, descriptive name
+
+# --- The top-level program (design §4.1) -------------------------------
+
+# `install_order` is the default-handler installation order (today the
+# C-only `builtin_default_install_order` + install loop — the #1 reason
+# effects diverged between backends). Promoting it to a `KProgram` field
+# makes it the single source of truth both translators read.
+#
+# `defaults` resolves each effect in `install_order` (that carries an
+# all-`$extern_handler` default block) to its op→runtime-symbol map.
+# Computed once at lowering (where the AST `decls` are in scope) so the
+# native translator never re-walks the AST: it reads field index from
+# the op position and the `kaix_default_<eff>_<op>` forwarder symbol from
+# `KDOp`. The C/LLVM-text emitters do NOT consume KIR, so this field is
+# native-only and invisible to the selfhost byte-id of the C path.
+pub type KProgram = { types: [KTypeDecl], fns: [KFn],
+                      handlers: [KHandlerDecl], install_order: [String],
+                      defaults: [KDefault], regions: [KRegion] }
+
+# One installable default handler: the effect name and its ops in
+# declaration order (field index = `nfx_op_base` + position). Each op
+# carries the runtime forwarder symbol the install stores into the Ev
+# blob (the `kaix_default_<eff>_<op>` mirror of the `$extern_handler`
+# C symbol; see `lvm_kaix_symbol`).
+pub type KDefault = KDef(String, [KDefOp])
+pub type KDefOp = KDOp(String, String)   # op name → runtime forwarder sym
+
+# A handler declaration: the effect it handles, its clause-body thunk
+# symbols (one per op), and an optional return-clause thunk symbol.
+pub type KHandlerDecl = { eff: String, sym: String,
+                          op_thunks: [KOpThunk], ret_thunk: Option[String] }
+
+pub type KOpThunk = KOT(String, String)   # op name → clause-body thunk sym
