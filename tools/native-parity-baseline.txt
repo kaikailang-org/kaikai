@@ -1,0 +1,313 @@
+# native-parity-baseline.txt — the allowed-gap ratchet for the in-process
+# libLLVM native backend (KIR Lane 1.5, docs/kir-design.md §"Lane 1.5").
+#
+# Each non-comment line is a fixture (relative path) that currently
+# DIVERGES from the C-direct oracle under `--backend=native` — a known
+# gap, not a regression. tools/test-backend-parity.sh (with
+# TARGET_BACKEND=native NATIVE_PARITY_RATCHET=1) gates against this list:
+#
+#   - a fixture that fails parity but is NOT listed here => FAIL (a NEW
+#     gap / regression — the burn-down went backwards).
+#   - a listed fixture that now PASSES => OK, with a prompt to remove it
+#     from this file (the ratchet tightens; a gap closed).
+#   - listed == failing => OK at baseline.
+#
+# The flip to native-default (Lane 1.5) proceeds only when this file is
+# EMPTY (full corpus parity). First measured 2026-06-09: 168 gaps / 513
+# fixtures. Burn-down 1 (2026-06-10) closed 31: the missing-symbols family
+# (24, `kai_assert_check` symbol) + a slice of unbound-register (const /
+# prelude-fn-value inline + nested record sub-pattern binds + default-arm
+# binders) + `mini_ledger` (build-failed-other, closed as a side effect of
+# the assert fix) → 137 gaps.
+#
+# Burn-down 2 (2026-06-10) closed 55 (137 → 82), two root causes, both in
+# the KIR lowering (stage2/compiler/kir_lower*.kai):
+#   (1) UNARY MINUS aliased the binary `-`. `EUnop("-", a)` lowered to
+#       `KPrim("-", [a])` → a one-arg call to the two-arg `kaix_sub`; the
+#       missing operand read an uninitialised register, so EVERY negative
+#       literal / `0 - x` diverged. Fix: `unop_prim` maps `-` → `neg`
+#       (→ `kaix_neg`, the one-arg helper, mirror of emit_c's `kai_op_neg`).
+#   (2) LOCALS-SHADOW-IMPORTS. `lower_var` consulted the EFn/prelude table
+#       BEFORE the local-binder check, so a param/binder named like a stdlib
+#       `pub fn` (`init`, `sum`, `head`, `acc`, …) lowered to a CLOSURE over
+#       the stdlib thunk instead of the local read — the closure then
+#       reached an arithmetic op as a non-Int operand. Fix: thread a
+#       `locals` set (params/captures + every `let`/match binder, via
+#       `ls_emit`) and check it first in `lower_var` / `lower_callee_dispatch`
+#       (the #748/#749 rule, the KIR mirror of emit_c's `EmitCtx.lcs`).
+# This was transverse: the locals-shadow bug hit fixtures across runtime-
+# type-mismatch (26/27 of the family), output-mismatch, exit-code-mismatch,
+# SIGSEGV, missing-symbols, and no-effect-handler — any local name colliding
+# with a stdlib fn → 82 gaps. Issue #801 (stream carrier, PR #809) then
+# added 6 new corpus fixtures (4 stream_* + demos/wc + ctor_field_effect_row)
+# as gaps → 88. Issue #810 (#[unstable] transparency, PR #810) then added
+# `attr_unstable_refine_narrow` (native SIGSEGV, C clean — a backend gap,
+# not a regression) → 89.
+#
+# CROSS-PLATFORM NOTE: `list_helpers` + `list_zip3_scan` PASS native on
+# macOS but SIGSEGV (139) on Linux. Burn-down 2 closed them locally; CI
+# (the merge oracle, Linux) showed them still divergent, so they stay
+# listed (+2 → 91). The lesson burn-down 1's retro flagged: the ratchet is
+# validated on Linux — a macOS-only pass is NOT a closed gap.
+#
+# Burn-down 3 (2026-06-10) closed 9 (91 → 82), one root cause in the KIR
+# match lowering (kir_lower_variant.kai + kir_lower_walk.kai):
+#   SHARED-TAG SUB-DISCRIMINATION. A `match` arm sharing its top-level tag
+#   with a sibling but discriminating on a payload sub-pattern
+#   (`Exited(0)` vs `Exited(_)`, `Branch(Red, _)` vs `Branch(Black, _)`)
+#   lowered to a `KSwitch` with TWO cases of the same i32 tag → `module
+#   verify failed: Duplicate integer as switch case` (LLVM rejects it),
+#   AND the second arm was dead (nothing tested the payload). Fix: group
+#   arms by tag (`plan_arms` dedups), emit ONE switch case per tag, and
+#   for a tag shared by N>1 arms route that case to a sub-fail-chain that
+#   tests each arm's payload — `kai_eq_raw slot lit` for a literal slot,
+#   `kai_tag_eq slot ctor_tag` for a nullary ctor / enum slot (mirror of
+#   the oracle's `emit_pat_test_variant_subs`). The unique-tag cases keep
+#   the bare O(1) switch jump. The whole `Duplicate integer as switch
+#   case` family (18 fixtures) is GONE: 9 close outright; the other 9
+#   (regex / json-unicode / map) now BUILD + RUN but DIVERGE on a
+#   PRE-EXISTING bug the build error masked (regex char-class parse, json
+#   `\uXXXX` decode, Call-param-mismatch), reclassified to their new
+#   families. `kaix_tag_eq` is an additive runtime shim (runtime_llvm.c).
+#   The two cross-platform Linux-only SIGSEGV gaps (`list_helpers`,
+#   `list_zip3_scan`) stay listed — burn-down 3 does not touch their root
+#   cause. → 82 gaps remain — see docs/native-parity-gaps.md.
+#
+# Some gaps are FLAKY under native (intermittent SIGSEGV / pointer-bearing
+# output): e.g. examples/stdlib/hex_basic.kai diverges ~50% of runs. Those
+# are still gaps — intermittent parity is not parity — and are listed here.
+# The ratchet re-verifies any "new gap" up to 3 times and only flags a
+# regression when it diverges on EVERY attempt, so a sub-100% flaky fixture
+# never fails CI at random.
+#
+# Burn-down 6 (2026-06-12) closed 14 (81 → 67), FOUR root causes — see
+# docs/lane-experience-native-parity-burndown-6.md:
+#   - EBang (postfix `!`) was unhandled in `lower_expr` (fell to a silent
+#     unit). `lower_bang` (kir_lower_walk.kai) mirrors emit_c's `emit_bang`:
+#     `condbr (kai_tag_eq bv Some/Ok) ? ok : fail`, fail→`KRet bv`
+#     (early-return), ok→`KProj bv 0`. Transversal.
+#   - Clock dead-code synth-handler: native aborted on a `KPerform <eff>` for
+#     a default-block effect performed in a DEAD fn main never installs.
+#     `kir_synth_handler_effects` = a SUPERSET of `defaults` (every
+#     default-block effect, no main_row filter) on the new
+#     `KProgram.synth_defaults`, fed only to the dispatch; install/pop stay on
+#     `defaults`. This also resolved the actor/Spawn dispatch shape for the
+#     dual_actor / mailbox / nested_lambda_with_mailbox / http_server fixtures.
+#   - nested-variant Form B (variant-slot) + Form A (list-head
+#     record-field-variant): the payload-bearing nested-variant decision tree
+#     (test the tag, recurse the sub-bind) — closed reuse_nested_subpattern.
+# The two cross-platform Linux-only SIGSEGV gaps (`list_helpers`,
+# `list_zip3_scan`) STAY listed — the burn-down 1/2/3 lesson: a macOS pass is
+# not a closed gap (the ratchet is validated on Linux/CI). The 14 removed
+# above are deterministic macOS closes from lowering-level fixes (platform-
+# agnostic by construction); if any diverges on Linux, CI flags it and it is
+# re-added. selfhost byte-id OK; test-kir GREEN; zero parity regressions.
+#
+# char/hex decode (2026-06-12, `np-decode`) closed 2 (67 → 65), ONE root
+# cause — see docs/lane-experience-np-decode.md:
+#   - `kai_llvm_build_string_span` (stage2/runtime.h) decodes string-literal
+#     escapes itself (the C-direct oracle emits the span verbatim into
+#     `kai_str("...")` and lets cc decode it). Its hand-rolled switch only
+#     handled `\n \t \r \0 \" \\`; the C99 escapes `\a \b \f \v`, hex `\xHH`,
+#     and octal `\ooo` fell to a default that dropped the `\` and kept the
+#     letter — `"\x41"` → bytes `x41` not `A`, corrupting the JSON byte-table
+#     (`"\x01..\xff"`) and every literal carrying such an escape. Now decodes
+#     C99-exactly. Closed hex_escape_literal + json_surrogate_decode.
+#     json_basic / regex / jwt still diverge on SEPARATE causes (json-array
+#     nested-variant list-match, regex matcher logic) — NOT char/hex.
+#
+# Real box/unbox (2026-06-13) closed 5 (65 → 60), ONE root cause — see
+# docs/lane-experience-np-real.md:
+#   - The KIR was all-boxed (`slot_of_ty`→SBoxed) and IGNORED the unbox
+#     pass's `.mode`, re-boxing every Real and lowering arithmetic to the
+#     consuming `kaix_mul`/`kaix_add` — but it inherited perceus's RC-plan,
+#     which SKIPS the dup/drop of unbox-promoted-raw vars
+#     (`prc_pat_bindings_skip_raw`). A multi-use raw Real (`rhs` in
+#     `mul(self,rhs)`, `a` in `a*7.0`) thus double-freed: the slab was reused
+#     and read as a `double` → `9.88131e-324`. Fix (asu, Camino A): the KIR
+#     is MODE-SLAVE like the C emitter — a `MUnboxed` Real lowers to a raw
+#     `f64` register (`SReal`) + native `fadd`/`fmul`/`fcmp`
+#     (`kir_lower_raw.kai` + `llvm_build_fbinop`/`fcmp`), boxing only at the
+#     raw↔boxed border (`kaix_real` / `kaix_real_field` borrow). No RC on a
+#     raw value, so the double-free cannot arise. Closed
+#     unbox_bench_real / unbox_phase2_cond_real / complex_basic /
+#     complex_heterogeneous + the `^`-on-Real fixture math_real_basic (its
+#     raw base reached `kaix_pow_int` correctly once the operand was raw).
+#     ADDITIVE: only `MUnboxed` Real nodes take the raw path; every boxed
+#     family (Int / Bool-from-calls / records) is untouched.
+# Burn-down 7 (2026-06-13, `np-crash`) closed 14 (65 → 51), TWO mechanical
+# root causes in the KIR lowering — see docs/lane-experience-np-crash.md.
+# (Disjoint from np-decode's 2: those were char/hex string-span escapes;
+# these are pipe-lowering + match-guard control flow, no overlap.)
+#   - PIPE-LOWERING. `EPipe(lhs, rhs)` lowered to a no-op unit (the call
+#     vanished). `lower_pipe` (kir_lower_walk.kai) rewrites it to the
+#     equivalent `ECall` with `lhs` spliced in as the FIRST arg, then
+#     delegates to `lower_call` — the same desugar emit_c's `emit_pipe_expr`
+#     does at codegen, so the full named-call dispatch (ctor/prelude/efn/
+#     variant/kaix_apply) is reused. The burn-down-3 partial cut trapped only
+#     because it hand-built the callee. Closed collatz/euler1/factorials/forth/
+#     wc/demos-vs/capture/minimal-fizzbuzz + quicksort×2 (a lost `filter` left
+#     `sort(unit)` recursing on a non-shrinking input → SIGSEGV).
+#   - MATCH GUARDS + ALL-BINDER DISPATCH. Arm guards (`X if cond -> …`) were
+#     dropped wholesale (`Arm(p, _, body)`), and an all-binder match over a
+#     scalar fell to the variant tag-switch → `kaix_variant_tag_of` faults on a
+#     tagged Int (SIGSEGV). `lower_guard_chain` is a linear fail-chain (per arm:
+#     pattern-test → bind → guard-test → body | next-arm, source order, no
+#     KTagOf), diverted to whenever `match_has_any_guard OR not
+#     match_has_discriminating_pattern` (asu review: the O(1) switch is sound
+#     only when the tag alone decides the winner). Closed fizzbuzz/imc/collatz +
+#     attr_unstable_refine_narrow + int_field_inline.
+# The two Linux-only gaps (`list_helpers`, `list_zip3_scan`) STILL stay listed
+# (now pass on the macOS dev box too, but the ratchet is Linux/CI-validated).
+# selfhost byte-id OK; test-kir GREEN; ASAN clean on the closed crashes; zero
+# parity regressions. The DESIGN-bearing residue (Real-arith RC unboxing,
+# multi/nested alias-dispatch, Hash proto-dispatch table registration, Spawn
+# fiber runtime) is documented in docs/native-parity-gaps.md, not forced.
+#
+# native-multi-alias-capture (2026-06-14, refs #789) closed the multi/nested
+# alias-dispatch cluster — ONE root cause. A closure capturing 2+ same-effect
+# handler-id sentinels (`__alias_id__<a>`) HUNG the native backend (exit 124)
+# because the evidence-frame allocas were keyed by EFFECT NAME, so two nested
+# same-effect installs shared one KaiEvidence node → `node->parent == node`
+# self-cycle → infinite `kai_evidence_lookup_node_by_id`. Fix: key the frame
+# per install-SITE (the handler `sym`), mirroring emit_c's per-`({})` lexical
+# `_node` — `sym` added to `KSetjmp`/`KPop`/`KBindEvState`, `nfx_*_reg` derive
+# from it. Closed demos/spiral/main + m7b_15_nested_alias +
+# m8_12_self_delegating_handler + multi_var_state_index (4); new minimal
+# fixture examples/effects/multi_var_closure_capture.kai. selfhost byte-id OK
+# (FALSE-GREEN for this bug — compiler.kai has no nested same-effect handlers;
+# the cluster fixtures vs C-direct are the real gate); tier0 OK; ASAN clean.
+# `list_helpers`/`list_zip3_scan` STAY listed (Linux/CI-validated, not closed
+# by this lane). See docs/lane-experience-native-multi-alias-capture.md.
+#
+# Do NOT add a fixture here to silence a regression — fix the backend.
+# This list only records the gaps that predate the ratchet.
+#
+# CORPUS GROWTH (main advanced under burn-down 5): rebasing onto origin/main
+# brought 8 new fixtures (weather/vs demos, FFI extern-C, a perceus leak
+# audit) that DIVERGE under native for PRE-EXISTING causes outside this
+# lane's zone — `KPerform: no handler for effect Spawn` (issue_82_leak_audit),
+# extern-C symbols the native link doesn't resolve (ffi_*), pipe-lowering /
+# output mismatch (demos). None touch the namespace / bit-op / KBindEvState
+# fixes this lane shipped; they are listed as gaps (the same way #801/#810
+# corpus growth was absorbed in burn-down 2), NOT regressions.
+#
+# CLAUSE-CAPTURE ABI (lane native-clause-capture-abi, 2026-06-14) closed 6
+# (45 → 39 macOS / measured pass=425 fail=37 skip=55 of 517 file-mode +
+# cross_package/consumer in package-mode), one root cause: the native
+# install never filled the Ev `env` slot (byte 8), so a handler clause that
+# captured an enclosing binding aborted (`clause param origin`). The fix is
+# the full capture/evidence channel — `PEnvCapture(j)` in the KIR (a clause
+# capture indexes the handle's cross-clause union `env_caps`, NOT the
+# closure-captures array a lambda's `PCapture` reads), an env array the
+# install fills in union order and points Ev field 1 at, and a clause
+# prologue that dups each capture out of `self->env[j]` (mirror of emit_c's
+# `kai_internal_dup(_env->kai_<name>)`). Closed: ctor_field_effect_row,
+# r9_clause_capture, stream_abort_leak, stream_mock_disk, stream_skip_policy
+# (+ cross_package/consumer, package-mode). `net_dns_resolve` STAYS — its
+# divergence is a SEPARATE root (the NetDns default handler + list-cons
+# match in `resolve_first`, not clause capture; documented in the retro).
+# The order-distinguishing guard is `clause_capture_subset_order.kai`
+# (r9's two clauses both capture `tag` at union slot 0 — false-green for the
+# index-order bug; the new fixture forces a subset capture apart).
+#
+# LONE-ARM VARIANT SUB-TEST (lane native-lone-arm-subtest, 2026-06-14)
+# closed 13 (39 → 26 listed / measured static-LLVM18 pass=439 fail=24 of 518
+# file-mode), ONE root cause in the KIR variant-match lowering
+# (`lower_one_group`, kir_lower_walk.kai). A switch case whose tag is matched
+# by EXACTLY ONE arm took a fast-path that bound the arm's fields and jumped
+# straight to the body — assuming the tag alone decided the winner. False
+# when that lone arm DISCRIMINATES on its payload (`Some(91)` literal slot,
+# `Some(Red)` nullary-ctor slot, a nested variant): the tag-switch proved the
+# constructor, not the sub-pattern, so the bare jump matched EVERY `Some(_)`.
+# `Some(91)` captured `Some(49)`. Fix: a lone arm that is NOT its tag's
+# catch-all (`var_arm_is_tag_catchall` = false) routes through the SAME
+# `lower_group_chain` sub-fail-chain a shared tag uses, with its miss falling
+# to `ldef`; only the non-discriminating lone arm keeps the O(1) direct jump.
+# The C-direct oracle was always correct (emit_c lowers from the AST, not the
+# KIR), so this was native-only. MISDIAGNOSED in docs/native-parity-gaps.md
+# as THREE separate families — "json-real-in-object", "char/hex decode", and
+# "regex matcher logic" — all one bug: each matcher uses a lone discriminating
+# variant arm (`match char_at(s,k) { Some(']') -> .. ; _ -> .. }`), so EVERY
+# non-empty JSON array/object returned None and the regex/jwt matchers took
+# the wrong branch. Closed json_basic, json_real_×4, json_surrogate_encode,
+# jwt_encoder, regex_basic/predicate/anchors/subsume_×3. Regression fixture:
+# examples/effects/match_lone_variant_arm_subtest.kai (literal slot + nested +
+# nullary-ctor slot, native==C). selfhost byte-id OK; tier0 OK; ASAN clean.
+#
+# LIST-IN-VARIANT-SLOT (lane native-list-in-slot, 2026-06-14) closed 2
+# (26 → 24 listed / static-LLVM18 pass=442 fail=22 of 519), ONE root cause in
+# the KIR variant bind+test (kir_lower_bind.kai + kir_lower_variant.kai +
+# kir_lower_walk.kai). A list pattern as a SUB-PATTERN of a variant slot
+# (`Some([x, y])`) was unhandled: `bind_slot_pattern` had no `PList` case
+# (x/y stayed unbound → backend aborted `unbound register`), and
+# `psub_is_discriminating` did not count a list slot as discriminating (so the
+# arm wrongly became its tag's catch-all, skipping the length test). A list
+# pattern interleaves its length test with its head/tail binds, so it cannot
+# be split into the test-then-bind the variant module uses. Fix: a lone-list-
+# slot arm (`var_arm_lone_list_slot`) is lowered by reusing the list decision-
+# tree `lm_emit_cells` against the projected slot — the seam lives in the walk
+# (`emit_arm_subtests_and_binds`), the only module importing BOTH kir_lower_
+# variant and kir_lower_match (variant cannot call lm_emit_cells: import cycle).
+# `psub_is_discriminating += PList` (the slot now discriminates); a list slot
+# reaching the per-slot test path (a MIXED multi-discriminating-slot payload,
+# still a subset gap) traps loud (`var_seal_list_unsupported`), never matches
+# length-less. Closed binserialize_derive_nested + net_dns_resolve (its
+# `resolve_first` uses a list-cons match in a variant slot). Regression fixture:
+# examples/effects/match_list_in_variant_slot.kai (exact-length + rest-binder +
+# variant-head-in-slot-list, native==C). selfhost byte-id OK; tier0 OK; ASAN
+# + KAI_TRACE_RC clean (native runtime leaks all — stage0 runtime, pre-existing
+# — but no double-free: the slot is a borrow projection, asu-reviewed).
+# KNOWN RESIDUAL (separate native gap, NOT closed here): a list pattern whose
+# HEAD is itself a list pattern (`[[a, b], ..._]` / `Some([[a,b], ..]])`)
+# aborts native `unbound register` — `lm_emit_head` does not recurse into a
+# PList head. C-direct correct. Documented in docs/native-parity-gaps.md; no
+# corpus fixture exercises it yet, so it is not on this ratchet.
+#
+# LITERAL-LIST-HEAD (lane native-literal-list-head, 2026-06-14) closed 1
+# (24 → 23 listed / static-LLVM18 pass=444 fail=21 of 520), ONE root cause in
+# the KIR list-match (`lm_head_seal_test`, kir_lower_match.kai). A LITERAL head
+# in a list pattern (`[""]`, `[0, ...rest]`) fell to the catch-all seal (an
+# unconditional pass) — `lm_head_seal_test` tested variant / variant-record
+# heads but not a `PLit` head — so `[""]` matched ANY one-element list
+# (`["hello"]` wrongly took the `[""]` arm). This silently broke `string.lines`
+# (its `lines_drop_trailing_empty` has a `[""]` arm before `[x]`, so a non-
+# empty single line `["hello"]` collapsed to `[]`). Fix: emit
+# `kai_eq_raw headv lit` for a literal head (reusing `lm_field_eq`, the same
+# equality the record-field path uses, over the already-projected head value).
+# `psub_is_discriminating(PLit)` already routed a literal head into the seal.
+# Closed string_lines_chars. Regression fixture:
+# examples/effects/match_literal_list_head.kai (`[""]` vs `[x]` + `[0, ...]`
+# literal head, native==C). selfhost byte-id OK; tier0 OK; ASAN clean.
+#
+# UNIT-NAME COMPILE-TIME REFLECTION (lane native-unit-name, 2026-06-14) closed
+# 1 (23 → 22 listed / static-LLVM18 pass=446 fail=20 of 521), ONE root cause in
+# the KIR callee classification (kir_lower.kai + kir_lower_walk.kai).
+# `unit_name(x)` (m12.8.x phase 2) is COMPILE-TIME reflection on a dimensioned
+# `Real<u>` — the unit is phantom (no runtime value carries it), so it must
+# inline the canonical unit symbol as a String constant read from the arg's
+# `.ty`, exactly as emit_c's `unit_name` case does. The KIR fell `unit_name`
+# to a direct call to `kaix_prelude_unit_name` (a runtime shim with no unit to
+# read → empty string), so `#{t}` over a `Real<s>` dropped its ` s` suffix
+# (the `impl[u: Measure] Show for Real<u>` display, stdlib/protocols.kai).
+# Fix: classify `unit_name` as `CkUnitName` and lower it to a constant `KStrV`
+# from `unit_name_of_ty(a.ty)` (the SAME extractor the oracle uses), mirror of
+# the existing `__strip_unit` compile-time intrinsic. Closed free_fall (its
+# `#{t}` / `#{h}` / `#{v}` over `Real<s>` / `Real<m>` / `Real<m/s>` now carry
+# their unit suffixes). Regression fixture: examples/effects/unit_name_interp.kai
+# (unit_name direct + interpolation + bare-Real defensive empty, native==C).
+# selfhost byte-id OK; tier0 OK; ASAN clean.
+demos/9d9l/huffman/main.kai
+demos/9d9l/weather/main.kai
+examples/effects/ffi_extern_c_basic.kai
+examples/effects/ffi_pub_axiom_cross_module/main.kai
+examples/effects/issue_668_map_large_in_fiber.kai
+examples/effects/m7a_6d_double_resume.kai
+examples/perceus/llvm_arm_top_reuse_shared.kai
+examples/perceus/llvm_rc_nested_match.kai
+examples/perceus/nested_pattern_reuse_balance.kai
+examples/perceus/reuse_record_basic.kai
+examples/perceus/scalar_fn_sig_deep_recursion.kai
+examples/stdlib/crypto_hash_basic.kai
+examples/stdlib/list_helpers.kai
+examples/stdlib/list_zip3_scan.kai

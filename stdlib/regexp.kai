@@ -1,0 +1,1450 @@
+#[doc("""
+stdlib/regexp.kai — RE2-style regular expressions.
+
+Pure full-kaikai implementation. Linear-time matching via NFA
+set-of-states simulation. RE2-compatible subset:
+  - Char literals + escapes (\\d \\w \\s . \\n \\t \\\\ \\/).
+  - Character classes [abc], [^abc], [a-z], [0-9].
+  - Anchors ^ $.
+  - Greedy quantifiers * + ? {n} {n,} {n,m}.
+  - Groups (...) capturing, (?:...) non-capturing.
+  - Alternation a|b.
+
+Out of scope: backreferences, lookaround, Unicode property
+classes, non-greedy quantifiers, named captures, inline flags.
+
+Bootstrap layering: full-kaikai (uses ++ in implementation,
+effects-aware diagnostics). Validated through kaic2 + the
+stage 2 test-stdlib harness.
+
+Phase 2 of the m12.6.x #7 / regex MVP lane lands the pattern
+parser only — RxAst types + parsing. NFA construction and
+simulation come in Phases 3 and 4.
+
+Public surface (canonical-only since the 2026-05-17 migration;
+the old `regex_*` / `rx_*` prefixes and the resolver's
+legacy-prefix tables are gone):
+
+  Canonical:  regexp.parse_pattern, regexp.compile_nfa,
+              regexp.simulate, regexp.ast_show, regexp.nfa_show,
+              regexp.compile, regexp.find, regexp.find_all,
+              regexp.replace, regexp.split,
+              regexp.compile_or_panic, regexp.matches
+
+`regexp.match` does not exist — `match` is a keyword; the
+operation is `find`. Bare names like `compile` / `split` are
+heavily shadowed in fixtures, so call sites should use the
+qualified form.
+""")]
+
+# ---- Types ----
+
+#[doc("""
+A single character range inside a class. `lo == hi` represents a
+single-character match. The class itself stores a list of ranges
+plus a `negated` flag.
+""")]
+pub type CharRange = CR(Char, Char)
+
+#[doc("""
+Anchor positions: start-of-input or end-of-input. Multiline mode
+is out of scope for v1, so ^/$ are absolute.
+""")]
+pub type Anchor = AnchorStart | AnchorEnd
+
+#[doc("""
+Pattern AST. The parser produces this; Phase 3 lowers to NFA.
+
+RxClass(ranges, negated): matches any char in ranges (or, when
+negated, any char NOT in ranges). Built-in classes (\\d \\w \\s)
+desugar to the corresponding RxClass at parse time. `.` desugars
+to a "any char except newline" class.
+
+RxConcat([]) is the empty sequence (matches empty string).
+RxAlt is at least 2 alternatives by construction; single-arm
+alternation is collapsed to the inner expression.
+
+RxRepeat(inner, min, max_opt): min..max bounded repeat. {n}
+becomes RxRepeat(inner, n, Some(n)); {n,} becomes RxRepeat(inner,
+n, None); {n,m} becomes RxRepeat(inner, n, Some(m)). The simpler
+RxStar/RxPlus/RxOpt forms are kept for clarity in the NFA pass.
+
+RxGroup(id, inner): capture group with 1-based id. Non-capturing
+groups (?:...) parse to inner directly without an RxGroup wrap.
+""")]
+pub type RxAst
+  = RxChar(Char)
+  | RxAny
+  | RxClass([CharRange], Bool)
+  | RxAnchor(Anchor)
+  | RxConcat([RxAst])
+  | RxAlt([RxAst])
+  | RxStar(RxAst)
+  | RxPlus(RxAst)
+  | RxOpt(RxAst)
+  | RxRepeat(RxAst, Int, Option[Int])
+  | RxGroup(Int, RxAst)
+
+#[doc("""
+Parser carries the input string, current position, and a
+monotonically-increasing capture-group counter. The counter is
+advanced when a `(...)` (non-`?:`) is opened, so groups are
+numbered in source order.
+""")]
+pub type RxParseState = { input: String, pos: Int, n: Int, group_id: Int }
+
+#[doc("""
+Parser result wrapper. `r = None` means the parse failed and the
+`err_msg` field describes what went wrong; `r = Some(ast)` is the
+successful parse paired with the consumed state.
+""")]
+pub type RxParseError = { msg: String, pos: Int }
+#[doc("A regex-parser result: the consumed parse state plus either the parsed AST (`r`) or a parse error (`err`).")]
+pub type PRx = { st: RxParseState, r: Option[RxAst], err: Option[RxParseError] }
+
+fn rx_ok(st: RxParseState, ast: RxAst) : PRx =
+  PRx { st: st, r: Some(ast), err: None }
+
+fn rx_err(st: RxParseState, msg: String) : PRx =
+  PRx { st: st, r: None, err: Some(RxParseError { msg: msg, pos: st.pos }) }
+
+# ---- Parse-state helpers ----
+
+fn rx_state_init(input: String) : RxParseState =
+  RxParseState { input: input, pos: 0, n: string_length(input), group_id: 0 }
+
+fn rx_at_end(st: RxParseState) : Bool = st.pos >= st.n
+
+fn rx_peek(st: RxParseState) : Option[Char] =
+  if rx_at_end(st) { None } else { char_at(st.input, st.pos) }
+
+fn rx_peek_at(st: RxParseState, off: Int) : Option[Char] =
+  if st.pos + off >= st.n { None } else { char_at(st.input, st.pos + off) }
+
+fn rx_advance(st: RxParseState) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos + 1, n: st.n, group_id: st.group_id }
+
+fn rx_advance_n(st: RxParseState, k: Int) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos + k, n: st.n, group_id: st.group_id }
+
+fn rx_bump_group(st: RxParseState) : RxParseState =
+  RxParseState { input: st.input, pos: st.pos, n: st.n, group_id: st.group_id + 1 }
+
+# ---- Public entry point ----
+
+#[doc("""
+Parse a pattern string into an RxAst. Returns Result so callers
+can handle malformed patterns explicitly. The error form carries
+a message and the byte offset at which parsing failed.
+""")]
+pub fn parse_pattern(pattern: String) : Result[RxParseError, RxAst] = {
+  let st0 = rx_state_init(pattern)
+  let r = rx_parse_alt(st0)
+  match r.r {
+    None -> match r.err {
+      Some(e) -> Err(e)
+      None    -> Err(RxParseError { msg: "regex parse failed", pos: r.st.pos })
+    }
+    Some(ast) ->
+      if rx_at_end(r.st) { Ok(ast) }
+      else {
+        Err(RxParseError {
+          msg: "trailing characters after regex",
+          pos: r.st.pos
+        })
+      }
+  }
+}
+
+# ---- Top-down recursive descent ----
+#
+# Grammar (informal):
+#   alt    ::= concat ("|" concat)*
+#   concat ::= atom*
+#   atom   ::= primary quantifier?
+#   primary ::= group | class | "." | anchor | escape | char
+#   group  ::= "(" "?:"? alt ")"
+#   class  ::= "[" "^"? class_item* "]"
+#
+# Each rx_parse_* takes an RxParseState and returns a PRx. The
+# parser is greedy; quantifiers attach to the most recent atom only
+# (no quantifier-on-empty).
+
+fn rx_parse_alt(st: RxParseState) : PRx = {
+  let r0 = rx_parse_concat(st)
+  match r0.r {
+    None -> r0
+    Some(first) -> rx_parse_alt_loop(r0.st, [first])
+  }
+}
+
+fn rx_parse_alt_loop(st: RxParseState, acc: [RxAst]) : PRx = {
+  match rx_peek(st) {
+    Some(c) -> if c == '|' {
+      let st1 = rx_advance(st)
+      let rn = rx_parse_concat(st1)
+      match rn.r {
+        None -> rn
+        Some(next) -> rx_parse_alt_loop(rn.st, list_append(acc, [next]))
+      }
+    } else { rx_finish_alt(st, acc) }
+    None -> rx_finish_alt(st, acc)
+  }
+}
+
+fn rx_finish_alt(st: RxParseState, alts: [RxAst]) : PRx = match alts {
+  []  -> rx_ok(st, RxConcat([]))
+  [a] -> rx_ok(st, a)
+  _   -> rx_ok(st, RxAlt(alts))
+}
+
+# `concat` parses a sequence of atoms until end-of-input, ')' or
+# '|'. An empty concat is valid (matches the empty string) so we
+# always succeed but may return RxConcat([]).
+fn rx_parse_concat(st: RxParseState) : PRx = rx_parse_concat_loop(st, [])
+
+fn rx_parse_concat_loop(st: RxParseState, acc: [RxAst]) : PRx = {
+  match rx_peek(st) {
+    None -> rx_finish_concat(st, acc)
+    Some(c) -> if c == '|' or c == ')' {
+      rx_finish_concat(st, acc)
+    } else {
+      let r = rx_parse_atom(st)
+      match r.r {
+        None -> r
+        Some(at) -> rx_parse_concat_loop(r.st, list_append(acc, [at]))
+      }
+    }
+  }
+}
+
+fn rx_finish_concat(st: RxParseState, items: [RxAst]) : PRx = match items {
+  []  -> rx_ok(st, RxConcat([]))
+  [x] -> rx_ok(st, x)
+  _   -> rx_ok(st, RxConcat(items))
+}
+
+# An atom is a primary expression optionally followed by a single
+# quantifier. Quantifiers do not stack (`a**` is rejected) — that
+# is the user's job to write `(a*)*` if they want the meaning.
+fn rx_parse_atom(st: RxParseState) : PRx = {
+  let r = rx_parse_primary(st)
+  match r.r {
+    None -> r
+    Some(p) -> rx_apply_quantifier(r.st, p)
+  }
+}
+
+fn rx_apply_quantifier(st: RxParseState, p: RxAst) : PRx = {
+  match rx_peek(st) {
+    None -> rx_ok(st, p)
+    Some(c) ->
+      if c == '*' { rx_ok(rx_advance(st), RxStar(p)) }
+      else if c == '+' { rx_ok(rx_advance(st), RxPlus(p)) }
+      else if c == '?' { rx_ok(rx_advance(st), RxOpt(p)) }
+      else if c == '{' { rx_parse_repeat(rx_advance(st), p) }
+      else { rx_ok(st, p) }
+  }
+}
+
+# {n}, {n,}, {n,m}. Reject malformed forms (`{}`, `{,5}`,
+# `{2,1}`).
+fn rx_parse_repeat(st: RxParseState, p: RxAst) : PRx = {
+  let rn = rx_parse_int(st)
+  match rn.r_int {
+    None    -> rx_err(rn.st, "expected count after `{`")
+    Some(lo) -> match rx_peek(rn.st) {
+      Some(c) -> if c == '}' {
+        rx_ok(rx_advance(rn.st), RxRepeat(p, lo, Some(lo)))
+      } else if c == ',' {
+        let st_after_comma = rx_advance(rn.st)
+        match rx_peek(st_after_comma) {
+          Some(c2) -> if c2 == '}' {
+            rx_ok(rx_advance(st_after_comma), RxRepeat(p, lo, None))
+          } else {
+            let rh = rx_parse_int(st_after_comma)
+            match rh.r_int {
+              None -> rx_err(rh.st, "expected count or `}` after `,`")
+              Some(hi) ->
+                if hi < lo { rx_err(rh.st, "repeat count {n,m}: m < n") }
+                else { match rx_peek(rh.st) {
+                  Some('}') -> rx_ok(rx_advance(rh.st), RxRepeat(p, lo, Some(hi)))
+                  _         -> rx_err(rh.st, "expected `}` to close repeat")
+                } }
+            }
+          }
+          None -> rx_err(st_after_comma, "unterminated `{`")
+        }
+      } else { rx_err(rn.st, "expected `,` or `}` after count") }
+      None -> rx_err(rn.st, "unterminated `{`")
+    }
+  }
+}
+
+# Parse a base-10 integer of one or more digits. Returns the
+# advanced state and the parsed value (or None if no digits).
+type RxIntParse = { st: RxParseState, r_int: Option[Int] }
+
+fn rx_parse_int(st: RxParseState) : RxIntParse =
+  rx_parse_int_loop(st, 0, false)
+
+fn rx_parse_int_loop(st: RxParseState, acc: Int, any: Bool) : RxIntParse = {
+  match rx_peek(st) {
+    Some(c) -> if char.is_digit(c) {
+      let d = char_to_int(c) - char_to_int('0')
+      rx_parse_int_loop(rx_advance(st), acc * 10 + d, true)
+    } else {
+      RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
+    }
+    None -> RxIntParse { st: st, r_int: if any { Some(acc) } else { None } }
+  }
+}
+
+# A primary expression is one of: group, class, anchor, ".", escape,
+# or a literal char.
+fn rx_parse_primary(st: RxParseState) : PRx = {
+  match rx_peek(st) {
+    None    -> rx_err(st, "unexpected end of pattern")
+    Some(c) ->
+      if c == '(' { rx_parse_group(rx_advance(st)) }
+      else if c == '[' { rx_parse_class(rx_advance(st)) }
+      else if c == '.' { rx_ok(rx_advance(st), RxAny) }
+      else if c == '^' { rx_ok(rx_advance(st), RxAnchor(AnchorStart)) }
+      else if c == '$' { rx_ok(rx_advance(st), RxAnchor(AnchorEnd)) }
+      else if c == '\\' { rx_parse_escape(rx_advance(st)) }
+      else if c == ')' or c == '|' or c == '*' or c == '+' or c == '?' or c == '{' or c == '}' or c == ']' {
+        rx_err(st, "unexpected metacharacter in primary position")
+      }
+      else { rx_ok(rx_advance(st), RxChar(c)) }
+  }
+}
+
+# `(` already consumed. Detect `?:` for non-capturing form, parse
+# inner alt, expect `)`.
+fn rx_parse_group(st: RxParseState) : PRx = {
+  let is_noncap =
+    match rx_peek(st) {
+      Some('?') -> match rx_peek_at(st, 1) { Some(':') -> true _ -> false }
+      _         -> false
+    }
+  let st1 = if is_noncap { rx_advance_n(st, 2) } else { st }
+  let st2 = if is_noncap { st1 } else { rx_bump_group(st1) }
+  let gid = if is_noncap { 0 } else { st2.group_id }
+  let r = rx_parse_alt(st2)
+  match r.r {
+    None -> r
+    Some(inner) -> match rx_peek(r.st) {
+      Some(')') -> {
+        let inner_wrapped = if is_noncap { inner } else { RxGroup(gid, inner) }
+        rx_ok(rx_advance(r.st), inner_wrapped)
+      }
+      _ -> rx_err(r.st, "expected `)` to close group")
+    }
+  }
+}
+
+# `[` already consumed. Parse optional `^` then class items until
+# closing `]`.
+fn rx_parse_class(st: RxParseState) : PRx = {
+  let neg = match rx_peek(st) { Some('^') -> true _ -> false }
+  let st1 = if neg { rx_advance(st) } else { st }
+  rx_parse_class_loop(st1, [], neg)
+}
+
+fn rx_parse_class_loop(st: RxParseState, acc: [CharRange], neg: Bool) : PRx = {
+  match rx_peek(st) {
+    None      -> rx_err(st, "unterminated character class")
+    Some(']') -> if list.is_empty(acc) {
+      rx_err(st, "empty character class")
+    } else { rx_ok(rx_advance(st), RxClass(acc, neg)) }
+    Some(c)   -> {
+      let r = rx_parse_class_atom(st, c)
+      match r.r_range {
+        None -> rx_err(r.st, "malformed character class")
+        Some(rng) -> rx_parse_class_loop(r.st, list_append(acc, [rng]), neg)
+      }
+    }
+  }
+}
+
+type RxRangeParse = { st: RxParseState, r_range: Option[CharRange] }
+
+# Parse a single class atom: a literal char, an escape, or a
+# range `a-z`. The leading char is `c`, already in the buffer at
+# st.pos.
+fn rx_parse_class_atom(st: RxParseState, c: Char) : RxRangeParse = {
+  let res_first = if c == '\\' {
+    rx_parse_escape_char(rx_advance(st))
+  } else {
+    RxCharParse { st: rx_advance(st), r_char: Some(c) }
+  }
+  match res_first.r_char {
+    None -> RxRangeParse { st: res_first.st, r_range: None }
+    Some(lo) -> {
+      # Optional range: `-` followed by another char (not `]`)
+      match rx_peek(res_first.st) {
+        Some('-') -> match rx_peek_at(res_first.st, 1) {
+          Some(']') -> RxRangeParse { st: res_first.st, r_range: Some(CR(lo, lo)) }
+          Some(_) -> {
+            let st_dash = rx_advance(res_first.st)
+            match rx_peek(st_dash) {
+              Some(c2) -> {
+                let res_hi = if c2 == '\\' {
+                  rx_parse_escape_char(rx_advance(st_dash))
+                } else {
+                  RxCharParse { st: rx_advance(st_dash), r_char: Some(c2) }
+                }
+                match res_hi.r_char {
+                  None     -> RxRangeParse { st: res_hi.st, r_range: None }
+                  Some(hi) -> RxRangeParse { st: res_hi.st, r_range: Some(CR(lo, hi)) }
+                }
+              }
+              None -> RxRangeParse { st: st_dash, r_range: None }
+            }
+          }
+          None -> RxRangeParse { st: res_first.st, r_range: None }
+        }
+        _ -> RxRangeParse { st: res_first.st, r_range: Some(CR(lo, lo)) }
+      }
+    }
+  }
+}
+
+# Parse an escape that introduces a primary RxAst (outside a class).
+# `\\d` `\\w` `\\s` desugar to RxClass; `\\D` `\\W` `\\S` are their
+# negations; everything else falls through to a literal char.
+fn rx_parse_escape(st: RxParseState) : PRx = {
+  match rx_peek(st) {
+    None    -> rx_err(st, "trailing backslash")
+    Some(c) -> {
+      let st1 = rx_advance(st)
+      if c == 'd' { rx_ok(st1, RxClass([CR('0', '9')], false)) }
+      else if c == 'D' { rx_ok(st1, RxClass([CR('0', '9')], true)) }
+      else if c == 'w' { rx_ok(st1, RxClass(rx_word_ranges(), false)) }
+      else if c == 'W' { rx_ok(st1, RxClass(rx_word_ranges(), true)) }
+      else if c == 's' { rx_ok(st1, RxClass(rx_space_ranges(), false)) }
+      else if c == 'S' { rx_ok(st1, RxClass(rx_space_ranges(), true)) }
+      else if c == 'n' { rx_ok(st1, RxChar('\n')) }
+      else if c == 't' { rx_ok(st1, RxChar('\t')) }
+      else if c == 'r' { rx_ok(st1, RxChar('\r')) }
+      else { rx_ok(st1, RxChar(c)) }
+    }
+  }
+}
+
+# Word characters per Perl/POSIX ASCII: [A-Za-z0-9_].
+fn rx_word_ranges() : [CharRange] =
+  [CR('A', 'Z'), CR('a', 'z'), CR('0', '9'), CR('_', '_')]
+
+# Whitespace: space, tab, newline, carriage-return, vertical-tab,
+# form-feed.
+fn rx_space_ranges() : [CharRange] =
+  [CR(' ', ' '), CR('\t', '\t'), CR('\n', '\n'), CR('\r', '\r')]
+
+# Inside a character class, `\\` introduces an escape that must
+# resolve to a single character (no class-of-class expansion in v1
+# — `[\\d]` is treated as the literal `d`, mirroring most engines'
+# strict reading; users wanting digits write `[0-9]` explicitly).
+type RxCharParse = { st: RxParseState, r_char: Option[Char] }
+
+fn rx_parse_escape_char(st: RxParseState) : RxCharParse = {
+  match rx_peek(st) {
+    None -> RxCharParse { st: st, r_char: None }
+    Some(c) -> {
+      let st1 = rx_advance(st)
+      let mapped =
+        if c == 'n' { '\n' }
+        else if c == 't' { '\t' }
+        else if c == 'r' { '\r' }
+        else { c }
+      RxCharParse { st: st1, r_char: Some(mapped) }
+    }
+  }
+}
+
+# ---- AST inspection helpers (debug / dump) ----
+#
+# Render an RxAst as a compact tree string for fixtures and
+# debugging. Char values use `Show[Char]` for natural ASCII output
+# (`Ch(a)` instead of `Ch(97)`). Phase 6 fixtures pin this format.
+
+#[doc("Renders a regex AST as a compact tree string (the debug/fixture format).")]
+pub fn ast_show(a: RxAst) : String = match a {
+  RxChar(c)     -> "Ch(#{c})"
+  RxAny         -> "Any"
+  RxClass(rs, neg) ->
+    string_concat_all(["Cls(", if neg { "^" } else { "" }, rx_ranges_show(rs), ")"])
+  RxAnchor(a) -> match a {
+    AnchorStart -> "Start"
+    AnchorEnd   -> "End"
+  }
+  RxConcat(xs) -> string_concat_all(["Cat(", rx_list_show(xs), ")"])
+  RxAlt(xs)    -> string_concat_all(["Alt(", rx_list_show(xs), ")"])
+  RxStar(x)    -> string_concat_all(["Star(", ast_show(x), ")"])
+  RxPlus(x)    -> string_concat_all(["Plus(", ast_show(x), ")"])
+  RxOpt(x)     -> string_concat_all(["Opt(", ast_show(x), ")"])
+  RxRepeat(x, lo, hi_opt) -> {
+    let hi_s = match hi_opt {
+      Some(h) -> int_to_string(h)
+      None    -> "*"
+    }
+    string_concat_all(["Rep(", ast_show(x), ",", int_to_string(lo), ",", hi_s, ")"])
+  }
+  RxGroup(id, x) ->
+    string_concat_all(["Grp(", int_to_string(id), ",", ast_show(x), ")"])
+}
+
+fn rx_list_show(xs: [RxAst]) : String = match xs {
+  []           -> ""
+  [x]          -> ast_show(x)
+  [x, ...rest] -> string_concat_all([ast_show(x), ",", rx_list_show(rest)])
+}
+
+fn rx_ranges_show(rs: [CharRange]) : String = match rs {
+  []           -> ""
+  [r]          -> rx_range_show(r)
+  [r, ...rest] -> string_concat_all([rx_range_show(r), ",", rx_ranges_show(rest)])
+}
+
+fn rx_range_show(r: CharRange) : String = match r {
+  CR(lo, hi) ->
+    if char_to_int(lo) == char_to_int(hi) { "#{lo}" }
+    else { "#{lo}-#{hi}" }
+}
+
+# ====================================================================
+# Phase 3 — NFA construction (Thompson-style)
+# ====================================================================
+#
+# Compile RxAst to an NFA whose start/accept states are connected by
+# a graph of transitions (char / class / epsilon / anchor / group
+# markers). Each AST node lowers to a "fragment" — a (start, accept)
+# pair — and parent nodes wire fragments together with ε-edges.
+#
+# State numbering uses a monotonically-increasing counter inside an
+# NfaBuilder. The accept state is the last one allocated; multiple
+# fragments are concatenated by patching the inner accept's
+# ε-transition to the outer fragment's start.
+
+#[doc("""
+A single transition leaving an NFA state. The target is referenced
+by state id (Int). Transitions are interpreted by Phase 4's
+simulator: TChar / TClass consume one input character, TEpsilon /
+TGroupOpen / TGroupClose / TAnchor are zero-width.
+""")]
+pub type NfaTransition
+  = TChar(Char, Int)                    # consume `c`, go to target
+  | TClass([CharRange], Bool, Int)      # consume one char in class (Bool = negated), go to target
+  | TAny(Int)                           # consume any char (except newline), go to target
+  | TEpsilon(Int)                       # zero-width edge, go to target
+  | TGroupOpen(Int, Int)                # mark group_id start, go to target
+  | TGroupClose(Int, Int)               # mark group_id end, go to target
+  | TAnchor(Anchor, Int)                # match anchor (start/end of input), go to target
+
+#[doc("One NFA state: its id, its outgoing transitions, and whether it is an accepting state.")]
+pub type NfaState = { id: Int, transitions: [NfaTransition], accept: Bool }
+
+#[doc("A compiled NFA: the state list, the start-state id, and the capture-group count.")]
+pub type Nfa = { states: [NfaState], start: Int, num_groups: Int }
+
+#[doc("""
+Builder threads the in-progress state list and a fresh-id counter
+through compilation. `num_groups` tracks the highest capture-group
+id seen (so the simulator allocates that many position slots).
+""")]
+pub type NfaBuilder = { states: [NfaState], next_id: Int, num_groups: Int }
+
+#[doc("""
+A compiled fragment: the entry state (where matching starts) and
+the accept state (whose outgoing ε wires to the next fragment).
+""")]
+pub type NfaFrag = NF(Int, Int)
+#                    ^start ^accept
+
+fn nb_init() : NfaBuilder = NfaBuilder { states: [], next_id: 0, num_groups: 0 }
+
+fn nb_fresh(b: NfaBuilder) : NfaBuilder = {
+  let st = NfaState { id: b.next_id, transitions: [], accept: false }
+  NfaBuilder {
+    states: list_append(b.states, [st]),
+    next_id: b.next_id + 1,
+    num_groups: b.num_groups
+  }
+}
+
+fn nb_last_id(b: NfaBuilder) : Int = b.next_id - 1
+
+# Update the transitions list of state `id` to `trs`. Linear scan;
+# fine for the sizes we deal with (NFA size O(pattern length)).
+fn nb_set_transitions(b: NfaBuilder, id: Int, trs: [NfaTransition]) : NfaBuilder =
+  NfaBuilder {
+    states: nb_replace_state(b.states, id, trs),
+    next_id: b.next_id,
+    num_groups: b.num_groups
+  }
+
+fn nb_replace_state(states: [NfaState], id: Int, trs: [NfaTransition]) : [NfaState] =
+  match states {
+    [] -> []
+    [s, ...rest] ->
+      if s.id == id {
+        [NfaState { id: s.id, transitions: trs, accept: s.accept }, ...rest]
+      } else {
+        [s, ...nb_replace_state(rest, id, trs)]
+      }
+  }
+
+# Append a transition to the existing list of state `id`.
+fn nb_add_transition(b: NfaBuilder, id: Int, t: NfaTransition) : NfaBuilder = {
+  let cur = nb_get_transitions(b.states, id)
+  nb_set_transitions(b, id, list_append(cur, [t]))
+}
+
+fn nb_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
+  []           -> []
+  [s, ...rest] -> if s.id == id { s.transitions } else { nb_get_transitions(rest, id) }
+}
+
+# Mark the state at `id` as accept. Used only on the final accept
+# state of the whole NFA — Thompson fragments don't need accept
+# flags on intermediate states.
+fn nb_mark_accept(b: NfaBuilder, id: Int) : NfaBuilder =
+  NfaBuilder {
+    states: nb_set_accept(b.states, id),
+    next_id: b.next_id,
+    num_groups: b.num_groups
+  }
+
+fn nb_set_accept(states: [NfaState], id: Int) : [NfaState] = match states {
+  [] -> []
+  [s, ...rest] ->
+    if s.id == id {
+      [NfaState { id: s.id, transitions: s.transitions, accept: true }, ...rest]
+    } else {
+      [s, ...nb_set_accept(rest, id)]
+    }
+}
+
+# Bump the highest-seen capture-group id. Called when compiling
+# RxGroup. The final NFA reports `max + 1` so that group 0 (the
+# whole match) plus all numbered groups have a slot.
+fn nb_record_group(b: NfaBuilder, gid: Int) : NfaBuilder =
+  NfaBuilder {
+    states: b.states,
+    next_id: b.next_id,
+    num_groups: if gid > b.num_groups { gid } else { b.num_groups }
+  }
+
+# ---- Compilation ----
+
+#[doc("""
+Top-level entry: build a fresh NFA from an AST. The accept state
+of the root fragment becomes the NFA's accept (single-accept by
+construction; matching ends when any path reaches it).
+""")]
+pub fn compile_nfa(ast: RxAst) : Nfa = {
+  let b0 = nb_init()
+  let r = compile_frag(b0, ast)
+  match r {
+    NB_Frag(b1, frag) -> match frag {
+      NF(start, accept) -> {
+        let b2 = nb_mark_accept(b1, accept)
+        Nfa {
+          states: b2.states,
+          start: start,
+          # +1 because group ids are 1-based; group 0 is the whole match.
+          num_groups: b2.num_groups + 1
+        }
+      }
+    }
+  }
+}
+
+# Builder + fragment pair returned by compile_frag. kaikai-minimal
+# does not have tuple types, so we wrap in a 1-variant nominal.
+type NB_FragR = NB_Frag(NfaBuilder, NfaFrag)
+
+# Compile a single AST node to a fragment. Each branch allocates
+# states via nb_fresh and wires transitions with nb_add_transition.
+fn compile_frag(b: NfaBuilder, a: RxAst) : NB_FragR = match a {
+  RxChar(c) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TChar(c, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxAny -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TAny(e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxClass(rs, neg) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TClass(rs, neg, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxAnchor(an) -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    let b2 = nb_fresh(b1)
+    let e = nb_last_id(b2)
+    let b3 = nb_add_transition(b2, s, TAnchor(an, e))
+    NB_Frag(b3, NF(s, e))
+  }
+  RxConcat(xs) -> compile_concat(b, xs)
+  RxAlt(xs)    -> compile_alt(b, xs)
+  RxStar(x)    -> compile_star(b, x)
+  RxPlus(x)    -> compile_plus(b, x)
+  RxOpt(x)     -> compile_opt(b, x)
+  RxRepeat(x, lo, hi_opt) -> compile_repeat(b, x, lo, hi_opt)
+  RxGroup(id, inner) -> compile_group(b, id, inner)
+}
+
+# Concatenation: empty -> a single ε-fragment (matches empty
+# string); non-empty -> compile each child, ε-wire successive
+# accepts to the next start.
+fn compile_concat(b: NfaBuilder, xs: [RxAst]) : NB_FragR = match xs {
+  []  -> {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  }
+  [first, ...rest] -> {
+    let r = compile_frag(b, first)
+    compile_concat_rest(r, rest)
+  }
+}
+
+fn compile_concat_rest(prev: NB_FragR, rest: [RxAst]) : NB_FragR = match prev {
+  NB_Frag(b, frag) -> match rest {
+    [] -> NB_Frag(b, frag)
+    [next, ...more] -> match frag {
+      NF(s, e) -> {
+        let r = compile_frag(b, next)
+        match r {
+          NB_Frag(b1, frag2) -> match frag2 {
+            NF(s2, e2) -> {
+              # Wire previous accept (e) to next start (s2) by ε.
+              let b2 = nb_add_transition(b1, e, TEpsilon(s2))
+              compile_concat_rest(NB_Frag(b2, NF(s, e2)), more)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Alternation: new start with ε-edges to each branch's start; new
+# accept with each branch's accept ε-wired in.
+fn compile_alt(b: NfaBuilder, xs: [RxAst]) : NB_FragR = {
+  # Allocate the outer start + accept up front so every branch
+  # knows where to wire.
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let b3 = compile_alt_branches(b2, xs, outer_s, outer_e)
+  NB_Frag(b3, NF(outer_s, outer_e))
+}
+
+fn compile_alt_branches(b: NfaBuilder, xs: [RxAst], outer_s: Int, outer_e: Int) : NfaBuilder = match xs {
+  [] -> b
+  [first, ...rest] -> {
+    let r = compile_frag(b, first)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) -> {
+          let b2 = nb_add_transition(b1, outer_s, TEpsilon(s))
+          let b3 = nb_add_transition(b2, e, TEpsilon(outer_e))
+          compile_alt_branches(b3, rest, outer_s, outer_e)
+        }
+      }
+    }
+  }
+}
+
+# Star: new start + new accept; ε-edges from outer_s to inner_s and
+# to outer_e (skip path); inner_e ε-back to inner_s (loop) and
+# ε-forward to outer_e.
+fn compile_star(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(s))
+        let b7 = nb_add_transition(b6, e, TEpsilon(outer_e))
+        NB_Frag(b7, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Plus: like star but no skip-path from outer_s — the body must
+# match at least once.
+fn compile_plus(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let r = compile_frag(b, x)
+  match r {
+    NB_Frag(b1, frag) -> match frag {
+      NF(s, e) -> {
+        # Add a loop-back ε from accept to start. The inner
+        # fragment's start/accept become the outer's directly —
+        # no need to allocate fresh wrapper states.
+        let b2 = nb_add_transition(b1, e, TEpsilon(s))
+        NB_Frag(b2, NF(s, e))
+      }
+    }
+  }
+}
+
+# Opt: ε-edge from outer_s to outer_e (skip path); compile body
+# between them.
+fn compile_opt(b: NfaBuilder, x: RxAst) : NB_FragR = {
+  let b1 = nb_fresh(b)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, x)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TEpsilon(s))
+        let b5 = nb_add_transition(b4, outer_s, TEpsilon(outer_e))
+        let b6 = nb_add_transition(b5, e, TEpsilon(outer_e))
+        NB_Frag(b6, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# Bounded repeat {n,m}: unroll into a chain of n required copies
+# followed by (m - n) optional copies. {n,} (max = None) emits
+# n required copies followed by a single Star wrapper for the
+# rest. {n,n} is just n required copies.
+fn compile_repeat(b: NfaBuilder, x: RxAst, lo: Int, hi_opt: Option[Int]) : NB_FragR = {
+  let r0 = compile_repeat_required(b, x, lo)
+  match r0 {
+    NB_Frag(b1, frag1) -> match frag1 {
+      NF(s1, e1) -> match hi_opt {
+        None    -> {
+          # Unbounded tail — append a Star.
+          let r_tail = compile_star(b1, x)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+        Some(hi) -> {
+          # Bounded tail — append (hi - lo) optional copies.
+          let r_tail = compile_repeat_optional(b1, x, hi - lo)
+          match r_tail {
+            NB_Frag(b2, frag_tail) -> match frag_tail {
+              NF(s_tail, e_tail) -> {
+                let b3 = nb_add_transition(b2, e1, TEpsilon(s_tail))
+                NB_Frag(b3, NF(s1, e_tail))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Compile `n` required copies of `x` chained by ε. n == 0 yields a
+# trivial pass-through (single state, start == accept).
+fn compile_repeat_required(b: NfaBuilder, x: RxAst, n: Int) : NB_FragR = {
+  if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_frag(b, x)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_required(b1, x, n - 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+# Compile `n` optional copies of `x` chained by ε. Each copy is
+# a fresh Opt-fragment (skip path included).
+fn compile_repeat_optional(b: NfaBuilder, x: RxAst, n: Int) : NB_FragR = {
+  if n <= 0 {
+    let b1 = nb_fresh(b)
+    let s = nb_last_id(b1)
+    NB_Frag(b1, NF(s, s))
+  } else {
+    let r = compile_opt(b, x)
+    match r {
+      NB_Frag(b1, frag) -> match frag {
+        NF(s, e) ->
+          if n == 1 { NB_Frag(b1, NF(s, e)) }
+          else {
+            let r2 = compile_repeat_optional(b1, x, n - 1)
+            match r2 {
+              NB_Frag(b2, frag2) -> match frag2 {
+                NF(s2, e2) -> {
+                  let b3 = nb_add_transition(b2, e, TEpsilon(s2))
+                  NB_Frag(b3, NF(s, e2))
+                }
+              }
+            }
+          }
+      }
+    }
+  }
+}
+
+# Capture group: outer_s opens the group, outer_e closes it.
+# Inner fragment is sandwiched between zero-width markers.
+fn compile_group(b: NfaBuilder, gid: Int, inner: RxAst) : NB_FragR = {
+  let b0 = nb_record_group(b, gid)
+  let b1 = nb_fresh(b0)
+  let outer_s = nb_last_id(b1)
+  let b2 = nb_fresh(b1)
+  let outer_e = nb_last_id(b2)
+  let r = compile_frag(b2, inner)
+  match r {
+    NB_Frag(b3, frag) -> match frag {
+      NF(s, e) -> {
+        let b4 = nb_add_transition(b3, outer_s, TGroupOpen(gid, s))
+        let b5 = nb_add_transition(b4, e, TGroupClose(gid, outer_e))
+        NB_Frag(b5, NF(outer_s, outer_e))
+      }
+    }
+  }
+}
+
+# ---- NFA dump (debug) ----
+#
+# Compact one-line-per-state textual dump for fixtures. Useful to
+# pin compilation shape before the simulator lands.
+
+#[doc("Renders a compiled NFA as a compact, one-line-per-state textual dump (the debug/fixture format).")]
+pub fn nfa_show(n: Nfa) : String =
+  string_concat_all([
+    "NFA(start=", int_to_string(n.start),
+    ", groups=", int_to_string(n.num_groups), ")\n",
+    rx_states_show(n.states)
+  ])
+
+fn rx_states_show(ss: [NfaState]) : String = match ss {
+  []           -> ""
+  [s, ...rest] -> string_concat(rx_state_show(s), rx_states_show(rest))
+}
+
+fn rx_state_show(s: NfaState) : String = {
+  let acc = if s.accept { "*" } else { " " }
+  string_concat_all([
+    "  ", acc, "[", int_to_string(s.id), "] ",
+    rx_transitions_show(s.transitions), "\n"
+  ])
+}
+
+fn rx_transitions_show(ts: [NfaTransition]) : String = match ts {
+  []           -> ""
+  [t]          -> rx_transition_show(t)
+  [t, ...rest] -> string_concat_all([rx_transition_show(t), ", ", rx_transitions_show(rest)])
+}
+
+fn rx_transition_show(t: NfaTransition) : String = match t {
+  TChar(c, dst)        -> "'#{c}'->#{int_to_string(dst)}"
+  TClass(rs, neg, dst) ->
+    string_concat_all(["[", if neg { "^" } else { "" }, rx_ranges_show(rs), "]->", int_to_string(dst)])
+  TAny(dst)            -> ".->#{int_to_string(dst)}"
+  TEpsilon(dst)        -> "ε->#{int_to_string(dst)}"
+  TGroupOpen(gid, dst) -> "(#{int_to_string(gid)}->#{int_to_string(dst)}"
+  TGroupClose(gid, dst) -> "#{int_to_string(gid)})->#{int_to_string(dst)}"
+  TAnchor(a, dst) -> match a {
+    AnchorStart -> "^->#{int_to_string(dst)}"
+    AnchorEnd   -> "$->#{int_to_string(dst)}"
+  }
+}
+
+# ====================================================================
+# Phase 4 — NFA simulation (set-of-states, leftmost-longest)
+# ====================================================================
+#
+# Pike-style simulator. Each *thread* is a (state_id, captures) pair.
+# At every input position we run an ε-closure over the active set,
+# then consume one input char with TChar / TClass / TAny edges. The
+# threadset is deduped by state_id (first thread to reach a given
+# state wins — gives the leftmost-longest semantics RE2 promises).
+#
+# Capture tracking: each thread carries an immutable map
+# `[Capture]` where Capture is `(group_id, start, end)`. TGroupOpen
+# bumps the start; TGroupClose bumps the end. Group 0 is reserved
+# for the whole-match span and is initialised when the seed thread
+# is built.
+#
+# leftmost-longest: try start positions 0, 1, 2, ... in order; for
+# each start, run the simulation and remember the longest accept
+# position. The first start that produces *any* accept wins (left)
+# and we return its longest span.
+
+#[doc("""
+Captured span. `start == -1` means the group has not opened yet
+along this thread; `end == -1` means it opened but did not close.
+""")]
+pub type Capture = { group_id: Int, start: Int, end: Int }
+
+#[doc("A successful match: the matched span (byte offsets `start`..`end`) and its capture groups.")]
+pub type Match = { start: Int, end: Int, groups: [Capture] }
+
+# Thread record: which NFA state and the per-thread capture stack.
+type Thread = { state_id: Int, captures: [Capture] }
+
+# Initialise a fresh capture vector with group 0's start anchored at
+# the input position the simulation seeds from. Group ids 1..n-1 are
+# absent until TGroupOpen fills them in.
+fn rx_init_captures(start_pos: Int) : [Capture] =
+  [Capture { group_id: 0, start: start_pos, end: -1 }]
+
+# Update the capture vector with a TGroupOpen at `pos`. If a record
+# for `gid` already exists, replace its start (last open wins for
+# that thread); otherwise append.
+fn rx_capture_open(caps: [Capture], gid: Int, pos: Int) : [Capture] =
+  rx_capture_set(caps, gid, pos, -1, true)
+
+fn rx_capture_close(caps: [Capture], gid: Int, pos: Int) : [Capture] =
+  rx_capture_set(caps, gid, -1, pos, false)
+
+fn rx_capture_set(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool) : [Capture] = match caps {
+  [] ->
+    if is_open { [Capture { group_id: gid, start: start_v, end: end_v }] }
+    else       { [Capture { group_id: gid, start: -1, end: end_v }] }
+  [c, ...rest] ->
+    if c.group_id == gid {
+      let new_c = if is_open {
+        Capture { group_id: gid, start: start_v, end: c.end }
+      } else {
+        Capture { group_id: gid, start: c.start, end: end_v }
+      }
+      [new_c, ...rest]
+    } else {
+      [c, ...rx_capture_set(rest, gid, start_v, end_v, is_open)]
+    }
+}
+
+# Close group 0 (the whole-match span) at `pos`. Used right before
+# returning a successful Match so the user always sees the match
+# bounds.
+fn rx_close_match(caps: [Capture], pos: Int) : [Capture] =
+  rx_capture_close(caps, 0, pos)
+
+# ---- Public entry point ----
+
+#[doc("""
+Simulate `nfa` over `input`. Returns Some(Match) at the leftmost
+position with the longest extent, or None if no match exists.
+""")]
+pub fn simulate(nfa: Nfa, input: String) : Option[Match] = {
+  let n = string_length(input)
+  rx_simulate_from(nfa, input, n, 0)
+}
+
+# Try start positions in order until one matches. n is precomputed.
+fn rx_simulate_from(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
+  if start > n { None }
+  else {
+    match rx_simulate_at(nfa, input, n, start) {
+      Some(m) -> Some(m)
+      None    -> rx_simulate_from(nfa, input, n, start + 1)
+    }
+  }
+}
+
+# Simulate from a fixed start position. Returns the longest accept
+# position (or None) by stepping the threadset forward.
+fn rx_simulate_at(nfa: Nfa, input: String, n: Int, start: Int) : Option[Match] = {
+  let seed = Thread { state_id: nfa.start, captures: rx_init_captures(start) }
+  let initial = rx_eps_closure(nfa, [seed], input, n, start)
+  # If any thread already in an accept state, the empty match
+  # at `start` is the current best. We keep stepping in case a
+  # longer match exists.
+  let initial_best = rx_pick_accept(nfa, initial, start)
+  rx_simulate_loop(nfa, input, n, start, initial, initial_best)
+}
+
+# Step pos by pos until threadset empties or input ends.
+fn rx_simulate_loop(nfa: Nfa, input: String, n: Int, pos: Int,
+                     threads: [Thread], best: Option[Match]) : Option[Match] = {
+  if pos >= n or list.is_empty(threads) { best }
+  else {
+    match char_at(input, pos) {
+      None    -> best
+      Some(c) -> {
+        let stepped = rx_step(nfa, threads, c)
+        let pos1 = pos + 1
+        let closed = rx_eps_closure(nfa, stepped, input, n, pos1)
+        let new_best = match rx_pick_accept(nfa, closed, pos1) {
+          Some(m) -> Some(m)
+          None    -> best
+        }
+        rx_simulate_loop(nfa, input, n, pos1, closed, new_best)
+      }
+    }
+  }
+}
+
+# If any thread is in an accept state, materialise its capture
+# vector as a Match record (closing group 0 at `end_pos`). Returns
+# None when no thread is at accept.
+fn rx_pick_accept(nfa: Nfa, threads: [Thread], end_pos: Int) : Option[Match] = match threads {
+  []           -> None
+  [t, ...rest] ->
+    if rx_state_is_accept(nfa.states, t.state_id) {
+      let caps = rx_close_match(t.captures, end_pos)
+      Some(Match { start: rx_match_start(caps), end: end_pos, groups: caps })
+    } else { rx_pick_accept(nfa, rest, end_pos) }
+}
+
+fn rx_match_start(caps: [Capture]) : Int = match caps {
+  [] -> 0
+  [c, ...rest] -> if c.group_id == 0 { c.start } else { rx_match_start(rest) }
+}
+
+fn rx_state_is_accept(states: [NfaState], id: Int) : Bool = match states {
+  [] -> false
+  [s, ...rest] -> if s.id == id { s.accept } else { rx_state_is_accept(rest, id) }
+}
+
+# ---- ε-closure ----
+#
+# Expand the threadset over zero-width transitions:
+# TEpsilon, TGroupOpen, TGroupClose, TAnchor (when satisfied at pos).
+# Anchors that don't match at the current position simply don't
+# expand — the thread stays where it is, but no new edge fires.
+#
+# Dedup: when a thread arrives at a state that already has a
+# representative in the closure, the *first* representative wins.
+# Pike-style. This keeps the threadset bounded by the number of
+# NFA states.
+
+fn rx_eps_closure(nfa: Nfa, seeds: [Thread], input: String, n: Int, pos: Int) : [Thread] = {
+  rx_eps_closure_loop(nfa, seeds, [], input, n, pos)
+}
+
+# Worklist algorithm: pop a thread, if its state is not yet in the
+# closure, add it and push its zero-width neighbours. Order
+# preserved so leftmost-priority is naturally the seed order.
+fn rx_eps_closure_loop(nfa: Nfa, work: [Thread], closure: [Thread],
+                        input: String, n: Int, pos: Int) : [Thread] = match work {
+  [] -> closure
+  [t, ...rest] ->
+    if rx_thread_in(closure, t.state_id) {
+      rx_eps_closure_loop(nfa, rest, closure, input, n, pos)
+    } else {
+      let closure1 = list_append(closure, [t])
+      let trs = rx_get_transitions(nfa.states, t.state_id)
+      let new_threads = rx_zero_width_targets(trs, t.captures, input, n, pos)
+      rx_eps_closure_loop(nfa, list_append(rest, new_threads), closure1, input, n, pos)
+    }
+}
+
+fn rx_thread_in(threads: [Thread], state_id: Int) : Bool = match threads {
+  [] -> false
+  [t, ...rest] -> if t.state_id == state_id { true } else { rx_thread_in(rest, state_id) }
+}
+
+# Collect every zero-width transition's target as a new thread,
+# updating captures appropriately. TAnchor only contributes when the
+# anchor condition holds at `pos`.
+fn rx_zero_width_targets(trs: [NfaTransition], caps: [Capture],
+                          input: String, n: Int, pos: Int) : [Thread] = match trs {
+  [] -> []
+  [t, ...rest] -> {
+    let mine = match t {
+      TEpsilon(dst) -> [Thread { state_id: dst, captures: caps }]
+      TGroupOpen(gid, dst) ->
+        [Thread { state_id: dst, captures: rx_capture_open(caps, gid, pos) }]
+      TGroupClose(gid, dst) ->
+        [Thread { state_id: dst, captures: rx_capture_close(caps, gid, pos) }]
+      TAnchor(an, dst) -> match an {
+        AnchorStart -> if pos == 0 { [Thread { state_id: dst, captures: caps }] } else { [] }
+        AnchorEnd   -> if pos >= n { [Thread { state_id: dst, captures: caps }] } else { [] }
+      }
+      _ -> []
+    }
+    list_append(mine, rx_zero_width_targets(rest, caps, input, n, pos))
+  }
+}
+
+fn rx_get_transitions(states: [NfaState], id: Int) : [NfaTransition] = match states {
+  [] -> []
+  [s, ...rest] -> if s.id == id { s.transitions } else { rx_get_transitions(rest, id) }
+}
+
+# ---- Step ----
+#
+# For each thread, try every consuming transition (TChar / TClass /
+# TAny) against the current character. Accumulate the targets. Order
+# preserved so the next ε-closure dedup keeps leftmost priority.
+
+fn rx_step(nfa: Nfa, threads: [Thread], c: Char) : [Thread] = match threads {
+  [] -> []
+  [t, ...rest] -> {
+    let trs = rx_get_transitions(nfa.states, t.state_id)
+    let here = rx_step_thread(trs, t.captures, c)
+    list_append(here, rx_step(nfa, rest, c))
+  }
+}
+
+fn rx_step_thread(trs: [NfaTransition], caps: [Capture], c: Char) : [Thread] = match trs {
+  [] -> []
+  [t, ...rest] -> {
+    let mine = match t {
+      TChar(ch, dst) ->
+        if ch == c { [Thread { state_id: dst, captures: caps }] } else { [] }
+      TClass(ranges, neg, dst) ->
+        if rx_class_matches(ranges, c) != neg { [Thread { state_id: dst, captures: caps }] }
+        else { [] }
+      TAny(dst) ->
+        # `.` matches any char EXCEPT newline (Perl/RE2 default).
+        if c == '\n' { [] } else { [Thread { state_id: dst, captures: caps }] }
+      _ -> []
+    }
+    list_append(mine, rx_step_thread(rest, caps, c))
+  }
+}
+
+fn rx_class_matches(ranges: [CharRange], c: Char) : Bool = match ranges {
+  [] -> false
+  [r, ...rest] -> match r {
+    CR(lo, hi) ->
+      if char_to_int(c) >= char_to_int(lo) and char_to_int(c) <= char_to_int(hi) { true }
+      else { rx_class_matches(rest, c) }
+  }
+}
+
+# ====================================================================
+# Phase 5 — Public API
+# ====================================================================
+#
+# Opaque `Regex` carrier wrapping a compiled `Nfa`. The lowercase
+# name is the public surface; the parser/NFA/simulator types stay
+# exported for power users (debugging, custom drivers) but are not
+# expected to be touched by typical code.
+#
+# Naming follows the pre-m14 flat-prefix convention:
+# `compile` / `find` / `find_all` / `replace`
+# / `split`. The m14 migration will rename them to
+# `regex.compile` etc.
+
+#[doc("An opaque compiled regular expression, wrapping its NFA. Build one with `compile`.")]
+pub type Regex = R(Nfa)
+
+#[doc("""
+Compile a pattern string. The error variant carries a
+human-readable message — the caller does not need to know about
+RxParseError's internals.
+""")]
+pub fn compile(pattern: String) : Result[String, Regex] =
+  match parse_pattern(pattern) {
+    Err(e) -> match e {
+      RxParseError { msg: m, pos: p } ->
+        Err(string_concat_all(["regex parse error at ", int_to_string(p), ": ", m]))
+    }
+    Ok(ast) -> Ok(R(compile_nfa(ast)))
+  }
+
+#[doc("Find the first (leftmost-longest) match of `re` in `s`.")]
+pub fn find(re: Regex, s: String) : Option[Match] = match re {
+  R(nfa) -> simulate(nfa, s)
+}
+
+#[doc("""
+Find every non-overlapping match. Zero-width matches advance the
+scan cursor by one character so we don't loop forever on
+patterns like `a*` against `bbb`.
+""")]
+pub fn find_all(re: Regex, s: String) : [Match] = match re {
+  R(nfa) -> rx_find_all_loop(nfa, s, 0, string_length(s), [])
+}
+
+fn rx_find_all_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [Match]) : [Match] = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> acc
+    Some(m) -> {
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      rx_find_all_loop(nfa, s, next, n, list_append(acc, [m]))
+    }
+  } }
+}
+
+#[doc("""
+Replace every non-overlapping match with `replacement`. The
+replacement supports `$0` (whole match) and `$1`..`$9` (numbered
+groups). Use `$$` for a literal `$`.
+""")]
+pub fn replace(re: Regex, s: String, replacement: String) : String = match re {
+  R(nfa) -> rx_replace_loop(nfa, s, replacement, 0, string_length(s), "")
+}
+
+fn rx_replace_loop(nfa: Nfa, s: String, repl: String, from_pos: Int, n: Int, acc: String) : String = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> string_concat(acc, string_slice(s, from_pos, n - from_pos))
+    Some(m) -> {
+      # Append source [from_pos..m.start) verbatim, then the
+      # expanded replacement. Advance to m.end (or +1 on a
+      # zero-width match) for the next iteration.
+      let prefix = string_slice(s, from_pos, m.start - from_pos)
+      let expanded = rx_expand_replacement(repl, m, s)
+      let acc1 = string_concat(acc, string_concat(prefix, expanded))
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      # Zero-width: also copy the skipped char so it is not lost.
+      let acc2 = if m.end == m.start and m.start < n {
+        match char_at(s, m.start) {
+          Some(c) -> string_concat(acc1, "#{c}")
+          None    -> acc1
+        }
+      } else { acc1 }
+      rx_replace_loop(nfa, s, repl, next, n, acc2)
+    }
+  } }
+}
+
+# Expand $N back-references in `repl` against the captured groups.
+# `$$` -> literal `$`. Unknown groups expand to the empty string
+# (mirrors most engines' lenient behaviour).
+fn rx_expand_replacement(repl: String, m: Match, src: String) : String = {
+  let n = string_length(repl)
+  rx_expand_loop(repl, 0, n, m, src, "")
+}
+
+fn rx_expand_loop(repl: String, i: Int, n: Int, m: Match, src: String, acc: String) : String = {
+  if i >= n { acc }
+  else { match char_at(repl, i) {
+    None -> acc
+    Some(c) ->
+      if c == '$' {
+        let i1 = i + 1
+        if i1 >= n { string_concat(acc, "$") }
+        else { match char_at(repl, i1) {
+          None -> string_concat(acc, "$")
+          Some(c2) ->
+            if c2 == '$' {
+              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, "$"))
+            } else if char.is_digit(c2) {
+              let gid = char_to_int(c2) - char_to_int('0')
+              let span = rx_group_span(m.groups, gid, src)
+              rx_expand_loop(repl, i1 + 1, n, m, src, string_concat(acc, span))
+            } else {
+              # `$x` where x is not a digit or $ — emit literally.
+              rx_expand_loop(repl, i1 + 1, n, m, src,
+                             string_concat(acc, string_concat("$", "#{c2}")))
+            }
+        } }
+      } else {
+        rx_expand_loop(repl, i + 1, n, m, src, string_concat(acc, "#{c}"))
+      }
+  } }
+}
+
+# Look up a captured span by group id. Missing or never-closed
+# groups expand to the empty string.
+fn rx_group_span(caps: [Capture], gid: Int, src: String) : String = match caps {
+  [] -> ""
+  [c, ...rest] ->
+    if c.group_id == gid {
+      if c.start >= 0 and c.end >= 0 and c.end >= c.start {
+        string_slice(src, c.start, c.end - c.start)
+      } else { "" }
+    } else { rx_group_span(rest, gid, src) }
+}
+
+#[doc("""
+Split `s` at every non-overlapping match of `re`. The match
+itself is excluded from the output (mirrors Python `re.split`).
+Empty matches are tolerated: the scan advances by one char so
+`"abc"` split by `"x*"` yields `["a", "b", "c"]` rather than
+looping. Trailing empty segments are kept (Python semantics).
+""")]
+pub fn split(re: Regex, s: String) : [String] = match re {
+  R(nfa) -> rx_split_loop(nfa, s, 0, string_length(s), [])
+}
+
+fn rx_split_loop(nfa: Nfa, s: String, from_pos: Int, n: Int, acc: [String]) : [String] = {
+  if from_pos > n { acc }
+  else { match rx_simulate_from(nfa, s, n, from_pos) {
+    None -> list_append(acc, [string_slice(s, from_pos, n - from_pos)])
+    Some(m) -> {
+      let segment = string_slice(s, from_pos, m.start - from_pos)
+      let acc1 = list_append(acc, [segment])
+      let next = if m.end > m.start { m.end } else { m.start + 1 }
+      rx_split_loop(nfa, s, next, n, acc1)
+    }
+  } }
+}
+
+#[doc("""
+m12.6.x #7: regex sigil + refinement-side `matches` predicate.
+
+The compiler desugars `~r/pattern/` to `compile_or_panic
+("pattern")` and `where matches <re>` to `matches(self, <re>)`.
+Putting both helpers here keeps the runtime contract for the sigil
+in one file alongside the engine itself.
+
+`compile_or_panic` is the sigil's runtime carrier: by the
+time it runs the parser has already accepted the literal, so an
+Err from `compile` means the supported subset doc and the
+engine disagree — which is a compiler bug worth crashing on, not
+a recoverable error worth threading through `Result`.
+""")]
+pub fn compile_or_panic(pattern: String) : Regex = match compile(pattern) {
+  Err(msg) -> panic(string_concat("invalid regex sigil: ", msg))
+  Ok(re)   -> re
+}
+
+#[doc("""
+`matches(s, re)` is the predicate-pure refinement-side primitive.
+Returns true iff the *entire* string `s` matches `re` (Pony / Ada
+Static_Predicate semantics — full match, not substring). The
+typical use is `String where matches ~r/^[a-z]+$/`; the parser's
+refinement-predicate sugar elides the `self` receiver so the
+source reads identically to the spec.
+
+v1 recompiles the pattern on every refinement check (the sigil
+itself does the compile). The intended optimization (hoist the
+sigil's compile to a module-level const) is tracked under the
+m12.6 #7 follow-up; mini_ledger's per-deposit pattern check is
+the canonical hot path to measure first.
+""")]
+pub fn matches(s: String, re: Regex) : Bool = match find(re, s) {
+  None    -> false
+  Some(m) -> m.start == 0 and m.end == string_length(s)
+}

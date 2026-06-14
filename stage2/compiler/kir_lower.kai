@@ -1,0 +1,676 @@
+# compiler/kir_lower.kai — KIR lowering base: state, name supply, block
+# accumulation, type/decl walks, and the pure helpers.
+#
+# This module holds everything the Expr→ANF recursion in
+# `kir_lower_walk.kai` builds ON but that does NOT itself recurse through
+# `lower_expr`. Keeping the non-recursive base here and the mutual
+# recursion (expr ↔ call ↔ if/match) in the walk module lets the import
+# DAG stay acyclic (base ← walk, never base → walk) while each file stays
+# small and A-grade.
+#
+# Determinism (design §7, Risk 2): byte-id of the downstream output
+# requires (a) ANF flattening uses fixed left-to-right order; (b) virtual
+# register names come from a monotonic counter RESET PER FUNCTION; (c)
+# blocks are emitted in generation order, never from a hash set. `LowerSt`
+# carries the per-function counter and the in-progress block list.
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.resolve
+import compiler.region
+import compiler.kir
+
+# --- Lowering state -----------------------------------------------------
+
+# Threaded immutably through the lowering, mirroring `EmitCtx`. A record
+# (not a positional tuple) so adding a field — lams / enc_fn for closure
+# lowering — does not touch every destructure site. Fields: per-function
+# reg + block-label counters, finished blocks (generation order), current
+# block label, current block's reversed statement list, the EFn symbol
+# table, the variant→tag table, the lifted-lambda table (`find_lam`), and
+# the enclosing-fn key the lambda lookup is scoped by.
+pub type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
+                     fns: [EFn], vs: [EVar], lams: [LamInfo], enc_fn: String,
+                     effs: [String], consts: [Decl],
+                     # `locals` is the set of names BOUND in the current fn
+                     # body (params + captures + every `let`/match binder).
+                     # It is the KIR mirror of emit_c's `EmitCtx.lcs`
+                     # (lexical-scope names): an `EVar(nm)` whose `nm` is in
+                     # `locals` is a genuine local read, and MUST win over a
+                     # same-name top-level fn / stdlib `pub fn` / prelude
+                     # builtin (the locals-shadow-imports rule, #748/#749).
+                     # Without it, a param named like a stdlib fn (e.g.
+                     # `init` vs `list.init`, `foldl`'s `init`) lowered to a
+                     # closure over the stdlib thunk instead of the local —
+                     # the closure then reached an arithmetic op as a
+                     # non-Int operand (the runtime-type-mismatch family).
+                     # Seeded at fn entry with params/captures; extended at
+                     # each binder. Forward-visible (a `let` is in scope
+                     # only after its definition), matching lexical order.
+                     locals: [String] }
+
+# Result of lowering one expression: its value atom + threaded state.
+pub type LRes = LRes(KVal, LowerSt)
+# Result of lowering a list of expressions: their atoms + threaded state.
+pub type LResMany = LResMany([KVal], LowerSt)
+
+pub type LSReg = LSReg(String, LowerSt)
+pub type LSLabel = LSLabel(String, LowerSt)
+pub type LSL3 = LSL3(String, String, String, LowerSt)
+pub type LSL2 = LSL2(String, String, LowerSt)
+pub type ArmPlan = ArmPlan([KCase], LowerSt)
+pub type RecPlan = RecPlan([KFieldInit], LowerSt)
+# An optional lowered value (handler state init) + threaded state.
+pub type LResOpt = LResOpt(Option[KVal], LowerSt)
+
+pub fn ls_new(fns: [EFn], variants: [EVar], lams: [LamInfo], effs: [String],
+              consts: [Decl]) : LowerSt =
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, vs: variants,
+            lams: lams, enc_fn: "", effs: effs, consts: consts, locals: [] }
+
+# Reset the per-function counters and block buffers, preserving the shared
+# tables. `enc_fn` is the fn/lambda symbol the body's nested lambdas are
+# scoped by (`find_lam` keys on it). `locals` is seeded with the fn's
+# bound names (params + captures) so a same-name top-level fn does not
+# shadow a local read in the body (#748/#749). Called at the head of
+# every KFn lowering (Risk 2b).
+pub fn ls_enter_fn(st: LowerSt, enc_fn: String, locals: [String]) : LowerSt =
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: st.fns, vs: st.vs,
+            lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts, locals: locals }
+
+# Rotate the EFn table so entries from module `mo` resolve FIRST, then enter
+# the fn. Mirror of the C / LLVM emitters, which call `fns_prefer_module(fns,
+# mo)` before lowering each fn body so a bare call to a name exported by BOTH
+# the current module and an import resolves to the SAME-MODULE definition
+# (`efn_resolve`'s first-match fallback). Without this the KIR resolved
+# `hashset.from_list`'s bare `empty()` to the imported `hashmap.empty`
+# (head of the table) instead of the local `hashset.empty` — the `no such
+# field inner` miscompile. Pure table reorder; no other state changes.
+pub fn ls_enter_fn_in(st: LowerSt, enc_fn: String, locals: [String],
+                      mo: Option[String]) : LowerSt =
+  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns_prefer_module(st.fns, mo),
+            vs: st.vs, lams: st.lams, enc_fn: enc_fn, effs: st.effs, consts: st.consts,
+            locals: locals }
+
+# Extend the lexical scope with one bound name (a `let` / match binder).
+# Forward-visible: a binder is in scope only after its definition. Idempotent
+# on duplicate names (a re-bind of the same name in a nested scope is a no-op
+# for the shadow test — the name is already known-local).
+pub fn ls_bind_local(st: LowerSt, name: String) : LowerSt =
+  if ls_is_local(st, name) { st }
+  else { LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns,
+                   vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs,
+                   consts: st.consts, locals: [name, ...st.locals] } }
+
+# Is `name` a name bound locally in the current fn body? (param / capture /
+# let / match binder). The shadow test `lower_var` consults before treating
+# a name as a top-level fn-value.
+pub fn ls_is_local(st: LowerSt, name: String) : Bool = name_in_list(st.locals, name)
+
+# A fresh virtual-register name, deterministic per function: `.t0`, `.t1`, …
+# The leading `.` is load-bearing, NOT cosmetic: a temporary shares the
+# fn's register table (string-keyed allocas) with the SURFACE binder names
+# that `bind_pattern_fields` emits verbatim (`PBind(name) -> KLet(name, …)`).
+# A user / stdlib binder named `t2` (e.g. `stdlib/collections/map.kai`'s
+# `TNode(xk, xv, _, t1, t2)`) would ALIAS a `t2` temporary — same alloca,
+# the second store clobbers the first. When their slots also differ (a
+# `tagof` temporary is `SInt32`, the surface sub-tree binder is `SBoxed`)
+# the clobber surfaces as `Call parameter type does not match function
+# signature` at verify; when the slots happen to match it corrupts silently.
+# `.` is rejected by the lexer in a surface identifier, so a `.tN` temporary
+# can NEVER collide with a surface name — an impossibility, not a heuristic
+# (`__t` would only lower the odds: a user CAN write `__t2`). LLVM accepts
+# `.` in a local value name (the walk already appends `.addr` to allocas).
+pub fn ls_fresh_reg(st: LowerSt) : LSReg =
+  LSReg(cat2(".t", int_to_string(st.rc)), ls_with_rc(st, st.rc + 1))
+
+# A fresh block label, deterministic per function: `L0`, `L1`, …
+pub fn ls_fresh_label(st: LowerSt) : LSLabel =
+  LSLabel(cat2("L", int_to_string(st.bc)), ls_with_bc(st, st.bc + 1))
+
+# --- Field updaters (record copy-with) ----------------------------------
+
+fn ls_with_rc(st: LowerSt, rc: Int) : LowerSt =
+  LowerSt { rc: rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+fn ls_with_bc(st: LowerSt, bc: Int) : LowerSt =
+  LowerSt { rc: st.rc, bc: bc, bs: st.bs, cl: st.cl, ss: st.ss, fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+
+# --- Block accumulation -------------------------------------------------
+
+# Append one statement to the block under construction (stored reversed).
+# A binder statement (`KLet` / `KStore`) also EXTENDS `locals` with its
+# destination name — the single chokepoint every match/let/record/variant
+# binder funnels through, so the lexical-scope set stays complete without
+# threading a bind callback through each binding site. Forward-visible: the
+# name enters scope at the statement that binds it (lexical order).
+pub fn ls_emit(st: LowerSt, s: KStmt) : LowerSt =
+  ls_emit_raw(ls_bind_local_of(st, s), s)
+
+# The name a binder statement introduces, if any (`KLet`/`KStore` dest).
+fn ls_bind_local_of(st: LowerSt, s: KStmt) : LowerSt = match s {
+  KLet(name, _, _, _) -> ls_bind_local(st, name)
+  KStore(name, _, _)  -> ls_bind_local(st, name)
+  _                   -> st
+}
+
+fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: st.cl, ss: [s, ...st.ss], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+
+# Seal the current block with a terminator and start a fresh block under
+# `next_label`. The sealed block joins `blocks` in generation order.
+pub fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc,
+            bs: list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }]),
+            cl: next_label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+
+# Seal the final block without opening a successor (function exit).
+pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] =
+  list_append(st.bs, [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }])
+
+# The variant tag for a constructor name. `evar_find_tag` returns 0 for an
+# unregistered name, so this is total.
+pub fn ls_variant_tag(st: LowerSt, name: String) : Int = evar_find_tag(st.vs, name)
+
+# Resolve a bare callee name to its mangled symbol via the EFn table; an
+# unresolved name (builtin / prim) keeps its bare name for the translator.
+pub fn c_sym_of_callee_st(st: LowerSt, name: String) : String = c_sym_of_callee(st.fns, name)
+
+# A first-class function value: an `EVar(nm)` that names a top-level fn
+# (not a local binder) lowers to a closure over the fn's thunk symbol.
+# Returns the closure descriptor (thunk-with-`@`, arity) or None when
+# `nm` is a local binder. Params / let-binders are never in the EFn
+# table, so an `efn_resolve` hit means a genuine fn reference (the
+# fn-vs-local-shadow case is a pre-existing resolver bug, out of scope).
+pub type FnValue = FV(String, Int)
+
+pub fn ls_fn_value(st: LowerSt, nm: String) : Option[FnValue] = match efn_resolve(st.fns, nm) {
+  Some(EFn(_, arity, mo, _)) -> Some(FV(cat3("_kai_", c_sym(nm, mo), "_thunk"), arity))
+  None                       -> kir_prelude_fn_value(nm)
+}
+
+# A PRELUDE builtin used as a first-class value (`map(xs, int_to_string)`):
+# the closure rides the runtime's pre-defined `kaix_<name>_thunk` (defined
+# in `stage0/runtime_llvm.c`). Mirror of emit_llvm's `llvm_prelude_find` →
+# `LP(_, arity, Some(thunk))` arm and emit_c's `prelude_find` → `EP` arm:
+# only the builtins with a `Some(thunk)` entry can be a value (most prims
+# are call-only). The native `nemit_closure_call` declares `sym` directly,
+# so it carries the bare runtime symbol (no `@`, no `&`). The set MUST stay
+# in lockstep with the runtime thunks; an unlisted name falls through to a
+# local-binder `KVar` (the genuine-local case `lower_var` ends on).
+fn kir_prelude_fn_value(nm: String) : Option[FnValue] =
+  if nm == "print"        { Some(FV("kaix_print_thunk", 1)) }
+  else if nm == "eprint"        { Some(FV("kaix_eprint_thunk", 1)) }
+  else if nm == "write_stdout"  { Some(FV("kaix_write_stdout_thunk", 1)) }
+  else if nm == "int_to_string" { Some(FV("kaix_int_to_string_thunk", 1)) }
+  else { None }
+
+# A qualified reference (`mod.fn`) as a fn-value: mint the prefixed thunk
+# symbol from the module + name (emit_c's EModCall value arm), resolving
+# the arity from the EFn table. Falls back to arity 0 when unresolved
+# (matches emit_c's `kai_<fname>` degenerate path — rare, surfaced here
+# rather than silently wrong).
+pub fn ls_fn_value_qualified(st: LowerSt, modn: String, name: String) : FnValue = match efn_resolve(st.fns, name) {
+  Some(EFn(_, arity, _, _)) -> FV(cat3("_kai_", c_sym(name, Some(modn)), "_thunk"), arity)
+  None                      -> FV(cat3("_kai_", c_sym(name, Some(modn)), "_thunk"), 0)
+}
+
+# A bare-name call is DIRECT when the callee is a known top-level fn or a
+# prelude builtin; otherwise it is a local binder holding a function
+# value (called indirectly). `prelude_names()` (resolve, target-neutral)
+# is the shared prelude list — no backend table is consulted here.
+pub fn callee_is_direct(st: LowerSt, callee: String) : Bool = match efn_resolve(st.fns, callee) {
+  Some(_) -> true
+  None    -> name_in_list(prelude_names(), callee)
+}
+
+fn name_in_list(xs: [String], target: String) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> if h == target { true } else { name_in_list(rest, target) }
+}
+
+# --- Top-level consts (inlined at their use site) -----------------------
+
+# The top-level `DConst` decls of a program, kept in `LowerSt.consts` so
+# `lower_var` materialises a const read as its literal body inline — the
+# same modelling as the C-direct oracle's `EmitCtx.consts` /
+# `const_body_of` (emit_c) and the LLVM-text backend's `llvm_const_body_of`
+# (a const is a literal with a name, not a function). Mirror of
+# emit_c's `const_decls_only`.
+pub fn kir_const_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DConst(_, _, _, _, _, _, _) -> kir_const_decls(rest, list_append(acc, [d]))
+    _                           -> kir_const_decls(rest, acc)
+  }
+}
+
+# A const decl's literal body by name, or None when `name` is not a
+# top-level const (then it is a fn / prelude builtin / local binder).
+# Mirror of emit_c's `const_body_of`.
+pub fn kir_const_body(consts: [Decl], name: String) : Option[Expr] = match consts {
+  [] -> None
+  [d, ...rest] -> match d {
+    DConst(_, cn, _, body, _, _, _) ->
+      if cn == name { Some(body) } else { kir_const_body(rest, name) }
+    _ -> kir_const_body(rest, name)
+  }
+}
+
+# --- Pure helpers (no recursion through lower_expr) ----------------------
+
+# Lift an AST node's `line`/`col` into a KIR position (Risk 7).
+pub fn kpos_of(x: Expr) : KPos = KAt(x.line, x.col)
+
+# Bind an op into a fresh register and return that register as the value —
+# the funnel through which every named subexpression flows (ANF's "name
+# every non-trivial result" rule). Boxed slot: every value-bearing op is
+# boxed today (unboxing is a later milestone, §4.6).
+pub fn bind_op(st: LowerSt, op: KOp, pos: KPos) : LRes =
+  bind_op_slot(st, op, SBoxed, pos)
+
+# As `bind_op`, but with an explicit slot. The lowering — never a backend
+# — decides a register's repr (asu review): a `KTagOf` result is the raw
+# `i32` tag word (`SInt32`), so the native backend lowers a real LLVM
+# `switch` over an integer scrutinee instead of reinterpreting a `ptr`.
+# KSlot stays the single source of truth for the register's type.
+pub fn bind_op_slot(st: LowerSt, op: KOp, slot: KSlot, pos: KPos) : LRes = match ls_fresh_reg(st) {
+  LSReg(name, st1) -> LRes(KVar(name), ls_emit(st1, KLet(name, slot, op, pos)))
+}
+
+# A tail terminator (sentinel / resume) ends the current block; nothing
+# follows it in valid IR. Seal here and open a fresh (unreachable)
+# successor so the cursor stays valid for the caller's exit KRet; the
+# translator drops the unnamed successor (Risk 1). The label is threaded
+# so the per-fn counter stays deterministic (Risk 2).
+pub fn seal_tail(st: LowerSt, term: KTerm) : LRes = match ls_fresh_label(st) {
+  LSLabel(dead, st1) -> LRes(KUnitV, ls_seal(st1, term, dead))
+}
+
+# Reloop assignments: param slot i ← value atom i, in order.
+pub fn assigns_of(vs: [KVal], idx: Int, acc: [KAssign]) : [KAssign] = match vs {
+  [] -> acc
+  [v, ...rest] -> assigns_of(rest, idx + 1, list_append(acc, [KAsg(idx, v)]))
+}
+
+# Wrap each value atom as a boxed slot-init. i64-inline (SIInt64) is
+# decided from the constructor's CtorIntSlots in a later milestone (§4.6);
+# the boxed default is correct, just not yet optimised.
+pub fn boxed_inits(vs: [KVal], acc: [KSlotInit]) : [KSlotInit] = match vs {
+  [] -> acc
+  [v, ...rest] -> boxed_inits(rest, list_append(acc, [SIBoxed(v)]))
+}
+
+# An uppercase-initial name is a constructor (the same lexical heuristic
+# perceus uses). Local copy so KIR lowering does not depend on perceus's
+# private `pcs_name_is_ctor` — keeps the module boundary clean.
+pub fn kir_name_is_ctor(nm: String) : Bool = match char_at(nm, 0) {
+  Some(c) -> c >= 'A' and c <= 'Z'
+  None    -> false
+}
+
+# Allocate three / two fresh block labels at once for the control-flow
+# forks, threading the counter deterministically.
+pub fn three_labels(st: LowerSt) : LSL3 = match ls_fresh_label(st) {
+  LSLabel(a, st1) -> match ls_fresh_label(st1) {
+    LSLabel(b, st2) -> match ls_fresh_label(st2) {
+      LSLabel(c, st3) -> LSL3(a, b, c, st3)
+    }
+  }
+}
+
+pub fn two_labels(st: LowerSt) : LSL2 = match ls_fresh_label(st) {
+  LSLabel(a, st1) -> match ls_fresh_label(st1) { LSLabel(b, st2) -> LSL2(a, b, st2) }
+}
+
+# Reopen a previously-named label as the current block (it must already be
+# sealed); sets the cursor for the next statements.
+pub fn reopen(st: LowerSt, label: String) : LowerSt =
+  LowerSt { rc: st.rc, bc: st.bc, bs: st.bs, cl: label, ss: [], fns: st.fns, vs: st.vs, lams: st.lams, enc_fn: st.enc_fn, effs: st.effs, consts: st.consts, locals: st.locals }
+
+# --- Type declarations --------------------------------------------------
+
+# Walk the decls collecting sum/record type declarations with resolved
+# tags. Constructors carry their slot kinds so translators never re-derive
+# boxed-vs-i64 (design §4.6).
+pub fn lower_types(ds: [Decl], variants: [EVar], acc: [KTypeDecl]) : [KTypeDecl] = match ds {
+  [] -> acc
+  [d, ...rest] -> lower_types(rest, variants, lower_type_one(d, variants, acc))
+}
+
+fn lower_type_one(d: Decl, variants: [EVar], acc: [KTypeDecl]) : [KTypeDecl] = match d {
+  DType(_, nm, _, body, _, _, _) -> match body {
+    TBSum(vs) -> list_append(acc, [KSumT(nm, lower_ctors(vs, variants, []))])
+    TBRecord(fields) -> list_append(acc, [KRecordT(nm, lower_fields(fields, []))])
+    _ -> acc
+  }
+  _ -> acc
+}
+
+fn lower_ctors(vs: [Variant], variants: [EVar], acc: [KCtor]) : [KCtor] = match vs {
+  [] -> acc
+  [v, ...rest] -> match v {
+    Var(vname, vtys) ->
+      lower_ctors(rest, variants,
+        list_append(acc, [KCtor { name: vname, tag: evar_find_tag(variants, vname),
+                                  slots: lower_ctor_slots(vtys, []) }]))
+  }
+}
+
+# Conservatively boxed until the lowering consults the unbox
+# classification; the translator reads the slot, never re-derives it.
+fn lower_ctor_slots(tys: [TypeExpr], acc: [KSlot]) : [KSlot] = match tys {
+  [] -> acc
+  [_, ...rest] -> lower_ctor_slots(rest, list_append(acc, [SBoxed]))
+}
+
+fn lower_fields(fields: [FieldDecl], acc: [KField]) : [KField] = match fields {
+  [] -> acc
+  [f, ...rest] -> match f {
+    FD(_, fname, _) ->
+      lower_fields(rest, list_append(acc, [KField { fname: fname, fslot: SBoxed }]))
+  }
+}
+
+# --- Regions / params ---------------------------------------------------
+
+pub fn lower_regions(rs: [RegionMark], acc: [KRegion]) : [KRegion] = match rs {
+  [] -> acc
+  [_, ...rest] -> lower_regions(rest, list_append(acc, [KRgn(list_length(acc), "region")]))
+}
+
+# Lower a fn / lambda parameter list. Each param is a `PDirect(i)` — the
+# i-th argument under whichever calling kind the enclosing `KFn` carries
+# (a normal fn's direct param, or a lambda/clause's `args[i]`).
+pub fn lower_params(ps: [Param], acc: [KParam]) : [KParam] =
+  lower_params_idx(ps, list_length(acc), acc)
+
+fn lower_params_idx(ps: [Param], i: Int, acc: [KParam]) : [KParam] = match ps {
+  [] -> acc
+  [p, ...rest] ->
+    lower_params_idx(rest, i + 1,
+      list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: KOwn, origin: PDirect(i) }]))
+}
+
+# Build a capture param: the j-th closure capture, read from `self`.
+pub fn capture_param(name: String, j: Int) : KParam =
+  KParam { name: name, slot: SBoxed, mode: KOwn, origin: PCapture(j) }
+
+# A return / param slot from a type annotation. Conservative boxed until
+# the lowering consults the unbox classification.
+pub fn slot_of_ty(t: Option[TypeExpr]) : KSlot = SBoxed
+
+# Resolve a binary operator to its prim name. Arithmetic / comparison ops
+# map 1:1 to a runtime helper the translator knows (`+` → `kai_add`,
+# etc.), so the raw op string passes through. `++` is overloaded on the
+# operand type (string concat vs list append): resolve it HERE, in the
+# lowering, from the typed AST — the translator must not re-derive types
+# (§5). The operand `a` carries the typer-stamped `ty`.
+pub fn binop_prim(op: String, a: Expr) : String =
+  if op == "++" {
+    match a.ty { Some(TyListT(_)) -> "kai_prelude_list_append" _ -> "kai_string_concat" }
+  } else { op }
+
+# Resolve a UNARY operator to its prim name. The unary `-` must NOT reuse
+# the binary `-` string: the binary maps to the two-operand `kaix_sub`, so
+# an `EUnop("-", a)` lowered as `KPrim("-", [a])` would emit a one-arg call
+# to a two-arg helper — the second operand reads an uninitialised register
+# (the mismatch the C-direct oracle never had, since `emit_c`'s
+# `unop_cname` maps unary `-` → `kai_op_neg`, a distinct symbol). Mirror
+# that split here: `-` → `neg` (the translator routes it to `kaix_neg`),
+# `not` keeps its own string (already a one-arg `kaix_not`).
+pub fn unop_prim(op: String) : String = if op == "-" { "neg" } else { op }
+
+# --- Callee classification (sentinel / perceus mark / ctor / direct) ----
+
+# How a named-call callee lowers. The dense `if/else if` chain over
+# sentinel + magic-name strings was a dispatch TABLE disguised as control
+# flow; promoting it to an enum + one pure classifier keeps the walk's
+# `lower_named_call` a flat `match` (cognitive-complexity discipline).
+pub type CalleeKind
+  = CkDup | CkDrop | CkBorrow | CkReuse
+  | CkTrmcStep | CkTrmcApply | CkTcrec | CkResume
+  | CkStripUnit | CkUnitName
+  | CkCtor | CkDirect
+
+# Classify a bare callee name. Pure (no re-entry into `lower_expr`), so it
+# lives in the base. The order mirrors the old chain exactly: perceus
+# marks first, then the TRMC/tcrec sentinels, then resume, then the
+# uppercase-initial constructor heuristic, then an ordinary direct call.
+pub fn classify_callee(callee: String) : CalleeKind =
+  if callee == "__perceus_dup" { CkDup }
+  else if callee == "__perceus_drop" { CkDrop }
+  else if callee == "__perceus_borrow" { CkBorrow }
+  else if is_reuse_mark(callee) { CkReuse }
+  else if string_starts_with_q(callee, "__kai_trmc|") { CkTrmcStep }
+  else if callee == "__kai_trmc_apply" { CkTrmcApply }
+  else if es_tcrec_is_sentinel(callee) { CkTcrec }
+  else if callee == "resume" { CkResume }
+  else if callee == "__strip_unit" { CkStripUnit }
+  else if callee == "unit_name" { CkUnitName }
+  else if kir_name_is_ctor(callee) { CkCtor }
+  else { CkDirect }
+
+fn is_reuse_mark(callee: String) : Bool =
+  callee == "__perceus_reuse_variant" or callee == "__perceus_reuse_cons" or callee == "__perceus_reuse_record"
+
+# An effect op call `Eff.op` (the flat `EVar("Eff.op")` the op-call
+# desugar produces). Splits to (eff, op) iff the prefix before the first
+# `.` is a declared effect name; otherwise None (an ordinary call or a
+# qualified ctor like `Some.x`).
+pub type EffOp = EffOp(String, String)
+
+pub fn split_eff_op(callee: String, effs: [String]) : Option[EffOp] =
+  match dot_index(callee, 0, string_length(callee)) {
+    Some(i) -> {
+      let eff = string_slice(callee, 0, i)
+      if name_in_list(effs, eff) {
+        Some(EffOp(eff, string_slice(callee, i + 1, string_length(callee) - i - 1)))
+      } else { None }
+    }
+    None -> None
+  }
+
+# Index of the first `.` in `s`, or None. Local scan (the compiler's flat
+# namespace has no generic `string_index_of`).
+fn dot_index(s: String, i: Int, n: Int) : Option[Int] =
+  if i >= n { None }
+  else { match char_at(s, i) { Some('.') -> Some(i) _ -> dot_index(s, i + 1, n) } }
+
+# --- Effect default-handler install order (design §5) -------------------
+
+# The canonical install order for the built-in default handlers. The
+# single source of truth both backends must agree on (the C and LLVM
+# copies of this list drifting was the #1 effect divergence the KIR
+# closes — design §5). Reproduced here (a target-neutral list, not
+# analysis) so `KProgram.install_order` carries it once.
+pub fn kir_builtin_install_order() : [String] =
+  ["Stdout", "Stderr", "Fail", "Stdin", "Env", "File", "Clock",
+   "Random", "SecureRandom", "NetTcp", "NetDns", "Signal", "Process", "Log",
+   "Mutable", "Cancel", "Link", "Monitor", "Spawn"]
+
+# User-declared effects in main's row that are NOT builtin defaults go
+# after the builtins (so pop order mirrors reverse-declaration). Mirror of
+# emit_c's `user_effects_in_row`.
+pub fn kir_user_effects_in_row(main_row: [String]) : [String] = match main_row {
+  [] -> []
+  [x, ...rest] ->
+    if name_in_list(kir_builtin_install_order(), x) { kir_user_effects_in_row(rest) }
+    else { [x, ...kir_user_effects_in_row(rest)] }
+}
+
+# The full install order: builtins first, then main-row user effects.
+# `main_row_labels` (emit_shared) extracts main's effect row.
+pub fn kir_install_order(decls: [Decl]) : [String] =
+  list_append(kir_builtin_install_order(), kir_user_effects_in_row(main_row_labels(decls)))
+
+# --- Default-handler op→runtime-symbol resolution (native install) ------
+#
+# For each effect in `install_order` carrying an all-`$extern_handler`
+# default block, resolve its ops to the `kaix_default_<eff>_<op>`
+# forwarders. The synthetic builtins (Stdout/Stderr/Fail/…) and any
+# user effect with a `default { }` block (Clock in stdlib/time.kai) go
+# through the SAME `find_effect_default_block` path — the compiler
+# injects the builtins as real `DEffect` decls with default blocks
+# (driver.kai `builtin_stdout_decl` &c.), so there is no second class.
+# Mirror of emit_llvm's `lvm_default_install_for_effect` op walk, but
+# producing target-neutral `KDefault` data the native translator reads.
+
+# Map the C symbol `kai_default_<eff>_<op>` carried by `$extern_handler`
+# to the LLVM-visible non-static forwarder `kaix_default_<eff>_<op>`
+# (issue #115: the static runtime handler is `kai_*`; only the `kaix_*`
+# mirror is callable from emitted code). Mirror of `lvm_kaix_symbol`.
+pub fn kir_kaix_symbol(c_sym: String) : String =
+  if string_starts_with_q(c_sym, "kai_") {
+    string_concat("kaix_", string_slice(c_sym, 4, string_length(c_sym) - 4))
+  } else { c_sym }
+
+# Recognise a `$extern_handler("c_symbol")` clause body and return the
+# bridged C symbol, or "" when the body is not such a bridge.
+#
+# Returns a plain `String`, NOT the `Option[String]` that emit_shared's
+# `extern_handler_c_symbol` returns — load-bearing, not style. The Option
+# form trips a kaic1 codegen bug that silently empties the bound value
+# (`Some("")` even though a direct strip returns the symbol); a plain
+# String in one SSA slot guarded on `== ""` sidesteps it. This is the same
+# fix `lvm_extern_handler_c_symbol` (emit_llvm) applies for the same reason
+# — see docs/lane-experience-llvm-parity-B.md. The native lowering runs in
+# the kaic1-built KAI_LLVM kaic2, so the bug bites here too.
+fn kir_extern_handler_c_symbol(body: Expr) : String = match body.kind {
+  EIntrinsic(name, args_) ->
+    if name == "extern_handler" {
+      match args_ {
+        [a] -> match a.kind {
+          EStr(span, is_triple) -> if is_triple { "" } else { strip_string_quotes(span) }
+          _ -> ""
+        }
+        _ -> ""
+      }
+    } else { "" }
+  _ -> ""
+}
+
+# The op→symbol pairs of one default block's clauses, in clause order
+# (= op declaration order, so the position is the Ev field offset). A
+# clause that does not bridge via `$extern_handler` (empty symbol) is skipped.
+fn kir_default_ops(cs: [HClause]) : [KDefOp] = match cs {
+  [] -> []
+  [HC(op_name, _, body, _, _), ...rest] -> {
+    let c_sym = kir_extern_handler_c_symbol(body)
+    if c_sym == "" { kir_default_ops(rest) }
+    else { [KDOp(op_name, kir_kaix_symbol(c_sym)), ...kir_default_ops(rest)] }
+  }
+}
+
+# The `KDefault` for one effect, or None when it carries no default block.
+fn kir_default_for_effect(eff: String, decls: [Decl]) : Option[KDefault] =
+  match find_effect_default_block(eff, decls) {
+    None         -> None
+    Some(defblk) -> match defblk {
+      DBlk(clauses, _, _, _) -> Some(KDef(eff, kir_default_ops(clauses)))
+    }
+  }
+
+# Resolve each effect that main ACTUALLY uses to its `KDefault`. The set is
+# `install_order ∩ main_row` (only effects in main's inferred row get a
+# default installed — exactly the C-direct `if list_has(main_row, eff)`
+# filter in `default_setups_for`); `install_order` itself is the full
+# builtin ORDER, not the install set. An effect with no default block (e.g.
+# a parametric `State[T]`) drops out via `find_effect_default_block`. The
+# result is in install order so native push/pop stays LIFO.
+pub fn kir_default_handlers(decls: [Decl]) : [KDefault] =
+  kir_default_handlers_loop(kir_install_order(decls), main_row_labels(decls), decls)
+
+fn kir_default_handlers_loop(order: [String], main_row: [String],
+                             decls: [Decl]) : [KDefault] = match order {
+  [] -> []
+  [eff, ...rest] ->
+    if name_in_list(main_row, eff) {
+      match kir_default_for_effect(eff, decls) {
+        None    -> kir_default_handlers_loop(rest, main_row, decls)
+        Some(d) -> [d, ...kir_default_handlers_loop(rest, main_row, decls)]
+      }
+    } else { kir_default_handlers_loop(rest, main_row, decls) }
+}
+
+# Synthesise a `KDefault` (op→field-index map) for EVERY effect DECLARED in
+# the program — a deliberate SUPERSET of `kir_default_handlers`. The native
+# backend emits a body for every fn, so a dead fn's `KPerform <eff>` needs a
+# synth `KHandlerDecl` for its op field index, or `nemit_perform` aborts the
+# build. The actual handler resolves from the evidence stack at runtime (the
+# C-direct oracle never aborts; it null-derefs only if the dead fn runs — it
+# does not). This set feeds ONLY `ndef_synth_handlers` (dispatch shape);
+# `kir_default_handlers` stays the install/teardown set (LIFO push/pop).
+#
+# Two shapes of dead-code perform reach here:
+#   - `today : Date / Clock`, never called from a Clock-free main. `Clock`
+#     carries a `default { }` block, so its `KDefault` is the default-op map.
+#   - `pump_lines : … / File + ReadFault`, dragged into a stream program
+#     that only calls `from_list`/`take`/`count`. `ReadFault` has NO default
+#     block, so we synthesise its op→field map straight from the `effect`
+#     decl (op names in declaration order = the Ev field offset, identical to
+#     the C-direct `Ev<eff>` struct layout). The recorded thunk symbol is
+#     never called — `nemit_perform` reads only the field index — so a
+#     never-installed effect is inert; the field map merely lets the build
+#     emit the dead `KPerform` as the oracle does. This drives `from_list`-
+#     only stream programs (`stream_early_stop`) and any dead File/Net perform
+#     to C-direct byte-id parity. Iterating DECLARED effects (not
+#     `install_order`, which is builtins ∪ main_row only) is what reaches a
+#     non-main-row effect like `ReadFault`.
+pub fn kir_synth_handler_effects(decls: [Decl]) : [KDefault] =
+  kir_synth_handlers_loop(decls, decls)
+
+fn kir_synth_handlers_loop(rem: [Decl], decls: [Decl]) : [KDefault] = match rem {
+  [] -> []
+  [d, ...rest] -> match d {
+    DEffect(_, eff, _, ops, defblk, _, _) ->
+      [kir_synth_default_for_effect(eff, ops, defblk),
+       ...kir_synth_handlers_loop(rest, decls)]
+    _ -> kir_synth_handlers_loop(rest, decls)
+  }
+}
+
+# The synth `KDefault` for one declared effect: its default-block op→symbol
+# map when a `default { }` block exists (the `$extern_handler` forwarders),
+# else the op names straight from the `effect` decl (no default block —
+# `ReadFault`/`File`/`Spawn`). The per-op symbol is a placeholder
+# (`kaix_synth_<eff>_<op>`) the runtime never invokes: a synth handler is
+# the field-index map for a dead-code perform, never an installed handler.
+fn kir_synth_default_for_effect(eff: String, ops: [EffectOp],
+                                defblk: Option[DefaultBlock]) : KDefault =
+  match defblk {
+    Some(DBlk(clauses, _, _, _)) -> KDef(eff, kir_default_ops(clauses))
+    None                         -> KDef(eff, kir_synth_ops(eff, ops))
+  }
+
+# Op→placeholder-symbol pairs in declaration order (the field offset). The
+# symbol is inert (never called); the position is the load-bearing datum.
+fn kir_synth_ops(eff: String, ops: [EffectOp]) : [KDefOp] = match ops {
+  [] -> []
+  [EOp(op_name, _, _, _, _, _), ...rest] ->
+    [KDOp(op_name, string_concat("kaix_synth_", string_concat(eff,
+       string_concat("_", op_name)))), ...kir_synth_ops(eff, rest)]
+}
+
+# --- Diagnostics --------------------------------------------------------
+
+# The surface name of an AST expression kind, for the loud "unhandled
+# node" trap (the Lane 0 silent-catch-all replacement). A local copy so
+# the lowering does not import `emit_llvm` (which would create a
+# lowering → emitter cycle — the emitter consumes KIR, never the other
+# way). Only the kinds that can plausibly reach a post-perceus AST need a
+# real name; the rest share a generic label.
+pub fn kir_expr_kind_name(k: ExprKind) : String = match k {
+  ELambda(_, _)     -> "ELambda"
+  EHandle(_, _, _, _, _, _, _) -> "EHandle"
+  ERecordLit(_, _)  -> "ERecordLit"
+  ERange(_, _, _)   -> "ERange"
+  EVariantsOf(_, _) -> "EVariantsOf"
+  EModCall(_, _)    -> "EModCall"
+  EBang(_)          -> "EBang"
+  EHole(_)          -> "EHole"
+  ETodo(_)          -> "ETodo"
+  EIntrinsic(_, _)  -> "EIntrinsic"
+  _                 -> "other"
+}
