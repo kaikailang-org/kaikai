@@ -1,0 +1,29 @@
+# R4 regression coverage — discarding a `Fiber[T]` value via `let _ =
+# spawn.spawn(...)` must not deadlock the scheduler.
+#
+# Closed by the scheduler-side fiber RC discipline: `kai_default_spawn_spawn`
+# takes its own incref on the wrapper before enqueue, and the trampoline
+# tail `kai_decref`s that ref at DONE/CANCELLED. The struct + stack free
+# is deferred via `kai_pending_free` and reaped by the next fiber on
+# entry/resume. (Was R4 in the retired `docs/known-regressions.md`;
+# closure recoverable from `git log`.)
+
+import actor
+import spawn
+
+fn worker(target: Pid[String]) : Unit / Actor[String] + Console = {
+  Actor.send(target, "hi")
+}
+
+fn run() : Unit / Actor[String] + Spawn + Console = {
+  let me = Actor.self()
+  # The bug: discarding the Fiber via `_` releases the value's only
+  # ref while the scheduler still references the underlying struct.
+  let _ = spawn.spawn(() => worker(me))
+  Stdout.print(Actor.receive())
+}
+
+fn main() : Int / Console + Spawn = {
+  with_mailbox { run() }
+  0
+}
