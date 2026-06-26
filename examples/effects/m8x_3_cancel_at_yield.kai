@@ -1,0 +1,36 @@
+# m8.x #3 — Cancel delivered at yield points.
+#
+# Worker prints + yields in a loop. Main yields twice (giving worker
+# two rounds), then calls spawn.cancel(f), then yields once more.
+# When worker resumes from the post-cancel yield, its NEXT effect-op
+# lookup (Stdout.print) hits the yield-point hook in
+# kai_evidence_lookup_node: cancel_requested && !cancel_delivered &&
+# cancel_pad_set is true, so the hook longjmps to the trampoline's
+# cancel_pad. The trampoline's second-return path marks the fiber
+# CANCELLED instead of DONE and continues with the awaiter walk.
+#
+# Under m8 v1 (and Phase 2 without Cancel delivery), the worker
+# would print "should not print"; under Phase 3, the hook unwinds
+# the body before the print runs.
+
+import spawn
+
+fn worker() : Int / Spawn + Console = {
+  Stdout.print("worker: round 1")
+  spawn.yield()
+  Stdout.print("worker: round 2")
+  spawn.yield()
+  Stdout.print("worker: should not print")
+  spawn.yield()
+  99
+}
+
+fn main() : Int / Spawn + Console + Cancel = {
+  let f = spawn.spawn(worker)
+  spawn.yield()       # worker prints round 1, yields back
+  spawn.yield()       # worker prints round 2, yields back
+  spawn.cancel(f)     # set cancel_requested
+  spawn.yield()       # gives worker the CPU; its next op sees the flag
+  Stdout.print("main: cancel sent")
+  0
+}

@@ -1,0 +1,48 @@
+#[doc("""
+Bit operations on `Int`. These are compiler intrinsics: each call
+lowers directly to the corresponding C operator with no
+function-call overhead, so this file declares no bodies.
+
+Operations:
+
+  bit_and(a, b)    a & b
+  bit_or(a, b)     a | b
+  bit_xor(a, b)    a ^ b
+  bit_not(a)       ~a
+
+  bit_shl(a, n)    a << n
+  bit_shr(a, n)    a >> n          (arithmetic — preserves sign)
+  bit_ushr(a, n)   ((uint64_t) a) >> n      (logical — zero-fill)
+
+  bit_count(a)     population count (set bits)
+  bit_test(a, n)   ((a >> n) & 1) != 0      (returns Bool)
+
+  bit_set(a, n)    a | (1 << n)
+  bit_clear(a, n)  a & ~(1 << n)
+  bit_toggle(a, n) a ^ (1 << n)
+
+Signatures (all `Int` unless noted; `bit_test` returns `Bool`):
+
+  pub fn bit_and(a: Int, b: Int) : Int
+  pub fn bit_or(a: Int, b: Int) : Int
+  pub fn bit_xor(a: Int, b: Int) : Int
+  pub fn bit_not(a: Int) : Int
+  pub fn bit_shl(a: Int, n: Int) : Int
+  pub fn bit_shr(a: Int, n: Int) : Int
+  pub fn bit_ushr(a: Int, n: Int) : Int
+  pub fn bit_count(a: Int) : Int
+  pub fn bit_test(a: Int, n: Int) : Bool
+  pub fn bit_set(a: Int, n: Int) : Int
+  pub fn bit_clear(a: Int, n: Int) : Int
+  pub fn bit_toggle(a: Int, n: Int) : Int
+
+Each flat name is also reachable dotted — `bit._and(a, b)` is exact
+sugar for `bit_and(a, b)`.
+
+Caveats:
+  - `Int` is 64-bit signed. `bit_shl(a, 64)` and shifts past the
+    width are C-undefined; do not rely on a specific result.
+  - `bit_shr` is arithmetic to match C's `>>` on signed types.
+    Reach for `bit_ushr` when you want zero-fill (e.g. extracting
+    a top-bit field from a packed value).
+""")]
