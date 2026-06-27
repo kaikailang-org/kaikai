@@ -1,0 +1,118 @@
+#[doc("""
+Complex numbers: a `{ re, im }` record plus an explicit-call API.
+Operator overloading is provided through `impl Add / Sub / Mul for
+Complex`, so `z1 + z2` dispatches to the protocol method.
+""")]
+
+#[doc("A complex number as a record of its real and imaginary parts (`re`, `im`).")]
+pub type Complex = { re: Real, im: Real }
+
+# ---- Constructors -------------------------------------------------
+
+#[doc("Constructs a complex number from its real and imaginary parts.")]
+pub fn mk(re: Real, im: Real) : Complex = Complex { re: re, im: im }
+
+#[doc("Lifts a real number to a complex number with zero imaginary part.")]
+pub fn from_real(r: Real) : Complex = mk(r, 0.0)
+
+# ---- Constants ----------------------------------------------------
+
+#[doc("The additive identity, `0 + 0i`.")]
+pub fn zero() : Complex = mk(0.0, 0.0)
+
+#[doc("The multiplicative identity, `1 + 0i`.")]
+pub fn one() : Complex = mk(1.0, 0.0)
+
+#[doc("The imaginary unit, `0 + 1i`.")]
+pub fn i_unit() : Complex = mk(0.0, 1.0)
+
+# ---- Magnitude ----------------------------------------------------
+
+#[doc("Squared magnitude `re² + im²` — avoids a square root.")]
+pub fn abs_sq(a: Complex) : Real = a.re * a.re + a.im * a.im
+
+# ---- Conjugate / negation -----------------------------------------
+
+#[doc("Complex conjugate: negates the imaginary part.")]
+pub fn conj(a: Complex) : Complex = mk(a.re, 0.0 - a.im)
+
+#[doc("Negates both the real and imaginary parts.")]
+pub fn neg(a: Complex) : Complex = mk(0.0 - a.re, 0.0 - a.im)
+
+# ---- Named arithmetic ---------------------------------------------
+# These coexist with the operator-dispatch protocol impls below.
+
+#[doc("Adds two complex numbers componentwise.")]
+pub fn add(a: Complex, b: Complex) : Complex =
+  mk(a.re + b.re, a.im + b.im)
+
+#[doc("Subtracts two complex numbers componentwise.")]
+pub fn sub(a: Complex, b: Complex) : Complex =
+  mk(a.re - b.re, a.im - b.im)
+
+#[doc("Multiplies two complex numbers.")]
+pub fn mul(a: Complex, b: Complex) : Complex =
+  mk(a.re * b.re - a.im * b.im,
+     a.re * b.im + a.im * b.re)
+
+#[doc("""
+Complex division `(a * conj(b)) / abs_sq(b)`. Named-function only:
+the result type is `Complex`, not `Self`, so it does not surface
+through the operator-dispatch pathway.
+""")]
+pub fn div(a: Complex, b: Complex) : Complex {
+  let denom = abs_sq(b)
+  let num = mul(a, conj(b))
+  mk(num.re / denom, num.im / denom)
+}
+
+# ---- Operator impls -----------------------------------------------
+
+impl Add for Complex {
+  fn add(self: Complex, rhs: Complex) : Complex =
+    mk(self.re + rhs.re, self.im + rhs.im)
+}
+
+impl Sub for Complex {
+  fn sub(self: Complex, rhs: Complex) : Complex =
+    mk(self.re - rhs.re, self.im - rhs.im)
+}
+
+impl Mul for Complex {
+  fn mul(self: Complex, rhs: Complex) : Complex =
+    mk(self.re * rhs.re - self.im * rhs.im,
+       self.re * rhs.im + self.im * rhs.re)
+}
+
+# ---- Heterogeneous arithmetic -------------------------------------
+# Parametrised impls `impl P[Other] for Self` let mixed `Real`/`Complex`
+# expressions dispatch to the matching operator method.
+
+impl Add[Real] for Complex {
+  fn add(self: Complex, rhs: Real) : Complex = mk(self.re + rhs, self.im)
+}
+
+impl Add[Complex] for Real {
+  fn add(self: Real, rhs: Complex) : Complex = mk(self + rhs.re, rhs.im)
+}
+
+impl Sub[Real] for Complex {
+  fn sub(self: Complex, rhs: Real) : Complex = mk(self.re - rhs, self.im)
+}
+
+impl Sub[Complex] for Real {
+  fn sub(self: Real, rhs: Complex) : Complex = mk(self - rhs.re, 0.0 - rhs.im)
+}
+
+impl Mul[Real] for Complex {
+  fn mul(self: Complex, rhs: Real) : Complex = mk(self.re * rhs, self.im * rhs)
+}
+
+impl Mul[Complex] for Real {
+  fn mul(self: Real, rhs: Complex) : Complex = mk(self * rhs.re, self * rhs.im)
+}
+
+impl Div[Real] for Complex {
+  fn div(self: Complex, rhs: Real) : Complex = mk(self.re / rhs, self.im / rhs)
+}
+# Div[Complex] for Real intentionally omitted — it needs conj/abs_sq.
