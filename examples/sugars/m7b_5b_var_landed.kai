@@ -1,0 +1,23 @@
+# m7b #5b — `var name = init` lowered by the pre-resolve desugar into
+# `handle { rest } with State[T](init) as name { ... }`. This fixture
+# pins both the unannotated (`var counter = 0`) and the annotated
+# (`var typed_counter: Int = 0`) forms working end-to-end. Successor
+# of the pre-#5b `var_not_yet_implemented.kai` placeholder. The
+# annotated cell is wrapped in its own block so its handler pops
+# before the unannotated one is touched again — see `m7b_5b_var_nested`
+# for the rationale.
+
+fn main() : Int {
+  var counter = 0
+  counter.set(3)
+  let counter_value = counter.get()
+  assert counter_value == 3
+  let typed_total = {
+    var typed_counter: Int = 0
+    typed_counter.set(counter_value + 4)
+    typed_counter.get()
+  }
+  assert typed_total == 7
+  assert counter.get() == 3
+  0
+}
