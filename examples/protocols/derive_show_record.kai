@@ -1,0 +1,11 @@
+# m12.8: `#derive(Show)` synthesises a structural impl for a record
+# whose fields already implement Show.
+
+#[derive(Show)]
+type Point = { x: Int, y: Int }
+
+fn main() : Int {
+  let p = Point { x: 3, y: 4 }
+  print(show(p))
+  0
+}

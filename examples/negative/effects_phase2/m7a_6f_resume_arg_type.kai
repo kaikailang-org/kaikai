@@ -1,0 +1,19 @@
+# m7a #6f negative test — `resume(v)` is now type-checked against
+# the op's declared return type. Counter.tick() : Unit, so resume's
+# parameter is `Unit`. Calling `resume(42)` is a type error in the
+# clause body. Before m7a #6f the clause body was not walk-typed
+# (Doc C OQ #9), so this passed silently.
+
+effect Counter {
+  tick() : Unit
+}
+
+fn main() : Int {
+  let r = handle {
+    Counter.tick()
+    0
+  } with Counter {
+    tick(resume) -> resume(42)
+  }
+  r
+}
