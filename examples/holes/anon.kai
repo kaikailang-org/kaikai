@@ -1,0 +1,7 @@
+fn f(x: Int, y: Int) : Int {
+  x + ?
+}
+
+fn main() {
+  print(int_to_string(f(2, 3)))
+}
