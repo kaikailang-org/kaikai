@@ -1,0 +1,22 @@
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.93.0"
+version_files = ["VERSION"]
+tag_format = "v$version"
+update_changelog_on_bump = true
+changelog_file = "CHANGELOG.md"
+changelog_incremental = true
+major_version_zero = true
+
+# Map cz's default Conventional-Commits types onto Keep-a-Changelog
+# section names so the generated section headings match the legacy
+# (pre-cz) CHANGELOG entries.
+change_type_map = { "feat" = "Added", "fix" = "Fixed", "perf" = "Changed", "refactor" = "Changed" }
+change_type_order = ["BREAKING CHANGE", "Added", "Fixed", "Changed", "Removed"]
+
+# Bump commits trigger CI: GitHub Actions evaluates [skip ci] BEFORE workflow
+# triggers, so adding it would also block the tag-triggered release.yml. The
+# release pipeline (GitHub release + brew tap update) depends on workflows
+# actually running on the bump tag. We accept ~2-3 minutes of tier1 on each
+# bump as the cost of an honest pipeline. Tag was confirmed as the dependency
+# 2026-05-10 (v0.51.0 silently skipped release because of the prior [skip ci]).
