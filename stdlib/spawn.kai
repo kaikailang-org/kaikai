@@ -1,0 +1,72 @@
+#[doc("""
+One-line wrappers around the `Spawn` effect ops. New code should
+prefer the direct `Spawn.spawn` / `Spawn.await` / `Spawn.select` /
+`Spawn.cancel` surface.
+""")]
+
+#[doc("""
+Spawn a new fiber that runs `f`. Effects of `f` propagate through
+the open row variable `e` into the caller's row.
+""")]
+pub fn spawn[T, e](f: () -> T / e) : Fiber[T] / Spawn + e =
+  Spawn.spawn(f)
+
+#[doc("Wait for a child fiber to finish, returning its result.")]
+pub fn await[T](f: Fiber[T]) : T / Spawn =
+  Spawn.await(f)
+
+#[doc("""
+Wait for any of the listed fibers. Returns the result of the first
+`Fiber[T]` already done on entry; otherwise parks on the head and
+returns its result on wakeup.
+""")]
+pub fn select[T](fs: [Fiber[T]]) : T / Spawn =
+  Spawn.select(fs)
+
+#[doc("""
+Request cancellation of a child fiber. Delivery happens at the
+target's next effect-op lookup: the runtime's yield-point hook
+longjmps to the target's trampoline `cancel_pad`, unwinding the
+body and marking the fiber `KAI_FIBER_CANCELLED`.
+""")]
+pub fn cancel[T](f: Fiber[T]) : Unit / Spawn =
+  Spawn.cancel(f)
+
+#[doc("""
+Rotate the run queue: the caller goes back on the tail and the head
+ready fiber resumes. No-op when the caller is the lone ready fiber.
+Use this inside CPU loops with no other yield points to give the
+scheduler a chance to inject `Cancel.raise()`.
+""")]
+pub fn yield() : Unit / Spawn =
+  Spawn.yield()
+
+#[doc("""
+When set to true, the current fiber stops being cancelled by linked
+peers' termination; instead each terminating peer delivers a
+"Normal" or "Crashed" String message into the current fiber's
+mailbox. The fiber must already be inside a `with_mailbox { ... }`
+scope for the delivery to land; otherwise the runtime falls back to
+default cancel propagation.
+""")]
+pub fn set_trap_exit(on: Bool) : Unit / Spawn =
+  Spawn.set_trap_exit(on)
+
+#[doc("""
+Runs `body` as a structured-concurrency scope. Use the cap-binding
+form `nursery { n -> n.spawn(task); n.await(f) }`, or the bare form
+calling `Spawn` ops directly.
+
+Children spawned inside the scope are joined automatically: the
+nursery does not return until every child has finished, even with no
+explicit `await`. If a child terminates by cancellation, the
+remaining siblings are cancelled and the failure re-raises out of
+the scope. The body's own effect row passes through; the scope
+itself rides `Spawn`.
+""")]
+pub fn nursery[T, e](body: () -> T / Spawn + e) : T / Spawn + e = {
+  Spawn.scope_enter()
+  let r = body()
+  Spawn.scope_exit()
+  r
+}

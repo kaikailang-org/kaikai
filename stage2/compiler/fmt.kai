@@ -1,0 +1,97 @@
+# compiler/fmt.kai — `kai fmt` entry point (issue #781 split).
+#
+# After #781 the formatter is a cluster of A-grade modules; this
+# file is the thin top: `fmt_program` walks the decl list, draining
+# collected comments at line boundaries and separating decls by a
+# blank line. The per-node walkers live in fmt_expr / fmt_decl /
+# fmt_effect; the writer + comment machinery in fmt_writer /
+# fmt_comments.
+#
+# Public surface: `fmt_program`. `collect_comments` + `Cmt` are pub
+# from fmt_comments / fmt_writer; the driver and module tests import
+# those directly.
+#
+# Scope: `kai fmt` formats the full language surface — generics,
+# effects, handlers, protocols, impls, units, refinements — not just
+# a Tongariki MVP subset (the pre-#781 header claimed otherwise; it
+# was stale). Real-number literals and one typed-lambda-param case
+# were the genuine gaps #781 closed.
+
+import compiler.ast
+import compiler.fmt_writer
+import compiler.fmt_decl
+
+# ---- top-level entry ------------------------------------------------
+
+#[doc("Pretty-print a parsed program to canonical kaikai source, interleaving the collected comments at line boundaries.")]
+pub fn fmt_program(decls: [Decl], cmts: [Cmt]) : String {
+  let s0 = fmt_init(cmts)
+  let s1 = fmt_decls(decls, s0, true)
+  let s2 = fmt_drain_rest(s1)
+  fmt_finish(s2)
+}
+
+# Walk decls, separating each by a blank line. `first` flag suppresses
+# the leading blank line for the very first decl.
+fn fmt_decls(decls: [Decl], s: FmtSt, first: Bool) : FmtSt {
+  match decls {
+    [] -> s
+    [d, ...rest] -> {
+      let s1 = if first {
+        s
+      } else {
+        fmt_blank_line(s)
+      }
+      let s2 = fmt_drain_before(s1, decl_line(d))
+      let s3 = fmt_decl(d, s2)
+      let s3a = fmt_drain_trailing_after(s3, decls_trailing_limit(d, rest))
+      let s4 = fmt_ensure_newline(s3a)
+      fmt_decls(rest, s4, false)
+    }
+  }
+}
+
+# Upper bound for `fmt_drain_trailing_after` between the just-
+# emitted decl and what follows. Two cases:
+#   non-last  → the next decl's start line; any trailing in the
+#               gap belongs to `d` (gap can't carry a leading on a
+#               line that has code).
+#   last      → `0`, the unbounded sentinel (see
+#               `fmt_drain_trailing_after`). A trailing on the LAST
+#               source line of a multi-line last decl (a sum-variant
+#               arm, a wrapped record field) sits below
+#               `decl_line(d)`, so the old `decl_line(d) + 1` bound
+#               missed it and the comment demoted to leading-position
+#               on re-format — the issue #785 non-idempotency. Any
+#               trailing pending after the last decl can only belong
+#               to it (no code follows), so the unbounded drain is
+#               sound and there is no decl below to mis-anchor against.
+fn decls_trailing_limit(d: Decl, rest: [Decl]) : Int {
+  match rest {
+    [] -> 0
+    [next, ..._tail] -> decl_line(next)
+  }
+}
+
+fn decl_line(d: Decl) : Int {
+  match d {
+    DFn(_, _, _, _, _, _, _, line, _, _) -> line
+    DType(_, _, _, _, line, _, _) -> line
+    DTest(_, _, line, _) -> line
+    DBench(_, _, line, _) -> line
+    DCheck(_, _, _, line, _) -> line
+    DImport(_, line, _) -> line
+    DEffect(_, _, _, _, _, line, _, _) -> line
+    DProtocol(_, _, _, _, line, _) -> line
+    DImpl(_, _, _, _, line, _) -> line
+    DDerive(_, _, line, _) -> line
+    DUnstable(_, line, _) -> line
+    DDoc(_, _, _, line, _) -> line
+    DModuleDoc(_, _, line, _) -> line
+    DUnit(_, _, _, line, _) -> line
+    DUse(_, line, _) -> line
+    DAxiom(_, _, _, _, _, _, _, _, line, _) -> line
+    DConst(_, _, _, _, _, line, _) -> line       # issue #269
+    DExternType(_, _, line, _) -> line           # FFI v2
+  }
+}

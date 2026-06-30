@@ -1,0 +1,16 @@
+# Contract-predicate purity is derived from the effect row, not an
+# opt-in attribute. `user_helper` has an empty effect row (the `: Bool`
+# form with no `/ e`), so it is pure and a `requires` clause may call
+# it directly — no annotation needed. (The old `[<refinement_pure>]`
+# marker was removed: the effect system already carries this fact.)
+
+fn user_helper(n: Int) : Bool = n > 0
+
+fn divide(a: Int, b: Int) : Int
+  requires user_helper(b)
+  = a / b
+
+fn main() : Unit / Stdout {
+  Stdout.print("q=#{int_to_string(divide(10, 5))}")
+  Stdout.print("q=#{int_to_string(divide(20, 4))}")
+}
