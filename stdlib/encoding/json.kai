@@ -1,0 +1,731 @@
+#[doc("""
+stdlib/encoding/json.kai — JSON encoder + decoder.
+
+Pure functional. Operates on a small algebraic data type
+(`JsonValue`) and `String`. No effects.
+
+Coverage of RFC 8259:
+  - null, true, false: yes
+  - numbers: integers (`JNum`) and reals (`JReal`). Integers are
+    parsed when the lexeme has no `.` / `e` / `E`; otherwise the
+    full RFC 8259 number grammar (fraction + exponent) is parsed
+    into a `Real` via the prelude `string_to_real`.
+  - strings: full escape table (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`,
+    `\r`, `\t`, `\uXXXX`); the decoder folds `\uXXXX` to a UTF-8
+    byte sequence (1–3 bytes for the basic multilingual plane) and
+    handles surrogate pairs `\uD8xx\uDCxx` for non-BMP codepoints
+    (emojis, supplementary CJK, etc.) emitting the corresponding
+    4-byte UTF-8 sequence. Lone or invalid surrogates yield `None`.
+    The encoder emits raw UTF-8 bytes for non-ASCII characters,
+    which is RFC 8259 §8.1 compliant for JSON exchanged between
+    systems.
+  - arrays: yes
+  - objects: yes; key ordering preserved on encode/decode.
+
+Public surface:
+
+  pub type JsonValue
+    = JNull
+    | JBool(Bool)
+    | JNum(Int)
+    | JReal(Real)
+    | JStr(String)
+    | JArr([JsonValue])
+    | JObj([Pair[String, JsonValue]])
+
+  pub fn json_encode(v: JsonValue) : String
+  pub fn json_decode(s: String) : Option[JsonValue]
+""")]
+
+# ---- AST ---------------------------------------------------------
+
+#[doc("A parsed JSON value: null, bool, integer, real, string, array, or object.")]
+pub type JsonValue
+  = JNull
+  | JBool(Bool)
+  | JNum(Int)
+  | JReal(Real)
+  | JStr(String)
+  | JArr([JsonValue])
+  | JObj([Pair[String, JsonValue]])
+
+# ---- Encoder -----------------------------------------------------
+
+# Escape a String per RFC 8259 §7. Walks the input char-by-char
+# and emits the standard escape sequence for the seven required
+# escapes plus any control character below U+0020.
+fn json_escape_loop(s: String, i: Int, acc: String) : String = {
+  if i >= string_length(s) { acc }
+  else { match char_at(s, i) {
+    None    -> acc
+    Some(c) -> {
+      let esc = json_escape_char(c)
+      json_escape_loop(s, i + 1, string_concat(acc, esc))
+    }
+  } }
+}
+
+fn json_escape_char(c: Char) : String = {
+  let n = char_to_int(c)
+  if c == '"'        { "\\\"" }
+  else if c == '\\'  { "\\\\" }
+  else if c == '\n'  { "\\n" }
+  else if c == '\r'  { "\\r" }
+  else if c == '\t'  { "\\t" }
+  else if n < 32 {
+    # \uXXXX for any other control character.
+    string_concat("\\u00", json_hex_byte(n))
+  }
+  else if n < 127 {
+    string_slice(json_ascii_table(), n - 32, 1)
+  }
+  else {
+    # Bytes ≥ 0x7F are emitted verbatim. The kaikai source string is
+    # walked byte-by-byte (`char_at` is byte-indexed); valid UTF-8
+    # input round-trips as raw UTF-8 per RFC 8259 §8.1.
+    json_byte_to_str(n)
+  }
+}
+
+# Hex digits 0–F (lowercase), used to render `\u00XX` for the
+# control characters that don't have a dedicated short escape.
+fn json_hex_byte(n: Int) : String = {
+  let hi = json_hex_digit((n / 16) % 16)
+  let lo = json_hex_digit(n % 16)
+  string_concat(hi, lo)
+}
+
+fn json_hex_digit(n: Int) : String =
+  string_slice("0123456789abcdef", n, 1)
+
+# Printable ASCII (32..126) packed as a single string. Indexing
+# `json_ascii_table()` at `c - 32` gives the 1-char String for
+# any non-control byte. For bytes ≥ 127 this would over-index, but
+# `json_escape_char` only routes here for `c >= 32 and c < 127`-ish
+# inputs; the encoder accepts arbitrary chars and renders them via
+# the printable-table when they fit (UTF-8 bytes ≥ 128 emit their
+# raw byte, which JSON accepts inside string literals only when
+# the surrounding text is valid UTF-8 — assumed here).
+fn json_ascii_table() : String =
+  " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+#[doc("Serialises a `JsonValue` to a compact JSON string (RFC 8259, no insignificant whitespace).")]
+pub fn json_encode(v: JsonValue) : String = match v {
+  JNull       -> "null"
+  JBool(b)    -> if b { "true" } else { "false" }
+  JNum(n)     -> int_to_string(n)
+  JReal(r)    -> real_to_string(r)
+  JStr(s)     -> string_concat(string_concat("\"", json_escape_loop(s, 0, "")), "\"")
+  JArr(xs)    -> string_concat(string_concat("[", string.join(list.map(xs, json_encode), ",")), "]")
+  JObj(ps)    -> string_concat(string_concat("{", string.join(list.map(ps, json_encode_pair), ",")), "}")
+}
+
+fn json_encode_pair(p: Pair[String, JsonValue]) : String =
+  string_concat(
+    string_concat(string_concat("\"", json_escape_loop(p.fst, 0, "")), "\":"),
+    json_encode(p.snd))
+
+# ---- Decoder -----------------------------------------------------
+#
+# Recursive-descent parser. The state is a (String, Int) pair —
+# the input and a cursor — passed through every helper. To keep
+# the surface small, helpers return `Option[Pair[JsonValue, Int]]`
+# (None on parse error; on success, the value plus the cursor
+# position right after the consumed token).
+#
+# Whitespace is silently skipped before every token. Trailing
+# garbage after the top-level value yields a parse error.
+
+type JParse = { v: JsonValue, i: Int }
+
+fn jp_some(v: JsonValue, i: Int) : Option[JParse] =
+  Some(JParse { v: v, i: i })
+
+# Skip ASCII whitespace (space, tab, CR, LF) starting at `i`.
+fn json_skip_ws(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if c == ' ' or c == '\t' or c == '\n' or c == '\r' {
+                 json_skip_ws(s, i + 1)
+               } else { i }
+  } }
+}
+
+# Match a literal at the cursor: returns the new cursor on match,
+# or None.
+fn json_match_lit(s: String, i: Int, lit: String) : Option[Int] = {
+  let ll = string_length(lit)
+  if i + ll > string_length(s) { None }
+  else if string_slice(s, i, ll) == lit { Some(i + ll) }
+  else { None }
+}
+
+# A pending container frame on the iterative parser's explicit
+# stack. ArrFrame accumulates an array's items; ObjFrame
+# accumulates an object's key/value pairs plus the (optional)
+# key whose value is currently being parsed.
+type JFrame
+  = ArrFrame([JsonValue])
+  | ObjFrame([Pair[String, JsonValue]], Option[String])
+
+#[doc("""
+Top-level: skip leading whitespace, parse a value, demand only
+whitespace until end-of-input. The iterative driver keeps an
+explicit stack of pending container frames so deeply-nested
+JSON does not blow the fiber stack — recursion is bounded to
+the leaf parsers (string / number / null / bool), each of
+which produces a value in a fixed number of frames.
+""")]
+pub fn json_decode(s: String) : Option[JsonValue] = {
+  let i0 = json_skip_ws(s, 0)
+  match json_parse_iter(s, i0, []) {
+    None    -> None
+    Some(r) -> {
+      let i_end = json_skip_ws(s, r.i)
+      if i_end == string_length(s) { Some(r.v) } else { None }
+    }
+  }
+}
+
+# Dispatch on the first non-whitespace char, returning either a
+# completed leaf or — for `{` / `[` — the new container frame
+# the caller pushes onto the stack.
+fn json_parse_value(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i)
+  if j >= string_length(s) { None }
+  else { match char_at(s, j) {
+    None    -> None
+    Some(c) -> {
+      if c == '{' { json_parse_object(s, j) }
+      else if c == '[' { json_parse_array(s, j) }
+      else if c == '"' { json_parse_string(s, j) }
+      else if c == 't' or c == 'f' { json_parse_bool(s, j) }
+      else if c == 'n' { json_parse_null(s, j) }
+      else if c == '-' or char.is_digit(c) { json_parse_number(s, j) }
+      else { None }
+    }
+  } }
+}
+
+# ---- Iterative driver ---------------------------------------------
+#
+# Walks the input with an explicit stack of pending container
+# frames. The whole loop lives in a single self-tail-recursive
+# function (`json_loop`) so kaikai's mandatory TCO collapses every
+# iteration onto the same stack frame — mutual tail recursion
+# across two functions is explicitly out of scope per
+# docs/perceus-honesty-targets.md §TCO, which would otherwise
+# overflow the 64 KiB default fiber stack on a ~40 KB payload.
+#
+# `mode` encodes what the loop is looking for next:
+#   ModeValue   — parse a value (leaf or container open)
+#   ModeAfterValue(v) — value `v` just completed; feed to the top
+#                       frame, handle the separator, continue
+#   ModeObjKey  — read a key + `:` and push an ObjFrame frame
+
+type JMode
+  = ModeValue
+  | ModeAfterValue(JsonValue)
+  | ModeObjKey
+
+fn json_parse_iter(s: String, i: Int, stack: [JFrame]) : Option[JParse] =
+  json_loop(s, i, stack, ModeValue)
+
+fn json_loop(s: String, i: Int, stack: [JFrame], mode: JMode) : Option[JParse] = match mode {
+  # ---- ModeValue: parse a single value at position i -------------
+  ModeValue -> {
+    let j = json_skip_ws(s, i)
+    if j >= string_length(s) { None }
+    else { match char_at(s, j) {
+      None    -> None
+      Some(c) -> {
+        if c == '{' {
+          let k = json_skip_ws(s, j + 1)
+          match char_at(s, k) {
+            Some('}') -> json_loop(s, k + 1, stack, ModeAfterValue(JObj([])))
+            _         -> json_loop(s, k, [ObjFrame([], None), ...stack], ModeObjKey)
+          }
+        }
+        else if c == '[' {
+          let k = json_skip_ws(s, j + 1)
+          match char_at(s, k) {
+            Some(']') -> json_loop(s, k + 1, stack, ModeAfterValue(JArr([])))
+            _         -> json_loop(s, k, [ArrFrame([]), ...stack], ModeValue)
+          }
+        }
+        else if c == '"' { match json_parse_string(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == 't' or c == 'f' { match json_parse_bool(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == 'n' { match json_parse_null(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else if c == '-' or char.is_digit(c) { match json_parse_number(s, j) {
+          None    -> None
+          Some(r) -> json_loop(s, r.i, stack, ModeAfterValue(r.v))
+        } }
+        else { None }
+      }
+    } }
+  }
+
+  # ---- ModeAfterValue(v): feed v into the top frame -------------
+  ModeAfterValue(v) -> match stack {
+    []             -> Some(JParse { v: v, i: i })
+    [top, ...rest] -> match top {
+      # Build head-first; the runtime's list_append walks the
+      # existing prefix recursively, so cons + reverse-on-close
+      # keeps both space and time linear in the result length.
+      ArrFrame(acc) -> {
+        let acc1 = [v, ...acc]
+        let j = json_skip_ws(s, i)
+        match char_at(s, j) {
+          Some(',') -> json_loop(s, json_skip_ws(s, j + 1), [ArrFrame(acc1), ...rest], ModeValue)
+          Some(']') -> json_loop(s, j + 1, rest, ModeAfterValue(JArr(list_reverse(acc1))))
+          _         -> None
+        }
+      }
+      ObjFrame(acc, pending_key) -> match pending_key {
+        None     -> None    # invariant: a value lands only after a key was set
+        Some(k)  -> {
+          let acc1 = [Pair { fst: k, snd: v }, ...acc]
+          let j = json_skip_ws(s, i)
+          match char_at(s, j) {
+            Some(',') -> json_loop(s, json_skip_ws(s, j + 1),
+                                     [ObjFrame(acc1, None), ...rest], ModeObjKey)
+            Some('}') -> json_loop(s, j + 1, rest, ModeAfterValue(JObj(list_reverse(acc1))))
+            _         -> None
+          }
+        }
+      }
+    }
+  }
+
+  # ---- ModeObjKey: read `"key":` and switch to ModeValue --------
+  ModeObjKey -> {
+    let j = json_skip_ws(s, i)
+    match char_at(s, j) {
+      Some('"') -> match json_parse_string(s, j) {
+        None    -> None
+        Some(rk) -> match rk.v {
+          JStr(k) -> {
+            let j2 = json_skip_ws(s, rk.i)
+            match char_at(s, j2) {
+              # Bind the key onto the top ObjFrame and continue
+              # looking for the value position.
+              Some(':') -> match stack {
+                [ObjFrame(acc, _), ...rest] ->
+                  json_loop(s, json_skip_ws(s, j2 + 1),
+                             [ObjFrame(acc, Some(k)), ...rest], ModeValue)
+                _ -> None
+              }
+              _ -> None
+            }
+          }
+          _ -> None
+        }
+      }
+      _ -> None
+    }
+  }
+}
+
+fn json_parse_null(s: String, i: Int) : Option[JParse] = match json_match_lit(s, i, "null") {
+  None    -> None
+  Some(j) -> jp_some(JNull, j)
+}
+
+fn json_parse_bool(s: String, i: Int) : Option[JParse] = match json_match_lit(s, i, "true") {
+  Some(j) -> jp_some(JBool(true), j)
+  None    -> match json_match_lit(s, i, "false") {
+    Some(j) -> jp_some(JBool(false), j)
+    None    -> None
+  }
+}
+
+# Number: RFC 8259 grammar — optional `-`, integer part, optional
+# fractional part, optional exponent. If neither `.` nor `e/E`
+# appears, the lexeme parses as `JNum(Int)`; otherwise as
+# `JReal(Real)` via the prelude `string_to_real`.
+fn json_parse_number(s: String, i: Int) : Option[JParse] = {
+  let neg = match char_at(s, i) {
+    Some(c) -> c == '-'
+    None    -> false
+  }
+  let int_start = if neg { i + 1 } else { i }
+  let int_end = json_digits_end(s, int_start)
+  if int_end == int_start { None }
+  else {
+    let frac_end = json_scan_frac(s, int_end)
+    match frac_end {
+      None    -> None
+      Some(fe) -> {
+        let exp_end = json_scan_exp(s, fe)
+        match exp_end {
+          None     -> None
+          Some(ee) -> {
+            let is_real = ee != int_end
+            if is_real {
+              let lex = string_slice(s, i, ee - i)
+              match string_to_real(lex) {
+                None    -> None
+                Some(r) -> jp_some(JReal(r), ee)
+              }
+            } else {
+              let mag_str = string_slice(s, int_start, int_end - int_start)
+              match string_to_int(mag_str) {
+                None    -> None
+                Some(m) -> jp_some(JNum(if neg { 0 - m } else { m }), int_end)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn json_digits_end(s: String, i: Int) : Int = {
+  if i >= string_length(s) { i }
+  else { match char_at(s, i) {
+    None    -> i
+    Some(c) -> if char.is_digit(c) { json_digits_end(s, i + 1) } else { i }
+  } }
+}
+
+# Optional `.` followed by one or more digits. Returns the cursor
+# after the fractional part if present (or unchanged if absent),
+# `None` if a `.` is not followed by at least one digit.
+fn json_scan_frac(s: String, i: Int) : Option[Int] = {
+  match char_at(s, i) {
+    Some('.') -> {
+      let d_end = json_digits_end(s, i + 1)
+      if d_end == i + 1 { None } else { Some(d_end) }
+    }
+    _ -> Some(i)
+  }
+}
+
+# Optional `[eE][+-]?` followed by one or more digits.
+fn json_scan_exp(s: String, i: Int) : Option[Int] = {
+  match char_at(s, i) {
+    Some(c) -> if c == 'e' or c == 'E' {
+      let after_sign = match char_at(s, i + 1) {
+        Some(c2) -> if c2 == '+' or c2 == '-' { i + 2 } else { i + 1 }
+        None     -> i + 1
+      }
+      let d_end = json_digits_end(s, after_sign)
+      if d_end == after_sign { None } else { Some(d_end) }
+    } else { Some(i) }
+    None -> Some(i)
+  }
+}
+
+# String: opening `"`, then chars / escapes until closing `"`. The
+# escape table mirrors `json_escape_char` plus `\uXXXX`. Codepoints
+# in the basic multilingual plane (excluding the surrogate range)
+# are emitted as 1–3 UTF-8 bytes; non-BMP codepoints are decoded
+# from a `\uD8xx\uDCxx` surrogate pair into their 4-byte UTF-8
+# sequence per RFC 8259 §7. Lone surrogates (high without low or
+# low without preceding high) yield `None`.
+fn json_parse_string(s: String, i: Int) : Option[JParse] = {
+  let i1 = i + 1   # skip opening `"`
+  json_parse_string_loop(s, i1, "")
+}
+
+fn json_parse_string_loop(s: String, i: Int, acc: String) : Option[JParse] = {
+  if i >= string_length(s) { None }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> {
+      if c == '"' { jp_some(JStr(acc), i + 1) }
+      else if c == '\\' { json_parse_escape(s, i + 1, acc) }
+      else { json_parse_string_loop(s, i + 1,
+                                     string_concat(acc, string_slice(s, i, 1))) }
+    }
+  } }
+}
+
+fn json_parse_escape(s: String, i: Int, acc: String) : Option[JParse] = {
+  if i >= string_length(s) { None }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> {
+      let appended = json_escape_decode(c)
+      match appended {
+        Some(ch_str) -> json_parse_string_loop(s, i + 1, string_concat(acc, ch_str))
+        None         -> if c == 'u' { json_parse_unicode(s, i + 1, acc) }
+                        else { None }
+      }
+    }
+  } }
+}
+
+fn json_escape_decode(c: Char) : Option[String] = {
+  if c == '"'      { Some("\"") }
+  else if c == '\\' { Some("\\") }
+  else if c == '/'  { Some("/") }
+  else if c == 'b'  { Some("\b") }
+  else if c == 'f'  { Some("\f") }
+  else if c == 'n'  { Some("\n") }
+  else if c == 'r'  { Some("\r") }
+  else if c == 't'  { Some("\t") }
+  else { None }
+}
+
+# Decode `\uXXXX` at cursor `i` (positioned immediately after the
+# `\u`). Returns `None` on hex parse failure, on a lone low
+# surrogate, or on a high surrogate not followed by a `\uYYYY` low
+# surrogate. The decoded codepoint is UTF-8 encoded into the
+# accumulator; the cursor advances past all consumed characters
+# (one `\uXXXX` for BMP, two for a surrogate pair).
+fn json_parse_unicode(s: String, i: Int, acc: String) : Option[JParse] = {
+  match json_read_hex4(s, i) {
+    None     -> None
+    Some(cp) -> {
+      let i1 = i + 4
+      if cp >= 0xDC00 and cp <= 0xDFFF {
+        # Lone low surrogate.
+        None
+      } else if cp >= 0xD800 and cp <= 0xDBFF {
+        # High surrogate: require immediately following `\uYYYY`.
+        if i1 + 6 > string_length(s) { None }
+        else {
+          let bs = string_slice(s, i1, 2)
+          if bs == "\\u" {
+            match json_read_hex4(s, i1 + 2) {
+              None      -> None
+              Some(low) -> {
+                if low >= 0xDC00 and low <= 0xDFFF {
+                  let cp_full = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
+                  json_parse_string_loop(s, i1 + 6,
+                    string_concat(acc, json_utf8_encode(cp_full)))
+                } else {
+                  # High surrogate not followed by low — malformed.
+                  None
+                }
+              }
+            }
+          } else { None }
+        }
+      } else {
+        # BMP codepoint (excluding surrogate range): emit 1–3 UTF-8
+        # bytes.
+        json_parse_string_loop(s, i1, string_concat(acc, json_utf8_encode(cp)))
+      }
+    }
+  }
+}
+
+# Decode one hex character to a 4-bit value. Mirrors hex_char_value
+# in stdlib/encoding/hex.kai; inlined here because the bare `to_int`
+# name is shadowed by `core/string.to_int`. Distinct identifier from
+# the encode helper `json_hex_digit(n: Int) : String` above — same
+# conceptual inverse, but kaikai dispatches by name (not arity), so
+# the two helpers need separate names.
+fn json_hex_char_value(c: Char) : Option[Int] = {
+  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+fn json_hex4_loop(s: String, i: Int, end: Int, acc: Int) : Option[Int] = {
+  if i >= end { Some(acc) }
+  else { match char_at(s, i) {
+    None    -> None
+    Some(c) -> match json_hex_char_value(c) {
+      None    -> None
+      Some(v) -> json_hex4_loop(s, i + 1, end, (acc * 16) + v)
+    }
+  } }
+}
+
+# Read exactly four hex digits at cursor `i`. Returns the resulting
+# Int (0..0xFFFF) or None on out-of-bounds / non-hex input.
+fn json_read_hex4(s: String, i: Int) : Option[Int] = {
+  if i + 4 > string_length(s) { None }
+  else { json_hex4_loop(s, i, i + 4, 0) }
+}
+
+# UTF-8 encode a Unicode codepoint (assumed valid, i.e. not in the
+# surrogate range and ≤ 0x10FFFF) into a String of the appropriate
+# byte width.
+fn json_utf8_encode(cp: Int) : String = {
+  if cp < 0x80 {
+    json_byte_to_str(cp)
+  } else if cp < 0x800 {
+    string_concat_all([
+      json_byte_to_str(0xC0 + (cp / 64)),
+      json_byte_to_str(0x80 + (cp % 64))])
+  } else if cp < 0x10000 {
+    string_concat_all([
+      json_byte_to_str(0xE0 + (cp / 4096)),
+      json_byte_to_str(0x80 + ((cp / 64) % 64)),
+      json_byte_to_str(0x80 + (cp % 64))])
+  } else {
+    string_concat_all([
+      json_byte_to_str(0xF0 + (cp / 262144)),
+      json_byte_to_str(0x80 + ((cp / 4096) % 64)),
+      json_byte_to_str(0x80 + ((cp / 64) % 64)),
+      json_byte_to_str(0x80 + (cp % 64))])
+  }
+}
+
+# 1-byte string for any byte value. Avoids Show[Char] which renders
+# non-printable codepoints as `\xNNN`; the underlying runtime
+# representation is whatever bytes the source string contains.
+# Codepoint 0 is special-cased (the table below skips it because
+# embedding a NUL through `\x00` does not survive `kai_str`).
+fn json_byte_to_str(b: Int) : String = {
+  if b == 0 { json_byte_zero() }
+  else      { string_slice(json_byte_table(), b - 1, 1) }
+}
+
+# A 255-byte string covering bytes 0x01..0xFF, used as a slice
+# table by `json_byte_to_str`. The literal is emitted verbatim into
+# the generated C; the C compiler reads each `\xNN` as a single
+# byte.
+fn json_byte_table() : String =
+  "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40\x41\x42\x43\x44\x45\x46\x47\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f\x50\x51\x52\x53\x54\x55\x56\x57\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f\x60\x61\x62\x63\x64\x65\x66\x67\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f\x70\x71\x72\x73\x74\x75\x76\x77\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+
+# `\x00` decodes to a NUL byte. kaikai strings carry a length, so
+# a NUL is observable through length / slice but not through C-style
+# strlen. Returns a 1-char string built from `string_slice` to avoid
+# the embed-zero-in-source issue.
+fn json_byte_zero() : String = string_slice(json_byte_table(), 0, 0)
+
+# Array: `[` value (`,` value)* `]`. Empty array allowed.
+fn json_parse_array(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i + 1)
+  match char_at(s, j) {
+    Some(']') -> jp_some(JArr([]), j + 1)
+    _         -> json_parse_array_items(s, j, [])
+  }
+}
+
+fn json_parse_array_items(s: String, i: Int, acc: [JsonValue]) : Option[JParse] = {
+  match json_parse_value(s, i) {
+    None    -> None
+    Some(r) -> {
+      let acc1 = list_append(acc, [r.v])
+      let j = json_skip_ws(s, r.i)
+      match char_at(s, j) {
+        Some(',') -> json_parse_array_items(s, json_skip_ws(s, j + 1), acc1)
+        Some(']') -> jp_some(JArr(acc1), j + 1)
+        _         -> None
+      }
+    }
+  }
+}
+
+# Object: `{` (key:value (`,` key:value)*)? `}`.
+fn json_parse_object(s: String, i: Int) : Option[JParse] = {
+  let j = json_skip_ws(s, i + 1)
+  match char_at(s, j) {
+    Some('}') -> jp_some(JObj([]), j + 1)
+    _         -> json_parse_object_pairs(s, j, [])
+  }
+}
+
+fn json_parse_object_pairs(s: String, i: Int, acc: [Pair[String, JsonValue]]) : Option[JParse] = {
+  let j = json_skip_ws(s, i)
+  match char_at(s, j) {
+    Some('"') -> match json_parse_string(s, j) {
+      None    -> None
+      Some(rk) -> match rk.v {
+        JStr(k) -> {
+          let j2 = json_skip_ws(s, rk.i)
+          match char_at(s, j2) {
+            Some(':') -> {
+              let j3 = json_skip_ws(s, j2 + 1)
+              match json_parse_value(s, j3) {
+                None    -> None
+                Some(rv) -> {
+                  let acc1 = list_append(acc, [Pair { fst: k, snd: rv.v }])
+                  let j4 = json_skip_ws(s, rv.i)
+                  match char_at(s, j4) {
+                    Some(',') -> json_parse_object_pairs(s, json_skip_ws(s, j4 + 1), acc1)
+                    Some('}') -> jp_some(JObj(acc1), j4 + 1)
+                    _         -> None
+                  }
+                }
+              }
+            }
+            _ -> None
+          }
+        }
+        _ -> None
+      }
+    }
+    _ -> None
+  }
+}
+
+# ---- Drilling helpers ---------------------------------------------
+#
+# Convenience accessors for walking a parsed `JsonValue` tree
+# without writing the variant-match boilerplate at every step. The
+# accessors return `JNull` (not an error) on a mismatch so a chain
+# of `.get(...).at(0).get(...)` calls never panics on a malformed
+# payload — the leaf `as_*` extractor reports the failure as
+# `None`, leaving the caller in control of the fallback.
+
+#[doc("Looks up `key` in a JSON object, returning its value or `JNull` on a miss or a non-object.")]
+pub fn get(v: JsonValue, key: String) : JsonValue = match v {
+  JObj(pairs) -> json_pairs_get(pairs, key)
+  _           -> JNull
+}
+
+fn json_pairs_get(pairs: [Pair[String, JsonValue]], key: String) : JsonValue = match pairs {
+  []           -> JNull
+  [p, ...rest] -> if p.fst == key { p.snd } else { json_pairs_get(rest, key) }
+}
+
+#[doc("Indexes element `i` of a JSON array, returning its value or `JNull` when out of range or not an array.")]
+pub fn at(v: JsonValue, i: Int) : JsonValue = match v {
+  JArr(items) -> json_nth(items, i)
+  _           -> JNull
+}
+
+fn json_nth(xs: [JsonValue], i: Int) : JsonValue = match xs {
+  []           -> JNull
+  [x, ...rest] -> if i == 0 { x } else { json_nth(rest, i - 1) }
+}
+
+# Primitive extractors. Each returns `None` when the underlying
+# variant does not match the requested kind; `as_real` accepts
+# both JReal and JNum (widening to Real), and `as_int` accepts
+# JNum only (rejecting JReal because the caller asked for a
+# lossless integer).
+
+#[doc("Extracts the string when `v` is a JSON string, otherwise `None`.")]
+pub fn as_string(v: JsonValue) : Option[String] = match v {
+  JStr(s) -> Some(s)
+  _       -> None
+}
+
+#[doc("Extracts the integer when `v` is a JSON integer, otherwise `None` (a JSON real is rejected).")]
+pub fn as_int(v: JsonValue) : Option[Int] = match v {
+  JNum(n) -> Some(n)
+  _       -> None
+}
+
+#[doc("Extracts the value as a `Real` when `v` is a JSON real or integer, otherwise `None`.")]
+pub fn as_real(v: JsonValue) : Option[Real] = match v {
+  JReal(r) -> Some(r)
+  JNum(n)  -> Some(int_to_real(n))
+  _        -> None
+}
+
+#[doc("Extracts the boolean when `v` is a JSON bool, otherwise `None`.")]
+pub fn as_bool(v: JsonValue) : Option[Bool] = match v {
+  JBool(b) -> Some(b)
+  _        -> None
+}

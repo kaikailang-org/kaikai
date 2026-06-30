@@ -1,0 +1,20 @@
+# m7b #5b — `var` declared inside an `if` arm. The cell is local to
+# the arm's block; the outer function's effect row is unchanged. Doc B
+# §`State[T]` *Syntax note*: "The cell does not escape the block's
+# effect row."
+
+fn run(b: Bool) : Int {
+  if b {
+    var inner := 100
+    inner.set(inner.get() + 1)
+    inner.get()
+  } else {
+    -1
+  }
+}
+
+fn main() : Int {
+  assert run(true) == 101
+  assert run(false) == -1
+  0
+}

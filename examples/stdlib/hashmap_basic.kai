@@ -1,0 +1,96 @@
+# HashMap[k, v] — mutable hash table. put/remove mutate in place;
+# every op carries / Mutable. Read with the m[key] sugar.
+
+import collections.hashmap
+
+fn verify(label: String, ok: Bool) : Unit / Stdout =
+  if ok { Stdout.print(label ++ ": ok") } else { Stdout.print(label ++ ": FAIL") }
+
+fn opt_str(o: Option[Int]) : String = match o {
+  None    -> "none"
+  Some(n) -> int_to_string(n)
+}
+
+fn str_cmp(a: String, b: String) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
+fn int_cmp(a: Int, b: Int) : Int = if a == b { 0 } else if a < b { 0 - 1 } else { 1 }
+
+fn int_list_eq(a: [Int], b: [Int]) : Bool = match a {
+  [] -> match b {
+    [] -> true
+    _  -> false
+  }
+  [x, ...xs] -> match b {
+    []         -> false
+    [y, ...ys] -> if x == y { int_list_eq(xs, ys) } else { false }
+  }
+}
+
+fn fill(m: HashMap[Int, Int], i: Int, n: Int) : Unit / Mutable =
+  if i < n { hashmap.put(m, i, i * 3); fill(m, i + 1, n) }
+
+fn hits(m: HashMap[Int, Int], i: Int, n: Int, acc: Int) : Int / Mutable =
+  if i >= n { acc }
+  else { hits(m, i + 1, n, acc + (match m[i] { Some(v) -> if v == i * 3 { 1 } else { 0 }  None -> 0 })) }
+
+fn main() : Int / Stdout + Mutable = {
+  let m = hashmap.empty()
+  verify("empty size 0", hashmap.size(m) == 0)
+  verify("empty is_empty", hashmap.is_empty(m))
+  verify("empty get none", opt_str(m["x"]) == "none")
+
+  hashmap.put(m, "a", 1)
+  hashmap.put(m, "b", 2)
+  hashmap.put(m, "c", 3)
+  verify("size 3", hashmap.size(m) == 3)
+  verify("m['a']", opt_str(m["a"]) == "1")
+  verify("m['b']", opt_str(m["b"]) == "2")
+  verify("m['missing']", opt_str(m["zzz"]) == "none")
+  verify("contains 'c'", hashmap.contains(m, "c"))
+  verify("not contains 'd'", not hashmap.contains(m, "d"))
+
+  Stdout.print("keys: " ++ string.join(list.sort_by(hashmap.keys(m), str_cmp), ","))
+  Stdout.print("values: " ++ string.join(list.map(list.sort_by(hashmap.values(m), int_cmp), int_to_string), ","))
+
+  hashmap.put(m, "b", 20)
+  verify("update keeps size 3", hashmap.size(m) == 3)
+  verify("m['b'] updated", opt_str(m["b"]) == "20")
+
+  hashmap.remove(m, "b")
+  verify("remove drops size", hashmap.size(m) == 2)
+  verify("m['b'] gone", opt_str(m["b"]) == "none")
+  hashmap.remove(m, "ghost")
+  verify("remove missing is no-op", hashmap.size(m) == 2)
+
+  let fp = hashmap.from_pairs([
+    Pair { fst: "x", snd: 1 },
+    Pair { fst: "y", snd: 2 },
+    Pair { fst: "x", snd: 9 }
+  ])
+  verify("from_pairs size 2", hashmap.size(fp) == 2)
+  verify("from_pairs dup wins last", opt_str(fp["x"]) == "9")
+
+  let a = hashmap.from_pairs([Pair { fst: "p", snd: 1 }, Pair { fst: "q", snd: 2 }])
+  let b = hashmap.from_pairs([Pair { fst: "q", snd: 9 }, Pair { fst: "r", snd: 3 }])
+  hashmap.merge(a, b)
+  verify("merge size 3", hashmap.size(a) == 3)
+  verify("merge a wins 'q'", opt_str(a["q"]) == "2")
+  verify("merge keeps 'r'", opt_str(a["r"]) == "3")
+  verify("merge leaves b", hashmap.size(b) == 2)
+
+  # same input built twice -> same iteration order
+  let s1 = hashmap.empty()
+  let s2 = hashmap.empty()
+  fill(s1, 0, 500)
+  fill(s2, 0, 500)
+  verify("order stable across same-input runs",
+         int_list_eq(hashmap.keys(s1), hashmap.keys(s2)))
+
+  # large N drives several resizes
+  let big = hashmap.empty()
+  fill(big, 0, 100000)
+  verify("100K size exact", hashmap.size(big) == 100000)
+  verify("100K all round-trip", hits(big, 0, 100000, 0) == 100000)
+  verify("100K absent missing", opt_str(big[100000]) == "none")
+
+  0
+}
