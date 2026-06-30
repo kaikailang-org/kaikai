@@ -1,0 +1,129 @@
+#[doc("""
+core.tuple — generic n-field records for ad-hoc multi-return.
+
+A function returning n related values without a per-call nominal
+record returns `Pair[T, U]` / `Triple[T, U, V]` / `Quad[T, U, V, W]`;
+the caller reads `.fst` / `.snd` / `.trd` / `.frt`. Field names are
+positional — when the values have meaningful domain names, prefer a
+named record.
+
+The literals `(a, b)`, `(a, b, c)`, `(a, b, c, d)` are sugar for the
+corresponding record, and `(A, B)` ≡ `Pair[A, B]` in type and pattern
+positions. N is capped at 4; wider products should be named records.
+""")]
+
+#[doc("A two-field generic product, read as `.fst` / `.snd`. Sugar: `(a, b)`.")]
+pub type Pair[a, b] = { fst: a, snd: b }
+#[doc("A three-field generic product, read as `.fst` / `.snd` / `.trd`. Sugar: `(a, b, c)`.")]
+pub type Triple[a, b, c] = { fst: a, snd: b, trd: c }
+#[doc("A four-field generic product, read as `.fst` / `.snd` / `.trd` / `.frt`. Sugar: `(a, b, c, d)`.")]
+pub type Quad[a, b, c, d] = { fst: a, snd: b, trd: c, frt: d }
+
+#[doc("""
+Swaps the two components of a `Pair`.
+
+These helpers exist so function references can be passed where a
+lambda would otherwise be needed (e.g. `pairs |> map(tuple.swap)`);
+for plain projection use `p.fst` / `p.snd` directly. There are no
+bare `fst` / `snd` projection helpers on purpose: a prelude
+`fn fst(p) = p.fst` would poison every `record.fst` field access
+whose receiver type is not yet pinned by inference.
+""")]
+pub fn swap(p: Pair[a, b]) : Pair[b, a] = Pair { fst: p.snd, snd: p.fst }
+
+#[doc("Applies `f` to the first component, leaving the second unchanged.")]
+pub fn map_fst(p: Pair[a, b], f: (a) -> c) : Pair[c, b] =
+  Pair { fst: f(p.fst), snd: p.snd }
+
+#[doc("Applies `f` to the second component, leaving the first unchanged.")]
+pub fn map_snd(p: Pair[a, b], f: (b) -> c) : Pair[a, c] =
+  Pair { fst: p.fst, snd: f(p.snd) }
+
+#[doc("Maps both components at once: `f` over the first, `g` over the second.")]
+pub fn map_pair(p: Pair[a, b], f: (a) -> c, g: (b) -> d) : Pair[c, d] =
+  Pair { fst: f(p.fst), snd: g(p.snd) }
+
+#[doc("Returns the first component of a `Triple`.")]
+pub fn first(t: Triple[a, b, c]) : a = t.fst
+#[doc("Returns the second component of a `Triple`.")]
+pub fn second(t: Triple[a, b, c]) : b = t.snd
+#[doc("Returns the third component of a `Triple`.")]
+pub fn third(t: Triple[a, b, c]) : c = t.trd
+
+# These tests pin both surfaces: the explicit record-literal form and
+# the n-tuple sugar, which desugars to the same underlying records.
+test "Pair record literal + field access" {
+  let p = Pair { fst: 1, snd: "two" }
+  assert p.fst == 1
+  assert p.snd == "two"
+}
+
+test "2-tuple sugar (a, b) constructs a Pair" {
+  let p = (10, 20)
+  assert p.fst == 10
+  assert p.snd == 20
+}
+
+test "3-tuple sugar (a, b, c) constructs a Triple" {
+  let t = (1, 2, 3)
+  assert t.fst == 1
+  assert t.snd == 2
+  assert t.trd == 3
+}
+
+test "4-tuple sugar (a, b, c, d) constructs a Quad" {
+  let q = (1, 2, 3, 4)
+  assert q.fst == 1
+  assert q.snd == 2
+  assert q.trd == 3
+  assert q.frt == 4
+}
+
+test "nested Pair[Pair[Int, Int], String] round-trips cleanly" {
+  let inner = Pair { fst: 7, snd: 8 }
+  let outer = Pair { fst: inner, snd: "label" }
+  assert outer.fst.fst == 7
+  assert outer.fst.snd == 8
+  assert outer.snd == "label"
+}
+
+test "mixed-type tuple sugar (Int, String)" {
+  let p = (42, "answer")
+  assert p.fst == 42
+  assert p.snd == "answer"
+}
+
+test "swap exchanges Pair components" {
+  let p = Pair { fst: 1, snd: "x" }
+  let q = tuple.swap(p)
+  assert q.fst == "x"
+  assert q.snd == 1
+}
+
+test "map_fst applies f to first only" {
+  let p = Pair { fst: 3, snd: "k" }
+  let q = tuple.map_fst(p, { n -> n * 10 })
+  assert q.fst == 30
+  assert q.snd == "k"
+}
+
+test "map_snd applies f to second only" {
+  let p = Pair { fst: "k", snd: 4 }
+  let q = tuple.map_snd(p, { n -> n + 1 })
+  assert q.fst == "k"
+  assert q.snd == 5
+}
+
+test "map_pair applies f and g independently" {
+  let p = Pair { fst: 2, snd: 3 }
+  let q = tuple.map_pair(p, { a -> a + 100 }, { b -> b * 1000 })
+  assert q.fst == 102
+  assert q.snd == 3000
+}
+
+test "first / second / third project Triple fields" {
+  let t = Triple { fst: 1, snd: "two", trd: true }
+  assert tuple.first(t) == 1
+  assert tuple.second(t) == "two"
+  assert tuple.third(t) == true
+}
