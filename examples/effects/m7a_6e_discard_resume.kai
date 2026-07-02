@@ -1,0 +1,48 @@
+# m7a #6e — discard-resume. When a handler clause returns without
+# calling `resume`, the rest of the handle body is abandoned (Doc A
+# §*Discarding the continuation*). m7a #6e implements this with a
+# setjmp landing pad in the handle prologue: an op call whose
+# clause leaves `KaiCont.status` UNRESUMED pops the evidence and
+# longjmps back. The clause's return value flows through the handle
+# as the body's result.
+#
+# This is the canonical `try` shape (Doc B §`Fail` stdlib helpers):
+# the handler short-circuits on Fail.fail and returns Err; the rest
+# of the body never runs.
+
+effect Fail {
+  fail(msg: String) : Nothing
+}
+
+fn main() : Int {
+  # case 1: clause discards resume → returns clause body's value
+  let r1 = handle {
+    Fail.fail("expected: caught")
+    99
+  } with Fail {
+    fail(msg, resume) -> 7
+  }
+  assert r1 == 7
+
+  # case 2: clause discards resume + return clause runs
+  let r2 = handle {
+    Fail.fail("hello")
+    100
+  } with Fail {
+    fail(msg, resume) -> 1
+    return(x) -> x + 41
+  }
+  assert r2 == 42
+
+  # case 3: no Fail.fail in body → clause never runs, body flows
+  # through normally
+  let r3 = handle {
+    50
+  } with Fail {
+    fail(msg, resume) -> 0
+    return(x) -> x + 1
+  }
+  assert r3 == 51
+
+  0
+}

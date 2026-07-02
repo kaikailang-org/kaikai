@@ -1,0 +1,558 @@
+# compiler/kir_lower_fns.kai — function/program-level lowering: the
+# entry point `lower_to_kir`, the per-decl fn walk, and the lifted
+# `KFnLambda` / `KFnClause` generation (+ handler decls, install order).
+#
+# These drive ON `lower_expr` (in `kir_lower_walk.kai`) but `lower_expr`
+# never calls back into them, so the import graph stays acyclic
+# (`kir_lower_fns → kir_lower_walk → kir_lower`). Splitting them out of
+# the Expr-SCC walk keeps each file within the quality-gate size cap
+# (the walk is the mutual-recursion core; this file is the orchestration
+# layer around it).
+
+import compiler.ast
+import compiler.util
+import compiler.fnreg
+import compiler.emit_shared
+import compiler.ffi_v2
+import compiler.resolve
+import compiler.region
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_walk
+
+# --- Top-level: lower the whole program --------------------------------
+
+# Entry point (design §7 Lane 0). `raw_decls` is the post-perceus /
+# post-tcrec `[Decl]`; `regions` the region-mark metadata. Produces a
+# `KProgram` with everything resolved, so the translators resolve nothing
+# (design §5).
+pub fn lower_to_kir(raw_decls: [Decl], regions: [RegionMark],
+                    fns: [EFn], variants: [EVar], target_origin: Option[String]) : KProgram / Console {
+  let types = lower_types(raw_decls, variants, [])
+  # The lifted-lambda table is the SAME analysis the emitters run
+  # (`collect_decls` over the global-name set) — reused, not re-derived.
+  let lc      = collect_lams(raw_decls, fns, variants)
+  let st0     = ls_new(fns, variants, lc.lams, collect_effect_names(raw_decls),
+                       kir_const_decls(raw_decls, []), ffi_extern_names(raw_decls, []),
+                       collect_records(raw_decls))
+  # The extern-type registry classifies struct / opaque FFI types for
+  # the native shim. Threaded explicitly to the FFI-fn lowering
+  # (narrower than a LowerSt field).
+  let freg    = collect_extern_types(raw_decls)
+  let kfns    = lower_fns(raw_decls, st0, freg, fns_by_mod_new(fns), [])
+  # Each lifted lambda becomes a top-level `KFnLambda`, and each handler
+  # clause a `KFnClause` (mirror of emit_c's `emit_lam_helpers` /
+  # `emit_clause_bodies`), appended after the ordinary fns.
+  let lamfns  = lower_lam_fns(lc.lams, st0, [])
+  let clsfns  = lower_clause_fns(lc.clauses, lc.clauses, st0, [])
+  # Each test / bench body becomes a runner `KFn` returning the block's
+  # final boxed value (mirror of emit_c's `emit_test_fn` / `emit_bench_fn`,
+  # minus the inline setjmp — the native runtime helper holds the landing
+  # pad). The native `kai_main` driver calls them via the runner list; the
+  # C-direct backend never reads either. `target_origin` rotates the EFn
+  # table file-local exactly as the C emitters do (issue #335).
+  let rs = lower_runner_decls(raw_decls, target_origin, st0, freg)
+  KProgram { types: types,
+             fns: list_append(kfns, list_append(lamfns, list_append(clsfns, rs.fns))),
+             handlers: lower_handler_decls(lc.clauses, lc.clauses, []),
+             install_order: kir_install_order(raw_decls),
+             defaults: kir_default_handlers(raw_decls),
+             synth_defaults: kir_synth_handler_effects(raw_decls),
+             regions: lower_regions(regions, []), runners: rs.runners }
+}
+
+# The runner KFns + the KRunner index, built together so the emitted
+# symbol and the index agree. `_kai_test_<i>` / `_kai_bench_<i>` are
+# numbered per-kind in source order (the same scheme emit_c uses), so the
+# native driver and any cross-backend reasoning name the same block.
+pub type RunnerLower = { fns: [KFn], runners: [KRunner] }
+
+fn lower_runner_decls(decls: [Decl], target_origin: Option[String],
+                      st0: LowerSt, freg: [ExternTypeReg]) : RunnerLower / Console = {
+  let body_fns = fns_prefer_module(st0.fns, target_origin)
+  lower_runner_loop(decls, st0, freg, body_fns, 0, 0, [], [])
+}
+
+# Walk the decls accumulating one runner KFn + KRunner per test/bench
+# block. `ti`/`bi` are the per-kind counters. The runner sym is passed as
+# the fn name with `mo = None`, so `c_sym` keeps it literal
+# (`_kai_test_0`) and the native driver names the same symbol. The body's
+# own calls already resolve through the pre-rotated `body_fns`. Check
+# blocks carry `with`-clause params whose values the runtime generates —
+# that needs the parametrised-predicate runner the native check path does
+# not yet build, so they are skipped here and the wrapper keeps
+# `kai check` on the C oracle.
+fn lower_runner_loop(decls: [Decl], st: LowerSt, freg: [ExternTypeReg],
+                     body_fns: [EFn], ti: Int, bi: Int,
+                     fns_acc: [KFn], run_acc: [KRunner]) : RunnerLower / Console = match decls {
+  [] -> RunnerLower { fns: list_reverse(fns_acc), runners: list_reverse(run_acc) }
+  [d, ...rest] -> match d {
+    DTest(desc, body, line, col) -> {
+      # The sym IS the `__test__<line>_<col>` enc_fn the lambda collector
+      # stamped on this body's lambdas, so `find_lam` resolves a lambda
+      # inside the test body (a bare `_kai_test_<i>` sym would leave it
+      # "non-callable"). Mirror of emit_c's `test_enc`. The position is
+      # unique, so it doubles as the emitted symbol.
+      let sym = runner_enc_sym("__test__", line, col)
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let r = KRunner { sym: sym, desc: desc, kind: KRTest }
+      lower_runner_loop(rest, st, freg, body_fns, ti + 1, bi, [kfn, ...fns_acc], [r, ...run_acc])
+    }
+    DBench(desc, body, line, col) -> {
+      let sym = runner_enc_sym("__bench__", line, col)
+      let kfn = lower_fn(sym, [], None, body, None, body_fns, st, freg)
+      let r = KRunner { sym: sym, desc: desc, kind: KRBench }
+      lower_runner_loop(rest, st, freg, body_fns, ti, bi + 1, [kfn, ...fns_acc], [r, ...run_acc])
+    }
+    _ -> lower_runner_loop(rest, st, freg, body_fns, ti, bi, fns_acc, run_acc)
+  }
+}
+
+# The `__test__<line>_<col>` / `__bench__<line>_<col>` enc_fn key the
+# lambda collector (`collect_decls`) stamps on a test/bench body's
+# lambdas. The runner KFn reuses it as its symbol so `find_lam` resolves.
+fn runner_enc_sym(prefix: String, line: Int, col: Int) : String =
+  cat2(prefix, cat2(int_to_string(line), cat2("_", int_to_string(col))))
+
+# Run the shared lambda-collection pass (`collect_decls`) — the SAME
+# analysis the emitters run — to build the lifted-lambda + clause tables.
+# Mirror of the emitters' preamble: build the global-name set, walk decls.
+fn collect_lams(decls: [Decl], fns: [EFn], variants: [EVar]) : LamCollect / Console {
+  let globals = build_globals(fns, variants, collect_effect_names(decls), collect_op_qualified_names(decls), const_names(decls))
+  collect_decls(decls, lc_new(globals))
+}
+
+# --- Ordinary functions -------------------------------------------------
+
+# `fbm` memoises the per-module EFn-table rotation by module origin (one
+# entry per distinct module, not per fn body) — the `O(n²)` retention the
+# per-body rebuild caused on a self-compile. Threaded like the C emitter's
+# `fn_bodies_loop`: each body reads its rotated table from the cache and
+# passes the grown cache to the next decl.
+fn lower_fns(ds: [Decl], st: LowerSt, freg: [ExternTypeReg], fbm: FnsByMod, acc: [KFn]) : [KFn] / Console = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, name, _, params, ret_ty, _, body, _, _, mo) -> {
+      let r = fns_prefer_module_cached(fbm, mo)
+      let kfn = lower_fn(name, params, ret_ty, body, mo, r.table, st, freg)
+      lower_fns(rest, st, freg, r.cache, [kfn, ...acc])
+    }
+    _ -> lower_fns(rest, st, freg, fbm, acc)
+  }
+}
+
+# Lower one function to a KFn. Counters reset (Risk 2b); the enclosing-fn
+# key is the fn's own symbol so nested lambdas resolve to their LamInfo.
+# The body lowers into the entry block and whatever blocks the control
+# flow forks off; the final value seals the last block with `KRet`.
+fn lower_fn(name: String, params: [Param], ret_ty: Option[TypeExpr],
+            body: Expr, mo: Option[String], body_fns: [EFn], st0: LowerSt, freg: [ExternTypeReg]) : KFn / Console {
+  let sym = c_sym(name, mo)
+  # Enter WITH the EFn table already rotated to prefer `mo` (this fn's
+  # module) by the cached `lower_fns` loop, so a bare call inside the body
+  # resolves to a same-module definition over an imported homonym — the C /
+  # LLVM emitters do the same. (`hashset.from_list`'s `empty()` resolved to
+  # the imported `hashmap.empty` without this — `no such field`.)
+  let st = ls_enter_fn_with(st0, sym, param_local_names(params, []), body_fns)
+  # P3 raw scalar params: resolve this fn's UFnSig (the classifier already
+  # applied the no-tparams / no-FFI / no-effect-row gates and computed the
+  # per-param `raw_mask`). A `Some(US(...))` lowers each raw param to its
+  # scalar KSlot + a raw return slot, so the native backend declares an
+  # `i64`/`f64`/`i1` signature instead of all-`ptr`. `None` (FFI shims,
+  # proto dispatchers, effectful / generic fns) keeps the all-boxed shape.
+  # The unbox pass reads the SAME mask (`ufn_param_env`), so the body's raw
+  # param reads and these slots can never disagree.
+  let usig = lookup_ufn_sig(st.fns, name, mo)
+  let kparams = lower_params_sig(params, usig)
+  # An `extern "C" fn` (issue #260) lowers to a DFn whose body is the magic
+  # `ETodo("__kai_ffi__"[:override])` tag. C / LLVM-text intercept it in
+  # `emit_fn_body` and synthesise an unbox→extern-call→re-box shim from the
+  # params + ret type — NOT from the body expr. The native path consumes
+  # KIR, so the body would reach `lower_expr` and become a panic stub
+  # (`panic: todo: __kai_ffi__`). Classify it HERE into a body-less
+  # `KFnFfi`: the C-side symbol is resolved now (the issue #261 override
+  # carved out of the tag via `ffi_extern_symbol_of`) and the marshalling
+  # kinds are read from the AST types, so the native backend synthesises the
+  # shim without re-parsing the tag (one resolver, not three — asu review).
+  if body_is_ffi_extern(body) {
+    # The kaikai-visible wrapper symbol is `kai_<c_sym>` (NOT the bare
+    # `c_sym`): it must differ from the bare C symbol the shim calls, which
+    # IS the kaikai identifier verbatim (`puts`, `abs`). The native backend
+    # emits both into one module; sharing `@abs` made the wrapper recurse
+    # into itself. The C / LLVM-text oracles `kai_`-prefix every symbol, so
+    # they never clashed — this mangling brings the FFI wrapper into line
+    # WITHOUT prefixing the whole native backend (a separate concern).
+    let c_symbol = ffi_extern_symbol_of(body, name)
+    KFn { sym: ffi_wrapper_sym(name, mo), kind: KFnFfi(c_symbol, ffi_param_kinds(params, freg), kffi_kind_of_ret(ret_ty, freg)),
+          params: kparams, ret: slot_of_ty(ret_ty), blocks: [],
+          region_id: None, stateful: false }
+  } else {
+    # A `__proto_<op>` dispatcher's body is an `ETodo` marker that the shared
+    # lowering would otherwise reduce to a panic stub (the native path then
+    # aborts every protocol call). C / LLVM-text re-emit the dispatcher's body
+    # from the AST (`body_is_proto_dispatch`); the native path consumes KIR, so
+    # we lower the marker to a real dispatch HERE — a boxed call to the runtime
+    # `kaix_proto_dispatch<N>` shim, which derives the head tag, resolves the
+    # impl table, and indirect-calls (one ABI source of truth, shared with the
+    # oracle). C / LLVM never reach this branch (they intercept upstream).
+    # The body lowers BOXED (its natural shape — `lower_expr` boxes a raw
+    # value at the border). For a raw-return UFn, the native `KRet`
+    # re-materialises the result register at the raw return slot
+    # (`nemit_ret_value` → `nemit_atom_raw`, which unbox-borrows a boxed
+    # register down to its raw scalar), so `ret i64`/`f64`/`i1` matches the
+    # raw signature without a body-side raw path. Lowering the body raw
+    # would route a Bool/Char-returning body (the many `…is_none : Bool`
+    # fns) through `lower_scalar_unbox_border`, whose Int-vs-else split mis-
+    # routes a Bool to `real.unbox` (an `f64` fed to `kaix_bool_field` — a
+    # verify failure). Keeping the body boxed sidesteps that: the only raw
+    # crossing is at the `KRet`, where the slot is known exactly.
+    let r = if body_is_proto_dispatch(body) {
+      lower_proto_dispatch(proto_dispatch_parts(body), params, kpos_of(body), st)
+    } else { lower_expr(body, st) }
+    match r {
+      LRes(val, st1) -> KFn { sym: sym, kind: KFnNormal, params: kparams,
+                              ret: ret_slot_of_sig(usig), blocks: ls_finish(st1, KRet(val, kpos_of(body))),
+                              region_id: None, stateful: false }
+    }
+  }
+}
+
+# The KIR FFI marshalling kind of each `extern "C" fn` param, in
+# declaration order — the unbox direction the native shim applies before
+# the raw call. Reuses emit_shared's type→`FfiRetKind` classifier (the
+# typer's supported-FFI-type gate) and translates into the KIR's own
+# `KFfiKind`, so kir.kai stays free of an emit_shared dependency (Lane 0).
+fn ffi_param_kinds(params: [Param], freg: [ExternTypeReg]) : [KFfiKind] = match params {
+  []           -> []
+  [p, ...rest] -> [kffi_kind_of_param(p, freg), ...ffi_param_kinds(rest, freg)]
+}
+
+fn kffi_kind_of_param(p: Param, freg: [ExternTypeReg]) : KFfiKind = match p.ptype {
+  None    -> KFfiUnknown("missing")
+  Some(t) -> kffi_of_ret_kind(ffi_kind_of_ty_reg(t, freg), freg)
+}
+
+fn kffi_kind_of_ret(ret_ty: Option[TypeExpr], freg: [ExternTypeReg]) : KFfiKind =
+  kffi_of_ret_kind(ffi_ret_kind_of_reg(ret_ty, freg), freg)
+
+# Translate emit_shared's `FfiRetKind` to the KIR-local `KFfiKind`. An
+# opaque handle becomes `KFfiForeign`; a fixed-width annotation becomes
+# `KFfiFixed(bits, signed, is_float)`; a struct resolves its fields from
+# the registry into `KFfiStruct`. The native backend marshals all of
+# them directly.
+fn kffi_of_ret_kind(k: FfiRetKind, freg: [ExternTypeReg]) : KFfiKind = match k {
+  FfiRetUnit       -> KFfiUnit
+  FfiRetInt        -> KFfiInt
+  FfiRetReal       -> KFfiReal
+  FfiRetBool       -> KFfiBool
+  FfiRetChar       -> KFfiChar
+  FfiRetString     -> KFfiString
+  FfiRetForeign(_) -> KFfiForeign
+  FfiRetFixed(fx)  -> KFfiFixed(ffi_fixed_bits(fx), ffi_fixed_is_signed(fx), ffi_fixed_is_float(fx))
+  FfiRetFixedVal(t) -> kffi_of_fixed_val(t)
+  FfiRetStruct(n)  -> KFfiStruct(kffi_struct_fields(extern_struct_fields(freg, n), freg))
+  FfiRetUnknown(t) -> KFfiUnknown(t)
+}
+
+# Native FFI marshalling kind for an honest fixed-width VALUE type. The
+# box already carries the exact width (KAI_INT32/...), so it crosses as a
+# `KFfiFixedVal` whose shim reads the width field directly instead of the
+# `kai_intf` path the legacy `KFfiFixed` (Int-boxed annotation) uses.
+fn kffi_of_fixed_val(t: Ty) : KFfiKind = match t {
+  TyInt32  -> KFfiFixedVal(32, true)
+  TyUInt32 -> KFfiFixedVal(32, false)
+  TyUInt64 -> KFfiFixedVal(64, false)
+  _        -> KFfiUnknown("Int128 across the FFI boundary is not supported")
+}
+
+# Resolve each declared struct field into a `KFfiField` carrying its
+# marshalling kind (recursively, for nested structs).
+fn kffi_struct_fields(fields: [FieldDecl], freg: [ExternTypeReg]) : [KFfiField] = match fields {
+  []            -> []
+  [fd, ...rest] -> match fd {
+    FD(_, fname, fty) ->
+      [KFF(fname, kffi_of_ret_kind(ffi_kind_of_ty_reg(fty, freg), freg)),
+       ...kffi_struct_fields(rest, freg)]
+  }
+}
+
+# Collect the bare kaikai names of every `extern "C" fn` (DFn whose body is
+# the magic FFI tag). Seeds `LowerSt.ffi`, the set a call site consults to
+# decide whether to mangle the callee. Names (not c_syms) — the call site
+# sees the surface identifier before mangling.
+pub fn ffi_extern_names(ds: [Decl], acc: [String]) : [String] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, name, _, _, _, _, body, _, _, _) ->
+      if body_is_ffi_extern(body) { ffi_extern_names(rest, [name, ...acc]) }
+      else { ffi_extern_names(rest, acc) }
+    _ -> ffi_extern_names(rest, acc)
+  }
+}
+
+# Lower a protocol dispatcher body to a boxed call to the runtime dispatch
+# shim. The shim takes the proto id (boxed Int), the proto + op names (boxed
+# Strings, for the no-impl panic message) and the op's args; it derives the
+# receiver's head tag, resolves `kai_lookup_impl`, and indirect-calls the
+# impl (mirror of `emit_proto_dispatch_shim_c`). An arity-0 op (`Default.
+# default`) has no receiver to dispatch on — the monomorphiser is meant to
+# have pinned `Self`; reaching the body is an unresolved-call bug, so we keep
+# the loud panic stub the oracle also emits.
+fn lower_proto_dispatch(parts: ProtoDispatchParts, params: [Param],
+                        pos: KPos, st: LowerSt) : LRes / Console = match parts {
+  PDP(pname, opname) -> {
+    let arity = list_length(params)
+    if arity == 0 {
+      lower_panic_stub(kir_quote(concat_all(["no impl of ", pname, ".", opname,
+        " for runtime head (arity 0 op: caller must annotate Self)"])), st)
+    } else {
+      let shim = cat2("kaix_proto_dispatch", int_to_string(arity))
+      let args = [KIntV(stdlib_proto_id_int(pname)), KIntV(stdlib_proto_op_id_int(pname, opname)),
+                  KStrV(kir_quote(pname)), KStrV(kir_quote(opname)), ...proto_dispatch_arg_vals(params)]
+      bind_op(st, KCall(shim, args), pos)
+    }
+  }
+}
+
+# The dispatcher's params as `KVar` atoms in declaration order (the op's
+# receiver first), the boxed args the shim forwards to the resolved impl.
+fn proto_dispatch_arg_vals(params: [Param]) : [KVal] = match params {
+  []           -> []
+  [p, ...rest] -> [KVar(p.pname), ...proto_dispatch_arg_vals(rest)]
+}
+
+# --- Lambdas: lifted bodies as top-level `KFnLambda`s -------------------
+
+# One `KFnLambda` per lifted lambda. Its params are the lambda's own
+# params (`PDirect`) plus its captures (`PCapture`, read from `self`);
+# the body lowers with the lambda's id as the enclosing-fn key so a
+# nested lambda resolves to ITS LamInfo (mirror of emit_c's
+# `_kai_lam_<id>` enc_fn). Same body shape as a normal fn — only the
+# `kind` + param origins differ (asu review).
+fn lower_lam_fns(lams: [LamInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match lams {
+  [] -> acc
+  [l, ...rest] -> lower_lam_fns(rest, st0, list_append(acc, [lower_lam_fn(l, st0)]))
+}
+
+fn lower_lam_fn(l: LamInfo, st0: LowerSt) : KFn / Console = match l {
+  LamInfo(id, _, _, _, params, caps, body) -> {
+    let sym = cat2("_kai_lam_", int_to_string(id))
+    let st = ls_enter_fn(st0, sym, param_local_names(params, caps))
+    let kparams = list_append(lower_params(params, []), lower_captures(caps, 0, []))
+    match lower_expr(body, st) { LRes(val, st1) ->
+      KFn { sym: sym, kind: KFnLambda, params: kparams, ret: SBoxed,
+            blocks: ls_finish(st1, KRet(val, kpos_of(body))), region_id: None,
+            stateful: false } }
+  }
+}
+
+# Each capture name becomes a `PCapture(j)` param read from `self->as.clo`
+# at the matching index (the order the collector recorded in the lambda's
+# own caps list). Lambda-only — a clause uses `lower_env_captures`.
+fn lower_captures(caps: [String], j: Int, acc: [KParam]) : [KParam] = match caps {
+  [] -> acc
+  [c, ...rest] -> lower_captures(rest, j + 1, list_append(acc, [capture_param(c, j)]))
+}
+
+# A clause's captures become `PEnvCapture(j)` params, where `j` is the
+# capture's index in the HANDLE's cross-clause union (`env_caps`), NOT in
+# the clause's own caps list. The Ev `env` array the install fills is
+# laid out in union order, shared by every clause of the handle, so a
+# clause that captures a subset must still index by the union position
+# (mirror of emit_c, which keys env-struct fields by surface NAME — the
+# union order is that name's fixed slot). `caps` is the clause's own
+# capture list (preserved for the binder NAME); `env_caps` the handle
+# union (resolved for the INDEX).
+fn lower_env_captures(caps: [String], env_caps: [String], acc: [KParam]) : [KParam] / Console = match caps {
+  [] -> acc
+  [c, ...rest] -> {
+    let j = list_index_of_str(env_caps, c, 0)
+    # The clause's caps are a subset of the handle union by construction
+    # (`kir_merge_str_set` unions every clause's caps), so a miss is a
+    # lowering invariant break — fail loud rather than emit `PEnvCapture(-1)`
+    # (an out-of-bounds env read the backend would silently corrupt on).
+    let _ = if j < 0 { eprint(cat2("kir: clause capture not in handle union: ", c)) } else { () }
+    lower_env_captures(rest, env_caps, list_append(acc, [env_capture_param(c, j)]))
+  }
+}
+
+# A `PEnvCapture(j)` param: a boxed, owned cell the clause prologue fills
+# from `self->env[j]` (with a dup — perceus analyses the clause body in
+# isolation, same contract as a lambda capture).
+fn env_capture_param(name: String, j: Int) : KParam =
+  KParam { name: name, slot: SBoxed, mode: KOwn, origin: PEnvCapture(j) }
+
+# Index of `s` in `xs`, or -1 if absent. Local mirror to keep this off
+# the util import surface (the clause caps are always a subset of the
+# handle union, so the -1 is a should-not-happen defensive fallback).
+fn list_index_of_str(xs: [String], s: String, i: Int) : Int = match xs {
+  [] -> 0 - 1
+  [h, ...rest] -> if h == s { i } else { list_index_of_str(rest, s, i + 1) }
+}
+
+# The cross-clause union of every clause's captures for the handle pinned
+# at (hline, hcol) — mirror of emit_c's `handle_captures_at`. Stable
+# "first-occurrence-wins" order, shared by the install (env fill) and the
+# clause prologue (env index) so both agree by construction.
+fn kir_handle_captures_at(cls: [ClauseInfo], hline: Int, hcol: Int) : [String] = match cls {
+  [] -> []
+  [c, ...rest] -> match c {
+    CI(line, col, _, _, _, _, _, _, caps) ->
+      if line == hline and col == hcol {
+        kir_merge_str_set(caps, kir_handle_captures_at(rest, hline, hcol))
+      } else {
+        kir_handle_captures_at(rest, hline, hcol)
+      }
+  }
+}
+
+# Stable-order union of two string lists (mirror of emit_c's
+# `merge_string_set`): every element of `a` not already in `b`, prepended
+# in order, then `b`. Field order MUST match across install/read.
+fn kir_merge_str_set(a: [String], b: [String]) : [String] = match a {
+  [] -> b
+  [h, ...rest] ->
+    if list_has(b, h) { kir_merge_str_set(rest, b) }
+    else { [h, ...kir_merge_str_set(rest, b)] }
+}
+
+# The bound names a fn/lambda/clause introduces at entry — its params plus
+# its captures. Seeded into `LowerSt.locals` so the body's `lower_var`
+# reads them as locals (shadowing a same-name top-level fn), not as a
+# closure over a stdlib thunk. Match binders / `let`s extend this set
+# further as the body lowers; the params/captures are the entry seed.
+fn param_local_names(params: [Param], acc: [String]) : [String] = match params {
+  [] -> acc
+  [p, ...rest] -> param_local_names(rest, [p.pname, ...acc])
+}
+
+# --- Clauses: lifted bodies as top-level `KFnClause`s -------------------
+
+# One `KFnClause` per handler clause. Params = the clause's args
+# (`PDirect`), the trailing `resume` continuation (`PResume`, used by the
+# body so it enters Perceus one-shot analysis), and the captures
+# (`PEnvCapture`, read from the Ev `env` array at the handle-union index).
+# The body lowers with the clause's enc_fn as the lambda-scoping key.
+# `all_cls` is the whole program's clause list (threaded so each clause
+# can resolve its handle's cross-clause capture union).
+fn lower_clause_fns(clauses: [ClauseInfo], all_cls: [ClauseInfo], st0: LowerSt, acc: [KFn]) : [KFn] / Console = match clauses {
+  [] -> acc
+  [c, ...rest] -> lower_clause_fns(rest, all_cls, st0, list_append(acc, [lower_clause_fn(c, all_cls, st0)]))
+}
+
+fn lower_clause_fn(c: ClauseInfo, all_cls: [ClauseInfo], st0: LowerSt) : KFn / Console = match c {
+  CI(line, col, _, op, params, body, stateful, enc_fn, caps) -> {
+    let sym = clause_sym(line, col, op)
+    let st = ls_enter_fn(st0, enc_fn, param_local_names(params, caps))
+    # `PEnvCapture(j)` indexes the handle UNION, not the clause's own caps.
+    let env_caps = kir_handle_captures_at(all_cls, line, col)
+    let kparams = list_append(lower_clause_params(params), lower_env_captures(caps, env_caps, []))
+    match lower_expr(body, st) { LRes(val, st1) -> {
+      let blocks = ls_finish(st1, KRet(val, kpos_of(body)))
+      check_resume_one_shot(sym, blocks)
+      KFn { sym: sym, kind: KFnClause, params: kparams, ret: SBoxed,
+            blocks: blocks, region_id: None, stateful: stateful }
+    } }
+  }
+}
+
+# A clause's surface params: all but the last are ordinary args
+# (`PDirect`); the last is the `resume` continuation (`PResume`).
+fn lower_clause_params(params: [Param]) : [KParam] = {
+  let n = list_length(params)
+  lower_clause_params_idx(params, 0, n, [])
+}
+
+fn lower_clause_params_idx(params: [Param], i: Int, n: Int, acc: [KParam]) : [KParam] = match params {
+  [] -> acc
+  [p, ...rest] -> {
+    let origin = if i == n - 1 { PResume } else { PDirect(i) }
+    lower_clause_params_idx(rest, i + 1, n, list_append(acc, [KParam { name: p.pname, slot: SBoxed, mode: KOwn, origin: origin }]))
+  }
+}
+
+# --- Handler decls + one-shot resume check ------------------------------
+
+# One `KHandlerDecl` per (effect, handler-site) the clauses belong to.
+# Groups clauses by their (line, col) handler key, mapping each op to its
+# clause-thunk symbol so a `KInstall` resolves the right clause set. Each
+# decl carries `env_caps` (the handle's cross-clause capture union) so the
+# native install fills the Ev `env` array in the order the clause prologue
+# (`PEnvCapture`) indexes. `all_cls` is the whole program's clause list
+# (the union must see every clause of the handle, not just the head).
+fn lower_handler_decls(clauses: [ClauseInfo], all_cls: [ClauseInfo], acc: [KHandlerDecl]) : [KHandlerDecl] = match clauses {
+  [] -> acc
+  [CI(line, col, eff, op, _, _, _, _, _), ...rest] -> {
+    let sym = cat3("_kai_handler_", int_to_string(line), cat2("_", int_to_string(col)))
+    let ot  = KOT(op, clause_sym(line, col, op))
+    let ecaps = kir_handle_captures_at(all_cls, line, col)
+    lower_handler_decls(rest, all_cls, hdecl_add(acc, eff, sym, ot, ecaps))
+  }
+}
+
+# Add an op-thunk to the matching handler decl, or create the decl. The
+# `env_caps` of the first clause that opens the decl wins (all clauses of
+# one handle resolve the same union, so later ops carry the same list).
+fn hdecl_add(acc: [KHandlerDecl], eff: String, sym: String, ot: KOpThunk, ecaps: [String]) : [KHandlerDecl] = match acc {
+  [] -> [KHandlerDecl { eff: eff, sym: sym, op_thunks: [ot], ret_thunk: None, env_caps: ecaps }]
+  [h, ...rest] ->
+    if h.sym == sym { [KHandlerDecl { eff: h.eff, sym: h.sym, op_thunks: list_append(h.op_thunks, [ot]), ret_thunk: h.ret_thunk, env_caps: h.env_caps }, ...rest] }
+    else { [h, ...hdecl_add(rest, eff, sym, ot, ecaps)] }
+}
+
+# The clause-thunk symbol for an op clause (mirror of emit_c's
+# `_kai_clause_<line>_<col>_<op>`). `pub` so the handle site
+# (`kir_lower_walk`) mints the matching `KInstall` handler symbol.
+pub fn clause_sym(line: Int, col: Int, op: String) : String =
+  concat_all(["_kai_clause_", int_to_string(line), "_", int_to_string(col), "_", op])
+
+# One-shot resume is PINNED (design decision): a clause must not resume
+# the continuation more than once on any path. A `resume` is now a
+# `KResumeOp`/`KResume2Op` STATEMENT (an expression-call, mirror of the
+# C-direct oracle), so a LINEAR multi-resume (`let _ = resume(()) resume(())`)
+# is left to the runtime one-shot check (`kai_cont_resume` aborts on the
+# second), which is EXACTLY what the oracle does — the m7a #6d parity gap.
+# The structural check stays only for the shape the runtime cannot phrase as
+# helpfully: a resume reachable via a BACK-EDGE (a loop re-entering a block
+# that already resumed). Flag a clause that has BOTH a resume op and a
+# loop-forming terminator (loud, not silent).
+fn check_resume_one_shot(sym: String, blocks: [KBlock]) : Unit / Console =
+  if resume_count(blocks, 0) > 1 and blocks_have_backedge(blocks) {
+    eprint(concat_all(["kir: one-shot resume violation in clause ", sym,
+                       " (resume reachable more than once)"]))
+  } else { () }
+
+# Count `resume` ops across every block's statements (a resume is no longer a
+# terminator). A `KResumeOp`/`KResume2Op` only appears as a `KLet`/`KDo` RHS.
+fn resume_count(blocks: [KBlock], acc: Int) : Int = match blocks {
+  [] -> acc
+  [b, ...rest] -> resume_count(rest, acc + stmts_resume_count(b.stmts, 0))
+}
+
+fn stmts_resume_count(stmts: [KStmt], acc: Int) : Int = match stmts {
+  [] -> acc
+  [s, ...rest] -> stmts_resume_count(rest, acc + stmt_is_resume(s))
+}
+
+fn stmt_is_resume(s: KStmt) : Int = match s {
+  KLet(_, _, op, _) -> op_is_resume(op)
+  KDo(op, _)        -> op_is_resume(op)
+  _                 -> 0
+}
+
+fn op_is_resume(op: KOp) : Int = match op {
+  KResumeOp(_, _)     -> 1
+  KResume2Op(_, _, _) -> 1
+  _                   -> 0
+}
+
+# A back-edge is a tcrec/trmc goto (the only loop-forming terminators the
+# lowering emits); a plain `KBr` always targets a forward continuation.
+fn blocks_have_backedge(blocks: [KBlock]) : Bool = match blocks {
+  [] -> false
+  [b, ...rest] -> match b.term {
+    KTcrecGoto(_, _, _, _)            -> true
+    KTrmcStep(_, _, _, _, _, _, _, _, _) -> true
+    _                                 -> blocks_have_backedge(rest)
+  }
+}
