@@ -1,0 +1,66 @@
+fn area(s: box) : i64 {
+  entry:
+    .t0: i32 = tagof s
+    __pcs_scr: box = s
+    .t1$sd: box = s
+    .t1: box = ()
+    switch .t0 [11 -> L2, 12 -> L3] default L1
+  L1:
+    unreachable
+  L2:
+    r: box = proj s.0
+    dup r
+    dup r
+    .t2: i64 = prim i*(r, r)
+    .t3: i64 = prim i*(.t2, 3)
+    __pcs_arm_ret: i64 = .t3
+    drop r
+    do ()
+    .t4: box = prim int.box(__pcs_arm_ret)
+    .t1 <- .t4
+    br L0
+  L3:
+    w: box = proj s.0
+    dup w
+    dup w
+    .t5: i64 = prim i*(w, w)
+    __pcs_arm_ret: i64 = .t5
+    drop w
+    do ()
+    .t6: box = prim int.box(__pcs_arm_ret)
+    .t1 <- .t6
+    br L0
+  L0:
+    drop .t1$sd
+    ret .t1
+}
+
+fn sign(n: i64) : i64 {
+  entry:
+    .t0: i1 = prim i>(n, 0)
+    .t1: i64 = 0
+    condbr .t0 ? L0 : L1
+  L0:
+    .t1 <- 1
+    br L2
+  L1:
+    .t2: i64 = prim i-(0, 1)
+    .t1 <- .t2
+    br L2
+  L2:
+    ret .t1
+}
+
+fn main() : box {
+  entry:
+    .t0: box = con Circle #11 m1 {i64:2}
+    .t1: i64 = area(.t0)
+    a: box = .t1
+    .t2: i64 = sign(a)
+    .t3: i64 = prim i+(a, .t2)
+    .t4: box = prim int.box(.t3)
+    .t5: box = int_to_string(.t4)
+    .t6: box = perform Stdout.print(.t5)
+    ret .t6
+}
+
