@@ -1,0 +1,1017 @@
+# compiler/ast.kai — AST data model + semantic Ty / Row.
+#
+# Extracted from main.kai under issue #677 Phase 1f. This module
+# carries the SHARED data model that parser, resolver, typer,
+# desugarer, monomorphiser, and emitter all walk: the syntactic
+# AST (Expr / Pattern / TypeExpr / Decl / etc.) together with the
+# semantic Ty / Label / Row / RVBind types that the typer attaches
+# to AST nodes.
+#
+# Why both in one module
+#
+# `Expr` carries `ty: Option[Ty]`. `Ty` carries `TyRefineT(Ty, Expr)`
+# (refinement types). The two are mutually recursive. kaikai's
+# module resolver does NOT permit import cycles between modules
+# (verified empirically — see lane retro for this commit), so the
+# only way to share both across consumer modules is to bundle
+# them into a single module. ast.kai is that module.
+#
+# What stays in main.kai
+#
+# - Algorithmic helpers over Ty / Row (resolve_ty, row_of_expr,
+#   row_empty, rvbind_lookup, mk_rvbinds, unit_canon, etc.). They
+#   compose Ty with the parser and typer's working state and
+#   migrate into infer.kai when that module extracts.
+# - Parser state types (Parser, PExpr, PStmt, …) — they couple
+#   the parser to its progress markers, not to the AST shape.
+# - Operational types (Env, MArm, IntervalEnv, …) — they belong
+#   with the algorithm modules that produce them.
+#
+# What is NOT in this module
+#
+# - `tokenize` / Token / Lexer — already extracted to compiler/lex.kai.
+# - Diagnostic types (Severity, Diagnostic, …) — already in
+#   compiler/diag.kai.
+# - ParserState, PXxx workspace types — they extract with parse.kai.
+#
+# Phase 1f-specific notes
+#
+# - All AST top-level types and the four AST constructor helpers
+#   (mk_expr, with_ty, mk_pat, mk_ty) are pub. The un-pub audit
+#   (#677 follow-up) found ZERO un-pub candidates: every type
+#   in the module is pattern-matched somewhere in main.kai or
+#   another extracted module, and every helper is called
+#   externally. The extraction was minimal-surface by design.
+# - kaic1 (which still consumes the concatenated bundle until
+#   separate compilation lands) does not accept triple-quoted
+#   strings inside `#[doc(...)]`, so the doc surface here uses
+#   single-line attributes only; multi-paragraph rationale stays
+#   in `#` comments above each section.
+
+# AST types
+# ====================================================================
+
+# Expressions carry their source position on the wrapper, so variants
+# stay compact. Pattern matching on expressions therefore destructures
+# the record to reach `.kind`, then matches the sum.
+
+# `mode` records the value representation chosen for this node by the
+# unbox analysis pass (Tier 2.5; see `docs/unboxing-phase2-design.md`).
+# Parser stamps every `Expr` with `MUnknown`; the unbox pass rewrites
+# nodes whose type is unboxable and whose consumer accepts a raw scalar
+# to `MUnboxed`, otherwise `MBoxed`. The emitter consults `mode` to
+# pick between `KaiValue *` and the underlying C scalar (`int64_t` /
+# `int` / `uint32_t`). Phase 1 of the lane (this commit) lands the
+# field with codegen unchanged; the pass + emitter switches arrive in
+# subsequent milestones.
+pub type Expr = { kind: ExprKind, line: Int, col: Int,
+              ty: Option[Ty], mode: ValueMode }
+
+pub type ValueMode
+  = MUnknown   # parser default; unbox_pass assigns one of the below
+  | MBoxed     # KaiValue * (current behaviour everywhere)
+  | MUnboxed   # raw int64_t / int / uint32_t, chosen by `ty`
+
+# i64-inline (kind-1 Int variant slots) — the unbox pass needs to know,
+# per constructor, which payload slots are raw-`int64_t` Int fields so it
+# can seed `MUnboxed` for the sub-PBind binders that read them. The slot
+# kind classification lives in the emit layer (`variant_slot_kind`), which
+# sits AFTER unbox in the bundle, so the driver pre-computes this map (it
+# can reach both layers) and hands it to `unbox_pass`. Each `CIS(ctor,
+# is_int)` lists, in slot order, whether slot i is a kind-1 Int field.
+pub type CtorIntSlots = CIS(String, [Bool])
+
+pub type ExprKind
+  = EInt(Int)
+  | EReal(Real, String)                    # value + raw source span (round-trips decimals)
+  # A fixed-width integer literal: the decimal/hex/bin source span
+  # (digits only, suffix stripped) and the width type it was tagged
+  # with (TyInt32/TyUInt32/TyUInt64/TyInt128). The width rides the node
+  # itself, not the fragile `.ty` slot that intermediate passes drop;
+  # like `EReal`, the backend decodes the span at emit time, so even an
+  # `Int128` value above 2^63 survives the compiler's 64-bit decode.
+  | EFixed(String, Ty)
+  # An integer literal whose magnitude exceeds the compiler's 64-bit
+  # decode, carrying its source lexeme verbatim. The parser emits it in
+  # place of the past-i64 error so the typer can mint it to an
+  # arbitrary-precision carrier (`BigInt`/`DecimalBig`) or an `Int128`
+  # when the annotation supplies a concrete target; with no such context
+  # the typer surfaces the out-of-range diagnostic. Invariant: EIntLit
+  # never survives inference — every backend walker treats it as
+  # unreachable.
+  | EIntLit(String)
+  # A `<num>d` literal carrying its source lexeme verbatim, the suffix
+  # form for the `Decimal` carrier. The `d` supplies the target locally
+  # where an annotation is absent (`42d`), so the typer folds an exact
+  # `Decimal { raw, scale }` from the digits and errors on a magnitude
+  # past the `Int128` carrier. Same invariant as EIntLit: never survives
+  # inference, unreachable in every backend walker.
+  | EDecimalLit(String)
+  | EBool(Bool)
+  | EChar(Char)
+  | EStr(String, Bool)                      # raw source span (includes quotes), is_triple
+  | EUnit
+  | EVar(String)
+  | EUnder                                  # `_` (pattern context only, but lexer produces it anywhere)
+  | EPlaceholder                            # `.` placeholder (stage 1 extension; stage 0 rejects)
+  | ECall(Expr, [Expr])
+  | EField(Expr, String)
+  | EIndex(Expr, Expr)
+  | EBinop(String, Expr, Expr)
+  | EUnop(String, Expr)                     # "-" or "not"
+  | EIf(Expr, Expr, Option[Expr])
+  | EMatch(Expr, [Arm])
+  | ELambda([Param], Expr)
+  | ERecordLit(String, [FieldInit])
+  | EList([ListElem])
+  | ERange(Expr, Expr, Option[Expr])
+  | EBlock([Stmt], Option[Expr])
+  | EPipe(Expr, Expr)
+  # issue #201: `xs | f` — map-pipe. Until #201 the parser desugared
+  # `|` straight to `ECall(EVar("map"), [xs, f])`. The new shape keeps
+  # the surface visible to the typer so `|` and `||` can dispatch by
+  # the LHS's head type via the head-type-to-module map. The typer
+  # rewrites `EMapPipe` into `ECall(EModCall(<module>, "map"), …)` once
+  # the head type is known. Codegen never sees `EMapPipe` directly —
+  # it sees the rewritten ECall.
+  | EMapPipe(Expr, Expr)
+  # issue #201: `xs || f` — flat-map-pipe. Same dispatch rule as
+  # `EMapPipe` but looks up `flat_map` in the head's declaring module.
+  | EFlatMapPipe(Expr, Expr)
+  # issue #412: `xs |? p` — filter-pipe. Same dispatch rule as
+  # `EMapPipe` but looks up `filter` in the head's declaring module.
+  # The typer rewrites `EFilterPipe` into
+  # `ECall(EModCall(<module>, "filter"), …)` once the head type is known.
+  | EFilterPipe(Expr, Expr)
+  # Typed hole (M10). `None` payload → anonymous `?`. `Some(name)` →
+  # `?name`. Checker reports at each hole site; emitter falls back
+  # to a runtime panic so unfilled holes in a binary are loud.
+  | EHole(Option[String])
+  # m7d §1: `todo!(msg) : T` — a typed *unimplemented* marker. The
+  # message is a literal `String` extracted at parse time. Behaves
+  # like `EHole(None)` for inference (any expected type fits) and
+  # like a panic at runtime, but the checker reports it under a
+  # distinct `kind = "todo"` so tooling can tell `?` apart from
+  # "I will fill this in" markers.
+  | ETodo(String)
+  # The body of an `extern "C" fn` — a marker with no kaikai
+  # expression. Payload = the C-side symbol override, or "" when the
+  # kaikai identifier is the symbol. Only the desugar of an extern fn
+  # constructs it; the C / LLVM backends detect it on a `DFn` body and
+  # synthesise the FFI shim instead of emitting a body. Type-checks
+  # like a hole (any expected type fits) but carries no effect and no
+  # diagnostic. Appearing anywhere but a `DFn` body is a compiler bug.
+  | EExternBody(String)
+  # m7e §13: `expr!` — postfix `Option`/`Result` propagation.
+  # `e!` on `Option[T]` unwraps `Some(x) -> x`; `None` short-circuits
+  # with `return None` from the enclosing function. On `Result[E, T]`,
+  # `Ok(x) -> x`; `Err(e)` short-circuits with `return Err(e)`. The
+  # enclosing function's return type must be the matching `Option[U]`
+  # or `Result[E, U]` (same E — no `From`-style coercion). The typer
+  # validates the enclosing return type and stamps `x.ty` with the
+  # unwrapped success type, which the emitter consumes to choose the
+  # correct discriminator (`Some` / `Ok`).
+  | EBang(Expr)
+  # Effect handler (m7a #4b). `handle { body } with Eff [as alias]
+  # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
+  # rebinds the capability name inside the body. m7a #4b is parser
+  # only; type-checking and runtime are #4d / #6.
+  # m7b #11: parametric effects. `eff_tyargs` is the `[T1, T2]` after
+  # the effect name in `with Reader[Int]` (empty when none); `init_opt`
+  # is the `(init)` after the type args in `with State[Int](0)` form
+  # (None when the handler is stateless). Both extensions are inert
+  # for stateless effects, so existing handlers parse to `[]` /
+  # `None` and behave as before.
+  | EHandle(Expr, String, [TypeExpr], Option[Expr], Option[String], [HClause], Option[HReturn])
+  # m12.5: numeric literal annotated with a unit, e.g. `1.50<USD>` or
+  # `42<UserId>`. The inner Expr is always EInt or EReal; the
+  # UnitExprT comes from the source between the angle brackets.
+  | ELitUnit(Expr, UnitExprT)
+  # m7e §11: `variants[T]()` — enumerate the constructors of a sum
+  # type T whose every variant is nullary. The compiler has the
+  # constructor list after resolution; this node is a request to
+  # materialise it as a `[T]` literal in declaration order. The
+  # `()` suffix is required by the syntax but carries no payload —
+  # the parser rejects any argument list. Parser produces this via
+  # an explicit lookahead in `parse_ident_primary` when the source
+  # ident is `variants` and the next token is `[`. Resolver
+  # validates T (sum + nullary-only). Emitter materialises the
+  # ordered constructor list.
+  #
+  # The second field carries the resolved variant names. Parser
+  # leaves it `[]`; the typer fills it in `synth_variants_of` once
+  # T has been validated as a nullary-only sum. The emitter consumes
+  # the list directly — it has no env access to look the names up
+  # itself.
+  | EVariantsOf(TypeExpr, [String])
+  # m6.2: qualified module call. The resolver pass rewrites
+  # `EField(EVar(mod), fn)` to this variant when `mod` is unbound
+  # locally and bound in the module table (rule B — locals shadow
+  # imports). Phase 2.1 only adds the variant + the walker arms;
+  # the rewrite logic and typer/codegen support land in 2.3 / 2.4
+  # / 3 respectively. Until then, this variant is never constructed
+  # at runtime — every walker arm exists purely to keep the
+  # exhaustive matches valid.
+  | EModCall(String, String)
+  # Issue #556: `$<ident>(args)` — a compiler intrinsic call. Reserved
+  # sigil; user code cannot define new intrinsics. The first field is
+  # the intrinsic name (without the `$`), the second is the arg list.
+  # The typer enforces per-intrinsic shape rules (e.g. `$extern_handler`
+  # takes exactly one string-literal arg and is only valid inside a
+  # clause body that lives in a `default { }` block).
+  | EIntrinsic(String, [Expr])
+
+pub type ListElem = ElPlain(Expr) | ElSpread(Expr)
+
+pub type Arm = Arm(Pattern, Option[Expr], Expr)
+
+pub type FieldInit = FI(String, Expr)
+
+pub type Param = { pname: String, ptype: Option[TypeExpr], pline: Int, pcol: Int }
+
+pub type Stmt
+  = SLet(Pattern, Option[TypeExpr], Expr)
+  | SAssert(Expr, Option[Expr])
+  | SExprStmt(Expr)
+  # m7b #6: indexed write `a[i] := v` (with `a` an `Ident ("." Ident)*`
+  # field path). Lowered to a `Mutable.array_set`-style call by the
+  # pre-resolve `desugar_index_assign` pass; never reaches the checker.
+  | SIndexAssign(Expr, Expr, Expr, Int, Int)
+  # m7b #5: local mutable cell `var name [: T] = init`. The parser
+  # produces this node; the pre-resolve `desugar_var_decls` pass
+  # rewrites every block containing an SVar into the canonical
+  # `handle { rest } with State[T](init) as name { canonical clauses }`
+  # form (Doc B §`State[T]` *Syntax note*, Doc C §m7b #5). SVar
+  # therefore never reaches the resolver. The line/col point at the
+  # `var` keyword.
+  | SVar(String, Option[TypeExpr], Expr, Int, Int)
+  # m7e §25: `use Effect` at block scope — opens the effect's ops
+  # for bare-name resolution in the rest of the enclosing block.
+  # Same desugar pass as DUse handles both file-scope and block-
+  # scope opens. The line/col point at the `use` keyword.
+  | SUse(String, Int, Int)
+
+pub type Pattern = { pkind: PatKind, line: Int, col: Int }
+
+pub type PatKind
+  = PWild
+  | PLit(Expr)                              # literal pattern (stores an Expr of literal shape)
+  | PBind(String)
+  | PList([Pattern], Option[String])         # fixed sub-patterns, optional rest binder name
+  | PVariant(String, [Pattern])
+  | PVariantRecord(String, [PField])
+  | PRecord([PField])
+  | PHole(Option[String])                   # `?` or `?name` in pattern position
+  # m7d §14: `name @ pattern` — bind the whole scrutinee to `name`
+  # while still destructuring it as `pattern`. The bound name must
+  # be a fresh identifier; the inner pattern's bindings (if any)
+  # remain visible in the arm body. Disjoint from m7b §2's prefix
+  # `@cap` (an expression), which never appears in pattern position.
+  | PAs(String, Pattern)
+  # issue #187 phase 3: type-narrowing pattern `name : T`. Used over a
+  # union scrutinee to bind `name` at component type `T`; covers every
+  # variant of `T` for exhaustiveness purposes. The parser emits this
+  # for every `name : TyName(t, ...)` arm-pattern suffix, including
+  # refinement-type aliases — `lower_pattern_narrow_decls` rewrites
+  # the alias case back into `PBind` + `__ref_pred_t(name)` guard so
+  # m12.6.x semantics are preserved. What survives into the typer is
+  # always a non-refinement narrowing over a union component.
+  | PNarrow(String, TypeExpr)
+
+pub type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
+
+pub type TypeExpr = { tkind: TyKind, line: Int, col: Int }
+
+pub type TyKind
+  = TyName(String, [TypeExpr])              # Name or Name[T1, T2, ...]
+  | TyList(TypeExpr)
+  | TyFn([TypeExpr], TypeExpr, RowExpr)
+  # m12.5: dimensioned numeric type, e.g. `Real<USD>` or `Int<m/sec>`.
+  # The base TypeExpr is the underlying primitive (parser only ever
+  # produces this with `Real`/`Int` underneath); the UnitExprT carries
+  # the unit annotation that the typer canonicalises and unifies.
+  | TyDim(TypeExpr, UnitExprT)
+  # m12.6: refinement type, `BaseT where Predicate(self)`. The predicate
+  # is parsed as an Expr in the same expression grammar as the rest of
+  # the language; m12.6.b/c restrict it to the decidable subset and
+  # use it for compile-time + runtime contract verification. m12.6.a
+  # only stores the syntactic form; resolve_ty drops the refinement
+  # so it does not affect inference / unification yet.
+  | TyRefine(TypeExpr, Expr)
+  # issue #772: a compound effect row used as a type argument, e.g.
+  # `Stream[Int, Stdout + Fail]`. Produced by the parser ONLY in
+  # type-argument position when a `+`-joined row follows the first
+  # label. Short-lived like `TyRefine`: it is consumed and dissolved
+  # during transparent-alias substitution (`apply_tp_subst_row` folds
+  # its labels/tail into the alias row) and never survives into a
+  # resolved `Ty` or reaches the emitters. Any other use site is a
+  # parser bug; the row-substitution path is its only legal consumer.
+  | TyRow(RowExpr)
+
+# Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
+# + Fail`, ROpen for `T / Io + e` or `T / e` where the lowercase tail
+# `e` is a row variable scoped to the enclosing function declaration
+# (m7b #12). In the AST this is the *raw* parsed shape; resolve_ty
+# converts it into the semantic `Row` that lives inside `TyFnT`.
+#
+# m7b #11: each label carries optional type arguments (`Reader[Int]`
+# parses as `RL("Reader", [TyName("Int", [])])`). Stateless effects
+# (and pre-m7b #11 syntax) carry an empty arg list. ROpen merges m7b
+# #11 (parametric labels) with m7b #12 (open row variable in tail).
+pub type RowExpr = REmpty | RClosed([RowLabel]) | ROpen(String, [RowLabel])
+pub type RowLabel = RL(String, [TypeExpr])
+
+# m12.5: units of measure. UnitExprT is a tree of unit operations.
+# The canonicaliser flattens it to a sorted vector of (sym, exponent).
+# UVar appears only at the semantic level — the parser produces only
+# the other shapes; UVar is allocated by the unifier for unit
+# inference variables (parallel to TyVarT).
+pub type UnitExprT
+  = UOne                                    # the dimensionless unit "1"
+  | USym(String)                            # atomic unit name (USD, m, kg)
+  | UMul(UnitExprT, UnitExprT)              # product
+  | UInv(UnitExprT)                          # multiplicative inverse
+  | UPow(UnitExprT, Int)                     # integer power
+  | UVar(Int)                                # unit unification variable
+
+# m12.5: kind of a type parameter. KType is the default; KUnit marks a
+# parameter that ranges over units rather than types (`[u: Measure]`).
+# The surface keyword is `Measure` (issue #253: disambiguates from
+# `Unit` the void-return type). The internal AST tag and "#Unit"
+# suffix encoding are unchanged to minimise blast radius — they are
+# not user-visible. Kinds are encoded inside the tparam name with a
+# "#Unit" suffix so the existing `tparams: [String]` plumbing keeps
+# working unchanged.
+pub type Kind = KType | KUnit
+
+# m12.5: the KUnit tparam-name suffix sentinel. KType params keep the
+# user's surface name; KUnit params get this appended. The "#"
+# character can never appear in a kaikai identifier (the lexer accepts
+# only alnum + '_'), so the encoding is collision-free. Shared by the
+# parser's encoder (tp_make) and the typer's decoders (tp_kind_of /
+# tp_strip_kind), so it lives with the AST model.
+#[doc("The KUnit tparam-name suffix sentinel (`#Unit`); collision-free since `#` is not a legal identifier char.")]
+pub fn tp_unit_suffix() : String = "#Unit"
+
+# Handler clause (op): `op_name(args..., resume) -> body`. The
+# resume binding is conventionally the last param; m7a #4d will
+# validate. m7a #4b stores the param list verbatim.
+pub type HClause = HC(String, [Param], Expr, Int, Int)
+
+# Optional `return(x) -> expr` clause inside a handle. `pname` is
+# the parameter name bound inside `body`.
+pub type HReturn = HR(String, Expr, Int, Int)
+
+# Issue #533: user-declared default handler clauses attached to an
+# `effect E { ops; default { clauses } }` declaration. Carries the
+# same `HClause` / `HReturn` shapes that `EHandle` uses so the codegen
+# can later reuse the clause emit machinery. Stored as the new
+# Option[DefaultBlock] field on DEffect.
+pub type DefaultBlock = DBlk([HClause], Option[HReturn], Int, Int)
+
+pub type Decl
+  # m7b #13: optional type parameters on the function declaration —
+  # `pub fn id[T](x: T) : T = x`. Empty list for monomorphic decls.
+  # Each name in tparams is a quantified type variable in scope across
+  # the param types, return type, row, and body. Generalised in
+  # fn_scheme_of_decl so each call site fresh-instantiates.
+  #
+  # m6.2 v2: trailing `Option[String]` is the *module origin* — the
+  # surface name of the module that owns this decl, or None for
+  # decls authored in the root file. expand_imports + the prelude
+  # loader populate it (every imported / preloaded decl gets a
+  # `Some(<surface_name>)`); the parser produces only `None`. The
+  # codegen mints `kai_<m>__<name>` for `Some(m)` and `kai_<name>`
+  # for `None`, which lets two modules export the same bare name
+  # without a linker collision and lets a root-file `fn sum`
+  # silently shadow `pub fn sum` exported by a prelude.
+  = DFn(Bool, String, [String], [Param], Option[TypeExpr], RowExpr, Expr, Int, Int, Option[String])
+  # Hanga Roa: trailing `Option[String]` is the *module origin*,
+  # mirroring `DFn`. None for decls authored in the root file; the
+  # surface name of the owning module for decls coming through
+  # `expand_imports` / the core auto-load. The typer's type-name
+  # resolution uses this to disambiguate same-name records / sums /
+  # unions per-module — a user `type Pair = ...` in the root file
+  # shadows `core.tuple.Pair` only inside the root, while
+  # `core/tuple.kai`'s own internal uses of `Pair` keep resolving
+  # to their home module's definition.
+  | DType(Bool, String, [String], TypeBody, Int, Int, Option[String])
+  | DTest(String, Expr, Int, Int)
+  # bench v1 (issue #40): mirrors DTest but the runner times the body.
+  # Fields: description (raw quoted span), body, line, col.
+  | DBench(String, Expr, Int, Int)
+  # check v1 (issue #44): property-based check block. Mirrors DTest +
+  # DBench but the body is run N times with random inputs generated
+  # from the parameter type list. Fields: description (raw quoted
+  # span), `with`-clause params (each carrying an explicit type), body
+  # (must produce Bool), line, col.
+  | DCheck(String, [Param], Expr, Int, Int)
+  | DImport(ImportKind, Int, Int)
+  # m7b #11: optional type parameters on the effect declaration —
+  # `effect Reader[T] { ask() : T }`. Empty list for stateless effects.
+  # Issue #533: trailing Option[DefaultBlock] carries the parsed
+  # `default { clauses }` body, or None when the effect declares no
+  # default. Stage 1 (parser + AST) only; coverage check and codegen
+  # land in follow-up lanes.
+  | DEffect(Bool, String, [String], [EffectOp], Option[DefaultBlock], Int, Int, Option[String])
+  # m12.8: `protocol P { op_decls }` — single-dispatch ad-hoc
+  # polymorphism. Each ProtoOp carries a parameter list using `Self`
+  # as the first-position dispatch type. Defaults are not parsed in
+  # the v1 (the parser only accepts bodyless op signatures).
+  # Issue #180: optional [A1, A2, ...] type parameter list bound at
+  # protocol declaration scope (alongside the implicit `Self`). The
+  # impl-table key remains `(P, Self)` — `Ai` resolve at impl-site.
+  | DProtocol(Bool, String, [String], [ProtoOp], Int, Int)
+  # m12.8: `impl P for T { fn op(args) = body ... }` — supplies the
+  # ops of protocol `pname` for the concrete type `target`. The body
+  # decls live as ordinary DFns whose name is the op name (no
+  # mangling at parse time; the lower-protocols pass renames them to
+  # `__pimpl_<P>_<T>_<op>`).
+  # Issue #180: optional [T1, T2, ...] type-arg list (the protocol's
+  # `[A1, ...]` parameters monomorphised at this impl-site). Empty
+  # list means the legacy un-parametrised form `impl P for X`, which
+  # the resolver treats as `impl P[X] for X` (`Ai := Self`).
+  | DImpl(String, [TypeExpr], TypeExpr, [Decl], Int, Int)
+  # m12.8: `#derive(P, ...) type T = ...` — opt-in structural impl
+  # generator. The lower-protocols pass walks the type body and
+  # synthesises one DImpl per derived protocol. The parser keeps the
+  # annotation alongside the wrapped DType so the desugar pass has all
+  # the data in one node.
+  | DDerive([String], Decl, Int, Int)
+  # Issue #602: `#unstable` wrapper around a `pub fn / pub type / pub
+  # const`. Marks the inner declaration as not covered by the edition
+  # stability contract. The wrapper is preserved through the resolver
+  # and module-export collection so import-site enforcement can flag
+  # consumers that have not opted in via `[unstable]` in their
+  # `kai.toml`. Every downstream walker that recurses into Decl trees
+  # mirrors the existing `DDerive` / `DAttribPure` precedent: unwrap
+  # the inner Decl and walk that. The flag only affects diagnostics —
+  # codegen does not see it.
+  | DUnstable(Decl, Int, Int)
+  # `#[constructor]` wrapper around a `pub fn` returning the marked
+  # type. The typer reads it in `add_decls_loop` to register
+  # `type_name -> (home_module, fn_name)` so `Type(args)` desugars to a
+  # call to that fn (never the raw record literal). The wrapper is
+  # transparent for every other walker — unwrap the inner Decl and walk
+  # it, mirroring the `DUnstable` / `DDerive` precedent.
+  | DConstructor(Decl, Int, Int)
+  # Issue #681: `#[doc("...")]` / `#[doc("""...""")]` wrapper around a
+  # documented declaration. Fields: raw attribute source (the exact
+  # `#[doc(...)]` byte span, re-emitted verbatim by `kai fmt`),
+  # normalised doc text (surrounding whitespace stripped, internal
+  # newlines preserved), inner Decl, line, col. The wrapper is
+  # stripped right after parse by `doc_strip_collect`
+  # (compiler/doc_attr.kai) into a side table, so no pass beyond the
+  # formatter and the doc collector ever sees it.
+  | DDoc(String, String, Decl, Int, Int)
+  # Issue #681: module-level `#[doc(...)]` — an attribute in module
+  # position (not immediately followed by a declaration head). Same
+  # raw/text fields as DDoc, no inner Decl. The root file's module
+  # doc survives the pipeline up to `infer_program`, which lifts it
+  # into `TypedProgram.module_doc`; loaders for imported / prelude
+  # modules strip it at load time.
+  | DModuleDoc(String, String, Int, Int)
+  # m12.5: unit declaration. `unit USD` (alias = None) introduces an
+  # atomic unit symbol; `unit Newton = kg * m / sec^2` (alias = Some)
+  # introduces a named alias whose RHS the resolver expands eagerly
+  # before unification ever runs. Codegen emits nothing for DUnit.
+  | DUnit(Bool, String, Option[UnitExprT], Int, Int)
+  # m7e §25: `use Effect` at file scope — opens the effect's ops
+  # for bare-name resolution in every fn body of the file. The
+  # resolver desugar_use_decls expands every `EVar(name)` matching
+  # an opened op into `EField(EVar(eff), name)`. Ambiguity (two
+  # opened effects expose the same op name) is a hard error.
+  # `use` does NOT remove the cap from the row — the effect still
+  # appears in any caller's row annotation.
+  | DUse(String, Int, Int)
+  # m12.7: `axiom name[tparams](params) : T / row` — postulate a
+  # typed symbol with no body. Useful for FFI declarations,
+  # architectural placeholders, and selfhost scaffolding while a
+  # real definition is pending. Calling an axiom at runtime aborts
+  # via the same `todo!` trap (m7d §1) the lower pass synthesises:
+  # "any type fits" at inference, `kai_prelude_panic` at runtime.
+  # `lower_axioms` rewrites every DAxiom to a DFn with the panic
+  # body BEFORE any other Decl walker runs, so downstream passes
+  # only see DFn. Doc: `docs/proposed-extensions.md` §4.
+  #
+  # m12.7.x FFI v1: a `[<extern_c>]` attribute prefix flips the
+  # second `Bool` field on. When set, `lower_axiom_one` synthesises
+  # a real FFI shim body (an `ETodo` whose message is the magic
+  # tag `__kai_ffi__`) instead of the panic. The C / LLVM emitters
+  # detect that tag inside `emit_fn_body` and lower the body to a
+  # direct `extern "C"` call against the named symbol, so call
+  # sites of the form `puts("hi")` link straight to libc without
+  # any wrapper allocation.
+  #
+  # Issue #260: the surface syntax for FFI is now `extern "C" fn
+  # name(...) : T / Ffi`, equivalent to the old `[<extern_c>] axiom`
+  # form (which is rejected with a migration error). The `extern_c`
+  # flag stays as the underlying mechanism.
+  #
+  # Issue #261: the third `String` field carries an optional
+  # C-symbol override. Empty string means "no override — emit the
+  # kaikai identifier verbatim as the C symbol". A non-empty value
+  # (e.g. "InitWindow") means "emit that C symbol instead". Only
+  # meaningful when `extern_c` is true.
+  | DAxiom(Bool, Bool, String, String, [String], [Param], TypeExpr, RowExpr, Int, Int)
+  # Issue #269: `const NAME : T = expr` — top-level named constant.
+  # Replaces the earlier `DAttribPure(DFn arity-0)` desugar that
+  # treated every const as a parameterless function and pushed it
+  # into bare-name dispatch ranking. DConst binds the name
+  # monomorphically (`name : T`, no scheme, no instantiation) so
+  # const reads are global loads, not function calls, and consts
+  # never become dispatch candidates. Fields: is_pub, name,
+  # declared type, body expression, module_origin, line, col. Body is
+  # always a literal (number / string / list literal) — the kaikai
+  # const surface only allows literals, so a const read is a global
+  # load (or inlined literal), never a function call. `module_origin`
+  # carries the home module so `pub` enforcement (issue #510) sees a
+  # const's home directly, with NO lowering to a disguised zero-arg fn.
+  | DConst(Bool, String, TypeExpr, Expr, Option[String], Int, Int)
+  # A foreign type declared by `extern "C" type Name = { fields }` (a C
+  # struct passed by value) or `extern "C" opaque Name` (an opaque C
+  # handle kaikai threads through but never inspects). Fields: name,
+  # body, line, col. The resolver records the name in the FFI type
+  # registry the boundary classifier consults. Codegen emits nothing
+  # for the decl itself — the struct layout lives in the shim, the
+  # opaque is a runtime `KAI_FOREIGN` box.
+  | DExternType(String, ExternTypeBody, Int, Int)
+  # `theory Name = { prop* }` — a named assembly of unification
+  # properties from the closed property menu (the catalog surface for
+  # kinds). Fields: name, property idents, line, col. Catalog-only in
+  # v1 (`theory` is a hard keyword the theory catalog uses by
+  # convention); it carries no runtime meaning and is stripped right
+  # after parse, alongside `DKind`, before any typer pass runs.
+  | DTheory(String, [String], Int, Int)
+  # `kind Name : Theory with intro` — names a classification algebra
+  # (`Measure : AbelianGroup with unit`). Fields: is_pub, name, the
+  # theory it is classified by, the habitant-introducer word, line,
+  # col. Recognised contextually (`kind` is an ordinary identifier
+  # everywhere but item-declaration position, like `region`). v1 keeps
+  # `Measure`'s KUnit plumbing on its hardcoded path; the declaration
+  # is parsed and validated, then stripped before the typer.
+  | DKind(Bool, String, String, String, Int, Int)
+
+# Body of a `DExternType`. `ETStruct` carries the C struct's fields
+# (each typed with a fixed-width boundary type); `ETOpaque` is a bare
+# opaque handle with no inspectable layout.
+pub type ExternTypeBody = ETStruct([FieldDecl]) | ETOpaque
+
+# m12.8: a single operation declared inside a `protocol P { ... }`
+# block. Mirrors EffectOp's shape (no body, with optional generic
+# tparams), but lives in its own type so the resolver / typer can
+# distinguish protocol ops from effect ops cleanly.
+pub type ProtoOp = POp(String, [String], [Param], TypeExpr, Int, Int)
+
+# An operation declared inside an `effect Eff { ... }` block.
+# name[op_tparams](params) : ret_ty — no body, no `fn` keyword.
+# m7b #2: per-op type generics. `op_tparams` is the optional
+# `[T1, T2]` between op name and `(args)`. Empty for monomorphic
+# ops; non-empty when the op signature itself quantifies over
+# types (Doc B §`Mutable`'s `array_get[T]`, etc.).
+pub type EffectOp = EOp(String, [String], [Param], TypeExpr, Int, Int)
+
+# TBEffectAlias holds a closed sum of effect labels, e.g.
+# `type Io = Console + Stdin + Env + File` (m7b #1). The body is a
+# list of label names; non-effect labels and cycles are rejected at
+# resolve time. Single-effect aliases (`type Foo = Console`) parse as
+# TBAlias(TyName(name, [])) and are recognised at resolve time.
+pub type TypeBody = TBAlias(TypeExpr) | TBRecord([FieldDecl]) | TBSum([Variant]) | TBEffectAlias([String])
+# Record field declaration.
+#
+# `is_pub`: by default record fields are private to the module that
+# declares the type (mirroring the module-level `pub` discipline).
+# Marking a field `pub` exposes both read access (`r.field` from
+# outside the module) and construction-time naming (the field name
+# may appear in a `Foo { field: v }` literal written outside the
+# module). Pattern matching on the field is permitted only inside
+# the declaring module unless `pub`.
+#
+# Coherence: marking a field `pub` inside a non-`pub` record type
+# has no effect (the type itself is invisible outside the module);
+# the parser/validator reports it as a coherence error.
+pub type FieldDecl = FD(Bool, String, TypeExpr)
+pub type Variant = Var(String, [TypeExpr])
+
+pub type ImportKind
+  = IkPath(String)
+  | IkAlias(String, String)
+  | IkSelective(String, [String])
+  # m7f §7: `import ?name` — dependency hole. The compiler scans
+  # known stdlib modules (and modules in the search path) for a
+  # `pub fn name` and reports candidates so the user can replace
+  # the hole with an explicit module path. The hole itself does
+  # NOT load any module — it is a diagnostic-only construct that
+  # downstream passes drop after the symbol index runs.
+  | IkHole(String)
+
+# ---- small constructors ----
+pub fn mk_expr(k: ExprKind, line: Int, col: Int) : Expr =
+  Expr { kind: k, line: line, col: col, ty: None, mode: MUnknown }
+
+# Return a copy of `e` with its inferred type set. Used by `synth` to
+# hand back a typed expression tree alongside its Ty. Downstream passes
+# (emitter today ignores it; M3/M4 will consume) can traverse the tree
+# and read `.ty` at each node without re-running inference.
+pub fn with_ty(e: Expr, t: Ty) : Expr =
+  Expr { kind: e.kind, line: e.line, col: e.col, ty: Some(t), mode: e.mode }
+pub fn mk_pat(k: PatKind, line: Int, col: Int) : Pattern = Pattern { pkind: k, line: line, col: col }
+pub fn mk_ty(k: TyKind, line: Int, col: Int) : TypeExpr = TypeExpr { tkind: k, line: line, col: col }
+
+
+pub type Ty
+  = TyInt
+  | TyReal
+  | TyBool
+  | TyString
+  | TyChar
+  | TyUnit
+  # Lane 4 (#473): unsigned 8-bit integer, nominal — distinct from
+  # TyInt at the type level. Backed by `KaiTag = KAI_U8` at runtime
+  # (uint8_t in KaiValue.as.u8). The user-facing `Byte` alias in
+  # stdlib/core/byte.kai expands to TyByte via `expand_ta_decls`
+  # pre-typing. Conversions are explicit: `int_to_u8 : Int ->
+  # Result[String, u8]` (range-checks 0..255), `u8_to_int : u8 ->
+  # Int` (lossless widening). Array[u8] uses the contiguous
+  # `KAI_ARRAY_U8` runtime tag (uint8_t* data, 1B/element) rather
+  # than the boxed `KaiValue**` storage of generic Array[T].
+  | TyByte
+  # Fixed-width integers (Orongo 1.0, numeric lane A). Nominal,
+  # kind-distinct from TyInt exactly like TyByte: unboxed scalars that
+  # never reference-count. Int32/UInt32/UInt64 fit the compiler's 64-bit
+  # Int and ride `EInt` literals; Int128 needs 128-bit storage (a
+  # `__int128` union slot in the C runtime, `i128` in LLVM) and an
+  # `EFixed` textual literal. User-facing names Int32/UInt32/UInt64/
+  # Int128 ARE the FFI boundary types (extern "C" int32_t/uint32_t/
+  # uint64_t marshal to them honestly instead of a 64-bit Int cast).
+  # Arithmetic (`+ - * < ==`) wraps two's-complement via the unsigned
+  # width to keep overflow defined (no UBSan trap).
+  | TyInt32
+  | TyUInt32
+  | TyUInt64
+  | TyInt128
+  # KIR Lane 1 (in-process libLLVM backend, docs/kir-design.md §7.2):
+  # an opaque scalar handle for an LLVM C-API object
+  # (LLVMModuleRef / LLVMBuilderRef / LLVMValueRef / LLVMTypeRef /
+  # LLVMBasicBlockRef). It crosses as a RAW pointer-width scalar that
+  # is NEVER reference-counted and NEVER goes through the tagged-Int
+  # runtime (a 48-bit pointer losing a bit to Int tagging would be
+  # silent IR corruption — the worst bug class). `ty_is_unboxable_t`
+  # returns true for it, so unbox stamps `MUnboxed` and perceus's
+  # `prc_pat_bindings_skip_raw` leaves it out of the RC regime
+  # entirely (no dup/drop). It is distinct from `TyInt` at the type
+  # level so the typer cannot confuse a handle with an integer.
+  #
+  # A handle only ever appears in the COMPILER's own backend code
+  # (self-hosted kaikai calling the C-API prelude primitives at
+  # compile time) — never in a user program's AST and never on the
+  # C-text / bootstrap path. So like `TyUnion`, every new arm below
+  # is dead on the existing corpus and selfhost stays byte-identical:
+  # no existing program produces a `TyHandle` node.
+  | TyHandle
+  | TyListT(Ty)                         # resolved list type
+  | TyFnT([Ty], Ty, Row)                # resolved function type (with effect row)
+  # Hanga Roa: a TyCon carries the module that DECLARES the type
+  # as part of its identity, not just the bare name. Two TyCons
+  # with the same name but different `module_origin` are DIFFERENT
+  # types and never unify. All built-in nominal types live in the
+  # stdlib module that declares them (`Result` in `result`,
+  # `Option` in `option`, `Array` in `array`, …), so they always
+  # carry `Some(<mod>)` — there are no language-level nominal
+  # types without a module of origin. `None` is reserved for the
+  # user's root file.
+  | TyCon(Option[String], String, [Ty]) # module_origin, name, args
+  | TyVarT(Int)                         # unification variable
+  | TyAny                               # placeholder for "not yet resolved"
+  # m12.5: resolved dimensioned type. Inner Ty is always TyInt / TyReal
+  # (or a TyVarT that the unifier later pins to one of them); the
+  # unit lives in canonicalised form once the unifier touches it.
+  | TyDimT(Ty, UnitExprT)
+  # m12.6.x #1: resolved refinement type, `TyRefineT(base, pred)`.
+  # The predicate stays as the syntactic Expr from the parser. The
+  # unifier treats `TyRefineT(b, _)` ⊑ `b` (upcast OK, downcast
+  # demands explicit narrowing via `ensure(...)` or a match-arm
+  # `: RefinedT`); diagnostics, mangling, and most other walkers
+  # transparently recurse on `b`. Predicates are pure (no effects,
+  # no rows) so the row machinery is untouched.
+  | TyRefineT(Ty, Expr)
+  # issue #187 phase 1: union of types. `TyUnion([T1, T2, ..., Tn])`
+  # represents the union of `n` component types. Components are kept
+  # in normalised form (flattened, deduplicated, sorted by mangle_ty)
+  # whenever the typer compares unions for equality — see
+  # `normalize_union`. Phase 1 only adds the AST node and threads it
+  # through every Ty-walker; no resolver / parser path constructs
+  # `TyUnion` yet (that is Phase 2). Selfhost is byte-identical
+  # because every existing program produces an AST that contains no
+  # `TyUnion` node, so every new arm is dead until Phase 2 lights it
+  # up. Singleton unions and empty unions never appear in the
+  # representation: callers should collapse `TyUnion([T])` to `T`
+  # before constructing the node, and `TyUnion([])` is unreachable
+  # (Phase 2's resolver rejects it at parse time).
+  | TyUnion([Ty])
+
+# Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
+# The slot is reserved here in m7a #1; row unification (m7a #2) and
+# evidence-bearing rows (m7a #3+) populate it. For now every TyFnT
+# carries an empty row.
+pub type Label = { eff: String, ty_args: [Ty] }
+
+pub type Row = {
+  labels:        [Label],          # invariant: sorted by eff, syntactically deduplicated
+  tail:          Option[Int],      # row variable id, parallel to TyVarT
+  display_alias: Option[String],   # for diagnostics only; ignored by unification
+}
+
+# Row-variable binding: maps a surface name (`e`) to its allocated
+# row variable id within the enclosing function declaration.
+pub type RVBind = RVB(String, Int)
+
+# Synthetic field-name markers (issue #326). The parser injects these
+# sentinel names into anonymous-record / positional-tuple FieldInit
+# lists; downstream passes (record-literal desugar, codegen) branch on
+# them. They are an AST-shape convention shared between the parser and
+# its consumers, so they live with the AST model rather than inside the
+# parser. Real field names cannot start with `__`, so the sentinels are
+# unambiguous.
+pub fn pos_field_marker(i: Int) : String =
+  string_concat("__pos_", string_concat(int_to_string(i), "__"))
+
+pub fn spread_field_marker() : String = "__spread__"
+
+pub fn is_spread_field_marker(s: String) : Bool = s == "__spread__"
+
+pub fn is_pos_field_marker(s: String) : Bool {
+  let n = string_length(s)
+  if n < 8 { false }
+  else {
+    match char_at(s, 0) { Some(c0) -> if c0 != '_' { false } else {
+      match char_at(s, 1) { Some(c1) -> if c1 != '_' { false } else {
+        match char_at(s, 2) { Some(c2) -> if c2 != 'p' { false } else {
+          match char_at(s, 3) { Some(c3) -> if c3 != 'o' { false } else {
+            match char_at(s, 4) { Some(c4) -> if c4 != 's' { false } else {
+              match char_at(s, 5) { Some(c5) -> c5 == '_'
+                None -> false
+              }
+              } None -> false }
+            } None -> false }
+          } None -> false }
+        } None -> false }
+      } None -> false }
+  }
+}
+
+
+# ====================================================================
+# Record table (issue #648) — moved from main.kai under issue #677
+# phase 1m (desugar extraction). RecInfo is a shared AST-adjacent
+# type: the positional-record desugar (compiler.desugar) consumes
+# [RecInfo] in its pass signatures, and the typer threads the same
+# table through inference. ast.kai is the only home both import
+# without a lateral arrow. The typer-only rerank / module-slot
+# helpers (rerank_recs_*, option_str_eq, module_slot_compat) and the
+# arity-only rec_find_arity wrapper stay in main.kai.
+# ====================================================================
+
+#[doc("Record-table entry: type name, type params, field decls, module origin. Built by collect_records, consumed by the positional-record desugar (compiler.desugar) and the typer; an AST-adjacent shared type.")]
+pub type RecInfo = RI(String, [String], [FieldDecl], Option[String])
+
+# Issue #648 — arity-aware record lookup. Two layers, mirroring the
+# variant-side `variants_of_type_loop_arity` (issue #643):
+#
+# 1. **Arity match**. Caller passes `arity = list_length(args)` from
+#    its `TyCon(_, name, args)` scrutinee; we prefer a `RI` whose
+#    `tparams` length matches. Discriminates `Tree[k, v]` (arity 2)
+#    from `Tree` (arity 0).
+#
+# 2. **Field-set tie-break** for same-(name, arity) collisions. The
+#    record-side analog of the variant-side same-arity limitation:
+#    `stdlib/regexp.kai` declares `type Thread = { state_id, captures }`
+#    (private) and a user re-declares `type Thread = { id, name }`.
+#    Both have arity 0. The prelude code (which the typer must also
+#    re-check) accesses `t.state_id`; the user code accesses `t.name`.
+#    Resolving by arity alone hands one or the other the wrong field
+#    set. `rec_find_with_field` (used by field-access call sites)
+#    prefers a `RI` that actually declares the requested field —
+#    that suffices to keep BOTH the user's `t.name` and the prelude's
+#    `t.state_id` resolving to their respective declarations.
+#
+# `arity = -1` is the "caller does not know the arity" sentinel —
+# all matches by bare name are accepted and the first one wins, which
+# reproduces the legacy `rec_find` semantics over the newest-first
+# list.
+
+pub fn rec_find_arity_loop(rs: [RecInfo], target: String, arity: Int,
+                          fallback: Option[RecInfo]) : Option[RecInfo] {
+  match rs {
+    [] -> fallback
+    [r, ...rest] -> match r {
+      RI(nm, tps, _, _) ->
+        if nm == target {
+          if arity < 0 {
+            Some(r)
+          } else if list_length(tps) == arity {
+            Some(r)
+          } else {
+            let fb = match fallback {
+              Some(_) -> fallback
+              None    -> Some(r)
+            }
+            rec_find_arity_loop(rest, target, arity, fb)
+          }
+        } else {
+          rec_find_arity_loop(rest, target, arity, fallback)
+        }
+    }
+  }
+}
+
+pub fn rec_find_loop(rs: [RecInfo], target: String) : Option[RecInfo] =
+  rec_find_arity_loop(rs, target, -1, None)
+
+#[doc("Bare-name record lookup (no arity discrimination); newest-first so a later same-name record shadows an earlier one.")]
+pub fn rec_find(rs: [RecInfo], target: String) : Option[RecInfo] = rec_find_loop(rs, target)
+
+# Issue #648 — field-aware record lookup. When the caller knows the
+# field being accessed (or the field-set being constructed), prefer
+# an arity-matched `RI` that declares the requested field. This is
+# the record-side same-arity tie-breaker that the variant-side fix
+# left unresolved (`SplitN` / `NB_FragR` skip-list in issue #643).
+# A user `type Thread = { id, name }` and a private prelude `type
+# Thread = { state_id, captures }` collide on name + arity 0; the
+# walker hands the user's record back when the access site reads
+# `name`, and the prelude's when the access site reads `state_id`.
+
+#[doc("Field-aware record lookup: among same-(name, arity) records, prefer the one declaring the requested field. Issue #648.")]
+pub fn rec_find_with_field(rs: [RecInfo], target: String, arity: Int,
+                          field: String) : Option[RecInfo] =
+  rec_find_with_field_loop(rs, target, arity, field, None, None)
+
+pub fn rec_find_with_field_loop(rs: [RecInfo], target: String, arity: Int,
+                                field: String, by_field: Option[RecInfo],
+                                by_arity: Option[RecInfo]) : Option[RecInfo] {
+  match rs {
+    [] -> match by_field {
+      Some(_) -> by_field
+      None    -> by_arity
+    }
+    [r, ...rest] -> match r {
+      RI(nm, tps, fs, _) ->
+        if nm == target {
+          let arity_ok = arity < 0 or list_length(tps) == arity
+          if arity_ok {
+            if field_decl_list_has(fs, field) {
+              # First arity-matched record that declares `field`
+              # wins outright — no further walking needed.
+              Some(r)
+            } else {
+              let ba = match by_arity {
+                Some(_) -> by_arity
+                None    -> Some(r)
+              }
+              rec_find_with_field_loop(rest, target, arity, field, by_field, ba)
+            }
+          } else {
+            rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+          }
+        } else {
+          rec_find_with_field_loop(rest, target, arity, field, by_field, by_arity)
+        }
+    }
+  }
+}
+
+pub fn field_decl_list_has(fs: [FieldDecl], target: String) : Bool {
+  match fs {
+    [] -> false
+    [f, ...rest] -> match f {
+      FD(_, nm, _) -> if nm == target { true } else { field_decl_list_has(rest, target) }
+    }
+  }
+}
+
+#[doc("Declaration-order index of `target` in a `[FieldDecl]` list, or -1 if absent.")]
+pub fn field_decl_index(fs: [FieldDecl], target: String) : Int =
+  field_decl_index_loop(fs, target, 0)
+
+fn field_decl_index_loop(fs: [FieldDecl], target: String, i: Int) : Int = match fs {
+  [] -> -1
+  [f, ...rest] -> match f {
+    FD(_, nm, _) -> if nm == target { i } else { field_decl_index_loop(rest, target, i + 1) }
+  }
+}
+
+#[doc("Shared field-index oracle: the declaration-order slot of `field` on record `target`, or `None` for an unknown/polymorphic type. Single source of truth for the canonical layout — field reads, record assembly, and reuse all index through it so they never drift.")]
+pub fn rec_field_index(rs: [RecInfo], target: String, arity: Int,
+                       field: String) : Option[Int] =
+  match rec_find_with_field(rs, target, arity, field) {
+    None     -> None
+    Some(ri) -> match ri {
+      RI(_, _, fs, _) -> match field_decl_index(fs, field) {
+        -1 -> None
+        n  -> Some(n)
+      }
+    }
+  }
+
+#[doc("The declaration-order slot of `field` when `opt_t` is a known record type, else `None`. The `EField` read site of both backends calls this to choose a constant-index load over the `kai_op_field` strcmp; `None` (unknown / polymorphic / non-record base) keeps the strcmp fallback.")]
+pub fn field_index_of(recs: [RecInfo], opt_t: Option[Ty], field: String) : Option[Int] = match opt_t {
+  Some(t) -> field_index_of_t(recs, t, field)
+  None    -> None
+}
+
+fn field_index_of_t(recs: [RecInfo], t: Ty, field: String) : Option[Int] = match t {
+  TyCon(_, cname, cargs) -> rec_field_index(recs, cname, list_length(cargs), field)
+  TyRefineT(inner, _)    -> field_index_of_t(recs, inner, field)
+  _                      -> None
+}
+
+#[doc("Project a decl stream into the record table ([RecInfo]), newest-first.")]
+pub fn collect_records(ds: [Decl]) : [RecInfo] = collect_records_loop(ds, [])
+
+# Sum-type registry for the region-brand walker (issue #71). The
+# shallow `ty_expr_contains_fiber/pid` walker only sees TypeExprs;
+# a `type Boxed = Wrap(Fiber[Int])` would otherwise hide the Fiber
+# inside the variant's payload, since the surface TypeExpr is just
+# `TyName("Boxed", [])`. SumInfo records (type name, tparams,
+# variants) per `DType ... TBSum`, threaded through `infer_program`
+# the same way `RecInfo` is.
+
+pub fn collect_records_loop(ds: [Decl], acc: [RecInfo]) : [RecInfo] {
+  match ds {
+    [] -> acc
+    [d, ...rest] -> match d {
+      DType(_, nm, tps, body, _, _, mo) -> match body {
+        TBRecord(fs) -> collect_records_loop(rest, [RI(nm, tps, fs, mo), ...acc])
+        _ -> collect_records_loop(rest, acc)
+      }
+      _ -> collect_records_loop(rest, acc)
+    }
+  }
+}
+
+# Protocol registry types (issue #677 phase 1n0). Sunk here from the
+# protocols block in main.kai ahead of the infer + protocols
+# extraction lanes: these appear both in the infer public surface
+# (`infer_program_with_protos_cached`'s signature) and are produced by
+# the protocols block, so sinking them into ast.kai lets both lanes
+# import downward instead of laterally. The ops/impls/origins themselves
+# are populated by fns that stay in main.kai for now.
+
+#[doc("Registered protocol operation: (proto, op_name, params, ret, line, col).")]
+pub type ProtoOpReg = POR(String, String, [Param], TypeExpr, Int, Int)
+#                         proto    op_name params  ret      line col
+
+# Issue #180: ProtoTPReg lets `find_proto_impl_for_args` know whether
+# a protocol declared `[A]` parameters. When empty, only the legacy
+# (Self,Self) homogeneous match is valid — `pow_int(self: Self, exp:
+# Int)`'s second argument is not a proto-arg.
+#[doc("Protocol type-parameter registry: (proto, [tparam names]).")]
+pub type ProtoTPReg = PTPR(String, [String])
+#                         proto    tparam names
+
+#[doc("One free-fn protocol-bound obligation: type-kind tparam index (aligned with a monomorphised call's concrete `tys`) and its declared protocol bounds.")]
+pub type FnTPBound = FTB(Int, [String])
+#                       idx  proto names
+
+#[doc("Declared protocol bounds of a free fn, checked against each concrete instantiation. `mo` is the module origin so a call resolves against the right same-named fn.")]
+pub type FnBoundsRec = FBR(String, Option[String], [FnTPBound])
+#                          name    module_origin    per-tparam bounds
+
+#[doc("Protocol impl registry: (proto, type, op_name, impl_fn_name, [proto_arg_names], ret_head).")]
+pub type ProtoImplReg = PIR(String, String, String, String, [String], String)
+#                          proto    type    op_name impl_fn_name [proto_arg_names] ret_head
+# `ret_head` is the head TyName of the impl method's declared return
+# type (issue #180): for `impl Add[Complex] for Real { add(...) :
+# Complex }` it is "Complex", differing from the receiver `Real`. The
+# post-inference protocol-call rewrite reads it to correct the result
+# node's type from the dispatcher's `Self` (Real) to the impl's
+# promoted return (Complex), before unboxing runs.
+# Issue #180: proto_arg_names is the list of monomorphised type names
+# for each `Ai` parameter at the impl-site. Empty list means
+# legacy un-parametrised `impl P for X` (treated as `Ai = Self`).
+
+# Issue #597 boundary tagging: each protocol's home module recovered
+# by streaming through `decl_home_hint_reset` (DProtocol carries no
+# `module_origin` field today). `generate_dispatchers` looks up the
+# proto's tag here so every synthesised dispatcher inherits the same
+# `mo` the original protocol's prelude file would carry.
+#[doc("Protocol origin registry: (proto, module_origin).")]
+pub type ProtoOriginReg = PrOR(String, Option[String])
+#                             proto   module_origin
+
+# O(1) view over the immutable `impls` list, built once at the
+# `lower_protocols` boundary. `by_key` buckets every `PIR` by a hash of
+# `(proto, type)`; each bucket keeps its entries in `impls` order so a
+# bucket scan returns the same first-match as a full linear scan.
+# `by_sym` buckets by `impl_fn_name` for the return-head lookup.
+# `nbuckets == 0` marks the unbuilt placeholder: lookups fall back to
+# the linear scan over `impls`, so the index is purely additive.
+#[doc("Hash index over a ProtocolReg's impl table: (proto, type) and impl-fn-name buckets.")]
+pub type ImplIndex = { by_key: Array[[ProtoImplReg]],
+                       by_sym: Array[[ProtoImplReg]],
+                       nbuckets: Int }
+
+#[doc("Aggregate protocol registry: ops, impls, op_names, tparams, origins, impl_index.")]
+pub type ProtocolReg = { ops: [ProtoOpReg], impls: [ProtoImplReg],
+                         op_names: [String], tparams: [ProtoTPReg],
+                         origins: [ProtoOriginReg], impl_index: ImplIndex }

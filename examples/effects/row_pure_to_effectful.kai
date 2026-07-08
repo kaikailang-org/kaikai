@@ -1,0 +1,19 @@
+# issue #645 — UPDATED from m7a #2's original negative shape. The
+# language now accepts pure named callbacks passed to slots expecting
+# `(args) -> ret / e`. The asymmetry "effectful → pure" remains
+# rejected (see row_mismatch_higher_order.kai); only the loss-less
+# pure-to-effectful lift is now allowed via phantom-row elaboration
+# on REmpty signatures (`fn_scheme_of_decl`). See
+# `docs/effects.md` §*Subsumption: none — except for pure callbacks*.
+#
+# `pure_double` has an REmpty signature → its scheme gains a phantom
+# row variable; the call site instantiates it to a fresh free row
+# variable that unifies with `{Io}`. `use_io` accepts the value.
+
+effect Io { print(s: String) : Unit }
+
+fn pure_double(x: Int) : Int { x + x }
+
+fn use_io(f: (Int) -> Int / Io) : Int { 42 }
+
+fn main() : Int { use_io(pure_double) }
