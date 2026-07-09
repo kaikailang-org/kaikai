@@ -1,0 +1,325 @@
+# compiler/kir_lower_bind.kai — pattern-binder lowering for `match` arms
+# and destructuring `let`s.
+#
+# When a `match` arm or a `let` pattern binds names from the scrutinee, the
+# binders must become real KIR registers (`KLet name = <slot read>`) or the
+# arm body's `EVar(name)` lowers to an unbound register the native backend
+# aborts on. This module owns that bind emission, recursing into NESTED
+# sub-patterns so `let { p: { x, y } } = b` and `Some(x)` bind their inner
+# names against the EXTRACTED inner value. Mirror of emit_c's
+# `emit_pat_binds` / `emit_pat_binds_variant` / `emit_pat_binds_record`
+# (the boxed `k==0` arm — the KIR keeps every slot boxed today, so there is
+# no kind-split here). A bare `KLet`/`KProj` never increfs: Perceus's
+# already-placed KRC nodes own the refcounting (`lm_bind_name` note).
+#
+# It drives ON the lowering base (`bind_op`, `ls_emit`, `KProj`,
+# `KPrim`) but NEVER recurses into `lower_expr`, so the import graph stays
+# acyclic (`kir_lower ← kir_lower_bind ← kir_lower_walk`) — the same split
+# `kir_lower_match.kai` / `kir_lower_rec.kai` use for the list / record
+# decision trees.
+#
+# SOUNDNESS — the test/bind split (asu review). A `KSwitch` (or the
+# list/record decision tree) discriminates the tag of the TOP-LEVEL arm
+# pattern before this module's binds run, so binding the direct sub-slots
+# of that arm is safe. A NESTED `PVariant` / `PVariantRecord` sub-pattern
+# (`Node(_, .., Node(R, ..))`, `Some(JReal(r))`) carries its OWN tag
+# discriminant that NO test has emitted yet — binding its inner names
+# without that test would be a silent miscompile (a false-green build that
+# diverges at runtime). So a nested variant sub-pattern is NOT a mechanical
+# bind: it routes to `bind_unsupported_nested`, which traps loud and leaves
+# the binder unbound (the backend then refuses the module). A nested plain
+# `PRecord` is safe — a record has a single shape, no tag to test — so it
+# binds. This keeps the mechanical unbound-register family cleanly split
+# from the nested-variant-test family (a separate burn-down gap).
+
+import compiler.ast
+import compiler.util
+import compiler.emit_shared
+import compiler.kir
+import compiler.kir_lower
+import compiler.fnreg
+
+# --- top-level arm binds (the switch already tested the tag) ------------
+
+# Bind a TOP-LEVEL variant arm's sub-binders from the scrutinee. The
+# `KSwitch` already matched the arm's tag, so the direct sub-slots are safe
+# to bind. `PVariant` reads positional slots (`KProj scrv idx`);
+# `PVariantRecord` reads the payload record's named fields (`kai_op_field`).
+pub fn bind_pattern_fields(p: Pattern, scrv: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, scrv, 0, body, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, scrv, body, st)
+  # A top-level as-pattern (`a @ A`, `a: A` after the narrow rewrite): bind the
+  # whole scrutinee to `name`, then bind the inner pattern's own sub-binders.
+  PAs(name, _)              -> bind_pattern_fields(as_inner(p), scrv, body,
+                                 ls_emit(st, KLet(name, SBoxed, KLitOp(scrv), KAt(p.line, p.col))))
+  _                         -> st
+}
+
+fn bind_sub_binders(cn: String, subs: [Pattern], scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match subs {
+  [] -> st
+  [sp, ...rest] -> bind_sub_binders(cn, rest, scrv, idx + 1, body, bind_slot_pattern(cn, sp, scrv, idx, body, st))
+}
+
+# The runtime kind of ctor `cn`'s slot `idx`, classified with the IDENTICAL
+# `variant_slot_kind(te, [])` call the construction path uses (`typed_inits`,
+# `variant_i64_mask` — enums always `[]`), so a slot READ never disagrees with
+# how the ctor WROTE it. 1 = Int (`.i64` raw), 2 = Real, 3 = enum, 0 = boxed
+# pointer (the default: unresolvable ctors, runtime-minted variants with no
+# user-visible payload, and — since `enums` is `[]` — enum-typed slots, which
+# the ctor also built boxed). This single resolver is the one place the
+# read/write invariant lives; both `bind_slot_kslot` and `bind_slot_op`
+# consult it, never re-deriving the kind with a different `enums`.
+fn slot_kind_of(st: LowerSt, cn: String, idx: Int) : Int =
+  match evar_payload_tys(st.vs, cn) {
+    Some(tys) -> match variant_nth_ty(tys, idx) {
+                   Some(te) -> variant_slot_kind(te, [])
+                   None     -> 0
+                 }
+    None      -> 0
+  }
+
+# The KSlot a match-arm binder `nm` reads slot `idx` of ctor `cn` at. Only a
+# kind-1 Int slot can go raw (`SInt64`): the native variant layout lays ONLY
+# kind-1 Int slots inline (`variant_i64_mask` is Int-only), so a kind-2 Real
+# slot is physically a boxed pointer — reading it raw (`.r` load) would read
+# the pointer bits as an `f64` (garbage). Real slots therefore stay `SBoxed`.
+#
+# A kind-1 Int binder is `SInt64` iff the unbox pass ALREADY seeded it
+# `MUnboxed` (`seed_variant_int_binders`, unbox.kai). That single verdict is
+# authoritative: the emitter obeys the SAME mode when it lowers the binder's
+# uses (an `EBinop` becomes a raw `icmp` because the KIR lowered it raw from
+# the mode; a boxed use re-boxes at the mode-slave border). Re-deriving rawness
+# here with a separate predicate would produce a SECOND verdict that diverges
+# from the mode — a raw register loaded where the KIR planned boxed, or vice
+# versa, the #1110 self-compile SIGSEGV. One discriminant, no desync: `nm` is
+# `SInt64` exactly when its `EVar` reads carry mode `MUnboxed`.
+pub fn bind_slot_kslot(st: LowerSt, cn: String, idx: Int, nm: String, body: Expr) : KSlot / Console =
+  match slot_kind_of(st, cn, idx) {
+    1 -> if binder_mode_unboxed(nm, body) { SInt64 } else { SBoxed }
+    _ -> SBoxed
+  }
+
+# True iff an `EVar(nm)` read in `body` carries mode `MUnboxed` — the unbox
+# pass's raw verdict for this binder (`seed_variant_int_binders`). Every
+# `EVar(nm)` shares the one mode the pass seeded into the arm env, so the first
+# one found decides. A binder never read (`EUnit` sentinel, or a bind with no
+# arm body) is not raw — it stays boxed, a no-op either way.
+fn binder_mode_unboxed(nm: String, body: Expr) : Bool / Console = match evar_mode(nm, body) {
+  Some(m) -> match m { MUnboxed -> true _ -> false }
+  None    -> false
+}
+
+# The mode of the first `EVar(nm)` reached in `e` (any position), or None if
+# `nm` is not read. Walks every sub-Expr AND nested match patterns / stmts so
+# the search never misses a use behind a form `scan_uses_expr` skips.
+fn evar_mode(nm: String, e: Expr) : Option[ValueMode] / Console = match e.kind {
+  EVar(n)              -> if n == nm { Some(e.mode) } else { None }
+  ECall(f, xs)         -> em_first(evar_mode(nm, f), em_exprs(nm, xs))
+  EIntrinsic(_, xs)    -> em_exprs(nm, xs)
+  EField(x, _)         -> evar_mode(nm, x)
+  EIndex(a, b)         -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EBinop(_, a, b)      -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EUnop(_, x)          -> evar_mode(nm, x)
+  EBang(x)             -> evar_mode(nm, x)
+  ELitUnit(x, _)       -> evar_mode(nm, x)
+  EIf(c, t, oe)        -> em_first(evar_mode(nm, c), em_first(evar_mode(nm, t), em_opt(nm, oe)))
+  EMatch(s, arms)      -> em_first(evar_mode(nm, s), em_arms(nm, arms))
+  ELambda(_, b)        -> evar_mode(nm, b)
+  ERecordLit(_, fis)   -> em_fields(nm, fis)
+  EList(els)           -> em_elems(nm, els)
+  ERange(a, b, ob)     -> em_first(evar_mode(nm, a), em_first(evar_mode(nm, b), em_opt(nm, ob)))
+  EBlock(ss, tl)       -> em_first(em_stmts(nm, ss), em_opt(nm, tl))
+  EPipe(a, b)          -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EMapPipe(a, b)       -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EFlatMapPipe(a, b)   -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EFilterPipe(a, b)    -> em_first(evar_mode(nm, a), evar_mode(nm, b))
+  EHandle(b, _, _, io, _, cls, ro) -> em_first(evar_mode(nm, b), em_first(em_opt(nm, io), em_first(em_clauses(nm, cls), em_ret(nm, ro))))
+  _                    -> None
+}
+
+fn em_first(a: Option[ValueMode], b: Option[ValueMode]) : Option[ValueMode] = match a { Some(_) -> a None -> b }
+fn em_exprs(nm: String, es: [Expr]) : Option[ValueMode] / Console = match es {
+  []           -> None
+  [e, ...rest] -> em_first(evar_mode(nm, e), em_exprs(nm, rest))
+}
+fn em_opt(nm: String, oe: Option[Expr]) : Option[ValueMode] / Console = match oe { None -> None Some(e) -> evar_mode(nm, e) }
+fn em_arms(nm: String, arms: [Arm]) : Option[ValueMode] / Console = match arms {
+  []           -> None
+  [a, ...rest] -> em_first(match a { Arm(p, g, b) -> em_first(em_pat(nm, p), em_first(em_opt(nm, g), evar_mode(nm, b))) }, em_arms(nm, rest))
+}
+fn em_fields(nm: String, fis: [FieldInit]) : Option[ValueMode] / Console = match fis {
+  []           -> None
+  [f, ...rest] -> em_first(match f { FI(_, e) -> evar_mode(nm, e) }, em_fields(nm, rest))
+}
+fn em_elems(nm: String, els: [ListElem]) : Option[ValueMode] / Console = match els {
+  []           -> None
+  [el, ...rest] -> em_first(match el { ElPlain(e) -> evar_mode(nm, e) ElSpread(e) -> evar_mode(nm, e) }, em_elems(nm, rest))
+}
+fn em_stmts(nm: String, ss: [Stmt]) : Option[ValueMode] / Console = match ss {
+  []           -> None
+  [s, ...rest] -> em_first(em_stmt(nm, s), em_stmts(nm, rest))
+}
+fn em_stmt(nm: String, s: Stmt) : Option[ValueMode] / Console = match s {
+  SExprStmt(e)                -> evar_mode(nm, e)
+  SLet(p, _, rhs)             -> em_first(em_pat(nm, p), evar_mode(nm, rhs))
+  SVar(_, _, rhs, _, _)       -> evar_mode(nm, rhs)
+  SAssert(e, oe)              -> em_first(evar_mode(nm, e), em_opt(nm, oe))
+  SIndexAssign(b, i, v, _, _) -> em_first(evar_mode(nm, b), em_first(evar_mode(nm, i), evar_mode(nm, v)))
+  _                           -> None
+}
+fn em_clauses(nm: String, cls: [HClause]) : Option[ValueMode] / Console = match cls {
+  []           -> None
+  [c, ...rest] -> em_first(match c { HC(_, _, b, _, _) -> evar_mode(nm, b) }, em_clauses(nm, rest))
+}
+fn em_ret(nm: String, ro: Option[HReturn]) : Option[ValueMode] / Console = match ro {
+  None     -> None
+  Some(hr) -> match hr { HR(_, b, _, _) -> evar_mode(nm, b) }
+}
+# A pattern mentioning `nm` is a re-BIND (shadow) or a literal read; either way
+# the mode carried in the pattern is not an `Expr.mode`, so patterns contribute
+# no mode. Its only role is that a nested match still gets its body/guards
+# walked (above); the pattern itself yields None.
+fn em_pat(nm: String, p: Pattern) : Option[ValueMode] / Console = match p.pkind {
+  PLit(e) -> evar_mode(nm, e)
+  _       -> None
+}
+
+# The conservative "no bounded arm body" sentinel — a bind path with no arm
+# body passes this so an Int/Real slot binder stays boxed (`evar_mode` finds no
+# `EVar` in the `EUnit` body → None → `SBoxed`).
+pub fn bind_body_none() : Expr = mk_expr(EUnit, 0, 0)
+
+# The read op for slot `idx` of ctor `cn`. A kind-0 slot (a boxed pointer)
+# reads as a direct `.ptr` borrow (`KProjBorrow`), the native fast path that
+# skips `kaix_variant_arg`'s per-read mask branch; every typed slot (kind-1
+# Int, kind-2 Real, kind-3 enum) stays the mask-consulting `KProj`. The read op
+# always matches the ctor's write layout (both via `variant_slot_kind(te, [])`).
+fn bind_slot_op(st: LowerSt, cn: String, idx: Int, scrv: KVal) : KOp =
+  if slot_kind_of(st, cn, idx) == 0 { KProjBorrow(scrv, idx) } else { KProj(scrv, idx) }
+
+# Bind ONE positional slot's sub-pattern. A `PBind` aliases the slot; a
+# nested plain record projects the slot and recurses; an as-pattern binds
+# then descends; a nested VARIANT WITH payload traps loud (see the
+# soundness note). A NULLARY nested variant (`Branch(Red, ..)` — a no-arg
+# ctor / enum slot) binds NOTHING: it carries no inner name, only a tag the
+# shared-tag decision tree (kir_lower_variant) already tested, so it is a
+# safe no-op here, not the nested-variant-test gap. `PWild`/`PLit`/`PHole`
+# bind nothing (a `PLit` was a test on the switch / sub-chain path).
+# A nested VARIANT sub-pattern is now SOUND to bind: the decision tree's
+# `var_seal_variant` (kir_lower_variant) tested its tag (and recursed into
+# its own discriminating sub-slots) before this bind runs, so projecting the
+# slot and binding the payload's inner names is dominated by a passed tag
+# test — no false-green. A NULLARY ctor (`Red`, `None`) carries no inner
+# name, so it stays a no-op. The payload-bearing case projects the slot and
+# recurses through `bind_pattern_fields_any` (which binds a `PVariant`'s
+# direct sub-binders), the SAME shared bind recursion the record path uses.
+fn bind_slot_pattern(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console = match sp.pkind {
+  # A kind-0 pointer slot binder reads a direct `.ptr` borrow (`KProjBorrow`);
+  # every other slot stays the mask-consulting `KProj`. The read op matches the
+  # ctor's write layout (both via `variant_slot_kind(te, [])`), so no tagged
+  # pointer is ever read raw nor vice versa.
+  PBind(name)          -> ls_emit(st, KLet(name, bind_slot_kslot(st, cn, idx, name, body), bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)))
+  PRecord(_)           -> bind_nested_slot(cn, sp, scrv, idx, body, st)
+  PAs(name, _)         -> bind_nested_as(cn, sp, name, scrv, idx, body, st)
+  PVariant(_, subs)    -> if nullary_slot_ctor(subs) { st } else { bind_nested_slot(cn, sp, scrv, idx, body, st) }
+  PVariantRecord(_, _) -> bind_nested_slot(cn, sp, scrv, idx, body, st)
+  _                    -> st
+}
+
+# A nested ctor with no payload (`Red`, `None`) binds no inner name — the
+# shared-tag decision tree tested its tag, so binding is a no-op. A ctor
+# WITH payload is bound by `bind_nested_slot` (its sub-binders need
+# projecting), gated by the tag test the decision tree emitted.
+fn nullary_slot_ctor(subs: [Pattern]) : Bool = match subs {
+  [] -> true
+  _  -> false
+}
+
+# Project slot `idx` into a fresh register, then bind the nested sub-pattern
+# (plain record OR a tag-tested variant payload) against it. A nested
+# variant / record slot is always a kind-0 boxed pointer, so `bind_slot_op`
+# reads it as a direct `.ptr` borrow (the same hot child read the balance
+# rotations perform) rather than the mask-consulting `KProj`.
+fn bind_nested_slot(cn: String, sp: Pattern, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) ->
+    bind_pattern_fields_any(sp, sub, body, st1) }
+
+# An as-pattern slot (`name @ inner`): bind the slot to `name`, then bind
+# the inner pattern against the SAME projected value.
+fn bind_nested_as(cn: String, sp: Pattern, name: String, scrv: KVal, idx: Int, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, bind_slot_op(st, cn, idx, scrv), KAt(sp.line, sp.col)) { LRes(sub, st1) -> {
+    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(sub), KAt(sp.line, sp.col)))
+    bind_pattern_fields_any(as_inner(sp), sub, body, st2)
+  } }
+
+# --- bind against an already-extracted value ----------------------------
+
+# Bind a destructuring pattern against an already-extracted value (a `let`
+# RHS, a projected slot, a read field). A nested plain `PRecord` /
+# `PVariantRecord` payload binds its fields; a top-level-shaped `PVariant`
+# here arrives only from a context whose tag is settled (the let-bind of a
+# single-ctor type, an as-pattern inner), so its direct subs bind.
+pub fn bind_pattern_fields_any(p: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match p.pkind {
+  PVariant(cn, subs)        -> bind_sub_binders(cn, subs, v, 0, body, st)
+  PVariantRecord(_, fields) -> bind_record_subfields(fields, v, body, st)
+  PRecord(fields)           -> bind_record_subfields(fields, v, body, st)
+  _                         -> st
+}
+
+# Bind the named binding fields of a record / variant-record payload by
+# `kai_op_field` read, recursing into nested sub-patterns. Literal /
+# wildcard fields bind nothing. Mirror of emit_c's `emit_pat_binds_record`.
+fn bind_record_subfields(fields: [PField], v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match fields {
+  [] -> st
+  [PField(fname, sub, _), ...rest] ->
+    bind_record_subfields(rest, v, body, bind_field_pattern(fname, sub, v, body, st))
+}
+
+# A field whose sub-pattern is a nested VARIANT / VARIANT-RECORD
+# (`snd: JReal(r)`) is now SOUND to bind: the decision tree (`lm_field_tests`
+# / `rec_emit_tests`) tested the field's tag before this bind runs, so
+# reading the field and binding the payload's inner names is dominated by a
+# passed tag test. The variant/record/as cases all read the field into a
+# fresh register and recurse through `bind_pattern_fields_any`.
+fn bind_field_pattern(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console = match sub.pkind {
+  PBind(name)          -> ls_emit(st, KLet(name, SBoxed, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)))
+  PRecord(_)           -> bind_field_nested(fname, sub, v, body, st)
+  PAs(name, _)         -> bind_field_as(fname, name, sub, v, body, st)
+  PVariant(_, _)       -> bind_field_nested(fname, sub, v, body, st)
+  PVariantRecord(_, _) -> bind_field_nested(fname, sub, v, body, st)
+  _                    -> st
+}
+
+# A nested-record / tag-tested-variant field: read the field into a fresh
+# register (owned `kai_op_field`), then bind the sub-pattern against it
+# through the shared `bind_pattern_fields_any` recursion.
+fn bind_field_nested(fname: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) ->
+    bind_pattern_fields_any(sub, fv, body, st1) }
+
+# An as-pattern field (`f: name @ inner`): bind the field to `name`, then
+# the inner pattern against the same field value.
+fn bind_field_as(fname: String, name: String, sub: Pattern, v: KVal, body: Expr, st: LowerSt) : LowerSt / Console =
+  match bind_op(st, KPrim("kai_op_field", [v, KStrV(fname)]), KAt(sub.line, sub.col)) { LRes(fv, st1) -> {
+    let st2 = ls_emit(st1, KLet(name, SBoxed, KLitOp(fv), KAt(sub.line, sub.col)))
+    bind_pattern_fields_any(as_inner(sub), fv, body, st2)
+  } }
+
+# --- soundness guard ----------------------------------------------------
+
+# A nested VARIANT sub-pattern needs a tag TEST this module does not emit
+# (the nested-variant-test family). Trap LOUD and bind nothing: the binder
+# stays unbound, so the backend refuses the module rather than silently
+# miscompiling. NEVER bind a nested variant's inner names against an
+# untested value (the false-green a `bind_sub_binders` recursion would be).
+fn bind_unsupported_nested(p: Pattern, st: LowerSt) : LowerSt / Console = {
+  eprint(concat_all(["kir: nested variant sub-pattern needs a tag test (subset gap: nested-variant-test) at ",
+                     int_to_string(p.line), ":", int_to_string(p.col)]))
+  st
+}
+
+# The inner pattern of a `PAs(name, inner)`.
+pub fn as_inner(p: Pattern) : Pattern = match p.pkind {
+  PAs(_, inner) -> inner
+  _             -> p
+}
