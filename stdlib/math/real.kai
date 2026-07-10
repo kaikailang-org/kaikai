@@ -1,0 +1,100 @@
+#[doc("""
+Real (floating-point) helpers not covered by the Numeric protocol:
+the constants `real_pi` / `real_e` / `real_tau`, the two-arg `min` /
+`max`, and rounding (`trunc`, `floor`, `ceil`, `round`,
+`round_half_even`). (`abs`, `sign`, `pow_int`, `clamp` live in
+`Numeric for Real`.)
+
+Rounding is built on the truncating `real_to_int` runtime builtin
+and is bounded-precision: an Int64 holds numbers up to ~9.22e18, so
+values past that point round to 0.
+
+libm bindings (`real_sqrt`, `real_sin`, `real_pow`, …) are global
+prelude primitives, not wrapped here. Domain handling is
+pass-through: `real_sqrt(0.0 - 1.0)` is NaN, `real_log(0.0)` is
+-Inf; use `real_is_nan` / `real_is_inf` to inspect.
+""")]
+
+# ---- Constants ---------------------------------------------------
+
+#[doc("π to 18 significant digits (≥ IEEE 754 double precision).")]
+pub const real_pi : Real = 3.141592653589793238
+
+#[doc("Euler's number e to 18 significant digits.")]
+pub const real_e : Real = 2.718281828459045235
+
+#[doc("""
+τ = 2π to 18 significant digits. The "circle constant"; some find
+it more natural than π for angle work (e.g. `real_tau / 4` for a
+quarter turn).
+""")]
+pub const real_tau : Real = 6.283185307179586477
+
+# ---- min / max ---------------------------------------------------
+# These coexist with `list.min(xs)` / `int.min(a, b)`. Qualify call
+# sites (`real.min(a, b)`) where the bare name is ambiguous.
+
+#[doc("Returns the smaller of two reals.")]
+pub fn min(a: Real, b: Real) : Real = if a < b { a } else { b }
+
+#[doc("Returns the larger of two reals.")]
+pub fn max(a: Real, b: Real) : Real = if a > b { a } else { b }
+
+# ---- Rounding ----------------------------------------------------
+# All four built on the truncating `real_to_int` runtime builtin.
+# `real_trunc` is the direct round-trip; floor/ceil/round nudge the
+# result by 1.0 when the input has a non-zero fractional part on the
+# wrong side of zero.
+
+#[doc("Truncate toward zero. `real.trunc(3.7) == 3.0`, `real.trunc(-3.7) == -3.0`.")]
+pub fn trunc(x: Real) : Real = int_to_real(real_to_int(x))
+
+#[doc("""
+Round toward negative infinity. `real.floor(3.7) == 3.0`,
+`real.floor(-3.7) == -4.0`. For non-negative `x` floor and trunc
+agree; for strictly negative `x` with a fractional part we step
+down by 1.0.
+""")]
+pub fn floor(x: Real) : Real = {
+  let t = trunc(x)
+  if x < 0.0 and x != t { t - 1.0 } else { t }
+}
+
+#[doc("Round toward positive infinity. Mirror of real.floor.")]
+pub fn ceil(x: Real) : Real = {
+  let t = trunc(x)
+  if x > 0.0 and x != t { t + 1.0 } else { t }
+}
+
+#[doc("""
+Round half-away-from-zero (the "schoolbook" rule). 0.5 → 1.0,
+-0.5 → -1.0. A local `fn round` shadows this export; qualify
+(`real.round`) where that matters.
+""")]
+pub fn round(x: Real) : Real =
+  if x >= 0.0 { trunc(x + 0.5) }
+  else { trunc(x - 0.5) }
+
+#[doc("""
+Round half-to-even (banker's rounding, IEEE 754 default): ties
+break toward the even integer, so a long stream of midpoints does
+not bias the sum. 0.5 → 0.0, 1.5 → 2.0, 2.5 → 2.0, -2.5 → -2.0.
+
+Floats represent .5 exactly (it is a binary fraction), so the
+`f == 0.5` equality below is sound; other fractions take the strict
+branches.
+""")]
+pub fn round_half_even(x: Real) : Real = {
+  let t = trunc(x)
+  let f = x - t
+  if f > 0.5         { t + 1.0 }
+  else if f < (0.0 - 0.5) { t - 1.0 }
+  else if f == 0.5 {
+    if real_to_int(t) % 2 == 0 { t } else { t + 1.0 }
+  }
+  else if f == (0.0 - 0.5) {
+    if real_to_int(t) % 2 == 0 { t } else { t - 1.0 }
+  }
+  else { t }
+}
+

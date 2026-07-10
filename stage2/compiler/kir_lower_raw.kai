@@ -1,0 +1,234 @@
+# compiler/kir_lower_raw.kai — raw (unboxed) Real lowering helpers.
+#
+# The KIR is all-boxed by default (`slot_of_ty` → SBoxed). The UNBOX pass
+# (`unbox.kai`) marks an `Expr` `MUnboxed` when it is a raw C scalar and
+# every operand is raw; the C-direct oracle reads that `.mode` and emits
+# `double kair_x` raw arithmetic, boxing only at borders. Perceus, seeing a
+# raw binding, SKIPS its RC (`prc_pat_bindings_skip_raw`): a raw `double`
+# has no refcount. If the KIR ignores `.mode` and re-boxes, it inherits
+# perceus's RC-plan (which omitted the dup/drop of the raw vars) over BOXED
+# values — a use-after-free on any multi-use Real operand (the
+# `9.88131e-324` corruption). The fix (asu, Camino A): the KIR is
+# MODE-SLAVE, exactly like the C emitter — a `MUnboxed` Real lowers to a
+# raw `f64` register + native `fadd`/`fmul`/`fcmp`, boxing only at the
+# raw↔boxed border. This module owns the PURE classification half (no
+# recursion into `lower_expr`); `lower_expr_raw` lives in the Expr-SCC
+# `kir_lower_walk.kai`.
+#
+# SCOPE: REAL + INT arith/cmp. A node is raw-promoted iff it is `MUnboxed`
+# AND a natively-raw FORM in one of two scalar families:
+#   - REAL (asu, Camino A — the native-parity "Real box/unbox" family): a
+#     Real literal/var, Real arith (`+ - * /`), unary `-`, a Real comparison,
+#     or a logical over raw-Real comparisons.
+#   - INT (P1, native Int unboxing): an Int literal/var, Int arith
+#     (`+ - * / %`), or an Int comparison (`< > <= >= == !=` over Int
+#     operands). `+`/`-`/`*` yield a raw `i64` (native `add`/`sub`/`mul`,
+#     wrapping, NO nsw/nuw — kaikai Int wraps); an Int comparison yields a raw
+#     i1 (signed `icmp`), boxed only at a raw→boxed border. `/` and `%` are
+#     raw too, but route through the checked helper `kai_idiv_chk`/
+#     `kai_imod_chk` (not a bare `sdiv`/`srem`) so a zero divisor or
+#     INT64_MIN/-1 traps clean instead of running hardware UB. Bit-ops
+#     (`<<`, `&`, …) stay boxed (no raw `i`-prim lowering for them in v1).
+# Char/Bool nodes that are MUnboxed for OTHER reasons (a UFn call returning
+# Bool, a `Char == Char`) stay on the boxed path: boxed Char/Bool ride the
+# singleton cache (immortal, no double-free), and the scalar machinery
+# (`real.unbox`/`int.box`, `f==`/`i==`) is wrong for a Char/Bool operand.
+# The gate is the OPERAND type for a comparison/logical node, never just the
+# result type — `kir_kind_is_raw` inspects the children, so a `bool or bool`
+# from two UFn calls never enters, and a comparison routes to the f-family
+# (Real operands) or the i-family (Int operands) by operand type.
+
+import compiler.ast
+import compiler.kir
+
+# True when an optional type is `Real` (stripping Dim/Refinement wrappers) —
+# the one scalar this module raw-promotes.
+pub fn kir_ty_is_real(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_real_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_real_t(t: Ty) : Bool = match t {
+  TyReal              -> true
+  TyDimT(inner, _)    -> kir_ty_is_real_t(inner)
+  TyRefineT(inner, _) -> kir_ty_is_real_t(inner)
+  _                   -> false
+}
+
+# True when an optional type is `Int` (stripping Refinement wrappers). The
+# second scalar this module raw-promotes — but ONLY for a `let`-binder's
+# RHS / its EVar reads (a literal or a var), NEVER Int arith / bit-ops. A
+# boxed Int that escapes `let`-scope (a fn param) already rides perceus's
+# RC correctly; the gap is the `let` binding, which perceus skip-raws
+# (`prc_pat_bindings_skip_raw` sees `MUnboxed`) yet the all-boxed KIR
+# re-boxed with a SHARED cell — a use-after-free on any out-of-cache Int
+# (|n| > 65535) used twice by a consuming prim (`kaix_add` / `kaix_bit_*`
+# decref their args). Lowering the binder RAW (`SInt64`) + boxing a FRESH
+# `kaix_int` at each read (`nemit_load_reg_boxed`) matches the C-direct
+# oracle's `int64_t kair_x` + `kai_int(kair_x)` per use — no shared cell,
+# no RC, no double-free. Mirror of the Real raw path (the np-real lane),
+# extended to the Int `let`-binder FORM only.
+pub fn kir_ty_is_int(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_int_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_int_t(t: Ty) : Bool = match t {
+  TyInt               -> true
+  TyRefineT(inner, _) -> kir_ty_is_int_t(inner)
+  _                   -> false
+}
+
+# True iff an optional type is `Bool`. Used by the box→raw border to route a
+# Bool scalar through `bool.unbox` (→ `kaix_bool_field`, slot `SBool`) rather
+# than the Int / Real prims — a Bool fed to `real.unbox` reads `as.r` off a
+# boxed Bool (a silent miscompile + an LLVM type mismatch the verifier
+# rejects). A raw-Bool call arg (a `neg: Bool` param the callee unboxes) is
+# the case that needs it.
+pub fn kir_ty_is_bool(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> kir_ty_is_bool_t(t)
+  None    -> false
+}
+
+fn kir_ty_is_bool_t(t: Ty) : Bool = match t {
+  TyBool              -> true
+  TyRefineT(inner, _) -> kir_ty_is_bool_t(inner)
+  _                   -> false
+}
+
+# An Expr the KIR raw path handles. ONLY the natively-raw FORMS — a Real
+# literal, a Real var, Real arith (`+ - * /`), unary `-`, a Real comparison,
+# or a logical / `not` over raw-Real comparisons. A Real-typed `MUnboxed`
+# node of ANOTHER form (an `if`, a call, a field read) is NOT raw-promoted:
+# lowering it boxed (its natural shape) and then unbox→rebox at the border
+# would just add a redundant `real.unbox`/`real.box` round-trip. The guard
+# gates on the FORM, so such nodes stay on the plain boxed path. The operand
+# type gates a comparison/logical (not the Bool result): a `bool or bool`
+# from two UFn calls is NOT raw, even though `or` is logical.
+pub fn kir_node_is_raw(x: Expr) : Bool =
+  match x.mode { MUnboxed -> kir_kind_is_raw(x) _ -> false }
+
+# The natively-raw FORMS, by `.kind`. A literal / var is raw when its type
+# is Real or Int. Arithmetic is raw when typed Real (`f+ f- f* f/`) or Int
+# (`i+ i- i*` — `/`/`%` excluded, P1 guard #2). A comparison routes by
+# OPERAND type: Real operands → the f-family (yields a raw i1), Int operands
+# → the i-family (signed `icmp`). A logical (`and`/`or`/`not`) is raw when
+# its operands are raw (a comparison over either scalar). The gate inspects
+# children so a boxed-Char / boxed-Bool node never enters the scalar path.
+fn kir_kind_is_raw(x: Expr) : Bool = match x.kind {
+  EReal(_, _) -> kir_ty_is_real(x.ty)
+  EIntLit(_) -> kir_ty_is_real(x.ty)
+  EDecimalLit(_) -> kir_ty_is_real(x.ty)
+  EInt(_)     -> kir_ty_is_int(x.ty)
+  EVar(_)     -> kir_ty_is_real(x.ty) or kir_ty_is_int(x.ty)
+  ELitUnit(inner, _) -> kir_node_is_raw(inner)
+  # Arith routes by RESULT type, not op string: `+ - *` overlap the Real
+  # (`f`) and Int (`i`) families, so a type-blind `if op_is_freal { real }`
+  # would reject every Int `+`/`-`/`*` (its result is Int, not Real) before
+  # the Int branch ran. Gate on the type first: a Real-typed freal-arith is
+  # raw, an Int-typed iint-arith is raw (`/` excluded from the Int set).
+  EBinop(op, a, b) ->
+    if kir_ty_is_real(x.ty) { kir_op_is_raw_freal_arith(op) }
+    else if kir_ty_is_int(x.ty) { kir_op_is_raw_iint_arith(op) }
+    else if kir_op_is_raw_cmp(op) {
+      (kir_ty_is_real(a.ty) and kir_ty_is_real(b.ty)) or
+      (kir_ty_is_int(a.ty) and kir_ty_is_int(b.ty))
+    }
+    else if kir_op_is_raw_logical(op) { kir_node_is_raw(a) and kir_node_is_raw(b) }
+    else { false }
+  EUnop(op, a) ->
+    if op == "-" { kir_ty_is_real(x.ty) }
+    else if op == "not" { kir_node_is_raw(a) }
+    else { false }
+  _ -> false
+}
+
+# The boxing prim a raw value crosses to boxed through, by RESULT type:
+# `real.box` (→ `kaix_real`) for a Real, `bool.box` (→ `kaix_bool`) for the
+# raw-Bool result of a Real comparison / logical. Mirror of `box_wrap`.
+pub fn kir_raw_box_prim(opt_t: Option[Ty]) : String =
+  if kir_ty_is_real(opt_t) { "real.box" }
+  else if kir_ty_is_int(opt_t) { "int.box" }
+  else { "bool.box" }
+
+# The `fbinop` opcode for a raw-Real arithmetic operator (matches the
+# runtime `kai_llvm_build_fbinop` switch: 0=fadd 1=fsub 2=fmul 3=fdiv).
+# `%` has no `double` form (the unbox pass keeps Real `%` boxed), so it
+# never reaches here.
+pub fn kir_fbinop_op(op: String) : Int =
+  if op == "+" { 0 }
+  else if op == "-" { 1 }
+  else if op == "*" { 2 }
+  else { 3 }
+
+# Is `op` a raw-Real arithmetic operator (one `fbinop` lowers)? `/` is
+# included (native `fdiv`); `%` is excluded (boxed `kaix_mod`).
+pub fn kir_op_is_raw_freal_arith(op: String) : Bool =
+  op == "+" or op == "-" or op == "*" or op == "/"
+
+# The `ibinop` opcode for a raw-Int arithmetic operator: 0=add 1=sub 2=mul
+# (all WRAPPING, no nsw/nuw), 3=div 4=mod. The native emitter turns opcodes
+# 3/4 into a call to the checked helper (`kai_idiv_chk`/`kai_imod_chk`), not a
+# bare `sdiv`/`srem`, so div-by-zero and INT64_MIN/-1 trap.
+pub fn kir_ibinop_op(op: String) : Int =
+  if op == "+" { 0 }
+  else if op == "-" { 1 }
+  else if op == "*" { 2 }
+  else if op == "/" { 3 }
+  else { 4 }
+
+# Is `op` a raw-Int arithmetic operator (one `ibinop` lowers)? `+ - * / %`.
+# `/` and `%` lower to the checked helper on both backends (C emits
+# `kai_idiv_chk`/`kai_imod_chk`, native calls the shim), so div-by-zero and
+# INT64_MIN/-1 trap identically instead of diverging. Bit-ops stay boxed.
+pub fn kir_op_is_raw_iint_arith(op: String) : Bool =
+  op == "+" or op == "-" or op == "*" or op == "/" or op == "%"
+
+# The `fcmp` predicate code for a raw-Real comparison (matches the runtime
+# `kai_llvm_build_fcmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all ordered).
+pub fn kir_fcmp_pred(op: String) : Int =
+  if op == "<" { 0 }
+  else if op == ">" { 1 }
+  else if op == "<=" { 2 }
+  else if op == ">=" { 3 }
+  else if op == "==" { 4 }
+  else { 5 }
+
+# The `icmp` predicate code for a raw-Int comparison (matches the runtime
+# `kai_llvm_build_icmp` switch: 0=< 1=> 2=<= 3=>= 4=== 5=!=, all SIGNED).
+pub fn kir_icmp_pred(op: String) : Int =
+  if op == "<" { 0 }
+  else if op == ">" { 1 }
+  else if op == "<=" { 2 }
+  else if op == ">=" { 3 }
+  else if op == "==" { 4 }
+  else { 5 }
+
+# Is `op` a comparison (one `fcmp`/`icmp`+widen lowers)? The SAME operator
+# set for Real and Int operands; `kir_kind_is_raw` routes to the f- or
+# i-family by operand type.
+pub fn kir_op_is_raw_cmp(op: String) : Bool =
+  op == "<" or op == ">" or op == "<=" or op == ">=" or op == "==" or op == "!="
+
+# Is `op` a short-circuit boolean (`and`/`or` over two raw i1 bools)? The
+# unbox pass already evaluated both operands (it marks the whole node
+# MUnboxed only when both children are raw), so a strict raw `and`/`or` is
+# sound — same as the C oracle's `&&`/`||` on two raw `int` operands.
+pub fn kir_op_is_raw_logical(op: String) : Bool = op == "and" or op == "or"
+
+# The native i1 boolean opcode for `and`/`or` (1=and, 0=or; the emitter
+# maps to `LLVMBuildAnd`/`LLVMBuildOr`).
+pub fn kir_logical_op(op: String) : Int = if op == "and" { 1 } else { 0 }
+
+# The KIR prim NAME carrying a raw binary op. The native emitter
+# (`nemit_prim`) dispatches these to `llvm_build_fbinop` / `llvm_build_fcmp`
+# / `llvm_build_ibinop` / `llvm_build_icmp` / the i1 logical builder rather
+# than the boxed `kaix_*` helpers. The `f` prefix marks the raw-Real family,
+# `i` the raw-Int family; both keep them distinct from the boxed `+`/`<`
+# strings so a translator never confuses the two; logical `and`/`or` get a
+# `b` prefix (i1 domain).
+pub fn kir_raw_arith_prim(op: String) : String = cat2("f", op)
+pub fn kir_raw_cmp_prim(op: String) : String = cat2("f", op)
+pub fn kir_raw_logical_prim(op: String) : String = cat2("b", op)
+pub fn kir_raw_iarith_prim(op: String) : String = cat2("i", op)
+pub fn kir_raw_icmp_prim(op: String) : String = cat2("i", op)
