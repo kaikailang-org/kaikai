@@ -1,0 +1,22 @@
+# Issue #1130 — stdlib HOF closure borrow (`^f` / `^p`), now ACTIVE.
+#
+# `list.map`, `list.filter`, `list.foldl` annotate their closure parameter
+# with `^`. Under the owned convention each HOF paid one caller incref +
+# one callee decref of the closure PER CALL; with the borrowing indirect
+# call those collapse. `foldl` is self-recursive (borrow-through, zero RC
+# on the closure per element); `map`/`filter` delegate to an owned private
+# loop, so the closure takes a single dup-on-consume at that owned exit
+# (rule 3) instead of a per-element pair. This fixture drives all three
+# over the same closure and asserts the functional result; the counter gate
+# pins the per-element RC elision.
+
+fn main() : Int / Stdout = {
+  let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+  let doubled = list.map(xs, (x) => x * 2)
+  let evens = list.filter(xs, (x) => x % 2 == 0)
+  let total = list.foldl(xs, 0, (acc, x) => acc + x)
+  # sum(doubled)=110, len(evens)=5, total=55 → 110 + 5 + 55 = 170
+  let s = list.foldl(doubled, 0, (acc, x) => acc + x)
+  Stdout.print(int_to_string(s + list.length(evens) + total))
+  0
+}

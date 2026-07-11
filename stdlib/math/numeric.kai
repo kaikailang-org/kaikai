@@ -1,0 +1,84 @@
+#[doc("""
+Single-dispatch ring protocol. Every op dispatches on its first
+argument, so `add(a, b)` / `abs(x)` route to `Numeric for Int` or
+`Numeric for Real` by that argument's type. `zero` / `one` are the
+additive / multiplicative identities (resolved through the expected
+return type at the call site). Domain-specific, hence it lives under
+math/ alongside its impls rather than in protocols.kai.
+
+A `Numeric` type is a ring: two monoids over the same `Self` —
+additive (`add`, `zero`) and multiplicative (`mul`, `one`). That is
+exactly what `list.sum` / `list.product` need: one `Self` folded
+under two operations at once. The typer does NOT verify the ring
+axioms (associativity, distributivity); they are the implementor's
+contract, like `Ord` being a total order by convention.
+""")]
+
+# ---- Numeric protocol --------------------------------------------
+
+protocol Numeric {
+  add(a: Self, b: Self) : Self
+  mul(a: Self, b: Self) : Self
+  zero() : Self
+  one() : Self
+  abs(x: Self) : Self
+  sign(x: Self) : Int
+  pow_int(base: Self, exp: Int) : Self
+  clamp(x: Self, lo: Self, hi: Self) : Self
+}
+
+# ---- Int impl ----------------------------------------------------
+
+# Tail-recursive accumulator for Int.pow_int. Internal.
+fn int_pow_int_loop(base: Int, e: Int, acc: Int) : Int {
+  if e == 0 { acc }
+  else { int_pow_int_loop(base, e - 1, acc * base) }
+}
+
+impl Numeric for Int {
+  fn add(a: Int, b: Int) : Int = a + b
+  fn mul(a: Int, b: Int) : Int = a * b
+  fn zero() : Int = 0
+  fn one() : Int = 1
+
+  fn abs(x: Int) : Int =
+    if x < 0 { 0 - x } else { x }
+
+  fn sign(x: Int) : Int =
+    if x < 0 { 0 - 1 } else { if x > 0 { 1 } else { 0 } }
+
+  fn pow_int(base: Int, exp: Int) : Int =
+    if exp < 0 { 0 } else { int_pow_int_loop(base, exp, 1) }
+
+  fn clamp(x: Int, lo: Int, hi: Int) : Int =
+    if lo > hi { x }
+    else { if x < lo { lo } else { if x > hi { hi } else { x } } }
+}
+
+# ---- Real impl ---------------------------------------------------
+
+# Tail-recursive accumulator for Real.pow_int. Internal.
+fn real_pow_int_loop(base: Real, e: Int, acc: Real) : Real {
+  if e == 0 { acc }
+  else { real_pow_int_loop(base, e - 1, acc * base) }
+}
+
+impl Numeric for Real {
+  fn add(a: Real, b: Real) : Real = a + b
+  fn mul(a: Real, b: Real) : Real = a * b
+  fn zero() : Real = 0.0
+  fn one() : Real = 1.0
+
+  fn abs(x: Real) : Real =
+    if x < 0.0 { 0.0 - x } else { x }
+
+  fn sign(x: Real) : Int =
+    if x < 0.0 { 0 - 1 } else { if x > 0.0 { 1 } else { 0 } }
+
+  fn pow_int(base: Real, exp: Int) : Real =
+    if exp < 0 { 0.0 } else { real_pow_int_loop(base, exp, 1.0) }
+
+  fn clamp(x: Real, lo: Real, hi: Real) : Real =
+    if lo > hi { x }
+    else { if x < lo { lo } else { if x > hi { hi } else { x } } }
+}
