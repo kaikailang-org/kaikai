@@ -1,0 +1,55 @@
+pi: ok
+e: ok
+tau: ok
+tau == 2*pi: ok
+abs 3.5: ok
+abs -3.5: ok
+abs 0: ok
+sign +: ok
+sign -: ok
+sign 0: ok
+min 3 7: ok
+min 7 3: ok
+max 3 7: ok
+max 7 3: ok
+min eq: ok
+clamp in: ok
+clamp lo: ok
+clamp hi: ok
+clamp degen: ok
+2^0: ok
+2^1: ok
+2^10: ok
+0.5^4: ok
+0^5: ok
+neg exp -> 0: ok
+trunc 3.7: ok
+trunc -3.7: ok
+trunc 3.0: ok
+trunc 0.0: ok
+floor 3.7: ok
+floor -3.7: ok
+floor 3.0: ok
+floor -3.0: ok
+floor 0.0: ok
+ceil 3.2: ok
+ceil -3.2: ok
+ceil 3.0: ok
+ceil -3.0: ok
+ceil 0.0: ok
+round 3.4: ok
+round 3.5: ok
+round 3.6: ok
+round -3.4: ok
+round -3.5: ok
+round 0.0: ok
+rhe 0.5: ok
+rhe 1.5: ok
+rhe 2.5: ok
+rhe 3.5: ok
+rhe -0.5: ok
+rhe -1.5: ok
+rhe -2.5: ok
+rhe 1.7: ok
+rhe 1.3: ok
+rhe -1.7: ok
