@@ -1,0 +1,32 @@
+# m7a #6b smoke test — `handle { body } with Eff { ... } return(x) -> ...`
+# allocates an EvE on the stack, pushes a KaiEvidence node, runs the
+# body, pops, then applies the return clause. The body must not call
+# any op of `Counter`: the op-call lowering through the EvE struct is
+# m7a #6c. Here the body is a plain literal (42); the return clause
+# adds 1; main returns 43, which becomes the process exit code via
+# the runtime's main wrapper.
+
+effect Counter {
+  tick() : Unit
+  get() : Int
+}
+
+fn main() : Int {
+  let r = handle {
+    42
+  } with Counter {
+    tick(resume) -> resume(())
+    get(resume) -> resume(0)
+    return(x) -> x + 1
+  }
+  assert r == 43
+  # nested handle: each `({...})` shadows the outer _ev / _node.
+  let s = handle {
+    100
+  } with Counter {
+    tick(resume) -> resume(())
+    get(resume) -> resume(0)
+  }
+  assert s == 100              # no return clause → identity
+  0
+}

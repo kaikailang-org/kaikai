@@ -1,0 +1,195 @@
+fn head_or_zero(xs: box) : i64 {
+  entry:
+    __pcs_scr: box = xs
+    .t0$sd: box = xs
+    .t0: box = ()
+    .t1: box = prim kai_is_nil_b(xs)
+    condbr .t1 ? L3 : L2
+  L3:
+    br L1
+  L1:
+    .t2: box = prim int.box(0)
+    .t0 <- .t2
+    br L0
+  L2:
+    .t3: box = prim kai_is_cons_b(xs)
+    condbr .t3 ? L6 : L5
+  L6:
+    h: box = proj xs.0
+    .t4: box = proj xs.1
+    __list_rest_13_10__: box = .t4
+    br L4
+  L4:
+    dup h
+    dup __list_rest_13_10__
+    .t0 <- h
+    br L0
+  L5:
+    unreachable
+  L0:
+    drop .t0$sd
+    ret .t0
+}
+
+fn second_or(xs: box, d: i64) : i64 {
+  entry:
+    __pcs_scr: box = xs
+    .t0$sd: box = xs
+    .t0: box = ()
+    .t1: box = prim kai_is_cons_b(xs)
+    condbr .t1 ? L3 : L2
+  L3:
+    .t2: box = proj xs.1
+    .t3: box = prim kai_is_cons_b(.t2)
+    condbr .t3 ? L4 : L2
+  L4:
+    m: box = proj .t2.0
+    .t4: box = proj .t2.1
+    __list_rest_17_13__: box = .t4
+    br L1
+  L1:
+    dup m
+    dup __list_rest_17_13__
+    .t0 <- m
+    br L0
+  L2:
+    br L5
+  L5:
+    .t5: box = prim int.box(d)
+    .t0 <- .t5
+    br L0
+  L0:
+    drop .t0$sd
+    ret .t0
+}
+
+fn drop_two(xs: box) : box {
+  entry:
+    dup xs
+    __pcs_scr: box = xs
+    .t0$sd: box = xs
+    .t0: box = ()
+    .t1: box = prim kai_is_cons_b(xs)
+    condbr .t1 ? L3 : L2
+  L3:
+    .t2: box = proj xs.1
+    .t3: box = prim kai_is_cons_b(.t2)
+    condbr .t3 ? L4 : L2
+  L4:
+    .t4: box = proj .t2.1
+    rest: box = .t4
+    br L1
+  L1:
+    dup rest
+    .t0 <- rest
+    br L0
+  L2:
+    br L5
+  L5:
+    dup xs
+    .t0 <- xs
+    br L0
+  L0:
+    drop .t0$sd
+    __pcs_ret: box = .t0
+    drop xs
+    do ()
+    ret __pcs_ret
+}
+
+fn classify(xs: box) : i64 {
+  entry:
+    dup xs
+    __pcs_scr: box = xs
+    .t0$sd: box = xs
+    .t0: box = ()
+    .t1: box = prim kai_is_nil_b(xs)
+    condbr .t1 ? L3 : L2
+  L3:
+    br L1
+  L1:
+    .t2: box = prim int.box(0)
+    .t0 <- .t2
+    br L0
+  L2:
+    .t3: box = prim kai_is_cons_b(xs)
+    condbr .t3 ? L6 : L5
+  L6:
+    x: box = proj xs.0
+    .t4: box = proj xs.1
+    .t5: box = prim kai_is_nil_b(.t4)
+    condbr .t5 ? L7 : L5
+  L7:
+    br L4
+  L4:
+    dup x
+    .t0 <- x
+    br L0
+  L5:
+    .t6: box = prim kai_is_cons_b(xs)
+    condbr .t6 ? L10 : L9
+  L10:
+    a: box = proj xs.0
+    .t7: box = proj xs.1
+    .t8: box = prim kai_is_cons_b(.t7)
+    condbr .t8 ? L11 : L9
+  L11:
+    b: box = proj .t7.0
+    .t9: box = proj .t7.1
+    .t10: box = prim kai_is_nil_b(.t9)
+    condbr .t10 ? L12 : L9
+  L12:
+    br L8
+  L8:
+    dup b
+    dup a
+    .t11: box = prim +(a, b)
+    .t0 <- .t11
+    br L0
+  L9:
+    br L13
+  L13:
+    dup xs
+    .t12: box = drop_two(xs)
+    .t13: i64 = head_or_zero(.t12)
+    .t0 <- .t13
+    br L0
+  L0:
+    drop .t0$sd
+    __pcs_ret: box = .t0
+    drop xs
+    do ()
+    ret __pcs_ret
+}
+
+fn main() : box {
+  entry:
+    .t0: box = prim int.box(7)
+    .t1: box = prim int.box(8)
+    .t2: box = prim int.box(9)
+    .t3: box = prim kai_nil()
+    .t4: box = prim kai_cons(.t2, .t3)
+    .t5: box = prim kai_cons(.t1, .t4)
+    .t6: box = prim kai_cons(.t0, .t5)
+    .t7: i64 = head_or_zero(.t6)
+    .t8: box = prim int.box(4)
+    .t9: box = prim int.box(5)
+    .t10: box = prim kai_nil()
+    .t11: box = prim kai_cons(.t9, .t10)
+    .t12: box = prim kai_cons(.t8, .t11)
+    .t13: i64 = second_or(.t12, 0)
+    .t14: i64 = prim i+(.t7, .t13)
+    .t15: box = prim int.box(3)
+    .t16: box = prim int.box(9)
+    .t17: box = prim kai_nil()
+    .t18: box = prim kai_cons(.t16, .t17)
+    .t19: box = prim kai_cons(.t15, .t18)
+    .t20: i64 = classify(.t19)
+    .t21: i64 = prim i+(.t14, .t20)
+    r: i64 = .t21
+    .t22: box = prim int.box(r)
+    .t23: box = int_to_string(.t22)
+    .t24: box = perform Stdout.print(.t23)
+    ret .t24
+}
+
