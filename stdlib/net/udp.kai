@@ -1,0 +1,81 @@
+#[doc("""
+The `NetUdp` effect plus the pure / forwarding helpers that fall out
+of its op set. `import net.udp`.
+
+Limitations: IPv4 only, blocking ops, bytes carried as `[Int]`,
+`SocketAddr.host` a textual dotted-quad, Err-first `Result`. The
+NetUdp default handler is auto-installed around `main` when
+`/ NetUdp` is in the row — there is no `with_udp` installer.
+""")]
+
+#[doc("Opaque UDP socket handle. The `fd` is the OS descriptor; `port` is the bound port.")]
+pub type UdpSocket = { priv fd: Int, port: Int }
+
+#[doc("A datagram endpoint — a textual IPv4 host and a port.")]
+pub type SocketAddr = { host: String, port: Int }
+
+#[doc("""
+Byte-level datagram UDP. `bind` opens a socket; `send` / `recv` move
+`[Int]` byte lists (`recv` pairs the source address with the bytes);
+`close` releases the socket. The default handler bridges each op to
+the runtime's blocking datagram sockets.
+""")]
+pub effect NetUdp {
+  bind(host: String, port: Int) : Result[String, UdpSocket]
+  send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[String, Int]
+  recv(s: UdpSocket, max: Int) : Result[String, Pair[SocketAddr, [Int]]]
+  close(s: UdpSocket) : Unit
+  default {
+    bind(host, port, resume)   -> $extern_handler("kai_default_netudp_bind")
+    send(s, dst, data, resume) -> $extern_handler("kai_default_netudp_send")
+    recv(s, max, resume)       -> $extern_handler("kai_default_netudp_recv")
+    close(s, resume)           -> $extern_handler("kai_default_netudp_close")
+  }
+}
+
+#[doc("""
+Read back the local port a UdpSocket is bound to — useful when the
+caller passed `port = 0` to `bind` so the kernel picks a free port.
+""")]
+pub fn local_port(s: UdpSocket) : Int = s.port
+
+#[doc("""
+Bind a UDP socket to `host:port`. `host = ""` or `"0.0.0.0"` binds
+INADDR_ANY; `port = 0` asks the kernel for an ephemeral port,
+readable afterwards via `local_port`. Err-first Result.
+""")]
+pub fn bind(host: String, port: Int) : Result[String, UdpSocket] / NetUdp =
+  NetUdp.bind(host, port)
+
+#[doc("""
+Send a datagram of `data` (a [Int], each element truncated to a
+byte) to `dst`. Returns the byte count sent on success.
+""")]
+pub fn send(s: UdpSocket, dst: SocketAddr, data: [Int]) : Result[String, Int] / NetUdp =
+  NetUdp.send(s, dst, data)
+
+#[doc("""
+Receive one datagram of at most `max` bytes. Returns the source
+address paired with the received bytes (kaikai has no tuples, so
+the pair is a `Pair[SocketAddr, [Int]]` record with `fst` / `snd`
+slots). `max <= 0` is a panic — there is no useful "read zero
+bytes" call.
+""")]
+pub fn recv(s: UdpSocket, max: Int) : Result[String, Pair[SocketAddr, [Int]]] / NetUdp =
+  NetUdp.recv(s, max)
+
+#[doc("""
+Close a UDP socket. Errors from close(2) are logged and swallowed
+by the handler — there is nothing useful a caller can do with
+them — so the surface op returns Unit.
+""")]
+pub fn close(s: UdpSocket) : Unit / NetUdp =
+  NetUdp.close(s)
+
+#[doc("""
+Construct a SocketAddr from a textual IPv4 host and a port. Pure
+helper so callers building a `send` destination do not need the
+`SocketAddr { ... }` record literal at every call site.
+""")]
+pub fn addr(host: String, port: Int) : SocketAddr =
+  SocketAddr { host: host, port: port }
