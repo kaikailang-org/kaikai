@@ -1,0 +1,9 @@
+# m7b #11k — when the body's `Reader.ask()` call resolves its T to
+# Int (via the `+1`) but the function declares `/ Reader[String]`,
+# the row mismatch diagnostic must mention `Reader[Int]` (and not
+# just `Reader`). Without per-instance row.ty_args propagation the
+# message would degenerate to `Reader vs Reader`, which is useless.
+
+fn ask_int_from_str_decl() : Int / Reader[String] = Reader.ask() + 1
+
+fn main() : Int = 0

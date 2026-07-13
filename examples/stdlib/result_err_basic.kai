@@ -1,0 +1,15 @@
+# issue #182 — smoke test for result_err (Result -> Option of error).
+
+fn pretty(o: Option[String]) : String {
+  match o {
+    Some(e) -> "some=#{e}"
+    None    -> "none"
+  }
+}
+
+fn main() {
+  let ok  : Result[String, Int] = Ok(11)
+  let bad : Result[String, Int] = Err("nope")
+  println(pretty(result.err(ok)))
+  println(pretty(result.err(bad)))
+}

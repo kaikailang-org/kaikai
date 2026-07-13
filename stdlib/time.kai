@@ -1,0 +1,207 @@
+#[doc("""
+Temporal primitives + the `Clock` effect.
+
+Ships the effect, the `WallTime` / `Instant` / `Duration` types,
+the effectful wrappers, and pure `Duration` arithmetic.
+""")]
+
+# ---- Types ----
+
+#[doc("""
+Wall-clock instant: seconds + nanos since the Unix epoch (1970-01-01
+UTC). Two `WallTime`s are subtractable; the result is a `Duration`.
+Wall time can jump backwards (NTP correction, leap seconds), so do
+**not** use it to measure elapsed intervals — use `Instant` instead.
+""")]
+pub type WallTime = { secs: Int, nanos: Int }
+
+#[doc("""
+Monotonic-clock instant. Opaque: construct with `instant_of_nanos`,
+read with `instant_to_nanos`, and compare or subtract against other
+`Instant`s from the same process (`instant_lt` / `instant_eq` /
+`elapsed_since`, the last yielding a non-negative `Duration` when the
+right operand is later). The epoch is implementation-defined and may
+shift across process restarts; serialise `WallTime` for a portable
+timestamp.
+""")]
+pub type Instant = { priv secs: Int, priv nanos: Int }
+
+#[doc("""
+Time interval. Stored normalised: `0 <= nanos < 1_000_000_000` and
+the sign lives on `secs`. Construct via the helpers below; reading
+the fields directly is allowed but the normalisation invariant is
+the constructors' job to maintain.
+""")]
+pub type Duration = { secs: Int, nanos: Int }
+
+# ---- The Clock effect ----
+#
+# Trap: `sleep_ns`'s handler blocks the OS thread inside `nanosleep`
+# and so does not deliver `Cancel.raise` mid-sleep.
+#
+# No `sleep_until(deadline)` op: `Instant`-typed deadlines would need
+# `monotonic_now` available outside the handler, complicating handler
+# isolation. The `deadline_in` helper derives a deadline locally
+# instead.
+#[doc("The clock capability: read wall-clock time, read a monotonic instant, and sleep. A default handler bridges to the runtime clock.")]
+pub effect Clock {
+  wall_now() : WallTime
+  monotonic_now() : Instant
+  sleep_ns(ns: Int) : Unit
+
+  # Default handler bridges each op to its runtime clock entry.
+  default {
+    wall_now(resume)      -> $extern_handler("kai_default_clock_wall_now")
+    monotonic_now(resume) -> $extern_handler("kai_default_clock_monotonic_now")
+    sleep_ns(ns, resume)  -> $extern_handler("kai_default_clock_sleep_ns")
+  }
+}
+
+# ---- Public wrappers (effectful) ----
+
+#[doc("Reads the current wall-clock time (rides `Clock`).")]
+pub fn now() : WallTime / Clock = Clock.wall_now()
+#[doc("Reads the current monotonic instant (rides `Clock`).")]
+pub fn monotonic() : Instant / Clock = Clock.monotonic_now()
+#[doc("Suspends the current fiber for duration `d` (rides `Clock`).")]
+pub fn sleep(d: Duration) : Unit / Clock =
+  Clock.sleep_ns(duration_to_nanos(d))
+
+#[doc("""
+Compute a deadline `d` from now, using the monotonic clock. The
+returned `Instant` is what callers compare against in cancel-aware
+loops (`while monotonic() < deadline { ... }`). Emits one Clock op,
+not two.
+""")]
+pub fn deadline_in(d: Duration) : Instant / Clock = {
+  let n = monotonic()
+  instant_add_duration(n, d)
+}
+
+# ---- Pure Duration arithmetic (no effect) ----
+#
+# Constructors keep `0 <= nanos < 1e9`. Negative inputs go to
+# `secs`; e.g. `millis(-1)` is `Duration { secs: -1, nanos:
+# 999_000_000 }`.
+
+#[doc("A `Duration` of `n` nanoseconds.")]
+pub fn nanos_dur(n: Int) : Duration = nanos_to_duration(n)
+#[doc("A `Duration` of `n` microseconds.")]
+pub fn micros(n: Int) : Duration = nanos_to_duration(n * 1000)
+#[doc("A `Duration` of `n` milliseconds.")]
+pub fn millis(n: Int) : Duration = nanos_to_duration(n * 1_000_000)
+#[doc("A `Duration` of `n` seconds.")]
+pub fn seconds(n: Int) : Duration = Duration { secs: n, nanos: 0 }
+#[doc("A `Duration` of `n` minutes.")]
+pub fn minutes(n: Int) : Duration = Duration { secs: n * 60, nanos: 0 }
+#[doc("A `Duration` of `n` hours.")]
+pub fn hours(n: Int)   : Duration = Duration { secs: n * 3600, nanos: 0 }
+
+#[doc("""
+Convert a Duration to total nanoseconds. Saturates silently if the
+result overflows Int — callers that need overflow detection should
+stay in seconds + nanos.
+""")]
+pub fn duration_to_nanos(d: Duration) : Int =
+  d.secs * 1_000_000_000 + d.nanos
+
+#[doc("""
+Convert total nanoseconds to a normalised Duration. Handles negative
+totals by pushing the borrow onto secs and keeping nanos in
+`[0, 1e9)`.
+""")]
+pub fn nanos_to_duration(n: Int) : Duration = {
+  let s = n / 1_000_000_000
+  let r = n - s * 1_000_000_000
+  if r < 0 { Duration { secs: s - 1, nanos: r + 1_000_000_000 } }
+  else     { Duration { secs: s,     nanos: r } }
+}
+
+#[doc("Sum two Durations, normalising the result.")]
+pub fn duration_add(a: Duration, b: Duration) : Duration =
+  nanos_to_duration(duration_to_nanos(a) + duration_to_nanos(b))
+
+#[doc("Difference `a - b`. May be negative.")]
+pub fn duration_sub(a: Duration, b: Duration) : Duration =
+  nanos_to_duration(duration_to_nanos(a) - duration_to_nanos(b))
+
+#[doc("""
+True iff `a` represents an earlier or equal point on the same axis
+as `b`. The axis (wall vs monotonic) is the caller's responsibility
+— the type system does not prevent comparing a `WallTime` with an
+`Instant`.
+""")]
+pub fn duration_lt(a: Duration, b: Duration) : Bool =
+  duration_to_nanos(a) < duration_to_nanos(b)
+
+#[doc("True when two durations are equal.")]
+pub fn duration_eq(a: Duration, b: Duration) : Bool =
+  a.secs == b.secs and a.nanos == b.nanos
+
+# ---- Instant arithmetic (monotonic axis) ----
+
+#[doc("""
+Construct an `Instant` from a total nanosecond count on the monotonic
+axis. Normalises to `0 <= nanos < 1_000_000_000`, pushing any borrow
+onto the seconds field like the `Duration` constructors.
+""")]
+pub fn instant_of_nanos(ns: Int) : Instant = {
+  let s = ns / 1_000_000_000
+  let r = ns - s * 1_000_000_000
+  if r < 0 { Instant { secs: s - 1, nanos: r + 1_000_000_000 } }
+  else     { Instant { secs: s,     nanos: r } }
+}
+
+#[doc("""
+Total nanoseconds of an `Instant` since its implementation-defined
+epoch. Saturates silently if the result overflows Int.
+""")]
+pub fn instant_to_nanos(t: Instant) : Int =
+  t.secs * 1_000_000_000 + t.nanos
+
+#[doc("Advances an `Instant` on the monotonic axis by a `Duration`.")]
+pub fn instant_add_duration(t: Instant, d: Duration) : Instant = {
+  let total = t.secs * 1_000_000_000 + t.nanos + duration_to_nanos(d)
+  let s = total / 1_000_000_000
+  let r = total - s * 1_000_000_000
+  if r < 0 { Instant { secs: s - 1, nanos: r + 1_000_000_000 } }
+  else     { Instant { secs: s,     nanos: r } }
+}
+
+#[doc("""
+Elapsed time from `start` to `stop`. Negative if the clock went
+backwards, but a well-behaved monotonic clock never does — that's
+the point of using `Instant` over `WallTime`.
+""")]
+pub fn elapsed_since(start: Instant, stop: Instant) : Duration =
+  nanos_to_duration(
+    (stop.secs - start.secs) * 1_000_000_000 + (stop.nanos - start.nanos))
+
+#[doc("True when `a` is an earlier monotonic instant than `b`.")]
+pub fn instant_lt(a: Instant, b: Instant) : Bool =
+  if a.secs == b.secs { a.nanos < b.nanos }
+  else                { a.secs < b.secs }
+
+#[doc("True when two instants are equal.")]
+pub fn instant_eq(a: Instant, b: Instant) : Bool =
+  a.secs == b.secs and a.nanos == b.nanos
+
+# ---- WallTime arithmetic ----
+
+#[doc("Advances a `WallTime` by a `Duration`.")]
+pub fn walltime_add_duration(t: WallTime, d: Duration) : WallTime = {
+  let total = t.secs * 1_000_000_000 + t.nanos + duration_to_nanos(d)
+  let s = total / 1_000_000_000
+  let r = total - s * 1_000_000_000
+  if r < 0 { WallTime { secs: s - 1, nanos: r + 1_000_000_000 } }
+  else     { WallTime { secs: s,     nanos: r } }
+}
+
+#[doc("True when `a` is an earlier wall-clock time than `b`.")]
+pub fn walltime_lt(a: WallTime, b: WallTime) : Bool =
+  if a.secs == b.secs { a.nanos < b.nanos }
+  else                { a.secs < b.secs }
+
+#[doc("True when two wall-clock times are equal.")]
+pub fn walltime_eq(a: WallTime, b: WallTime) : Bool =
+  a.secs == b.secs and a.nanos == b.nanos
