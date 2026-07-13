@@ -1,0 +1,69 @@
+#[doc("""
+The `NetDns` effect plus the wrappers over its single `resolve` op
+and a custom-handler installer for callers that intercept name
+resolution (tests, allow-lists) instead of hitting the network.
+`import net.dns`.
+
+NetDns is a capability distinct from NetTcp on purpose: a component
+that should resolve names but never open a socket carries `/ NetDns`
+and is statically prevented from going further.
+
+Limitations: IPv4 only (`AF_INET`), no reverse DNS, no caching/TTL.
+""")]
+
+#[doc("Resolved IPv4 address, carried as its textual dotted-quad form for logging round-trips.")]
+pub type IpAddr = { addr: String }
+
+#[doc("""
+Resolve a hostname to a list of IPv4 addresses via getaddrinfo(3).
+The default handler bridges to the runtime resolver; `Result` is
+Err-first.
+""")]
+pub effect NetDns {
+  resolve(host: String) : Result[String, [IpAddr]]
+  default {
+    resolve(host, resume) -> $extern_handler("kai_default_netdns_resolve")
+  }
+}
+
+#[doc("""
+Resolve `host` (a hostname or IPv4 dotted-quad) to the list of IPv4
+addresses the runtime's getaddrinfo(3) shim returns. Thin pass-
+through to the effect op so callers get the full list (an empty
+`Ok([])` is a valid resolution — `resolve_first` is the helper that
+treats "no addresses" as an error).
+""")]
+pub fn resolve(host: String) : Result[String, [IpAddr]] / NetDns =
+  NetDns.resolve(host)
+
+#[doc("""
+Resolve `host` and return only the first address, or `Err` when the
+host resolves to no addresses. Keeps the runtime a thin getaddrinfo
+shim — the "no addresses" case is shaped here, not in C.
+""")]
+pub fn resolve_first(host: String) : Result[String, IpAddr] / NetDns =
+  match NetDns.resolve(host) {
+    Ok([])        -> Err("no addresses for #{host}")
+    Ok([a, ..._]) -> Ok(a)
+    Err(m)        -> Err(m)
+  }
+
+#[doc("""
+Run `body` under a `NetDns` handler backed by the caller-supplied
+`resolver` instead of the getaddrinfo default. Lets a test resolve
+from a fixed table, or an allow-list resolver reject unknown hosts,
+without touching the network. Substitutes `NetDns` in the body row;
+any other effects in `e` flow through unchanged. Only needed to
+override the default — real resolution needs no installer.
+""")]
+pub fn with_dns[R, e](
+  resolver: (String) -> Result[String, [IpAddr]],
+  body: () -> R / NetDns + e
+) : R / e = {
+  handle {
+    body()
+  } with NetDns {
+    resolve(host, resume) -> resume(resolver(host))
+    return(x) -> x
+  }
+}
