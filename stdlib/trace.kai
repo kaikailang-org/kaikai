@@ -1,0 +1,89 @@
+#[doc("""
+Minimal `Trace` effect for ad-hoc structured logging:
+`log(msg)` emits a one-line message, `checkpoint(name)` marks a
+labeled point. The default handler `with_trace_default` prefixes
+every line with `[trace] ` and writes via `Stdout.print`; output is
+deterministic (no timestamps) so fixtures can golden-match it.
+
+No runtime default handler is installed, so callers must wrap the
+relevant region in `with_trace_default { ... }` or another `Trace`
+handler. `Stdout.print` appends a trailing newline, so the handler
+does not add one.
+""")]
+
+#[doc("The tracing capability: emit free-form log messages and named checkpoints. No default handler is installed; wrap a region in `with_trace_default`.")]
+pub effect Trace {
+  log(msg: String) : Unit
+  checkpoint(name: String) : Unit
+}
+
+#[doc("""
+Run `body` under a `Trace` handler that writes every op to stdout
+in `[trace] ...` form. Substitutes `Trace` in the body row for
+`Stdout` in the result row; any other effects in `e` flow through
+unchanged.
+""")]
+pub fn with_trace_default[R, e](body: () -> R / Trace + e) : R / Stdout + e = {
+  handle {
+    body()
+  } with Trace {
+    log(msg, resume) -> {
+      Stdout.print("[trace] " ++ msg)
+      resume(())
+    }
+    checkpoint(name, resume) -> {
+      Stdout.print("[trace] checkpoint: " ++ name)
+      resume(())
+    }
+    return(x) -> x
+  }
+}
+
+#[doc("""
+Internal carrier for `with_log_prefix`. Handler-clause bodies
+cannot close over the enclosing fn's locals — only `self`, the
+continuation, the op args, and (when parametric) `state` — so the
+prefix string is threaded through this effect's `state` slot. Only
+`with_log_prefix` should install a handler for it.
+""")]
+pub effect TracePrefix[T] {
+  read() : T
+}
+
+#[doc("""
+Wrap `body` in a `Trace` handler that prepends `prefix ++ ": "` to
+every `log` and `checkpoint` op, then re-emits the message via
+`Trace.log` to the next handler on the stack. The result row keeps
+`Trace` because the clause bodies invoke it themselves.
+
+`checkpoint` is folded into a `log` call rather than re-emitted as
+`Trace.checkpoint`, so the outer handler's checkpoint formatting
+does not stack on top of the prefix. The self-delegating
+`Trace.log` inside a clause resolves to the *outer* handler (the
+runtime skips this handler while its clause is executing);
+otherwise the call would re-enter the same clause and recurse
+forever.
+""")]
+pub fn with_log_prefix[R, e](
+  prefix: String,
+  body: () -> R / Trace + e
+) : R / Trace + e = {
+  handle {
+    handle {
+      body()
+    } with Trace {
+      log(msg, resume) -> {
+        Trace.log(TracePrefix.read() ++ ": " ++ msg)
+        resume(())
+      }
+      checkpoint(name, resume) -> {
+        Trace.log(TracePrefix.read() ++ ": checkpoint: " ++ name)
+        resume(())
+      }
+      return(x) -> x
+    }
+  } with TracePrefix[String](prefix) {
+    read(resume) -> resume(state)
+    return(x) -> x
+  }
+}
