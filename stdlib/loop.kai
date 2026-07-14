@@ -1,0 +1,44 @@
+#[doc("""
+Koka-style control-flow helpers. Row-polymorphic over a single row
+variable `e`: each helper inherits its lambda arguments' effect row
+unchanged and introduces no effect of its own, relying on mandatory
+TCO. The double-trailing-lambda call shape reads naturally:
+
+  while  { i > 0 }  { i := i - 1 }
+  until  { done }   { process_one() }
+  repeat(10)         { Stdout.print("hi") }
+  forever            { handle_message() }
+""")]
+
+#[doc("""
+Loop while `pred` returns true; runs `body` between checks.
+The condition is re-evaluated every iteration. Returns Unit
+when `pred` finally returns false.
+""")]
+pub fn while(pred: () -> Bool / e, body: () -> Unit / e) : Unit / e =
+  if pred() { body(); while(pred, body) } else { () }
+
+#[doc("""
+Loop until `pred` returns true; `body` runs first, then the
+condition is checked. The do-while shape: the body executes
+at least once.
+""")]
+pub fn until(pred: () -> Bool / e, body: () -> Unit / e) : Unit / e = {
+  body()
+  if pred() { () } else { until(pred, body) }
+}
+
+#[doc("Run `body` exactly `n` times. `n <= 0` is a no-op.")]
+pub fn repeat(n: Int, body: () -> Unit / e) : Unit / e =
+  if n > 0 { body(); repeat(n - 1, body) } else { () }
+
+#[doc("""
+Loop `body` indefinitely. Only exits via `Cancel` (raised by
+the scheduler) or by the body itself raising an effect that
+unwinds (e.g. `Fail.fail`). Returns `Nothing` because there is
+no normal-completion path.
+""")]
+pub fn forever(body: () -> Unit / e) : Nothing / e = {
+  body()
+  forever(body)
+}
