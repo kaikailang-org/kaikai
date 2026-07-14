@@ -1,0 +1,26 @@
+empty size 0: ok
+empty is_empty: ok
+empty get none: ok
+size 3: ok
+m['a']: ok
+m['b']: ok
+m['missing']: ok
+contains 'c': ok
+not contains 'd': ok
+keys: a,b,c
+values: 1,2,3
+update keeps size 3: ok
+m['b'] updated: ok
+remove drops size: ok
+m['b'] gone: ok
+remove missing is no-op: ok
+from size 2: ok
+from dup wins last: ok
+merge size 3: ok
+merge a wins 'q': ok
+merge keeps 'r': ok
+merge leaves b: ok
+order stable across same-input runs: ok
+100K size exact: ok
+100K all round-trip: ok
+100K absent missing: ok
