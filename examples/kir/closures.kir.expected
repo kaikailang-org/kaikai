@@ -1,0 +1,39 @@
+fn apply(f: box, x: i64) : i64 {
+  entry:
+    .t0: box = prim int.box(x)
+    .t1: box = call_ind f(.t0)
+    ret .t1
+}
+
+fn inc(n: i64) : i64 {
+  entry:
+    .t0: i64 = prim i+(n, 1)
+    .t1: box = prim int.box(.t0)
+    ret .t1
+}
+
+fn main() : box {
+  entry:
+    base: box = 10
+    .t0: box = closure _kai_lam_13/1 [base]
+    bump: box = .t0
+    drop base
+    do ()
+    .t1: box = prim int.box(1)
+    .t2: box = call_ind bump(.t1)
+    .t3: i64 = prim int.unbox(.t2)
+    .t4: i64 = apply__cspec__Finc(.t3)
+    .t5: box = int_to_string(.t4)
+    .t6: box = perform Stdout.print(.t5)
+    ret .t6
+}
+
+lambda fn _kai_lam_13(n: box, base: box @cap0) : box {
+  entry:
+    dup n
+    dup base
+    .t0: box = prim +(n, base)
+    drop n
+    ret .t0
+}
+
