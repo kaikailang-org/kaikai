@@ -1,0 +1,2 @@
+effect not handled: Stdout
+`pure_fn`'s declared row does not include `Stdout`

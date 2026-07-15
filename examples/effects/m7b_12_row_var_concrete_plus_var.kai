@@ -1,0 +1,20 @@
+# m7b #12 positive — a function whose declared row mixes a
+# concrete label with a row variable. `log_around` performs
+# Console itself and additionally lets the body's effects flow
+# through `e`. Called with a body that itself performs Console,
+# the row instantiates so that the outer row stays `Console`.
+
+fn say_hi() : Unit / Console {
+  Stdout.print("hi")
+}
+
+fn log_around(body: () -> Unit / e) : Unit / Console + e = {
+  Stdout.print("before")
+  body()
+  Stdout.print("after")
+}
+
+fn main() : Int / Console {
+  log_around(say_hi)
+  0
+}
