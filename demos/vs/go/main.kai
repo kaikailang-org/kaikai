@@ -1,0 +1,63 @@
+# vs Go — error handling without `if err != nil` ladders
+#
+# Go's idiomatic error handling means every fallible call gets a
+# 3-line wrap: assignment, check, return. Pipelines that read a file,
+# parse, validate, and write spend more lines on `if err != nil` than
+# on actual logic.
+#
+# kaikai: `!` postfix propagates `Result` / `Option` errors to the
+# enclosing `Fail` handler. The pipeline reads as the dataflow it is.
+#
+# === Go equivalent (~25 lines) ===
+#
+#   func process(in, out string) error {
+#       data, err := os.ReadFile(in)
+#       if err != nil { return err }
+#       parsed, err := parseJSON(data)
+#       if err != nil { return err }
+#       err = validate(parsed)
+#       if err != nil { return err }
+#       result, err := transform(parsed)
+#       if err != nil { return err }
+#       return os.WriteFile(out, marshal(result), 0644)
+#   }
+#
+# === kaikai equivalent (target syntax) ===
+
+type Record = { id: Int, name: String, amount: Int }
+
+# Each step returns Result; in Go each call would need an
+# `if err != nil { return err }` check. In kaikai `!` propagates
+# Err to the enclosing Fail handler — the pipeline reads as the
+# dataflow it is.
+fn parse_amount(raw: String) : Result[Int, String] = match string.to_int(raw) {
+  Some(n) -> Ok(n)
+  None    -> Err("not an integer")
+}
+
+fn validate(amount: Int) : Result[Int, String] =
+  if amount >= 0 { Ok(amount) } else { Err("negative amount") }
+
+fn transform(amount: Int) : Result[Int, String] = Ok(amount * 2)
+
+# Whole pipeline in 4 lines; every `!` is a possible early return
+# on Err, propagated up the Result chain. Go would write three
+# `if err != nil { return err }` blocks for the same shape.
+fn process(input: String) : Result[Int, String] = {
+  let amount = parse_amount(input)!
+  let valid  = validate(amount)!
+  let result = transform(valid)!
+  Ok(result)
+}
+
+fn run(input: String) : Unit / Stdout = match process(input) {
+  Ok(n)    -> Stdout.print("result = #{n}")
+  Err(msg) -> Stdout.print("error: " ++ msg)
+}
+
+fn main() : Int / Stdout = {
+  run("21")     # OK path: 21 -> 21 -> 42
+  run("-5")     # validate rejects
+  run("nope")   # parse rejects
+  0
+}

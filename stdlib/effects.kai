@@ -1,0 +1,211 @@
+#[doc("""
+Atomic effect catalog — the builtin capabilities the runtime ships a
+default handler for, declared in surface kaikai.
+
+Auto-loaded as part of the core stdlib set, so user code names these
+effects (`Stdout.print`, `File.read_file`, ...) without an import.
+Each runtime-backed op bridges to its C entry through a `default { }`
+clause of the form `$extern_handler("kai_default_<eff>_<op>")`.
+
+Networking (`NetTcp` / `NetUdp` / `NetDns`) lives with its surface
+helpers in `net/`; concurrency and OS-process effects live in
+`effects/concurrent.kai` and `effects/os.kai`.
+""")]
+
+# ---- Console / IO leaves ----
+
+#[doc("Write a line to standard output. The default handler bridges to the runtime stdout writer.")]
+pub effect Stdout {
+  print(s: String) : Unit
+  default {
+    print(s, resume) -> $extern_handler("kai_default_stdout_print")
+  }
+}
+
+#[doc("Write a line to standard error. The default handler bridges to the runtime stderr writer.")]
+pub effect Stderr {
+  eprint(s: String) : Unit
+  default {
+    eprint(s, resume) -> $extern_handler("kai_default_stderr_eprint")
+  }
+}
+
+#[doc("""
+Read from standard input. `read_line` returns `None` at EOF;
+`read_bytes(n)` reads up to `n` raw bytes (a short read is the
+end-of-stream signal). The default handler bridges to the runtime
+stdin reader.
+""")]
+pub effect Stdin {
+  read_line() : Option[String]
+  read_bytes(n: Int) : String
+  default {
+    read_line(resume)     -> $extern_handler("kai_default_stdin_read_line")
+    read_bytes(n, resume) -> $extern_handler("kai_default_stdin_read_bytes")
+  }
+}
+
+#[doc("Abandon the current computation with a message. `fail` returns `Nothing`, so no resume is possible.")]
+pub effect Fail {
+  fail(msg: String) : Nothing
+  default {
+    fail(msg, resume) -> $extern_handler("kai_default_fail_fail")
+  }
+}
+
+#[doc("""
+The FFI capability tag carried by every `extern "C"` signature. It
+declares no ops — the type-level name exists so public signatures can
+mention `/ Ffi` honestly. Codegen routes FFI calls around the effect
+dispatcher entirely.
+""")]
+pub effect Ffi {}
+
+# ---- Process environment ----
+
+#[doc("""
+Read and mutate the process environment, plus read the argv list.
+Writes (`set_var` / `unset_var`) return `Result[Unit, String]`
+(Ok-first). The default handler bridges each op to its runtime
+entry.
+""")]
+pub effect Env {
+  args() : [String]
+  get(name: String) : Option[String]
+  set_var(name: String, value: String) : Result[Unit, String]
+  unset_var(name: String) : Result[Unit, String]
+  vars() : [Pair[String, String]]
+  default {
+    args(resume)                -> $extern_handler("kai_default_env_args")
+    get(name, resume)           -> $extern_handler("kai_default_env_get")
+    set_var(name, value, resume)-> $extern_handler("kai_default_env_set_var")
+    unset_var(name, resume)     -> $extern_handler("kai_default_env_unset_var")
+    vars(resume)                -> $extern_handler("kai_default_env_vars")
+  }
+}
+
+# ---- File IO ----
+
+#[doc("""
+Opaque file handle the chunked `File` ops return and consume. The
+`fd` field is the OS file descriptor; the runtime reads it by name,
+so the field name is load-bearing.
+""")]
+pub type FileHandle = { fd: Int }
+
+#[doc("""
+Read and write files, in bulk (`read_file` / `write_file`) or in
+chunks over an opaque `FileHandle`. `read_chunk` returns `Ok("")` at
+EOF. Errors ride `Result` (Ok-first). The default handler bridges
+each op to the runtime's thread-pooled IO.
+""")]
+pub effect File {
+  read_file(path: String) : Result[String, String]
+  write_file(path: String, contents: String) : Result[Unit, String]
+  open_read(path: String) : Result[FileHandle, String]
+  read_chunk(h: FileHandle, max: Int) : Result[String, String]
+  open_write(path: String) : Result[FileHandle, String]
+  write_chunk(h: FileHandle, data: String) : Result[Unit, String]
+  close_file(h: FileHandle) : Unit
+  default {
+    read_file(path, resume)       -> $extern_handler("kai_default_file_read_file")
+    write_file(path, contents, resume) -> $extern_handler("kai_default_file_write_file")
+    open_read(path, resume)       -> $extern_handler("kai_default_file_open_read")
+    read_chunk(h, max, resume)    -> $extern_handler("kai_default_file_read_chunk")
+    open_write(path, resume)      -> $extern_handler("kai_default_file_open_write")
+    write_chunk(h, data, resume)  -> $extern_handler("kai_default_file_write_chunk")
+    close_file(h, resume)         -> $extern_handler("kai_default_file_close_file")
+  }
+}
+
+# ---- Randomness ----
+
+#[doc("""
+Non-cryptographic randomness. `int_range(lo, hi)` is uniform in
+`[lo, hi]`. The default handler seeds a PCG64 generator from the
+process clock and pid. Use `SecureRandom` for security-sensitive
+draws.
+""")]
+pub effect Random {
+  int_range(lo: Int, hi: Int) : Int
+  default {
+    int_range(lo, hi, resume) -> $extern_handler("kai_default_random_int_range")
+  }
+}
+
+#[doc("""
+Cryptographically-secure randomness, deliberately separate from
+`Random` so a test handler stubbing `Random` cannot weaken
+security-sensitive paths. `int_range` is uniform-inclusive;
+`bytes(n)` draws `n` bytes (as `[Int]` in `[0, 255]`). The default
+handler bridges to the OS CSPRNG (getrandom / arc4random).
+""")]
+pub effect SecureRandom {
+  int_range(min: Int, max: Int) : Int
+  bytes(n: Int) : [Int]
+  default {
+    int_range(min, max, resume) -> $extern_handler("kai_default_securerandom_int_range")
+    bytes(n, resume)            -> $extern_handler("kai_default_securerandom_bytes")
+  }
+}
+
+# ---- Logging ----
+
+#[doc("""
+Leveled structured logging. The default handler writes each message
+to stderr in `[ISO8601Z] LEVEL message` form. Install a `Log`
+handler to capture or filter output.
+""")]
+pub effect Log {
+  debug(msg: String) : Unit
+  info(msg: String) : Unit
+  warn(msg: String) : Unit
+  error(msg: String) : Unit
+  default {
+    debug(msg, resume) -> $extern_handler("kai_default_log_debug")
+    info(msg, resume)  -> $extern_handler("kai_default_log_info")
+    warn(msg, resume)  -> $extern_handler("kai_default_log_warn")
+    error(msg, resume) -> $extern_handler("kai_default_log_error")
+  }
+}
+
+# ---- Mutation ----
+
+#[doc("""
+Observable mutation of `Array` cells and `Ref` references. Each op
+carries its own element generic so one handler instance serves every
+type. `var x = init` sugar and bare-builtin array writes route here;
+the default handler wraps the runtime's array/ref primitives.
+
+`array_set` / `array_grow` return the (mutated) `Array` to keep
+`xs = array_set(xs, i, v)` chains typing — the runtime mutates in
+place and hands the same array back.
+""")]
+pub effect Mutable {
+  array_make[T](n: Int, init: T) : Array[T]
+  array_length[T](a: Array[T]) : Int
+  array_get[T](a: Array[T], i: Int) : T
+  array_set[T](a: Array[T], i: Int, v: T) : Array[T]
+  array_grow[T](a: Array[T], n: Int, init: T) : Array[T]
+  ref_make[T](init: T) : Ref[T]
+  ref_get[T](r: Ref[T]) : T
+  ref_set[T](r: Ref[T], v: T) : Unit
+  default {
+    array_make(n, init, resume)    -> $extern_handler("kai_default_mutable_array_make")
+    array_length(a, resume)        -> $extern_handler("kai_default_mutable_array_length")
+    array_get(a, i, resume)        -> $extern_handler("kai_default_mutable_array_get")
+    array_set(a, i, v, resume)     -> $extern_handler("kai_default_mutable_array_set")
+    array_grow(a, n, init, resume) -> $extern_handler("kai_default_mutable_array_grow")
+    ref_make(init, resume)         -> $extern_handler("kai_default_mutable_ref_make")
+    ref_get(r, resume)             -> $extern_handler("kai_default_mutable_ref_get")
+    ref_set(r, v, resume)          -> $extern_handler("kai_default_mutable_ref_set")
+  }
+}
+
+# ---- Effect aliases ----
+
+#[doc("The combined console capability — `Stdout + Stderr + Stdin`.")]
+pub type Console = Stdout + Stderr + Stdin
+
+#[doc("The full IO capability — `Console + Env + File`.")]
+pub type Io = Console + Env + File
