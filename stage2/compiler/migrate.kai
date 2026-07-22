@@ -1,0 +1,155 @@
+# compiler/migrate.kai — `kai migrate` entry point.
+#
+# migrate is a source-preserving AST rewrite: parse the package,
+# rename every edition-broken surface form the rule set knows, and
+# re-emit through the fmt-writer. Idempotent, but the type-order
+# rewrites get there via the declared edition rather than by shape —
+# they are positional and would otherwise undo themselves. It never emits source
+# that does not parse — the driver reparses the output before writing
+# and aborts on failure. Changes the rule set cannot make safely are
+# reported as `manual:` pointers, never silently dropped.
+#
+# Two stateless passes over the top-level decls: `migrate_decls`
+# rewrites every body expression; `migrate_scan_decls` collects the
+# report. Both delegate the per-expression walk to migrate_walk /
+# migrate_scan and return plain lists.
+
+import compiler.ast
+import compiler.migrate_rules
+import compiler.migrate_types
+import compiler.migrate_walk
+import compiler.migrate_scan
+
+# --- rewrite pass over decls ------------------------------------------
+
+#[doc("Rewrite every expression body in a parsed program under the active rule set. Declarations with no expression body pass through unchanged.")]
+pub fn migrate_decls(decls: [Decl]) : [Decl] = map(decls, mig_decl)
+
+# The `Result` type-argument flip is positional, so it is involutive:
+# a second application undoes the first. Convergence comes from the
+# source edition, not from the type's shape — only a hanga-roa package
+# gets the flip, and migrating it makes it orongo. The call renames
+# below are shape-recognisable and stay idempotent on their own, so
+# they run under every edition.
+#[doc("Rewrite every expression body under the call-rename rules only, leaving type annotations untouched. Used when the source edition already carries the Ok-first `Result` order.")]
+pub fn migrate_decls_renames_only(decls: [Decl]) : [Decl] = map(decls, mig_decl_renames)
+
+fn mig_decl_renames(d: Decl) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> DFn(p, n, tp, ps, rt, row, mig_expr(false, body), l, c, mo)
+  DTest(desc, body, l, c) -> DTest(desc, mig_expr(false, body), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, mig_expr(false, body), l, c)
+  DCheck(desc, ps, body, l, c) -> DCheck(desc, ps, mig_expr(false, body), l, c)
+  DConst(p, n, t, body, mo, l, c) -> DConst(p, n, t, mig_expr(false, body), mo, l, c)
+  DImpl(pn, ta, tgt, ds, l, c) -> DImpl(pn, ta, tgt, migrate_decls_renames_only(ds), l, c)
+  DDerive(prots, inner, l, c) -> DDerive(prots, mig_decl_renames(inner), l, c)
+  DUnstable(inner, l, c) -> DUnstable(mig_decl_renames(inner), l, c)
+  DProtoLaws(thy, inner, l, c) -> DProtoLaws(thy, mig_decl_renames(inner), l, c)
+  DImplAxiom(thy, inner, l, c) -> DImplAxiom(thy, mig_decl_renames(inner), l, c)
+  DConstructor(inner, l, c) -> DConstructor(mig_decl_renames(inner), l, c)
+  DDoc(raw, txt, inner, l, c) -> DDoc(raw, txt, mig_decl_renames(inner), l, c)
+  _ -> d
+}
+
+fn mig_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tp, ps, rt, row, body, l, c, mo) -> DFn(p, n, tp, mig_params(ps), mig_ty_opt(rt), row, mig_expr(true, body), l, c, mo)
+  DTest(desc, body, l, c) -> DTest(desc, mig_expr(true, body), l, c)
+  DBench(desc, body, l, c) -> DBench(desc, mig_expr(true, body), l, c)
+  DCheck(desc, ps, body, l, c) -> DCheck(desc, mig_params(ps), mig_expr(true, body), l, c)
+  DConst(p, n, t, body, mo, l, c) -> DConst(p, n, mig_ty(t), mig_expr(true, body), mo, l, c)
+  DImpl(pn, ta, tgt, ds, l, c) -> DImpl(pn, mig_tys(ta), mig_ty(tgt), migrate_decls(ds), l, c)
+  DType(p, n, tp, body, l, c, mo) -> DType(p, n, tp, mig_type_body(body), l, c, mo)
+  DEffect(p, n, tp, ops, dfl, l, c, mo) -> DEffect(p, n, tp, map(ops, mig_effect_op), dfl, l, c, mo)
+  DProtocol(p, n, tp, ops, l, c) -> DProtocol(p, n, tp, map(ops, mig_proto_op), l, c)
+  DDerive(prots, inner, l, c) -> DDerive(prots, mig_decl(inner), l, c)
+  DUnstable(inner, l, c) -> DUnstable(mig_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c) -> DProtoLaws(thy, mig_decl(inner), l, c)
+  DImplAxiom(thy, inner, l, c) -> DImplAxiom(thy, mig_decl(inner), l, c)
+  DConstructor(inner, l, c) -> DConstructor(mig_decl(inner), l, c)
+  DDoc(raw, txt, inner, l, c) -> DDoc(raw, txt, mig_decl(inner), l, c)
+  _ -> d
+}
+
+# --- report pass over decls -------------------------------------------
+
+#[doc("Collect the migration report events across a whole program.")]
+pub fn migrate_scan_decls(decls: [Decl]) : [MigRep] = reduce(map(decls, scan_decl), [], cat_reps)
+
+fn scan_decl(d: Decl) : [MigRep] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> scan_expr(body)
+  DTest(_, body, _, _) -> scan_expr(body)
+  DBench(_, body, _, _) -> scan_expr(body)
+  DCheck(_, _, body, _, _) -> scan_expr(body)
+  DConst(_, _, _, body, _, _, _) -> scan_expr(body)
+  DImpl(_, _, _, ds, _, _) -> migrate_scan_decls(ds)
+  DDerive(_, inner, _, _) -> scan_decl(inner)
+  DUnstable(inner, _, _) -> scan_decl(inner)
+  DProtoLaws(_, inner, _, _) -> scan_decl(inner)
+  DImplAxiom(_, inner, _, _) -> scan_decl(inner)
+  DConstructor(inner, _, _) -> scan_decl(inner)
+  DDoc(_, _, inner, _, _) -> scan_decl(inner)
+  _ -> []
+}
+
+# --- type-flip counting -----------------------------------------------
+
+#[doc("Total number of `Result[_, _]` annotations the type flip rewrites across a whole program.")]
+pub fn migrate_type_flip_count(decls: [Decl]) : Int = sum_ints(map(decls, decl_flip_count))
+
+fn sum_ints(ns: [Int]) : Int = reduce(ns, 0, add2)
+fn add2(a: Int, b: Int) : Int = a + b
+
+fn decl_flip_count(d: Decl) : Int = match d {
+  DFn(_, _, _, ps, rt, _, body, _, _, _) -> add2(add2(mig_params_flips(ps), mig_ty_opt_flips(rt)), expr_flip_count(body))
+  DConst(_, _, t, body, _, _, _) -> add2(mig_ty_flips(t), expr_flip_count(body))
+  DCheck(_, ps, body, _, _) -> add2(mig_params_flips(ps), expr_flip_count(body))
+  DTest(_, body, _, _) -> expr_flip_count(body)
+  DBench(_, body, _, _) -> expr_flip_count(body)
+  DImpl(_, ta, tgt, ds, _, _) -> add2(add2(sum_ints(map(ta, mig_ty_flips)), mig_ty_flips(tgt)), migrate_type_flip_count(ds))
+  DType(_, _, _, body, _, _, _) -> type_body_flip_count(body)
+  DEffect(_, _, _, ops, _, _, _, _) -> sum_ints(map(ops, effect_op_flip_count))
+  DProtocol(_, _, _, ops, _, _) -> sum_ints(map(ops, proto_op_flip_count))
+  DDerive(_, inner, _, _) -> decl_flip_count(inner)
+  DUnstable(inner, _, _) -> decl_flip_count(inner)
+  DProtoLaws(_, inner, _, _) -> decl_flip_count(inner)
+  DImplAxiom(_, inner, _, _) -> decl_flip_count(inner)
+  DConstructor(inner, _, _) -> decl_flip_count(inner)
+  DDoc(_, _, inner, _, _) -> decl_flip_count(inner)
+  _ -> 0
+}
+
+fn type_body_flip_count(b: TypeBody) : Int = match b {
+  TBAlias(t) -> mig_ty_flips(t)
+  TBRecord(fds) -> sum_ints(map(fds, field_flip_count))
+  TBSum(vs) -> sum_ints(map(vs, variant_flip_count))
+  TBEffectAlias(_) -> 0
+}
+
+fn field_flip_count(fd: FieldDecl) : Int = match fd {
+  FD(_, _, t) -> mig_ty_flips(t)
+}
+
+fn variant_flip_count(v: Variant) : Int = match v {
+  Var(_, vts) -> sum_ints(map(vts, mig_ty_flips))
+}
+
+fn effect_op_flip_count(op: EffectOp) : Int = match op {
+  EOp(_, _, ps, ret, _, _) -> add2(mig_params_flips(ps), mig_ty_flips(ret))
+}
+
+fn proto_op_flip_count(op: ProtoOp) : Int = match op {
+  POp(_, _, ps, ret, _, _) -> add2(mig_params_flips(ps), mig_ty_flips(ret))
+}
+
+# --- report rendering -------------------------------------------------
+
+#[doc("Render the `manual:` reports as one diagnostic block, one line per report, or the empty string when the rule set applied cleanly.")]
+pub fn migrate_manual_report(reps: [MigRep]) : String = match mig_manuals(reps) {
+  [] -> ""
+  ms -> "migrate: #{int_to_string(list_length(ms))} change(s) need manual attention:\n#{manual_lines(ms)}"
+}
+
+fn manual_lines(ms: [MigrateManual]) : String = match ms {
+  [] -> ""
+  [MM(l, c, msg)] -> "  manual: #{int_to_string(l)}:#{int_to_string(c)} — #{msg}\n"
+  [MM(l, c, msg), ...rest] -> "  manual: #{int_to_string(l)}:#{int_to_string(c)} — #{msg}\n#{manual_lines(rest)}"
+}

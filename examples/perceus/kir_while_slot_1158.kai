@@ -1,0 +1,17 @@
+# while-loop var cells lower to registers — the loop pastes into main
+# and the counters live as raw scalar cells (or, when the inline
+# lowering bails, as the KIR fusion chain's `__vcell_` rewrite). The
+# companion gate greps the KIR: main must carry no State install /
+# perform and must hold register-form cells.
+
+import loop
+
+fn main() : Unit / Console = {
+  var i := 0
+  var acc := 0
+  while { i < 100000 } {
+    acc := (acc * 1103515245 + i) % 2147483647
+    i := i + 1
+  }
+  Stdout.print(int_to_string(acc))
+}

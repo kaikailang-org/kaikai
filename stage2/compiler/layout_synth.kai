@@ -1,0 +1,88 @@
+#[doc("""
+compiler.layout_synth - recognise the Layout shape of a record's fields.
+
+A field is Layout-bearing when its type is `U<N><be>` or `U<N><le>`: a
+fixed-width unsigned integer head carrying a `be`/`le` habitant. A record
+is a Layout record when EVERY field is one - a single non-Layout field
+disqualifies it, so a partial encoder is never generated.
+
+`#[derive(Layout)]` consumes this classification to build the protocol
+impl (`compiler.layout_derive`). TLV (`Bytes<len>`) and nested Layout
+records are rejected up front rather than silently mis-encoded.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.diag
+
+# One Layout field: its name, byte width, and byte order.
+pub type LayoutField = LFld(String, Int, Bool)
+#                         name    width  is_be
+
+#[doc("The field name of a Layout field.")]
+pub fn lf_name(f: LayoutField) : String = match f { LFld(n, _, _) -> n }
+#[doc("The byte width of a Layout field.")]
+pub fn lf_width(f: LayoutField) : Int = match f { LFld(_, w, _) -> w }
+#[doc("True when a Layout field is big-endian.")]
+pub fn lf_is_be(f: LayoutField) : Bool = match f { LFld(_, _, be) -> be }
+
+#[doc("The Layout fields of a record body, or None if the record is not Layout-bearing (no field carries a `be`/`le` habitant) or mixes a non-Layout field in.")]
+pub fn layout_fields_of(fields: [FieldDecl]) : Option[[LayoutField]] =
+  lfo_loop(fields, [], false)
+
+# Fold the field list. A record is Layout-bearing iff EVERY field is a
+# Layout field and there is at least one - a single non-Layout field
+# (a plain `Int`, a nested record, a TLV `Bytes<len>`) makes the whole
+# record non-Layout, so it is left to the plain-record path and any
+# `encode`/`decode` on it is rejected. A partial encoder is never
+# generated.
+fn lfo_loop(fields: [FieldDecl], acc: [LayoutField], saw: Bool) : Option[[LayoutField]] =
+  match fields {
+    [] -> if saw { Some(list_reverse(acc)) } else { None }
+    [f, ...rest] -> match layout_field_of(f) {
+      Some(lf) -> lfo_loop(rest, [lf, ...acc], true)
+      None -> None
+    }
+  }
+
+# A single field: `FD(_, name, TyDim(TyName("U32"), USym("be")))` ->
+# `LFld("magic", 4, true)`. Any other shape is not a Layout field.
+fn layout_field_of(fd: FieldDecl) : Option[LayoutField] = match fd {
+  FD(_, name, te) -> match te.tkind {
+    TyDim(base, u) -> match base.tkind {
+      TyName(headname, _) -> match layout_order_of(u) {
+        Some(is_be) -> match layout_width_of(headname) {
+          Some(w) -> Some(LFld(name, w, is_be))
+          None -> None
+        }
+        None -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# The byte order of a habitant expr: `be` -> Some(true), `le` ->
+# Some(false), anything else (a compound, a non-order symbol) -> None.
+# Kind resolution qualifies the habitant (`be` -> `Layout$be`) before
+# this runs at rewrite time, so strip the qualifier first; pre-
+# resolution (synthesis) the symbol is already bare.
+fn layout_order_of(u: UnitExprT) : Option[Bool] = match u {
+  USym(s) -> {
+    let bare = kind_sym_bare(s)
+    if bare == "be" { Some(true) } else if bare == "le" { Some(false) } else { None }
+  }
+  _ -> None
+}
+
+# Byte width of a fixed-width unsigned head name (`U32` -> 4). Only the
+# unsigned heads carry a decode-clean unsigned round-trip; signed heads
+# are a follow-up (sign extension), so they are not Layout-bearing yet.
+fn layout_width_of(name: String) : Option[Int] =
+  if name == "U8" { Some(1) }
+  else if name == "U16" { Some(2) }
+  else if name == "U32" { Some(4) }
+  else if name == "U64" { Some(8) }
+  else { None }
