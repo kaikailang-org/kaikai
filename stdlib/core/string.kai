@@ -1,0 +1,454 @@
+#[doc("""
+core.string — byte-indexed string helpers over the runtime string
+builtins. Lengths and offsets are byte counts unless a name says
+otherwise (`char_count`, `chars`, `char_indices` are codepoint-aware).
+""")]
+
+#[doc("""
+The byte offset at which a Unicode codepoint begins in the buffer —
+the element type of `char_indices`. A nominal record so `.off`/`.cp`
+read clearer than `.fst`/`.snd` at call sites.
+""")]
+pub type CharIndex = { off: Int, cp: Char }
+
+#[doc("""
+Byte count of `s` (O(1)), matching the byte-indexed `slice`/`char_at`
+family. For the Unicode codepoint count use `char_count`; `byte_length`
+is an explicit synonym when the unit needs to be unambiguous.
+""")]
+pub fn length(s: String) : Int = string_length(s)
+#[doc("Returns the substring of `len` bytes starting at byte offset `from`.")]
+pub fn slice(s: String, from: Int, len: Int) : String = string_slice(s, from, len)
+#[doc("Parses `s` as a base-10 integer, returning `None` on malformed input.")]
+pub fn to_int(s: String) : Option[Int] = string_to_int(s)
+#[doc("Concatenates two strings.")]
+pub fn concat(a: String, b: String) : String = string_concat(a, b)
+
+#[doc("True when `s` begins with `prefix`.")]
+pub fn starts_with(s: String, prefix: String) : Bool {
+  let pl = string_length(prefix)
+  if pl > string_length(s) { false }
+  else { string_slice(s, 0, pl) == prefix }
+}
+
+#[doc("True when `s` ends with `suffix`.")]
+pub fn ends_with(s: String, suffix: String) : Bool {
+  let sl = string_length(s)
+  let xl = string_length(suffix)
+  if xl > sl { false }
+  else { string_slice(s, sl - xl, xl) == suffix }
+}
+
+#[doc("""
+Returns `Some(rest)` with `prefix` removed when `s` starts with it,
+`None` otherwise — fusing the membership check with the slice.
+""")]
+pub fn drop_prefix(s: String, prefix: String) : Option[String] {
+  if starts_with(s, prefix) {
+    let pl = string_length(prefix)
+    Some(string_slice(s, pl, string_length(s) - pl))
+  } else {
+    None
+  }
+}
+
+#[doc("Returns `Some(s)` without a trailing `suffix`, or `None` when `s` does not end with it.")]
+pub fn drop_suffix(s: String, suffix: String) : Option[String] {
+  if ends_with(s, suffix) {
+    let sl = string_length(s)
+    Some(string_slice(s, 0, sl - string_length(suffix)))
+  } else {
+    None
+  }
+}
+
+fn string_trim_left_loop(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_trim_left_loop(s, i + 1, n)
+                 } else { i }
+      None -> i
+    }
+  }
+}
+
+fn string_trim_right_loop(s: String, i: Int) : Int {
+  if i <= 0 { 0 }
+  else {
+    match char_at(s, i - 1) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_trim_right_loop(s, i - 1)
+                 } else { i }
+      None -> i
+    }
+  }
+}
+
+#[doc("Removes leading and trailing whitespace (space, tab, newline, carriage return).")]
+pub fn trim(s: String) : String {
+  let n = string_length(s)
+  let lo = string_trim_left_loop(s, 0, n)
+  let hi = string_trim_right_loop(s, n)
+  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+}
+
+fn string_repeat_loop(s: String, n: Int, acc: [String]) : [String] =
+  if n <= 0 { acc } else { string_repeat_loop(s, n - 1, [s, ...acc]) }
+
+#[doc("Returns `s` repeated `n` times; `n <= 0` yields the empty string.")]
+pub fn repeat(s: String, n: Int) : String = string_concat_all(string_repeat_loop(s, n, []))
+
+# Interleave `sep` before every element past the first, building the
+# flat `[String]` that `string_concat_all` joins in a single pass.
+fn string_join_loop(xs: [String], sep: String) : [String] = match xs {
+  []           -> []
+  [x, ...rest] -> [sep, x, ...string_join_loop(rest, sep)]
+}
+
+#[doc("Concatenates the strings with `sep` inserted between consecutive elements.")]
+pub fn join(xs: [String], sep: String) : String = match xs {
+  []           -> ""
+  [x, ...rest] -> string_concat_all([x, ...string_join_loop(rest, sep)])
+}
+
+# Helpers below are byte-indexed and ASCII-aware where it matters;
+# `pad_left`/`pad_right` count bytes, not codepoints.
+
+#[doc("""
+Cuts `s` at every non-overlapping occurrence of `sep`. An empty
+separator panics. Trailing/leading empty pieces are preserved
+(`split(",a,", ",")` → `["", "a", ""]`).
+""")]
+pub fn split(s: String, sep: String) : [String] {
+  if string_length(sep) == 0 { panic("string.split: separator is empty") }
+  else { string_split(s, sep) }
+}
+
+#[doc("""
+`replace(s, from, to)` rewrites every non-overlapping occurrence
+of `from` with `to`. Replacing an empty `from` is a no-op (would
+otherwise spin forever inserting `to` between every byte).
+""")]
+pub fn replace(s: String, from: String, to: String) : String {
+  if string_length(from) == 0 { s }
+  else { string.join(string.split(s, from), to) }
+}
+
+#[doc("Left-pads `s` with `fill` to at least `width` bytes; returns `s` unchanged when already that wide.")]
+pub fn pad_left(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(repeat("#{fill}", width - n), s) }
+}
+
+#[doc("Right-pads `s` with `fill` to at least `width` bytes; returns `s` unchanged when already that wide.")]
+pub fn pad_right(s: String, width: Int, fill: Char) : String {
+  let n = string_length(s)
+  if n >= width { s }
+  else { string_concat(s, repeat("#{fill}", width - n)) }
+}
+
+fn lines_drop_trailing_empty(xs: [String]) : [String] {
+  match xs {
+    [] -> []
+    [""] -> []
+    [x] -> [x]
+    [x, ...rest] -> [x, ...lines_drop_trailing_empty(rest)]
+  }
+}
+
+#[doc("Splits `s` on `'\\n'`, dropping a single trailing empty line; `lines(\"\")` is `[]`.")]
+pub fn lines(s: String) : [String] = lines_drop_trailing_empty(string_split(s, "\n"))
+
+fn string_bytes_loop(s: String, i: Int, acc: [Char]) : [Char] {
+  if i < 0 { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> string_bytes_loop(s, i - 1, [c, ...acc])
+      None    -> string_bytes_loop(s, i - 1, acc)
+    }
+  }
+}
+
+#[doc("Returns the bytes of `s` as `Char`s, one element per byte (multibyte UTF-8 is split into its bytes); for codepoints use `chars`.")]
+pub fn bytes(s: String) : [Char] = string_bytes_loop(s, string_length(s) - 1, [])
+
+fn string_chars_loop(s: String, off: Int, n: Int) : [Char] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [int_to_char(cp), ...string_chars_loop(s, off + step, n)]
+  }
+}
+
+#[doc("Returns the Unicode codepoints of `s` as `Char`s, decoding the UTF-8 buffer; for raw bytes use `bytes`.")]
+pub fn chars(s: String) : [Char] = string_chars_loop(s, 0, string_length(s))
+
+fn string_char_count_loop(s: String, off: Int, n: Int, acc: Int) : Int {
+  if off >= n { acc }
+  else {
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    string_char_count_loop(s, off + step, n, acc + 1)
+  }
+}
+
+#[doc("Returns the number of Unicode codepoints in `s` — the honest codepoint length, distinct from byte `length`.")]
+pub fn char_count(s: String) : Int = string_char_count_loop(s, 0, string_length(s), 0)
+
+#[doc("Explicit byte count of `s` — a synonym of `length`, spelled to make the unit unambiguous next to `char_count`.")]
+pub fn byte_length(s: String) : Int = string_length(s)
+
+# Each name below also exists as a bare core export (`list.is_empty`,
+# `char.to_upper`, …); first-arg-type narrowing routes the `String`
+# receiver here.
+
+#[doc("True iff `s` has zero bytes.")]
+pub fn is_empty(s: String) : Bool = string_length(s) == 0
+
+#[doc("""
+Reverses `s` by Unicode codepoint, never byte — `reverse("áb")` is
+`"bá"`, not a broken UTF-8 sequence. O(n), one pass, one allocation:
+each multibyte sequence is copied whole, so the bytes round-trip exact.
+""")]
+pub fn reverse(s: String) : String = string_reverse(s)
+
+#[doc("Uppercases each codepoint via ASCII case folding; non-letters pass through. Locale-independent.")]
+pub fn to_upper(s: String) : String = string_concat_all(list.reverse(string_map_chars(chars(s), char.to_upper, [])))
+
+#[doc("Lowercases each codepoint via ASCII case folding; non-letters pass through. Locale-independent.")]
+pub fn to_lower(s: String) : String = string_concat_all(list.reverse(string_map_chars(chars(s), char.to_lower, [])))
+
+# Tail-recursive accumulator (one `[String]`, one alloc per piece),
+# then `string_concat_all` joins in a single pass. The accumulator
+# leaves pieces reversed, so `list.reverse` restores source order.
+fn string_map_chars(cs: [Char], f: (Char) -> Char, acc: [String]) : [String] = match cs {
+  []        -> acc
+  [c, ...t] -> string_map_chars(t, f, ["#{f(c)}", ...acc])
+}
+
+#[doc("""
+Byte offset of the first occurrence of `needle`, or `None`.
+`index_of(s, "")` is `Some(0)`. Byte index, consistent with `slice`.
+""")]
+pub fn index_of(s: String, needle: String) : Option[Int] =
+  string_index_of_loop(s, needle, 0, string_length(s) - string_length(needle), string_length(needle))
+
+# Compare `needle`'s bytes against `s` at offset `at` in place — no
+# per-position slice, so the search is O(n·m) time and O(1) space.
+fn string_match_at(s: String, needle: String, at: Int, j: Int, m: Int) : Bool =
+  if j >= m { true }
+  else if string_byte_at_int(s, at + j) == string_byte_at_int(needle, j) {
+    string_match_at(s, needle, at, j + 1, m)
+  } else { false }
+
+fn string_index_of_loop(s: String, needle: String, i: Int, last: Int, m: Int) : Option[Int] =
+  if i > last { None }
+  else if string_match_at(s, needle, i, 0, m) { Some(i) }
+  else { string_index_of_loop(s, needle, i + 1, last, m) }
+
+fn string_char_indices_loop(s: String, off: Int, n: Int) : [CharIndex] {
+  if off >= n { [] }
+  else {
+    let cp = string_cp_at(s, off)
+    let w = string_cp_len(s, off)
+    let step = if w <= 0 { 1 } else { w }
+    [CharIndex { off: off, cp: int_to_char(cp) }, ...string_char_indices_loop(s, off + step, n)]
+  }
+}
+
+#[doc("Pairs each codepoint with the byte offset at which it begins, in a single pass.")]
+pub fn char_indices(s: String) : [CharIndex] = string_char_indices_loop(s, 0, string_length(s))
+
+fn string_is_blank_loop(s: String, i: Int, n: Int) : Bool {
+  if i >= n { true }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if is_space(c) or c == '\n' or c == '\r' or c == '\t' {
+                   string_is_blank_loop(s, i + 1, n)
+                 } else { false }
+      None -> true
+    }
+  }
+}
+
+#[doc("True for the empty string or any string whose characters are all whitespace (same rule as `trim`).")]
+pub fn is_blank(s: String) : Bool = string_is_blank_loop(s, 0, string_length(s))
+
+test "starts_with — prefix match, miss, full string, empty" {
+  assert starts_with("hello world", "hello") == true
+  assert starts_with("hello world", "world") == false
+  assert starts_with("abc", "abc") == true
+  assert starts_with("abc", "abcd") == false
+  assert starts_with("abc", "") == true
+}
+
+test "ends_with — suffix match, miss, empty suffix" {
+  assert ends_with("hello world", "world") == true
+  assert ends_with("hello world", "hello") == false
+  assert ends_with("abc", "abc") == true
+  assert ends_with("abc", "") == true
+  assert ends_with("a", "ab") == false
+}
+
+test "trim — leading/trailing whitespace, all-space, empty" {
+  assert trim("  hello  ") == "hello"
+  assert trim("\thello\n") == "hello"
+  assert trim("hello") == "hello"
+  assert trim("   ") == ""
+  assert trim("") == ""
+}
+
+test "repeat — zero, one, many, negative" {
+  assert string.repeat("ab", 0) == ""
+  assert string.repeat("ab", 1) == "ab"
+  assert string.repeat("ab", 3) == "ababab"
+  assert string.repeat("ab", -5) == ""
+  assert string.repeat("", 4) == ""
+}
+
+test "join — empty list, singleton, multi, empty separator" {
+  assert join([], ",") == ""
+  assert join(["a"], ",") == "a"
+  assert join(["a", "b", "c"], ",") == "a,b,c"
+  assert join(["a", "b"], "") == "ab"
+  assert join(["x", "y", "z"], " - ") == "x - y - z"
+}
+
+test "split — separator hits, leading/trailing/empty/no-match" {
+  assert split("a,b,c", ",") == ["a", "b", "c"]
+  assert split(",a,", ",") == ["", "a", ""]
+  assert split("hello", ",") == ["hello"]
+  assert split("", ",") == [""]
+  assert split("a::b::c", "::") == ["a", "b", "c"]
+}
+
+test "replace — multiple hits, no-op, empty from, into-empty" {
+  assert replace("hello world", "o", "0") == "hell0 w0rld"
+  assert replace("aaa", "a", "bb") == "bbbbbb"
+  assert replace("hello", "x", "y") == "hello"
+  assert replace("hello", "", "x") == "hello"
+  assert replace("a,b,c", ",", "") == "abc"
+}
+
+test "pad_left — short, exact, longer, empty input" {
+  assert pad_left("42", 5, '0') == "00042"
+  assert pad_left("hello", 5, ' ') == "hello"
+  assert pad_left("hello", 3, ' ') == "hello"
+  assert pad_left("", 3, '*') == "***"
+  assert pad_left("x", 4, '-') == "---x"
+}
+
+test "pad_right — short, exact, longer, empty input" {
+  assert pad_right("42", 5, '0') == "42000"
+  assert pad_right("hello", 5, ' ') == "hello"
+  assert pad_right("hello", 3, ' ') == "hello"
+  assert pad_right("", 3, '*') == "***"
+  assert pad_right("x", 4, '-') == "x---"
+}
+
+test "lines — basic, trailing newline, embedded blanks, empty" {
+  assert lines("a\nb\nc") == ["a", "b", "c"]
+  assert lines("a\nb\nc\n") == ["a", "b", "c"]
+  assert lines("a\n\nb") == ["a", "", "b"]
+  assert lines("") == []
+  assert lines("hello") == ["hello"]
+}
+
+test "chars — empty, single, multi (ASCII: byte == codepoint)" {
+  assert chars("") == []
+  assert chars("a") == ['a']
+  assert chars("abc") == ['a', 'b', 'c']
+  assert chars("ab\n") == ['a', 'b', '\n']
+}
+
+test "bytes — byte-level view, multibyte splits into bytes" {
+  assert bytes("") == []
+  assert bytes("abc") == ['a', 'b', 'c']
+  # "á" is 0xC3 0xA1 in UTF-8 — two bytes, two elements.
+  assert bytes("á") == [int_to_char(195), int_to_char(161)]
+}
+
+test "chars — codepoint-level view, multibyte decodes to one codepoint" {
+  # "áé▸" is 7 bytes, 3 codepoints: á=0xE1, é=0xE9, ▸=0x25B8.
+  assert chars("áé▸") == [int_to_char(225), int_to_char(233), int_to_char(9656)]
+}
+
+test "char_count / byte_length — codepoints vs bytes" {
+  assert char_count("") == 0
+  assert char_count("abc") == 3
+  assert char_count("áé▸") == 3
+  assert byte_length("áé▸") == 7
+  # Bare `length` collides with `list.length`; call the primitive so the
+  # test is unambiguous in every load mode.
+  assert string_length("áé▸") == 7
+}
+
+test "char_indices — codepoint with its starting byte offset" {
+  # "á!" — á at byte 0 (2 bytes), '!' at byte 2.
+  assert char_indices("á!") ==
+    [CharIndex { off: 0, cp: int_to_char(225) },
+     CharIndex { off: 2, cp: int_to_char(33) }]
+}
+
+test "is_blank — empty/spaces/tabs/newlines true; with content false" {
+  assert is_blank("") == true
+  assert is_blank("   ") == true
+  assert is_blank("\t\n\r ") == true
+  assert is_blank("a") == false
+  assert is_blank("  a  ") == false
+}
+
+# Results are bound with `let` before asserting because a bare
+# `is_empty(s)` inline in a comparison does not narrow by receiver type.
+test "is_empty — empty true, any content false" {
+  let a = is_empty("")
+  let b = is_empty(" ")
+  let c = is_empty("x")
+  assert a == true
+  assert b == false
+  assert c == false
+}
+
+test "reverse — empty, single, ascii, multibyte by codepoint" {
+  assert reverse("") == ""
+  assert reverse("a") == "a"
+  assert reverse("abc") == "cba"
+  # 2-byte á, 3-byte € / 中, 4-byte 😀: each codepoint copied whole.
+  assert reverse("áb") == "bá"
+  assert reverse("€中x") == "x中€"
+  assert reverse("😀ok") == "ko😀"
+  # round-trip across the full UTF-8 width range; byte length and
+  # codepoint count are invariant under reverse.
+  assert reverse(reverse("aá€😀z")) == "aá€😀z"
+  assert length(reverse("áb")) == length("áb")
+  assert char_count(reverse("😀ok")) == char_count("😀ok")
+}
+
+test "to_upper / to_lower — ascii fold, non-alpha unchanged, empty" {
+  let u1 = to_upper("hi 1!")
+  let u2 = to_upper("")
+  let l1 = to_lower("HI 1!")
+  let l2 = to_lower("")
+  assert u1 == "HI 1!"
+  assert u2 == ""
+  assert l1 == "hi 1!"
+  assert l2 == ""
+}
+
+test "index_of — hit, miss, empty needle, at start, at end" {
+  let h = index_of("hello", "ll")
+  let m = index_of("hello", "z")
+  let e = index_of("hello", "")
+  let s = index_of("hello", "he")
+  let t = index_of("hello", "lo")
+  assert h == Some(2)
+  assert m == None
+  assert e == Some(0)
+  assert s == Some(0)
+  assert t == Some(3)
+}

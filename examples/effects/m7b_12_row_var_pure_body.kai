@@ -1,0 +1,8 @@
+# m7b #12 positive — a row-polymorphic helper called with a pure
+# body has its row variable instantiated to the empty row, so the
+# caller stays pure.
+
+fn twice_int(body: () -> Int / e) : Int / e =
+  body() + body()
+
+fn main() : Int = twice_int(() => 42)

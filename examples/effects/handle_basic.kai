@@ -1,0 +1,22 @@
+# m7a #4b smoke test (positive) — parse `handle { body } with Eff
+# { clauses }` with a single op clause and a `return(x) -> body`
+# clause. Type-checking and runtime are deferred to m7a #4d / #6;
+# this file only exercises the parser and the AST shape.
+
+effect Io {
+  print(s: String) : Unit
+}
+
+# With m7a #4d in place, the `handle ... with Io { ... }` strips
+# `Io` from the body's accumulated row, so `main` itself stays
+# pure and can be declared `: Int` (no row).
+fn main() : Int {
+  let r = handle {
+    Io.print("inside")
+    42
+  } with Io {
+    print(s, resume) -> resume(())
+    return(x)        -> x
+  }
+  r
+}

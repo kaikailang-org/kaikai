@@ -1,0 +1,25 @@
+# native-selfhost-baseline.txt — the ratchet for the native self-host gate.
+#
+# The single non-comment, non-blank line below is an integer: the count of
+# `unbound register` subset-gap aborts the in-process libLLVM native backend
+# (`kaic2 --emit=native`) emits when it compiles the COMPILER ITSELF
+# (`stage2/main.kai`). tools/test-native-selfhost-gate.sh gates:
+#
+#   - count  > baseline  => FAIL (regression — native lost ground: a change
+#       made it reject a node it used to lower, or grew the compiler's use
+#       of an already-unlowered node).
+#   - count == baseline  => PASS (the known state held steady).
+#   - count  < baseline  => PASS, with a prompt to lower this file to the
+#       new count (ratchet tightens — mirror of tools/coverage-baseline.txt
+#       / native-parity-baseline.txt).
+#   - count == 0         => PASS, "native self-host ACHIEVED" — the compiler
+#       lowers under the native backend with no subset-gap aborts.
+#
+# The COMPILE gap is closed (0): the native backend lowers the whole
+# compiler with zero unbound-register aborts and produces an object. On a 0
+# count the gate goes further — it LINKS that object into an executable
+# kaic2-native, RUNS it (`--version`), and SELF-COMPILES: the native-built
+# kaic2 emits C for a sample program and that output must be byte-identical
+# to the C-direct oracle. The circle closes (issue #1021).
+
+0
