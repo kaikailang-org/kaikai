@@ -1,0 +1,45 @@
+#[doc("""
+Surface helpers on top of the `Process` effect. Module path:
+`import process`; qualified calls land as `process.start(...)`.
+
+POSIX only.
+""")]
+
+#[doc("""
+Start a child process via `fork(2)` + `execvp(3)`. Returns an
+opaque `Child` carrying the OS pid; standard fds inherit from the
+parent. Panics if the fork or exec fails.
+""")]
+pub fn start(cmd: String, args: [String]) : Child / Process =
+  Process.start(cmd, args)
+
+#[doc("""
+Wait for a child process to terminate and return its exit status
+as an `Exit` variant (`Exited(code)` or `Signaled(signo)`).
+Returns `Err(strerror)` if `waitpid` itself fails (e.g. ECHILD if
+the child was already reaped). Blocks the OS thread, not the fiber.
+""")]
+pub fn wait(c: Child) : Result[Exit, String] / Process =
+  Process.wait(c)
+
+#[doc("""
+Send a POSIX signal to a child process via `kill(pid, sig)`,
+lifting the libc errno to `Err(strerror)` on failure (e.g. ESRCH
+if the child was already reaped, EPERM on permission denial).
+
+`sig` is the raw POSIX signo (e.g. 9 for SIGKILL, 15 for SIGTERM,
+2 for SIGINT); see `signal(7)` for the full list.
+""")]
+pub fn kill(c: Child, sig: Int) : Result[Unit, String] / Process =
+  Process.kill(c, sig)
+
+#[doc("""
+Terminate the current process with the given exit code via libc
+`_exit(code)` (NOT `exit(3)`), so stdio buffers are NOT flushed;
+`print` everything you want printed before calling this.
+
+The op never resumes (return type `Nothing`) and Cancel handlers
+do NOT run — this is a hard kill of the current process.
+""")]
+pub fn exit(code: Int) : Nothing / Process =
+  Process.exit(code)

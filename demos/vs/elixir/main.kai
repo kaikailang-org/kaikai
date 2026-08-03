@@ -1,0 +1,68 @@
+# vs Elixir — typed actors with exhaustive match
+#
+# Elixir's `receive` matches incoming messages against patterns at
+# runtime. A typo in a message tag, a forgotten case, or a renamed
+# message becomes a runtime mailbox stall — the receiver waits forever
+# for a message it will never recognise. There is no compile-time
+# guarantee.
+#
+# kaikai: `Actor[Msg]` is parameterised by a sum type. The `match`
+# inside the loop is checked for exhaustiveness at compile time.
+# Adding a variant to the message type forces every receiver to
+# handle it. Renaming is a refactor, not a runtime ghost.
+#
+# === Elixir equivalent (~20 lines) ===
+#
+#   defmodule Counter do
+#     def start(n) do spawn(fn -> loop(n) end) end
+#     def loop(n) do
+#       receive do
+#         :inc                  -> loop(n + 1)
+#         :dec                  -> loop(n - 1)
+#         {:get, caller}        -> send(caller, n); loop(n)
+#         # add a new variant here? receivers elsewhere need updating —
+#         # the compiler will not tell you which.
+#       end
+#     end
+#   end
+#
+# === kaikai equivalent (target syntax) ===
+
+import actor
+
+type CounterMsg = Inc | Dec | Stop
+
+# Adding `Reset` here? Every match below stops compiling until handled.
+# The typer checks the match is exhaustive on the variant set —
+# Elixir's `receive` accepts any pattern and matches at runtime, so
+# a missed message hangs the receiver. kaikai turns that into a
+# compile error.
+fn step(n: Int, msg: CounterMsg) : Int = match msg {
+  Inc  -> n + 1
+  Dec  -> n - 1
+  Stop -> n
+  # add a `Reset` variant here? this `match` stops compiling until
+  # handled — and so does every other `match CounterMsg` in the program.
+}
+
+fn counter_drain(n: Int) : Int / Actor[CounterMsg] =
+  match Actor.receive() {
+    Stop -> n
+    msg  -> counter_drain(step(n, msg))
+  }
+
+# v1's inline-eager runtime cannot suspend across fibers, so the
+# demo pre-loads messages on `main`'s own mailbox and lets
+# `counter_drain` walk them inline. Real cross-fiber routing
+# arrives with the m8.x scheduler; the value here is the typer
+# rejecting any non-exhaustive match on `CounterMsg`.
+fn main() : Int / Spawn + Stdout = with_mailbox {
+  Actor.send(Actor.self(), Inc)
+  Actor.send(Actor.self(), Inc)
+  Actor.send(Actor.self(), Inc)
+  Actor.send(Actor.self(), Dec)
+  Actor.send(Actor.self(), Stop)
+  let value = counter_drain(0)
+  Stdout.print("counter = #{value}")
+  value
+}
