@@ -1,0 +1,38 @@
+# Issue #107 — Signal effect end-to-end. The shell harness in
+# stage2/Makefile (`test-effects` rule, `issue_107_signal_trap`
+# block) backgrounds this program, waits a moment, sends SIGTERM,
+# and asserts the program prints "got SigTerm" before exiting 0.
+#
+# The harness sends SIGTERM specifically (rather than SIGINT) so a
+# regression that makes Signal.await() return early with a stub
+# SigInt value cannot pass the diff. Real trap-and-handle is the
+# only path that produces "got SigTerm" deterministically.
+#
+# This is the upstream gap that gated lnds/ahu's `run_app`
+# Tongariki lane: programs need a clean way to react to Ctrl-C
+# (or SIGTERM from a supervisor / orchestrator).
+
+fn name_of(s: Sig) : String / Console = match s {
+  SigInt  -> "SigInt"
+  SigTerm -> "SigTerm"
+  SigHup  -> "SigHup"
+  SigUsr1 -> "SigUsr1"
+  SigUsr2 -> "SigUsr2"
+}
+
+fn main() : Int / Signal + Console = {
+  # Arm the handler BEFORE the "ready" marker. The harness
+  # (tests/sigharness.c) syncs on "ready" and signals immediately —
+  # the fixed post-ready sleep that once covered this window is gone.
+  # If "ready" printed first, a SIGTERM arriving before `Signal.on`
+  # would hit the default disposition and kill the process (exit 143),
+  # which surfaces under the slower ASAN build. Arming first makes
+  # "ready" mean the handler is installed. `Signal.on` prints nothing,
+  # so the golden is unchanged.
+  Signal.on(SigTerm)
+  Stdout.print("ready")
+  let s = Signal.await()
+  Stdout.print("got " ++ name_of(s))
+  Signal.off(SigTerm)
+  0
+}
