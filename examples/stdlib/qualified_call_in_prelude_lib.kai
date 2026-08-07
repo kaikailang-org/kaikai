@@ -1,0 +1,17 @@
+# Regression for issue #216 — qualified-call resolver in imported
+# modules. This file is imported by its sibling fixture, so its
+# bodies live in a non-root module. Before the fix, the EField->EModCall
+# rewrite skipped imported-module parse trees and `list.nth` here failed
+# with "undefined name `list`" pointing at the wrong source span.
+#
+# Imported by `qualified_call_in_prelude.kai` (run via the dedicated
+# `test-prelude-qualified-call` target); the stdlib glob skips
+# `*_lib.kai` so this file does not run as a standalone main.
+
+pub fn second(xs: [Int]) : Option[Int] = list.nth(xs, 1)
+
+pub fn first_or_zero(xs: [Int]) : Int =
+  match list.head(xs) {
+    None    -> 0
+    Some(x) -> x
+  }
