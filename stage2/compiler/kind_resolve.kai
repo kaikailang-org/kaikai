@@ -1,0 +1,357 @@
+#[doc("""
+compiler.kind_resolve — use-site kind resolution for habitant symbols.
+
+A bare `<sym>` in a `Real<sym>` annotation or an `N<sym>` literal must
+resolve to exactly one kind. When `sym` inhabits several kinds (`unit USD`
+and `cur USD`), resolution follows a fixed precedence — never
+order-of-declaration:
+
+  1. explicit qualification (`<Metric.m>`, already `Metric$m` from the
+     parser) — taken as-is;
+  2. `use kind K` — the module default for a bare habitant;
+  3. the symbol is unique to one kind — that kind;
+  4. otherwise a compile error demanding disambiguation.
+
+The pass rewrites each resolved bare `USym("sym")` to its qualified
+form `USym("Metric$sym")` so the abelian engine — which cancels by
+symbol-name equality — isolates habitants across kinds for free. It runs
+after alias expansion (so an alias body's factors inherit the use-site
+kind) and replaces the old unit-hygiene validator: undeclared, resolved,
+and ambiguous are one walk over one symbol→kinds map, differing only in
+the candidate count.
+""")]
+
+import compiler.util
+import compiler.ast
+import compiler.kinds
+import compiler.kind_theory
+import compiler.diag
+import compiler.unit_walk
+
+# Resolution context for one file: which kinds each atomic habitant
+# symbol inhabits, the kinds opened by `use kind`, the alias names
+# (left bare here for the later alias-expansion pass to resolve), the
+# (kind, theory) pairs the unit formation check dispatches on, the
+# value-domain (form-b) kinds as `KI(domain, kind)`, and the
+# closed-set kinds.
+pub type KindCtx = KCtx([SymKinds], [String], [String], [KindTheory], [KindIntro], [ClosedKind], [HabSlots])
+
+# The set of kinds a single habitant symbol inhabits.
+pub type SymKinds = SK(String, [String])
+#                      sym     kinds
+
+fn kc_syms(c: KindCtx) : [SymKinds] = match c { KCtx(s, _, _, _, _, _, _) -> s }
+fn kc_uses(c: KindCtx) : [String] = match c { KCtx(_, u, _, _, _, _, _) -> u }
+fn kc_aliases(c: KindCtx) : [String] = match c { KCtx(_, _, a, _, _, _, _) -> a }
+fn kc_theories(c: KindCtx) : [KindTheory] = match c { KCtx(_, _, _, m, _, _, _) -> m }
+fn kc_doms(c: KindCtx) : [KindIntro] = match c { KCtx(_, _, _, _, ds, _, _) -> ds }
+fn kc_closed(c: KindCtx) : [ClosedKind] = match c { KCtx(_, _, _, _, _, cs, _) -> cs }
+fn kc_hab_slots(c: KindCtx) : [HabSlots] = match c { KCtx(_, _, _, _, _, _, hs) -> hs }
+
+# The unit-symbol scope threaded through the unit-hygiene validator: the
+# file's kind context plus the locally-bound unit-kind tparams
+# (`[u: Metric]`) valid only inside the current declaration.
+pub type UnitScope = US(KindCtx, [String])
+
+#[doc("A unit scope with no local tparams, over the given kind context.")]
+pub fn unit_scope(ctx: KindCtx) : UnitScope = US(ctx, [])
+
+#[doc("Extend a unit scope with a declaration's local unit-kind tparam names.")]
+pub fn unit_scope_add_locals(s: UnitScope, locals: [String]) : UnitScope =
+  match s { US(ctx, ls) -> US(ctx, list_append(locals, ls)) }
+
+#[doc("True when `sym` names a unit-kind tparam bound locally in this scope (`[n: Dim]` inside the declaration). Such a symbol is a variable, not a concrete habitant.")]
+pub fn scope_is_local(s: UnitScope, sym: String) : Bool =
+  match s { US(_, ls) -> list_has(ls, sym) }
+
+#[doc("The atomic (kind, theory) pairs visible in a unit scope's kind context.")]
+pub fn scope_kind_theories(s: UnitScope) : [KindTheory] =
+  match s { US(ctx, _) -> kc_theories(ctx) }
+
+#[doc("The value domain a kind declares (`with Int` -> `Int`), or empty when the kind is not a form-b kind. The base `Dim` entry answers when the declaration stream is silent.")]
+pub fn scope_value_domain_of(s: UnitScope, kind: String) : String =
+  match s { US(ctx, _) -> {
+    let dom = domain_of_kind(kc_doms(ctx), kind)
+    if dom == "" { domain_of_kind(base_value_domain_kinds(), kind) } else { dom }
+  } }
+
+#[doc("The fixed atom set of a closed-set kind, or empty when the kind is open.")]
+pub fn scope_closed_atoms_of(s: UnitScope, kind: String) : [String] =
+  match s { US(ctx, _) -> closed_atoms_lookup(kc_closed(ctx), kind) }
+
+#[doc("The declared per-slot kinds of a type name, or None when the type declares no habitant slots.")]
+pub fn scope_habitant_slots_of(s: UnitScope, name: String) : Option[[String]] =
+  match s { US(ctx, _) -> habitant_slots_lookup(kc_hab_slots(ctx), name) }
+
+#[doc("Resolve a bare symbol within a unit scope (its kind context and local tparams).")]
+pub fn scope_resolve_sym(s: UnitScope, sym: String) : SymRes =
+  match s { US(ctx, ls) -> resolve_sym(ctx, ls, sym) }
+
+#[doc("""
+Build the resolution context from the declaration stream and the kind
+registry: fold every `DUnit(name, …, intro, …)` into the symbol→kinds
+map (via the introducer's kind), collect every `use kind K`, and the
+atomic (Module + Composition) kinds the formation guard reads. The
+`Layout` habitants (`be`/`le`) are seeded like a base kind so they
+resolve without importing a habitant file.
+""")]
+pub fn build_kind_ctx(decls: [Decl], reg: KindReg) : KindCtx =
+  KCtx(bkc_syms(decls, reg, base_habitant_syms()), bkc_uses(decls, []),
+       bkc_aliases(decls, []), atomic_kind_theories(decls),
+       value_domain_kinds(decls), closed_kind_sets(decls),
+       habitant_slot_decls(decls))
+
+# The base habitant->kinds seed: the shipped `Layout` habitants,
+# taken straight from the Composition engine's atom set so the
+# declaration in the catalog and this seed cannot drift apart.
+fn base_habitant_syms() : [SymKinds] = bhs_loop(composition_engine_atoms(), [])
+
+fn bhs_loop(atoms: [String], acc: [SymKinds]) : [SymKinds] = match atoms {
+  [] -> acc
+  [a, ...rest] -> bhs_loop(rest, sym_kinds_add(acc, a, "Layout"))
+}
+
+fn bkc_aliases(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DUnit(_, name, UBAlias(_), _, _, _) -> bkc_aliases(rest, [name, ...acc])
+    DDerive(_, inner, _, _) -> bkc_aliases([inner, ...rest], acc)
+    DUnstable(inner, _, _) -> bkc_aliases([inner, ...rest], acc)
+    DProtoLaws(_, inner, _, _) -> bkc_aliases([inner, ...rest], acc)
+    DImplAxiom(_, inner, _, _) -> bkc_aliases([inner, ...rest], acc)
+    DConstructor(inner, _, _) -> bkc_aliases([inner, ...rest], acc)
+    _ -> bkc_aliases(rest, acc)
+  }
+}
+
+fn bkc_syms(decls: [Decl], reg: KindReg, acc: [SymKinds]) : [SymKinds] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    # Alias habitants (`unit Newton = kg*m/s^2`) are left out of the
+    # map so kind rewriting skips them; alias expansion (a later
+    # pass) resolves the name to its body, whose atomic factors are
+    # the ones that carry a kind. Atomic and measure-carrying
+    # habitants are mapped; a closed-set kind's atoms register from
+    # its `kind` declaration, since it has no habitant decls.
+    DUnit(_, name, UBNone, intro, _, _) ->
+      bkc_syms(rest, reg, sym_kinds_add(acc, name, intro_kind(reg, intro)))
+    DUnit(_, name, UBMeasure(_), intro, _, _) ->
+      bkc_syms(rest, reg, sym_kinds_add(acc, name, intro_kind(reg, intro)))
+    DUnit(_, _, UBAlias(_), _, _, _) -> bkc_syms(rest, reg, acc)
+    DKind(_, name, _, _, HabClosed(_, atoms), _, _) ->
+      bkc_syms(rest, reg, closed_atom_syms(atoms, name, acc))
+    DDerive(_, inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
+    DUnstable(inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
+    DProtoLaws(_, inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
+    DImplAxiom(_, inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
+    DConstructor(inner, _, _) -> bkc_syms([inner, ...rest], reg, acc)
+    _ -> bkc_syms(rest, reg, acc)
+  }
+}
+
+fn intro_kind(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) { Some(k) -> k None -> measure_kind_name() }
+
+fn closed_atom_syms(atoms: [String], kind: String, acc: [SymKinds]) : [SymKinds] = match atoms {
+  [] -> acc
+  [a, ...rest] -> closed_atom_syms(rest, kind, sym_kinds_add(acc, a, kind))
+}
+
+fn bkc_uses(decls: [Decl], acc: [String]) : [String] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DUseKind(k, _, _) -> bkc_uses(rest, [k, ...acc])
+    _ -> bkc_uses(rest, acc)
+  }
+}
+
+# Record that `sym` inhabits `kind`, merging into any existing entry.
+fn sym_kinds_add(acc: [SymKinds], sym: String, kind: String) : [SymKinds] = match acc {
+  [] -> [SK(sym, [kind])]
+  [e, ...rest] -> match e {
+    SK(s, ks) ->
+      if s == sym {
+        if list_has(ks, kind) { acc } else { [SK(s, [kind, ...ks]), ...rest] }
+      } else { [e, ...sym_kinds_add(rest, sym, kind)] }
+  }
+}
+
+fn sym_kinds_lookup(c: KindCtx, sym: String) : [String] = skl_loop(kc_syms(c), sym)
+
+# Every form-b kind whose declared value domain is `dom`. A
+# user-declared kind shadows the base `Dim` entry — the base answers
+# only when the declaration stream is silent for the domain.
+fn domain_kinds_lookup(c: KindCtx, dom: String) : [String] =
+  match domain_kinds_of(kc_doms(c), dom) {
+    [] -> domain_kinds_of(base_value_domain_kinds(), dom)
+    ks -> ks
+  }
+
+fn skl_loop(xs: [SymKinds], sym: String) : [String] = match xs {
+  [] -> []
+  [e, ...rest] -> match e { SK(s, ks) -> if s == sym { ks } else { skl_loop(rest, sym) } }
+}
+
+# The single `use kind` open for `sym`: the used kind that `sym` also
+# inhabits, if exactly one such kind exists. Returns None otherwise.
+fn used_kind_for(c: KindCtx, candidates: [String]) : Option[String] =
+  ukf_loop(kc_uses(c), candidates, None)
+
+fn ukf_loop(uses: [String], candidates: [String], found: Option[String]) : Option[String] = match uses {
+  [] -> found
+  [u, ...rest] ->
+    if list_has(candidates, u) {
+      match found { None -> ukf_loop(rest, candidates, Some(u)) Some(_) -> None }
+    } else { ukf_loop(rest, candidates, found) }
+}
+
+# Result of resolving one bare symbol: the qualified rewrite, or an
+# error kind for the caller to report against a source position.
+pub type SymRes = SRok(String) | SRunknown | SRambig([String])
+
+# Resolve a bare habitant symbol under the precedence. A symbol already
+# carrying a qualifier (explicit `<Metric.m>`, or an idempotent second
+# pass) is returned unchanged; so is a unit-kind tparam in local scope
+# (`[u: Metric]` binds `u` as a unit variable, never a habitant) and a
+# built-in symbol.
+pub fn resolve_sym(c: KindCtx, locals: [String], sym: String) : SymRes {
+  # Already qualified, a local unit-kind tparam, or an alias name (which
+  # the later alias-expansion pass resolves) — leave bare/unchanged.
+  if kind_sym_is_qualified(sym) or list_has(locals, sym) or list_has(kc_aliases(c), sym) {
+    SRok(sym)
+  } else {
+    # A value habitant (`<3>`, `<"tag">`) resolves by its literal's
+    # domain against the form-b (`with Int` / `with String`) kinds;
+    # a symbol resolves by name against the declared-habitant map.
+    let dom = unit_sym_value_domain(sym)
+    let candidates =
+      if dom == "" { sym_kinds_lookup(c, sym) } else { domain_kinds_lookup(c, dom) }
+    pick_candidate(c, sym, candidates)
+  }
+}
+
+# The precedence over a candidate-kind list: unique wins, `use kind`
+# breaks a tie, anything else is ambiguous.
+fn pick_candidate(c: KindCtx, sym: String, candidates: [String]) : SymRes = match candidates {
+  [] -> SRunknown
+  [only] -> SRok(kind_qualify_nondefault(only, sym))
+  _ -> match used_kind_for(c, candidates) {
+    Some(k) -> SRok(kind_qualify_nondefault(k, sym))
+    None -> SRambig(candidates)
+  }
+}
+
+# --- rewrite: qualify every resolvable bare symbol; leave the rest ---
+# A symbol that does not resolve (unknown or ambiguous) is left bare so
+# the validation walk can report it against a source position. Rewrite
+# is a pure `UnitExprT -> UnitExprT`, fed to the generic `map_units`
+# walker per declaration with that declaration's unit-kind tparams as
+# locals.
+fn rewrite_unit(c: KindCtx, locals: [String], u: UnitExprT) : UnitExprT = match u {
+  UOne -> u
+  UVar(_) -> u
+  USym(s) -> match resolve_sym(c, locals, s) { SRok(q) -> USym(q) _ -> u }
+  UMul(a, b) -> UMul(rewrite_unit(c, locals, a), rewrite_unit(c, locals, b))
+  UInv(a) -> UInv(rewrite_unit(c, locals, a))
+  UPow(a, n) -> UPow(rewrite_unit(c, locals, a), n)
+  UJoin(a, b) -> UJoin(rewrite_unit(c, locals, a), rewrite_unit(c, locals, b))
+  UDims(us) -> UDims(rewrite_units(c, locals, us))
+}
+
+fn rewrite_units(c: KindCtx, locals: [String], us: [UnitExprT]) : [UnitExprT] = match us {
+  [] -> []
+  [u, ...rest] -> [rewrite_unit(c, locals, u), ...rewrite_units(c, locals, rest)]
+}
+
+# The unit-kind tparams a declaration binds — `[u: Metric]` binds `u`
+# as a unit variable that must not be rewritten as a habitant. Only
+# `DFn` carries tparams reachable by a unit annotation; other decls
+# bind none.
+#[doc("The surface names of a declaration's unit-kind type parameters (locals for rewriting).")]
+pub fn decl_unit_locals(d: Decl) : [String] = match d {
+  DFn(_, _, tparams, _, _, _, _, _, _, _) -> unit_locals_of(tparams, [])
+  DDerive(_, inner, _, _) -> decl_unit_locals(inner)
+  DUnstable(inner, _, _) -> decl_unit_locals(inner)
+  DProtoLaws(_, inner, _, _) -> decl_unit_locals(inner)
+  DImplAxiom(_, inner, _, _) -> decl_unit_locals(inner)
+  DConstructor(inner, _, _) -> decl_unit_locals(inner)
+  _ -> []
+}
+
+fn unit_locals_of(tparams: [String], acc: [String]) : [String] = match tparams {
+  [] -> list_reverse(acc)
+  [n, ...rest] ->
+    if tp_kind_is_unit(n) { unit_locals_of(rest, [tp_strip_kind(n), ...acc]) }
+    else { unit_locals_of(rest, acc) }
+}
+
+#[doc("""
+Rewrite every habitant symbol in the declaration stream to its
+qualified form. Runs before alias expansion; a per-declaration locals
+set (its unit-kind tparams) passes through unrewritten. Bare symbols
+that do not resolve are left for the unit-hygiene validator to report.
+""")]
+pub fn resolve_kinds_decls(decls: [Decl], reg: KindReg) : [Decl] {
+  let ctx = build_kind_ctx(decls, reg)
+  resolve_kinds_loop(decls, ctx, [])
+}
+
+#[doc("""
+Rewrite habitant symbols against a context built earlier. The catalog
+decls the context comes from are stripped before later passes run, so a
+stream that surfaces new bare symbols after the strip — a literal
+re-parsed out of a `#{...}` span — must re-resolve against the retained
+context rather than rebuild one from a catalog-free stream.
+""")]
+pub fn resolve_kinds_with_ctx(decls: [Decl], ctx: KindCtx) : [Decl] =
+  resolve_kinds_loop(decls, ctx, [])
+
+# Rewrite each decl with a named helper rather than a nested lambda:
+# the closure that `map_units_decl` needs captures only `ctx` + the
+# decl's locals, avoiding the transitive capture through two lambda
+# levels that the stage-1 codegen mishandles.
+fn resolve_kinds_loop(decls: [Decl], ctx: KindCtx, acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> resolve_kinds_loop(rest, ctx, [resolve_kinds_one(d, ctx), ...acc])
+}
+
+# An impl's methods each bind their own unit tparams, so each is
+# rewritten under its own locals rather than the impl's; the impl's own
+# type positions bind none.
+fn resolve_kinds_one(d: Decl, ctx: KindCtx) : Decl = match d {
+  DImpl(pname, pargs, target, methods, l, c, tags) -> {
+    let bare = (u) => rewrite_unit(ctx, [], u)
+    DImpl(pname,
+          map(pargs, (t) => map_units_typeexpr(t, bare)),
+          map_units_typeexpr(target, bare),
+          map(methods, (m) => resolve_kinds_one(m, ctx)),
+          l, c, tags)
+  }
+  _ -> {
+    let locals = decl_unit_locals(d)
+    map_units_decl(d, (u) => rewrite_unit(ctx, locals, u))
+  }
+}
+
+# The candidate kinds a still-bare symbol resolves to — the data the
+# unit-hygiene validator needs to phrase an ambiguity diagnostic. Empty
+# for a symbol declared in no kind (undeclared).
+#[doc("The kinds a bare habitant symbol inhabits, for the ambiguity diagnostic.")]
+pub fn sym_candidate_kinds(reg: KindReg, decls: [Decl], sym: String) : [String] =
+  sym_kinds_lookup(build_kind_ctx(decls, reg), sym)
+
+#[doc("""
+Drop every `DKind` / `DUseKind` from the stream. Run after kind
+resolution, which reads them; no later stage sees a catalog or
+`use kind` declaration (mirrors the DTheory/DDoc strip).
+""")]
+pub fn strip_kind_decls(decls: [Decl]) : [Decl] = skd_loop(decls, [])
+
+fn skd_loop(decls: [Decl], acc: [Decl]) : [Decl] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, _, _, _, _, _, _) -> skd_loop(rest, acc)
+    DUseKind(_, _, _) -> skd_loop(rest, acc)
+    _ -> skd_loop(rest, [d, ...acc])
+  }
+}
