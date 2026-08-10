@@ -1,0 +1,45 @@
+# The abort path must still release the producer's resource. The
+# `ReadFault` handler here abandons the continuation instead of resuming
+# (`bad_chunk` returns `Err(...)` and never calls `resume`), so the
+# unwind jumps clean over the producer's frame. `read_lines` brackets the
+# handle with `initially` / `finally`, so `close_file` runs anyway: the
+# mock counts one `close_file` call on abort, matching the skip path
+# (`stream_skip_policy.kai`, which resumes).
+#
+# The producer cannot defend itself by handling `ReadFault` — that would
+# shadow the consumer's skip-or-abort policy. `finally` is what closes
+# the gap without taking the policy decision away.
+
+import stream
+
+fn count_lines(path: String) : Int / File + ReadFault =
+  stream.read_lines(path) |> stream.count
+
+fn main() : Int / Stdout = {
+  let closes = array_make(1, 0)
+  let st     = array_make(1, 0)
+  let r = handle {
+    handle {
+      let n = count_lines("x")
+      Ok(n)
+    } with ReadFault {
+      bad_chunk(_m, _resume) -> Err("aborted")
+      open_fault(_m, _r)     -> Err("open aborted")
+    }
+  } with File {
+    open_read(_p, resume)        -> resume(Ok(file_handle(1)))
+    read_chunk(_h, _max, resume) -> {
+      let i = st[0]
+      st[0] := i + 1
+      if i == 0 { resume(Ok("a\nb\n")) }
+      else { resume(Err("disk gone")) }
+    }
+    close_file(_h, resume)       -> { closes[0] := closes[0] + 1; resume(()) }
+    open_write(_p, resume)       -> resume(Err("nw"))
+    write_chunk(_h, _d, resume)  -> resume(Err("nw"))
+    return(x)                    -> x
+  }
+  let msg = match r { Ok(_n) -> "OK" Err(e) -> e }
+  Stdout.print("abort result=#{msg} closes=#{int_to_string(closes[0])}\n")
+  0
+}
