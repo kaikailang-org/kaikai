@@ -1,0 +1,14 @@
+# m7b #9 — `|` and `|>` mix at the same precedence.
+#
+# `[1, 2, 3] | inc |> sum_all` parses left-assoc as
+# `(map([1, 2, 3], inc)) |> sum_all` = `sum_all([2, 3, 4])` = 9.
+
+fn inc(x: Int) : Int = x + 1
+
+fn sum_all(xs: [Int]) : Int = reduce(xs, 0, (acc, x) => acc + x)
+
+fn main(): Int / Console {
+  let total = [1, 2, 3] | inc |> sum_all
+  print(int_to_string(total))   # 9
+  0
+}
