@@ -1,0 +1,645 @@
+#[doc("""
+compiler.kinds — the per-file kind registry.
+
+A `kind K : AbelianGroup with intro` declaration names an abelian kind
+`K` and the word `intro` that declares its habitants (`metric m`). The
+introducer is a user-chosen identifier, so the LL(1) dispatch cannot
+know it without first seeing every kind declaration. A cheap linear
+pre-scan over the already-lexed token stream collects the
+`intro -> K` map before any body is parsed; the parser then recognises
+a habitant declaration by set membership, order-independently.
+
+The built-in `Measure` kind (introducer `unit`) is always present so
+`unit m` resolves through the same path.
+
+Depends only on lex + ast (never on parse), so the parser can import it
+without a cycle: token kinds are compared through `tk_name`, and the
+token source is sliced locally.
+""")]
+
+import compiler.util
+import compiler.chars
+import compiler.lex
+import compiler.ast
+
+# One `intro -> kind` binding from a `kind K : Thy with intro` decl.
+# `intro` is the habitant-introducer word; `kind` is the kind's name.
+pub type KindIntro = KI(String, String)
+#                       intro   kind
+
+# Kind registry for one file: every declared `intro -> kind` binding,
+# built-in `Measure`/`unit` included. Read-only once built.
+pub type KindReg = KReg([KindIntro])
+
+fn ki_intro(k: KindIntro) : String = match k { KI(i, _) -> i }
+fn ki_kind(k: KindIntro) : String = match k { KI(_, n) -> n }
+
+#[doc("The habitant symbol of a base-habitant binding (`KI(\"be\", \"Layout\")` -> `be`).")]
+pub fn ki_habitant(k: KindIntro) : String = match k { KI(h, _) -> h }
+
+#[doc("The kind a base-habitant binding inhabits (`KI(\"be\", \"Layout\")` -> `Layout`).")]
+pub fn ki_habitant_kind(k: KindIntro) : String = match k { KI(_, n) -> n }
+
+# --- type-parameter kind decoders (encode side is tp_make in parse) ---
+# A `[u: Measure]` param encodes as `u#Unit`; a `[u: Metric]` param as
+# `u#Unit:Metric`. The `#Unit` sentinel is a substring (suffix for
+# Measure, mid-string before `:Kind` for a user kind).
+
+# Index of the `#Unit` sentinel in an encoded tparam string, or -1.
+fn tp_unit_marker_index(stored: String) : Int =
+  tp_unit_marker_loop(stored, tp_unit_suffix(), 0,
+    string_length(stored) - string_length(tp_unit_suffix()))
+
+fn tp_unit_marker_loop(s: String, marker: String, i: Int, last: Int) : Int {
+  if i > last { -1 }
+  else if string_slice(s, i, string_length(marker)) == marker { i }
+  else { tp_unit_marker_loop(s, marker, i + 1, last) }
+}
+
+#[doc("True when an encoded tparam name ranges over a unit kind (`Measure` or a user kind).")]
+pub fn tp_kind_is_unit(stored: String) : Bool = tp_unit_marker_index(stored) >= 0
+
+# Index of the `#Shape` sentinel in an encoded tparam string, or -1.
+fn tp_shape_marker_index(stored: String) : Int =
+  tp_shape_marker_loop(stored, tp_shape_suffix(), 0,
+    string_length(stored) - string_length(tp_shape_suffix()))
+
+fn tp_shape_marker_loop(s: String, marker: String, i: Int, last: Int) : Int {
+  if i > last { -1 }
+  else if string_slice(s, i, string_length(marker)) == marker { i }
+  else { tp_shape_marker_loop(s, marker, i + 1, last) }
+}
+
+#[doc("True when an encoded tparam name ranges over the `Shape` kind (`[s: Shape]`).")]
+pub fn tp_kind_is_shape(stored: String) : Bool = tp_shape_marker_index(stored) >= 0
+
+#[doc("The `Kind` discriminant of an encoded tparam name.")]
+pub fn tp_kind_of(stored: String) : Kind =
+  if tp_kind_is_unit(stored) { KUnit }
+  else if tp_kind_is_shape(stored) { KShape }
+  else { KType }
+
+#[doc("The surface tparam name, stripping any encoded kind marker (`u#Unit:Metric` -> `u`, `s#Shape` -> `s`).")]
+pub fn tp_strip_kind(stored: String) : String {
+  let iu = tp_unit_marker_index(stored)
+  if iu >= 0 { string_slice(stored, 0, iu) }
+  else {
+    let is = tp_shape_marker_index(stored)
+    if is < 0 { stored } else { string_slice(stored, 0, is) }
+  }
+}
+
+#[doc("The kind a unit-param ranges over: `Measure` for a bare `#Unit`, the named kind after `#Unit:`, or empty for a non-unit param.")]
+pub fn tp_kind_name(stored: String) : String {
+  let i = tp_unit_marker_index(stored)
+  if i < 0 { "" }
+  else {
+    let after = i + string_length(tp_unit_suffix())
+    let sep = tp_unit_kind_sep()
+    if string_slice(stored, after, string_length(sep)) == sep {
+      let start = after + string_length(sep)
+      string_slice(stored, start, string_length(stored) - start)
+    } else { measure_kind_name() }
+  }
+}
+
+# Source slice of a token — a local copy so this module need not depend
+# on the parser's private `tok_source`.
+fn ksrc(src: String, t: Token) : String = string_slice(src, t.start, t.length)
+
+# Token-kind comparison via the lexer's stable name table, avoiding a
+# dependency on the parser's private `tk_is`.
+fn tk_named(t: Token, name: String) : Bool = tk_name(t.kind) == name
+
+#[doc("The empty registry seeded with the built-in `Measure`/`unit` binding.")]
+pub fn kind_reg_base() : KindReg = KReg(base_intros())
+
+# The shipped kinds every file can reference without declaring them:
+# `Measure`/`unit` (the default kind), `Currency`/`currency` (the
+# stdlib Module kind, habitants in `stdlib/money.kai`) and
+# `Perm`/`perm` (the stdlib Semilattice kind, habitants per domain).
+# The parser's per-file pre-scan starts here, so
+# habitants and `[c: Currency]` tparams parse across file boundaries.
+# Like `Measure`, the catalog declaration is the declarative mirror of
+# these entries — the catalog file itself is never in the decl stream.
+# `Shape` has no introducer word — its habitants are the arity-1 `type`
+# declarations, derived not spelled. The empty intro registers the kind
+# name so `[s: Shape]` parses, and matches no habitant-decl word.
+fn base_intros() : [KindIntro] =
+  [KI("unit", measure_kind_name()), KI("currency", "Currency"),
+   KI("perm", "Perm"), KI("region", "Region"), KI("layout", "Layout"),
+   KI("", "Shape"), KI("", dim_kind_name())]
+
+#[doc("The name of the shipped shape-index kind: `Int` value habitants over the HM core's first-order equality.")]
+pub fn dim_kind_name() : String = "Dim"
+
+#[doc("""
+The shipped value-domain (form-b) kind: `Dim` over `Int`. `<3>`
+resolves into it wherever no user-declared `with Int` kind is in
+scope — a user declaration shadows the base entry, never joins it,
+so pre-`Dim` programs keep their resolution unchanged.
+""")]
+pub fn base_value_domain_kinds() : [KindIntro] = [KI("Int", dim_kind_name())]
+
+#[doc("The habitant atoms the `Composition` engine ships with built-in semantics: the byte-order modifiers (`be` = big-endian, `le` = little-endian) Layout codegen keys on. A closed `with intro { ... }` set over Composition may name only these; `Layout`'s habitants are seeded from this list, so the engine is the single source the catalog's closed block is validated against.")]
+pub fn composition_engine_atoms() : [String] = ["be", "le"]
+
+#[doc("The habitant atoms a theory's engine ships, for closed-set (`with intro { ... }`) validation. Empty for a theory whose engine defines none — such a theory takes no closed set.")]
+pub fn engine_atoms_for_theory(thy: String) : [String] =
+  if thy == "Composition" { composition_engine_atoms() } else { [] }
+
+#[doc("The value domain of a value-habitant symbol: `Int` for an integer literal (`3`), `String` for a string literal (`\"tag\"`), empty for an ordinary identifier symbol.")]
+pub fn unit_sym_value_domain(s: String) : String {
+  if string_length(s) == 0 { "" }
+  else if sym_all_digits(s, 0) { "Int" }
+  else if string_slice(s, 0, 1) == "\"" { "String" }
+  else { "" }
+}
+
+fn sym_all_digits(s: String, i: Int) : Bool {
+  if i >= string_length(s) { true }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if ch_is_digit(c) { sym_all_digits(s, i + 1) } else { false }
+      None -> false
+    }
+  }
+}
+
+#[doc("The `Int` value of an all-digit `Dim` habitant atom (`\"3\"` -> `3`). Callers guard with `unit_sym_value_domain(s) == \"Int\"`; a non-digit char reads as 0.")]
+pub fn dim_atom_to_int(s: String) : Int = dim_atom_loop(s, 0, 0)
+
+fn dim_atom_loop(s: String, i: Int, acc: Int) : Int {
+  if i >= string_length(s) { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if ch_is_digit(c) { dim_atom_loop(s, i + 1, acc * 10 + (char_to_int(c) - char_to_int('0'))) } else { acc }
+      None -> acc
+    }
+  }
+}
+
+#[doc("The concrete `Int` length a resolved `Dim` habitant fixes, if any: `USym(\"Dim$n\")` -> `Some(n)`, `UOne` -> `Some(1)`; anything else (unit atom, `UVar`, `UDims`, a non-Int value habitant) -> `None`. The single oracle both the mangler and the codegen representation read to decide a fixed-width layout.")]
+pub fn dim_habitant_n(u: UnitExprT) : Option[Int] = match u {
+  UOne    -> Some(1)
+  USym(s) -> {
+    let bare = kind_sym_bare(s)
+    if unit_sym_value_domain(bare) == "Int" { Some(dim_atom_to_int(bare)) } else { None }
+  }
+  _ -> None
+}
+
+#[doc("True iff `t` is a fixed-width `Vec[e]<n>` with a concrete `Int` length AND a flat-scalar element (`Real`/`Int`/`Bool`/`Char`/`Byte`/`Int32`/`UInt32`/`UInt64`). This is the codegen representation switch — a fixed vec is a flat, header-less C aggregate. A non-scalar element (a nested vec, a record) keeps the dynamic `Vec`, so the inline aggregate stays one flat block.")]
+pub fn ty_is_fixed_vec(t: Ty) : Bool = match t {
+  TyDimT(base, u) -> match base {
+    TyCon(_, cn, cargs) ->
+      if cn == "Vec" and list_length(cargs) == 1 {
+        match dim_habitant_n(u) {
+          Some(_) -> match cargs { [e] -> ty_is_flat_scalar(e)  _ -> false }
+          None    -> false
+        }
+      } else { false }
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("`ty_is_fixed_vec` over an optional type; an absent type is not a fixed vec.")]
+pub fn ty_is_fixed_vec_opt(opt_t: Option[Ty]) : Bool = match opt_t {
+  Some(t) -> ty_is_fixed_vec(t)
+  None    -> false
+}
+
+#[doc("True for the primitive types that lower to a single flat C scalar — the elements a fixed-width `Vec` can store inline.")]
+pub fn ty_is_flat_scalar(t: Ty) : Bool = match t {
+  TyReal   -> true
+  TyInt    -> true
+  TyBool   -> true
+  TyChar   -> true
+  TyByte   -> true
+  TyInt32  -> true
+  TyUInt32 -> true
+  TyUInt64 -> true
+  _        -> false
+}
+
+#[doc("The element type of a fixed-width `Vec[e]<n>`; `TyAny` when `t` is not a fixed vec (callers gate on `ty_is_fixed_vec`).")]
+pub fn fixed_vec_elem(t: Ty) : Ty = match t {
+  TyDimT(base, _) -> match base { TyCon(_, _, [e]) -> e  _ -> TyAny }
+  _ -> TyAny
+}
+
+#[doc("The fixed length of a `Vec[e]<n>`; `0` when `t` is not a fixed vec (callers gate on `ty_is_fixed_vec`).")]
+pub fn fixed_vec_n(t: Ty) : Int = match t {
+  TyDimT(_, u) -> match dim_habitant_n(u) { Some(n) -> n  None -> 0 }
+  _ -> 0
+}
+
+#[doc("Every introducer word registered in `r` (for the parser's habitant-decl dispatch).")]
+pub fn kind_reg_introducers(r: KindReg) : [String] = match r {
+  KReg(bs) -> kind_field_of(bs, true, [])
+}
+
+#[doc("Every kind name registered in `r` (for validating `[u: Kind]` tparam annotations).")]
+pub fn kind_reg_kinds(r: KindReg) : [String] = match r {
+  KReg(bs) -> kind_field_of(bs, false, [])
+}
+
+fn kind_field_of(bs: [KindIntro], want_intro: Bool, acc: [String]) : [String] = match bs {
+  [] -> list_reverse(acc)
+  [b, ...rest] -> {
+    let v = if want_intro { ki_intro(b) } else { ki_kind(b) }
+    kind_field_of(rest, want_intro, [v, ...acc])
+  }
+}
+
+#[doc("The kind an introducer word declares habitants into, if registered.")]
+pub fn kind_of_introducer(r: KindReg, intro: String) : Option[String] = match r {
+  KReg(bs) -> kind_of_intro_loop(bs, intro)
+}
+
+fn kind_of_intro_loop(bs: [KindIntro], intro: String) : Option[String] = match bs {
+  [] -> None
+  [b, ...rest] -> if ki_intro(b) == intro { Some(ki_kind(b)) }
+                  else { kind_of_intro_loop(rest, intro) }
+}
+
+#[doc("True when `intro` is a registered habitant introducer (`unit` or a user kind's word).")]
+pub fn kind_reg_is_introducer(r: KindReg, intro: String) : Bool =
+  list_has(kind_reg_introducers(r), intro)
+
+#[doc("True when `name` names a registered kind (`Measure` or a user kind).")]
+pub fn kind_reg_has_kind(r: KindReg, name: String) : Bool =
+  list_has(kind_reg_kinds(r), name)
+
+#[doc("""
+Resolve a qualifier (a kind name `Metric` or an introducer word `metric`)
+to its kind name. `<Metric.m>` and `<metric.m>` both qualify `m` to the
+kind `Metric`. Returns None if the qualifier names neither.
+""")]
+pub fn kind_reg_resolve_qualifier(r: KindReg, qual: String) : Option[String] =
+  if kind_reg_has_kind(r, qual) { Some(qual) }
+  else { kind_of_introducer(r, qual) }
+
+#[doc("""
+The separator between a kind and its habitant in a qualified unit symbol
+(`Metric$m`). `$` is rejected by the unit lexer, so a qualified symbol
+is a disjoint subspace of user symbol names by construction.
+""")]
+pub fn kind_qual_sep() : String = "$"
+
+#[doc("Build the qualified form of a habitant symbol (`Metric` + `m` -> `Metric$m`).")]
+pub fn kind_qualify_sym(kind: String, sym: String) : String =
+  concat_all([kind, kind_qual_sep(), sym])
+
+#[doc("""
+Qualified form of a habitant, eliding the default kind. `Measure` (the
+kind every plain `unit` inhabits) stays bare (`m`), so all pre-kind code
+is byte-identical and an alias body's factors — expanded later, always
+bare — unify with a qualified literal. A user kind is materialised
+(`Metric$m`), which is what isolates it.
+""")]
+pub fn kind_qualify_nondefault(kind: String, sym: String) : String =
+  if kind == measure_kind_name() { sym } else { kind_qualify_sym(kind, sym) }
+
+#[doc("True when a unit symbol already carries a kind qualifier (`Metric$m`).")]
+pub fn kind_sym_is_qualified(s: String) : Bool = kind_qual_index(s) >= 0
+
+#[doc("""
+The separator between a home module and a habitant name in a
+module-qualified symbol (`metric::tick`). `:` is rejected by the unit
+lexer, so a module-qualified symbol is a disjoint subspace of user
+symbol names by construction.
+""")]
+pub fn mod_qual_sep() : String = "::"
+
+#[doc("Build the module-qualified form of a habitant name (`metric` + `tick` -> `metric::tick`).")]
+pub fn mod_qualify_sym(home: String, sym: String) : String =
+  concat_all([home, mod_qual_sep(), sym])
+
+#[doc("True when a habitant symbol already carries a home-module qualifier (`metric::tick`).")]
+pub fn mod_sym_has_home(s: String) : Bool = string_index_of_char(s, ':') >= 0
+
+#[doc("The kind of a qualified symbol (`Metric$m` -> `Metric`), or empty if bare.")]
+pub fn kind_sym_kind(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { "" } else { string_slice(s, 0, i) }
+}
+
+#[doc("The bare habitant of a symbol, dropping any kind qualifier (`Metric$m` -> `m`).")]
+pub fn kind_sym_bare(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { s }
+  else {
+    let start = i + string_length(kind_qual_sep())
+    string_slice(s, start, string_length(s) - start)
+  }
+}
+
+#[doc("""
+Mangle-safe form of a qualified symbol for C identifiers. The default
+kind `Measure` is elided (`Measure$m` -> `m`, byte-identical to
+pre-kind mangling); a user kind is kept but its `$` separator becomes
+the C-safe sentinel `_k_` (`Metric$m` -> `Metric_k_m`), so habitants
+stay isolated across kinds in codegen without emitting `$`.
+""")]
+pub fn kind_sym_mangle(s: String) : String {
+  let i = kind_qual_index(s)
+  if i < 0 { mod_sym_mangle(s) }
+  else {
+    let kind = string_slice(s, 0, i)
+    let bare = kind_sym_bare(s)
+    if kind == measure_kind_name() { mod_sym_mangle(bare) }
+    else { concat_all([kind, "_k_", mangle_safe(bare, 0, "")]) }
+  }
+}
+
+# A module-qualified name carries `::`, which is not a C identifier;
+# an unqualified one passes unchanged.
+fn mod_sym_mangle(s: String) : String =
+  if mod_sym_has_home(s) { mangle_safe(s, 0, "") } else { s }
+
+# A value habitant's bare form may carry non-identifier chars (a
+# string habitant keeps its quotes); C identifiers cannot, so any
+# such char mangles to `_`. Identifier habitants pass unchanged.
+fn mangle_safe(s: String, i: Int, acc: String) : String {
+  if i >= string_length(s) { acc }
+  else {
+    let piece = match char_at(s, i) {
+      Some(c) -> if ch_is_alnum(c) { string_slice(s, i, 1) } else { "_" }
+      None -> "_"
+    }
+    mangle_safe(s, i + 1, string_concat(acc, piece))
+  }
+}
+
+#[doc("True when `file` is the one compilation unit allowed to declare a `theory` or a builtin kind: the canonical kind catalog `<stdlib_path()>/core/kinds.kai`. Both paths are canonicalised via `abspath`.")]
+pub fn kind_catalog_file(file: String) : Bool =
+  abspath(file) == abspath(string_concat(stdlib_path(), "/core/kinds.kai"))
+
+#[doc("Diagnostic for a `theory` outside the catalog. A `builtin` body gets the closed-catalog message: there is nowhere a user may declare one.")]
+pub fn theory_reject_msg(props: [String]) : String =
+  if theory_props_builtin(props) {
+    "`builtin` theories are provided by the language and cannot be declared in user code"
+  } else {
+    "`theory` declarations are only allowed in the kind catalog (core/kinds.kai)"
+  }
+
+#[doc("The closed-kind guard: outside the catalog file, the builtin kinds cannot be redeclared and the builtin theories cannot classify a new kind. Returns the diagnostic, or None when the decl is legal.")]
+pub fn kind_closed_msg(file: String, kname: String, kthy: String) : Option[String] =
+  if kind_catalog_file(file) { None }
+  else if is_builtin_kind(kname) {
+    Some(concat_all(["`", kname, "` is a builtin kind and cannot be redeclared"]))
+  } else if is_builtin_theory(kthy) {
+    Some(concat_all(["`", kthy, "` is a builtin theory and cannot classify a user-declared kind"]))
+  } else { None }
+
+fn kind_qual_index(s: String) : Int =
+  kind_qual_index_loop(s, kind_qual_sep(), 0, string_length(s) - string_length(kind_qual_sep()))
+
+fn kind_qual_index_loop(s: String, sep: String, i: Int, last: Int) : Int {
+  if i > last { -1 }
+  else if string_slice(s, i, string_length(sep)) == sep { i }
+  else { kind_qual_index_loop(s, sep, i + 1, last) }
+}
+
+#[doc("""
+Build a `KindReg` from the declaration stream: fold every `DKind`'s
+introducer->kind binding onto the built-in `unit`->Measure base. Used
+over the merged program stream, where all kinds (cross-module) are
+visible, by the kind-resolution pass.
+""")]
+pub fn kind_reg_from_decls(decls: [Decl]) : KindReg =
+  KReg(kind_reg_from_decls_loop(decls, base_intros()))
+
+fn kind_reg_from_decls_loop(decls: [Decl], acc: [KindIntro]) : [KindIntro] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    # A form with no introducer word (derived habitants, value domain)
+    # still registers the kind name, like the base `Shape` entry.
+    DKind(_, name, _, _, hab, _, _) ->
+      kind_reg_from_decls_loop(rest, [KI(kind_hab_intro(hab), name), ...acc])
+    _ -> kind_reg_from_decls_loop(rest, acc)
+  }
+}
+
+#[doc("Every `kind -> value domain` pair declared by a `with <Domain>` (form-b) kind in the stream, as `KI(domain, kind)` bindings.")]
+pub fn value_domain_kinds(decls: [Decl]) : [KindIntro] = vdk_loop(decls, [])
+
+fn vdk_loop(decls: [Decl], acc: [KindIntro]) : [KindIntro] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, _, _, HabDomain(dom), _, _) -> vdk_loop(rest, [KI(dom, name), ...acc])
+    _ -> vdk_loop(rest, acc)
+  }
+}
+
+#[doc("Every closed-set kind in the stream plus the shipped `Layout`, as `(kind, atoms)` pairs. A closed kind's habitants are fixed: user habitant declarations into it are rejected.")]
+pub fn closed_kind_sets(decls: [Decl]) : [ClosedKind] =
+  cks_loop(decls, [CK("Layout", composition_engine_atoms())])
+
+# A closed-set kind and its fixed habitant atoms.
+pub type ClosedKind = CK(String, [String])
+
+#[doc("The kind name of a closed-set entry.")]
+pub fn ck_kind(c: ClosedKind) : String = match c { CK(k, _) -> k }
+
+#[doc("The fixed habitant atoms of a closed-set entry.")]
+pub fn ck_atoms(c: ClosedKind) : [String] = match c { CK(_, a) -> a }
+
+fn cks_loop(decls: [Decl], acc: [ClosedKind]) : [ClosedKind] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, _, _, HabClosed(_, atoms), _, _) -> cks_loop(rest, [CK(name, atoms), ...acc])
+    _ -> cks_loop(rest, acc)
+  }
+}
+
+#[doc("The fixed atom set of `kind` in a closed-set list, or empty when the kind is open.")]
+pub fn closed_atoms_lookup(cs: [ClosedKind], kind: String) : [String] = match cs {
+  [] -> []
+  [c, ...rest] -> if ck_kind(c) == kind { ck_atoms(c) } else { closed_atoms_lookup(rest, kind) }
+}
+
+# A type with a declared `<>` habitant-slot list: the type name and one
+# `"name:Kind"` string per slot (`HS("Matrix", ["m:Dim", "n:Dim"])`).
+# The slot name round-trips through `kai fmt`; the kind is what the
+# annotation validator checks. A type absent from the table declares no
+# slots, so its `<>` annotation is a free brand (the pre-slot behaviour).
+pub type HabSlots = HS(String, [String])
+
+#[doc("The type name of a habitant-slot entry.")]
+pub fn hs_name(h: HabSlots) : String = match h { HS(n, _) -> n }
+
+#[doc("The raw `\"name:Kind\"` slot strings of a habitant-slot entry.")]
+pub fn hs_slots(h: HabSlots) : [String] = match h { HS(_, ss) -> ss }
+
+#[doc("The kind name of a `\"name:Kind\"` slot string (`\"m:Dim\"` -> `Dim`); the whole string when it carries no separator.")]
+pub fn habitant_slot_kind_of(slot: String) : String = slot_kind_scan(slot, 0, string_length(slot))
+
+fn slot_kind_scan(s: String, i: Int, n: Int) : String {
+  if i >= n { s }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ':' { string_slice(s, i + 1, n - i - 1) } else { slot_kind_scan(s, i + 1, n) }
+      None -> s
+    }
+  }
+}
+
+#[doc("The slot name of a `\"name:Kind\"` slot string (`\"m:Dim\"` -> `m`); the whole string when it carries no separator.")]
+pub fn habitant_slot_name_of(slot: String) : String = slot_name_scan(slot, 0, string_length(slot))
+
+fn slot_name_scan(s: String, i: Int, n: Int) : String {
+  if i >= n { s }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == ':' { string_slice(s, 0, i) } else { slot_name_scan(s, i + 1, n) }
+      None -> s
+    }
+  }
+}
+
+# The kind name of each slot, dropping the round-trip name.
+fn slot_kinds_of(slots: [String]) : [String] = match slots {
+  [] -> []
+  [s, ...rest] -> [habitant_slot_kind_of(s), ...slot_kinds_of(rest)]
+}
+
+#[doc("The compiler-side habitant slots of the builtin shape-indexed types (`Vec`, `Matrix`), which carry no `type` declaration to spell them.")]
+pub fn base_habitant_slots() : [HabSlots] =
+  [HS("Vec", [string_concat("n:", dim_kind_name())]),
+   HS("Matrix", [string_concat("m:", dim_kind_name()), string_concat("n:", dim_kind_name())])]
+
+#[doc("""
+Every type in the stream that declares a `<>` habitant-slot list, plus
+the builtin shape-indexed types seeded compiler-side. A user `type`
+declaration shadows a builtin entry of the same name. This is the ONE
+reader of the disjoint `DType` slot field — no positional type-arg
+consumer touches it, so a habitant slot is never mis-read as a tparam.
+""")]
+pub fn habitant_slot_decls(decls: [Decl]) : [HabSlots] =
+  hsd_loop(decls, base_habitant_slots())
+
+fn hsd_loop(decls: [Decl], acc: [HabSlots]) : [HabSlots] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DType(_, name, _, _, _, _, _, slots) -> match slots {
+      [] -> hsd_loop(rest, acc)
+      _  -> hsd_loop(rest, hab_slots_add(acc, name, slots))
+    }
+    _ -> hsd_loop(rest, acc)
+  }
+}
+
+# A user declaration shadows any base entry of the same name.
+fn hab_slots_add(acc: [HabSlots], name: String, slots: [String]) : [HabSlots] = match acc {
+  [] -> [HS(name, slots)]
+  [e, ...rest] -> if hs_name(e) == name { [HS(name, slots), ...rest] } else { [e, ...hab_slots_add(rest, name, slots)] }
+}
+
+#[doc("The declared per-slot kinds of `name`, or None when the type declares no habitant slots.")]
+pub fn habitant_slots_lookup(hs: [HabSlots], name: String) : Option[[String]] = match hs {
+  [] -> None
+  [e, ...rest] -> if hs_name(e) == name { Some(slot_kinds_of(hs_slots(e))) } else { habitant_slots_lookup(rest, name) }
+}
+
+#[doc("Every form-b kind in a `KI(domain, kind)` list whose value domain is `dom`.")]
+pub fn domain_kinds_of(ds: [KindIntro], dom: String) : [String] = dko_loop(ds, dom, [])
+
+fn dko_loop(ds: [KindIntro], dom: String, acc: [String]) : [String] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] ->
+    if ki_habitant(d) == dom { dko_loop(rest, dom, [ki_habitant_kind(d), ...acc]) }
+    else { dko_loop(rest, dom, acc) }
+}
+
+#[doc("The value domain `kind` declares in a `KI(domain, kind)` list, or empty when it is not a form-b kind.")]
+pub fn domain_of_kind(ds: [KindIntro], kind: String) : String = match ds {
+  [] -> ""
+  [d, ...rest] ->
+    if ki_habitant_kind(d) == kind { ki_habitant(d) } else { domain_of_kind(rest, kind) }
+}
+
+#[doc("""
+Pre-scan the token stream for every `kind K : Thy with intro` head and
+build the file's `KindReg`. Deliberately dumb: it locates a `kind` in
+declaration position, the kind name after it, then skips to the `with`
+and captures the introducer that follows — it validates neither the
+theory nor the name (the real parser does). Order-independent: the map
+is complete before any body is parsed.
+""")]
+pub fn prescan_kinds(src: String, toks: [Token]) : KindReg =
+  KReg(prescan_loop(src, toks, base_intros()))
+
+fn prescan_loop(src: String, toks: [Token], acc: [KindIntro]) : [KindIntro] = match toks {
+  [] -> acc
+  [t, ...rest] ->
+    if tk_at_kind_head(src, t, rest) {
+      match scan_one_kind(src, rest) {
+        Some(b) -> prescan_loop(src, rest, [b, ...acc])
+        None    -> prescan_loop(src, rest, acc)
+      }
+    } else { prescan_loop(src, rest, acc) }
+}
+
+# A `kind` head is the identifier `kind` immediately followed by an
+# IDENT (the kind name) — the shape the parser's `decl_head_is_kind`
+# keys on, minus the `:` lookahead the scanner does not need (it skips
+# to `with` regardless).
+fn tk_at_kind_head(src: String, t: Token, rest: [Token]) : Bool =
+  tk_named(t, "IDENT") and ksrc(src, t) == "kind" and next_is_ident(rest)
+
+fn next_is_ident(toks: [Token]) : Bool = match toks {
+  [] -> false
+  [t, ..._] -> tk_named(t, "IDENT")
+}
+
+# `rest` begins at the kind name. Capture it, skip to the first `with`,
+# and take the introducer token after it. Returns the `intro -> kind`
+# binding, or None if the head is malformed (the real parser reports
+# the diagnostic).
+fn scan_one_kind(src: String, rest: [Token]) : Option[KindIntro] = match rest {
+  [] -> None
+  [name_tok, ...after_name] -> {
+    let kind_name = ksrc(src, name_tok)
+    match skip_to_with(after_name) {
+      None -> None
+      Some(after_with) -> match after_with {
+        [] -> None
+        [intro_tok, ..._] -> Some(KI(introducer_word(src, intro_tok), kind_name))
+      }
+    }
+  }
+}
+
+# The introducer is either the `unit` keyword or a plain IDENT; both
+# render to their surface word. An uppercase ident is a value DOMAIN
+# (`with Int`, form b), not an introducer: the binding keeps the kind
+# name reachable but registers no habitant-declaring word.
+fn introducer_word(src: String, t: Token) : String {
+  let w = if tk_named(t, "unit") { "unit" } else { ksrc(src, t) }
+  if word_is_upper(w) { "" } else { w }
+}
+
+fn word_is_upper(w: String) : Bool = match char_at(w, 0) {
+  Some(c) -> ch_is_upper(c)
+  None -> false
+}
+
+# Skip tokens up to and including the first `with`, bounded by the next
+# declaration head so a missing `with` does not run past its decl.
+fn skip_to_with(toks: [Token]) : Option[[Token]] = match toks {
+  [] -> None
+  [t, ...rest] ->
+    if tk_named(t, "with") { Some(rest) }
+    else if scan_boundary(t) { None }
+    else { skip_to_with(rest) }
+}
+
+# Tokens that end a declaration head — reaching one before `with` means
+# this `kind` has no introducer clause (the parser errors on it).
+fn scan_boundary(t: Token) : Bool =
+  tk_named(t, "theory") or tk_named(t, "fn") or tk_named(t, "type") or
+  tk_named(t, "effect") or tk_named(t, "protocol") or tk_named(t, "impl") or
+  tk_named(t, "EOF")

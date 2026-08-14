@@ -1,0 +1,50 @@
+# m14-pre #5 — smoke test for list.sort and list.sort_by.
+# Coverage: empty, singleton, sorted, reverse, duplicates, and
+# stability (sort_by with a coarse key — equal-keyed elements
+# must preserve their original relative order).
+
+fn show_ints(xs: [Int]) : String =
+  string_concat("[", string_concat(string.join(map(xs, int_to_string), ","), "]"))
+
+fn show_strs(xs: [String]) : String =
+  string_concat("[", string_concat(string.join(xs, ","), "]"))
+
+fn key_len(s: String) : Int = string_length(s)
+
+# Comparator: sort by string length, ascending. Equal-length
+# strings stay in their original relative order (stable).
+fn cmp_len(a: String, b: String) : Int {
+  let la = string_length(a)
+  let lb = string_length(b)
+  if la < lb { 0 - 1 }
+  else if la > lb { 1 }
+  else { 0 }
+}
+
+# Reverse-int comparator — verifies sort_by accepts custom orders.
+fn cmp_int_desc(a: Int, b: Int) : Int {
+  if a > b { 0 - 1 }
+  else if a < b { 1 }
+  else { 0 }
+}
+
+fn main() {
+  # list.sort — empty, singleton, already sorted, reverse, mixed.
+  println(show_ints(list.sort([])))
+  println(show_ints(list.sort([7])))
+  println(show_ints(list.sort([1, 2, 3])))
+  println(show_ints(list.sort([3, 2, 1])))
+  println(show_ints(list.sort([3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5])))
+  println(show_ints(list.sort([0 - 3, 1, 0 - 5, 2, 0])))    # negatives
+
+  # list.sort_by — descending Int order.
+  println(show_ints(list.sort_by([1, 5, 3, 2, 4], cmp_int_desc)))
+
+  # Stability: sort by string length. Original input is
+  #   ["bee", "ant", "fox", "owl", "dog", "x"]
+  # All the 3-letter strings tie; merge-sort with left-wins on
+  # ties must keep them in input order, so the expected output is
+  #   ["x", "bee", "ant", "fox", "owl", "dog"]
+  let xs = ["bee", "ant", "fox", "owl", "dog", "x"]
+  println(show_strs(list.sort_by(xs, cmp_len)))
+}
