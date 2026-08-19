@@ -1,0 +1,43 @@
+# Bounded(1, BlockSender) parks a sender on a full mailbox.
+#
+# The consumer owns a String mailbox with policy Bounded(1, BlockSender) —
+# capacity 1, full-push parks the caller. main pushes three messages
+# back-to-back, so the second and third push each park main until the
+# consumer frees the slot. The proof is delivery, not order: with a Drop
+# policy the capacity-1 mailbox would shed two of the three messages, so
+# all three receipts arriving (in send order) shows the sender parked
+# instead of discarding.
+#
+# Every printed line is ordered by happens-before — the receipts by the
+# consumer's own program order, main's closing line by the consumer's
+# ack — so the output is identical at any KAI_THREADS.
+
+import spawn
+import actor
+
+# The consumer owns the Bounded(1, BlockSender) mailbox (spawn_actor_policy
+# installs it inside the consumer's own fiber) and drains it via its own
+# Actor.receive(). main holds the consumer's Pid and sends to it; when the
+# bounded slot is full the SENDER (main) parks until the consumer pops. A
+# capability does not cross a spawn, so the mailbox lives where it is read.
+fn consumer(parent: Pid[String]) : Unit / Actor[String] + Console = {
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Actor.send(parent, "done")
+}
+
+fn run_block_sender() : Unit / Actor[String] + Spawn + Console = {
+  let me = Actor.self()
+  let c = spawn_actor_policy(Bounded(1, BlockSender), () => consumer(me))
+  Actor.send(c, "msg1")
+  Actor.send(c, "msg2")
+  Actor.send(c, "msg3")
+  let _ = Actor.receive()
+  Stdout.print("main: done")
+}
+
+fn main() : Int / Spawn + Console = {
+  with_mailbox { run_block_sender() }
+  0
+}

@@ -1,0 +1,66 @@
+# Forces every key into one bucket chain via a constant-hash sum-type
+# key, so the chaining path (insert/get/overwrite/remove) is exercised.
+
+import collections.hashmap
+
+type K = K1 | K2 | K3 | K4 | K5
+
+impl Hash for K {
+  fn hash(x: K) : Int = 42
+}
+
+impl Eq for K {
+  fn eq(a: K, b: K) : Bool = match (a, b) {
+    (K1, K1) -> true
+    (K2, K2) -> true
+    (K3, K3) -> true
+    (K4, K4) -> true
+    (K5, K5) -> true
+    _        -> false
+  }
+}
+
+fn verify(label: String, ok: Bool) : Unit / Stdout =
+  if ok { Stdout.print(label ++ ": ok") } else { Stdout.print(label ++ ": FAIL") }
+
+fn opt_str(o: Option[Int]) : String = match o {
+  None    -> "none"
+  Some(n) -> int_to_string(n)
+}
+
+fn main() : Int / Stdout + Mutable = {
+  let m = hashmap.empty()
+  hashmap.put(m, K1, 10)
+  hashmap.put(m, K2, 20)
+  hashmap.put(m, K3, 30)
+  hashmap.put(m, K4, 40)
+
+  verify("chain size 4", hashmap.size(m) == 4)
+  verify("K1", opt_str(m[K1]) == "10")
+  verify("K2", opt_str(m[K2]) == "20")
+  verify("K3", opt_str(m[K3]) == "30")
+  verify("K4", opt_str(m[K4]) == "40")
+  verify("absent K5", opt_str(m[K5]) == "none")
+
+  hashmap.put(m, K2, 99)
+  verify("overwrite keeps size 4", hashmap.size(m) == 4)
+  verify("K2 overwritten", opt_str(m[K2]) == "99")
+  verify("K1 untouched", opt_str(m[K1]) == "10")
+
+  hashmap.remove(m, K3)
+  verify("remove drops size", hashmap.size(m) == 3)
+  verify("K3 gone", opt_str(m[K3]) == "none")
+  verify("K1 survives", opt_str(m[K1]) == "10")
+  verify("K4 survives", opt_str(m[K4]) == "40")
+
+  hashmap.remove(m, K1)
+  hashmap.remove(m, K2)
+  hashmap.remove(m, K4)
+  verify("drained size 0", hashmap.size(m) == 0)
+  verify("drained is_empty", hashmap.is_empty(m))
+
+  hashmap.put(m, K5, 50)
+  verify("re-insert after drain", opt_str(m[K5]) == "50")
+
+  0
+}
