@@ -1,0 +1,19 @@
+# m12.8 phase 2 / m4c Phase 3: same `impl[u: Measure] Show for Real<u>`
+# covers both unit-bearing and bare values. After m4c Phase 3 each
+# concrete `u` (USD, EUR, ...) gets its own specialised body via
+# `mangle_name(name, [], [USym(u)])`, so the impl body emits exactly
+# what the user wrote. Pre-Phase-3 a special-case rewrite
+# (`try_rewrite_show_dim_real`) appended ` <unit>` even when the
+# impl's body did not — Phase 3 retired the workaround. This test
+# pins the new behaviour: a body of just `real_to_string(__strip_unit(x))`
+# emits the bare numeric for both `Real<USD>` and `Real`.
+
+unit USD
+
+fn main() : Int {
+  let priced  : Real<USD> = 42.5<USD>
+  let plain   : Real      = 3.14
+  print("with unit:    #{priced}")
+  print("without unit: #{plain}")
+  0
+}

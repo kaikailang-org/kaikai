@@ -1,0 +1,26 @@
+# m7a #6d smoke test — `resume(v)` is now a runtime call
+# (kai_cont_resume) that flips the KaiCont's status byte from
+# UNRESUMED to RESUMED and then tail-calls the continuation's fn.
+# In m7a #6d the fn is kai_cont_identity, so resume still behaves
+# as direct-style identity, but the one-shot check is observable:
+# a clause that calls resume twice will abort with the runtime
+# diagnostic. This file exercises the one-shot OK path.
+
+effect Counter {
+  tick() : Unit
+  get() : Int
+}
+
+fn main() : Int {
+  let r = handle {
+    Counter.tick()
+    Counter.tick()
+    Counter.get()
+  } with Counter {
+    tick(resume) -> resume(())
+    get(resume) -> resume(7)
+    return(x) -> x
+  }
+  assert r == 7
+  0
+}

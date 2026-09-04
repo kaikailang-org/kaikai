@@ -1,0 +1,606 @@
+# compiler/name_uses.kai — where the root file names a contested name.
+#
+# The syntactic position selects the class: an annotation names a type,
+# an effect row names an effect, a `<>` slot names a kind. A position
+# that decides the class needs nothing from the user (§3), so the scan
+# only has to report the names whose home is still contested once the
+# class is fixed.
+#
+# Scoped to the root file's own declarations: a module's internal uses
+# resolve against its own home and are never ambiguous to its author.
+
+import compiler.util
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.modules
+import compiler.scope_walk
+import compiler.kinds
+import compiler.decl_names
+import compiler.name_contest
+
+#[doc("One contested reference: `NUse(class, name, line, col, op)`. `op` is the operation a protocol was reached through, else empty.")]
+pub type NUse = NUse(NCls, String, Int, Int, String)
+
+#[doc("A protocol dispatcher name paired with its protocol: `NDisp(\"__proto_op\", op, protocol)`. The lowering leaves the dispatcher where the source named the operation.")]
+pub type NDisp = NDisp(String, String, String)
+
+#[doc("Every reference in the root file's declarations to a name contested in its class. `t` is the whole-program table; `target` the root module; `ds` the protocol dispatchers; `core` the core homes, outranked by the user's.")]
+pub fn nu_scan(decls: [Decl], t: [NEnt], target: String, ds: [NDisp],
+      core: [String]) : [NUse] =
+  list_reverse(nu_decls(decls, NuCx { t: t, target: target, ds: ds, core: core }, []))
+
+#[doc("The contested constant references of the root file. Scanned before module scoping keys them: a keyed read no longer shows its bare spelling.")]
+pub fn nu_scan_consts(decls: [Decl], target: String) : [NUse] =
+  nu_scan(decls, nt_only(nt_collect(decls, target), NCConst), target, [], [])
+
+#[doc("The dispatchers of a lowered protocol registry.")]
+pub fn nu_dispatchers(reg: ProtocolReg) : [NDisp] = nu_disp_build(reg.ops, [])
+
+fn nu_disp_build(ops: [ProtoOpReg], acc: [NDisp]) : [NDisp] = match ops {
+  [] -> acc
+  [POR(proto, op, _, _, _, _, _), ...rest] ->
+    nu_disp_build(rest, [NDisp(concat_all(["__proto_", op]), op, proto), ...acc])
+}
+
+#[doc("`a` followed by the uses of `b` not already reported in `a`.")]
+pub fn nu_merge(a: [NUse], b: [NUse]) : [NUse] = match b {
+  [] -> a
+  [NUse(c, n, l, col, op), ...rest] ->
+    if nu_seen(a, c, n) { nu_merge(a, rest) }
+    else { nu_merge(list_append(a, [NUse(c, n, l, col, op)]), rest) }
+}
+
+# The scan's fixed inputs: the table, the root module, the dispatchers.
+type NuCx = { t: [NEnt], target: String, ds: [NDisp], core: [String] }
+
+fn nu_decls(ds: [Decl], cx: NuCx, acc: [NUse]) : [NUse] =
+  match ds {
+    [] -> acc
+    [d, ...rest] -> nu_decls(rest, cx, nu_decl(d, cx, acc))
+  }
+
+# Only root-authored decls are scanned; an imported decl's uses belong
+# to its own home, where they resolve.
+fn nu_decl(d: Decl, cx: NuCx, acc: [NUse]) : [NUse] = match d {
+  DFn(_, _, _, ps, ret, row, body, _, _, mo) -> match mo {
+    Some(_) -> acc
+    None    -> nu_expr(body, cx,
+                 nu_row(row, cx, nu_ret(ret, cx, nu_params(ps, cx, acc))))
+  }
+  DConst(_, _, ty, body, mo, _, _) -> match mo {
+    Some(_) -> acc
+    None    -> nu_expr(body, cx, nu_ty(ty, cx, acc))
+  }
+  DDerive(_, inner, _, _)       -> nu_decl(inner, cx, acc)
+  DUnstable(inner, _, _)        -> nu_decl(inner, cx, acc)
+  DProtoLaws(_, inner, _, _, _) -> nu_decl(inner, cx, acc)
+  DImplAxiom(_, inner, _, _, _) -> nu_decl(inner, cx, acc)
+  DConstructor(inner, _, _)     -> nu_decl(inner, cx, acc)
+  DDoc(_, _, inner, _, _)       -> nu_decl(inner, cx, acc)
+  DAttr(_, inner, _, _)         -> nu_decl(inner, cx, acc)
+  _ -> acc
+}
+
+fn nu_params(ps: [Param], cx: NuCx, acc: [NUse]) : [NUse] =
+  match ps {
+    [] -> acc
+    [p, ...rest] -> nu_params(rest, cx, nu_ret(p.ptype, cx, acc))
+  }
+
+fn nu_ret(r: Option[TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
+  match r {
+    None     -> acc
+    Some(ty) -> nu_ty(ty, cx, acc)
+  }
+
+fn nu_ty(ty: TypeExpr, cx: NuCx, acc: [NUse]) : [NUse] =
+  match ty.tkind {
+    TyName(n, targs) ->
+      nu_ty_list(targs, cx, nu_hit(NCType, n, ty.line, ty.col, cx, acc))
+    TyList(inner)      -> nu_ty(inner, cx, acc)
+    TyFn(ps, r, row)   -> nu_row(row, cx, nu_ty(r, cx, nu_ty_list(ps, cx, acc)))
+    TyDim(base, _)     -> nu_ty(base, cx, acc)
+    TyRefine(base, _)  -> nu_ty(base, cx, acc)
+    _ -> acc
+  }
+
+fn nu_ty_list(tys: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] =
+  match tys {
+    [] -> acc
+    [ty, ...rest] -> nu_ty_list(rest, cx, nu_ty(ty, cx, acc))
+  }
+
+fn nu_row(r: RowExpr, cx: NuCx, acc: [NUse]) : [NUse] =
+  match r {
+    REmpty         -> acc
+    RClosed(ls)    -> nu_labels(ls, cx, acc)
+    ROpen(_, ls)   -> nu_labels(ls, cx, acc)
+  }
+
+fn nu_labels(ls: [RowLabel], cx: NuCx, acc: [NUse]) : [NUse] =
+  match ls {
+    [] -> acc
+    [RL(n, targs), ...rest] ->
+      nu_labels(rest, cx,
+                nu_ty_list(targs, cx, nu_row_hit(n, targs, cx, acc)))
+  }
+
+# A row label carries no position of its own; borrow the first type
+# argument's, falling back to the declaration site the caller reports.
+fn nu_row_hit(n: String, targs: [TypeExpr], cx: NuCx, acc: [NUse]) : [NUse] = match targs {
+  []          -> nu_hit(NCEffect, n, 0, 0, cx, acc)
+  [a, ..._]   -> nu_hit(NCEffect, n, a.line, a.col, cx, acc)
+}
+
+# The value classes a bare name may denote. Which one it is comes from
+# the table, not from the spelling: a name declared as a constructor is
+# reported as one, a constant as one, a protocol dispatcher as its
+# protocol. A name in none of these is a function, already covered by
+# its own reporter.
+fn nu_expr(e: Expr, cx: NuCx, acc: [NUse]) : [NUse] = {
+  let here = match sym_read_kind(e.kind) {
+    EVar(n)     -> nu_name_hit(n, e.line, e.col, false, cx, acc)
+    ECall(c, _) -> match sym_read_kind(c.kind) {
+      EVar(n) -> nu_name_hit(n, c.line, c.col, true, cx, acc)
+      _       -> acc
+    }
+    _ -> acc
+  }
+  nu_positions(xp_positions(e), cx, here)
+}
+
+fn nu_positions(ps: [XPos], cx: NuCx, acc: [NUse]) : [NUse] =
+  match ps {
+    [] -> acc
+    [XP(_, child), ...rest] -> nu_positions(rest, cx, nu_expr(child, cx, acc))
+  }
+
+# `called` records whether the source wrote the name with an argument
+# list. The help text spells the qualified form the reader must type, and
+# a nullary constructor read as a plain reference has no `(...)` to show.
+#
+# A function is contested only where it is CALLED. This walk carries no
+# scope, so a bare `EVar` may well be a local binder — a `let` named like
+# a stdlib export, or a field binder a `#[derive]` body reads back — and
+# a local shadows imports rather than competing with them. A call
+# position cannot be a local of that shape, so it is the one place the
+# name is unambiguously the function.
+fn nu_name_hit(name: String, line: Int, col: Int, called: Bool, cx: NuCx,
+      acc: [NUse]) : [NUse] =
+  match nu_disp_find(cx.ds, name) {
+    Some(NDisp(_, op, proto)) -> nu_hit_op(NCProtocol, proto, line, col, op, cx, acc)
+    None ->
+      if list_length(nt_homes(cx.t, NCCtor, name)) > 0 {
+        nu_hit_call(NCCtor, name, line, col, called, cx, acc)
+      } else if called and list_length(nt_homes(cx.t, NCFn, name)) > 0 {
+        nu_hit_call(NCFn, name, line, col, called, cx, acc)
+      } else {
+        nu_hit_call(NCConst, name, line, col, called, cx, acc)
+      }
+  }
+
+# Dispatchers all start with `__`; anything else skips the list.
+fn nu_disp_find(ds: [NDisp], name: String) : Option[NDisp] =
+  if nu_internal(name) { nu_disp_loop(ds, name) } else { None }
+
+fn nu_internal(name: String) : Bool = match char_at(name, 0) {
+  Some(c0) -> c0 == '_' and match char_at(name, 1) { Some(c1) -> c1 == '_'  None -> false }
+  None -> false
+}
+
+fn nu_disp_loop(ds: [NDisp], name: String) : Option[NDisp] = match ds {
+  [] -> None
+  [d, ...rest] -> match d {
+    NDisp(dn, _, _) -> if dn == name { Some(d) } else { nu_disp_loop(rest, name) }
+  }
+}
+
+fn nu_hit(cls: NCls, name: String, line: Int, col: Int, cx: NuCx, acc: [NUse]) : [NUse] =
+  nu_hit_op(cls, name, line, col, "", cx, acc)
+
+# A name written without an argument list carries the marker the report
+# reads to leave `(...)` off the spelling it suggests.
+fn nu_hit_call(cls: NCls, name: String, line: Int, col: Int, called: Bool,
+      cx: NuCx, acc: [NUse]) : [NUse] =
+  nu_hit_op(cls, name, line, col, if called { "" } else { nu_bare_mark() }, cx, acc)
+
+#[doc("The `op` marker a use site carries when the source named it without an argument list.")]
+pub fn nu_bare_mark() : String = "ref"
+
+fn nu_hit_op(cls: NCls, name: String, line: Int, col: Int, op: String,
+      cx: NuCx, acc: [NUse]) : [NUse] =
+  if list_length(nt_contested(cx.t, cls, name, cx.target, cx.core)) == 0 { acc }
+  else if nu_seen(acc, cls, name) { acc }
+  else { [NUse(cls, name, line, col, op), ...acc] }
+
+fn nu_seen(acc: [NUse], cls: NCls, name: String) : Bool = match acc {
+  [] -> false
+  [NUse(c, n, _, _, _), ...rest] ->
+    if n == name and ncls_word(c) == ncls_word(cls) { true }
+    else { nu_seen(rest, cls, name) }
+}
+
+# ==== const keying across modules ====
+#
+# A colliding const read keys to the module that owns it: the reader's
+# own first, else the first exported one of another home. The collision
+# table comes from `nt_collect` — boundary-stamped homes, not a
+# streaming scan — so a `DConst`'s identity is set where it is parsed,
+# like every other name class this module resolves.
+
+#[doc("One const-keying context: the collision table (NEnt NCConst entries), the reading decl's home, and the root module name. `free` off restricts the rewrite to qualified reads (the interp lift keys those; free reads wait for the scope-aware rerun). `mt` maps a written qualifier to its tagged module name — empty when the stream's qualifiers are already tagged.")]
+pub type CSCtx = { coll: [NEnt], home: String, target: String,
+                   free: Bool, mt: [ModuleEntry] }
+
+#[doc("The const collisions of `decls`: consts whose name another home also declares, in stream order (boundary-stamped homes).")]
+pub fn nu_const_coll(decls: [Decl], target: String) : [NEnt] {
+  let all = nt_collect(decls, target)
+  nu_keep_collided(all, all, [])
+}
+
+fn nu_keep_collided(all: [NEnt], todo: [NEnt], acc: [NEnt]) : [NEnt] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    NEnt(NCConst, n, h, _) ->
+      if nu_other_home(all, n, h) { nu_keep_collided(all, rest, [e, ...acc]) }
+      else { nu_keep_collided(all, rest, acc) }
+    _ -> nu_keep_collided(all, rest, acc)
+  }
+}
+
+fn nu_other_home(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, _), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h != home { true }
+    else { nu_other_home(rest, name, home) }
+}
+
+#[doc("A decl's home for both reading and streaming: a DConst carries its own `module_origin` (None marks the root); everything else follows the streaming reset.")]
+pub fn nu_reader_home(d: Decl, cur: String, target: String) : String = match d {
+  DConst(_, _, _, _, mo, _, _) -> match mo { Some(m) -> m  None -> target }
+  DDoc(_, _, inner, _, _) -> nu_reader_home(inner, cur, target)
+  DAttr(_, inner, _, _)   -> nu_reader_home(inner, cur, target)
+  _ -> decl_home_hint_reset(d, cur, target)
+}
+
+#[doc("The module that owns a read of `name` from the context's home: the reader's own const if it declares one, else the first exported const of another module. The root's consts are never a foreign pick — the root is not importable.")]
+pub fn nu_const_owner(cx: CSCtx, name: String) : Option[String] =
+  if nu_const_declares(cx.coll, name, cx.home) { Some(cx.home) }
+  else { nu_const_foreign_pub(cx.coll, name, cx.home, cx.target) }
+
+fn nu_const_declares(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, _), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h == home { true }
+    else { nu_const_declares(rest, name, home) }
+}
+
+fn nu_const_foreign_pub(t: [NEnt], name: String, home: String,
+      target: String) : Option[String] = match t {
+  [] -> None
+  [NEnt(c, n, h, p), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and p and h != home and h != target { Some(h) }
+    else { nu_const_foreign_pub(rest, name, home, target) }
+}
+
+#[doc("True when `home` declares a pub const `name` in the collision table.")]
+pub fn nu_is_pub_const(t: [NEnt], name: String, home: String) : Bool = match t {
+  [] -> false
+  [NEnt(c, n, h, p), ...rest] ->
+    if ncls_word(c) == "constant" and n == name and h == home and p { true }
+    else { nu_is_pub_const(rest, name, home) }
+}
+
+fn nu_const_re(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+
+fn nu_scope_params(ps: [Param], acc: [String]) : [String] = sw_params(ps, acc)
+
+#[doc("Rewrite the free reads of colliding const names in one expression; `sh` holds the names already bound in scope.")]
+pub fn nu_const_expr(e: Expr, sh: [String], cx: CSCtx) : Expr =
+  sw_expr(e, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+# `mod.NAME` where NAME is a colliding pub const of `mod`: key it
+# here — rqc collapses an uppercase qualified export to a bare
+# `EVar` (the variant-ctor rule), which would lose the module. The
+# qualifier maps through `mt` first: an aliased import collides
+# under its tagged name, not the name the file wrote.
+# Private consts fall through so rqc / pub-access still diagnose.
+fn nu_const_leaf(e: Expr, sh: [String], cx: CSCtx) : Option[Expr] = match sym_read_kind(e.kind) {
+  EVar(nm) ->
+    if not cx.free or list_has(sh, nm) { Some(e) }
+    else { match nu_const_owner(cx, nm) {
+      Some(m) -> if m == cx.target { Some(e) } else { Some(nu_const_re(e, EModCall(m, nm))) }
+      None    -> Some(e)
+    } }
+  EField(obj, f) -> match obj.kind {
+    EVar(m) -> {
+      let tm = mt_tagged_name(cx.mt, m)
+      if not list_has(sh, m) and nu_is_pub_const(cx.coll, f, tm) {
+        Some(nu_const_re(e, EModCall(tm, f)))
+      } else { None }
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn nu_const_hclauses(hcs: [HClause], sh: [String], cx: CSCtx) : [HClause] =
+  sw_hclauses(hcs, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+fn nu_const_hreturn_opt(o: Option[HReturn], sh: [String], cx: CSCtx) : Option[HReturn] =
+  sw_hreturn_opt(o, sh, (x, s) => nu_const_leaf(x, s, cx), (t) => t, (n) => n)
+
+#[doc("Rewrite free reads of colliding const names to `EModCall(home, name)`, resolving each against the reading decl's own module first. Runs before rqc: a qualified `mod.CONST` read is keyed here, before the uppercase collapse can drop its module. `scopes`/`global_mt` give each decl its segment module table, so a qualifier written as a per-file import alias keys under its tagged name; pass empty tables when the stream's qualifiers are already tagged.")]
+pub fn nu_scope_const_decls(decls: [Decl], coll: [NEnt], target: String,
+      scopes: [ModScope], global_mt: [ModuleEntry]) : [Decl] =
+  if list_length(coll) == 0 { decls }
+  else { nu_scope_const_loop(decls, coll, target, target, scopes, global_mt, []) }
+
+fn nu_scope_const_loop(ds: [Decl], coll: [NEnt], cur: String, target: String,
+      scopes: [ModScope], global_mt: [ModuleEntry], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> {
+    let home = nu_reader_home(d, cur, target)
+    let seg = if home == target { "" } else { home }
+    let cx = CSCtx { coll: coll, home: home, target: target, free: true,
+                     mt: ms_table(scopes, seg, global_mt) }
+    nu_scope_const_loop(rest, coll, home, target, scopes, global_mt, [nu_const_decl(d, cx), ...acc])
+  }
+}
+
+fn nu_const_sub_decls(ds: [Decl], cx: CSCtx) : [Decl] = match ds {
+  [] -> []
+  [d, ...rest] -> [nu_const_decl(d, cx), ...nu_const_sub_decls(rest, cx)]
+}
+
+fn nu_const_decl(d: Decl, cx: CSCtx) : Decl = match d {
+  DFn(p, n, tps, ps, ret, row, body, l, c, mo) ->
+    DFn(p, n, tps, ps, ret, row, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
+  DConst(p, n, ty, body, mo, l, c) -> DConst(p, n, ty, nu_const_expr(body, [], cx), mo, l, c)
+  DTest(n, body, l, c, mo)  -> DTest(n, nu_const_expr(body, [], cx), l, c, mo)
+  DBench(n, body, l, c, mo) -> DBench(n, nu_const_expr(body, [], cx), l, c, mo)
+  DCheck(n, ps, body, l, c, mo) ->
+    DCheck(n, ps, nu_const_expr(body, nu_scope_params(ps, []), cx), l, c, mo)
+  DEffect(p, n, tps, ops, dblk, l, c, mo) -> match dblk {
+    Some(DBlk(hcs, ret, bl, bc)) ->
+      DEffect(p, n, tps, ops,
+              Some(DBlk(nu_const_hclauses(hcs, [], cx), nu_const_hreturn_opt(ret, [], cx), bl, bc)),
+              l, c, mo)
+    None -> d
+  }
+  DImpl(pn, tas, fty, subs, l, c, ss) -> DImpl(pn, tas, fty, nu_const_sub_decls(subs, cx), l, c, ss)
+  DDerive(ps, inner, l, c)    -> DDerive(ps, nu_const_decl(inner, cx), l, c)
+  DUnstable(inner, l, c)      -> DUnstable(nu_const_decl(inner, cx), l, c)
+  DProtoLaws(t, inner, l, c, mo)  -> DProtoLaws(t, nu_const_decl(inner, cx), l, c, mo)
+  DImplAxiom(t, inner, l, c, mo)  -> DImplAxiom(t, nu_const_decl(inner, cx), l, c, mo)
+  DConstructor(inner, l, c)   -> DConstructor(nu_const_decl(inner, cx), l, c)
+  DDoc(r, t, inner, l, c)     -> DDoc(r, t, nu_const_decl(inner, cx), l, c)
+  DAttr(r, inner, l, c)       -> DAttr(r, nu_const_decl(inner, cx), l, c)
+  _ -> d
+}
+
+# ==== unit habitant sites ====
+#
+# A `unit` name is not a package-global: two habitants of the same
+# name declared in different modules are distinct atoms. Each site
+# stamps its home where the decl is parsed (the decl's own
+# `module_origin`, `target` for the root), like every other class
+# this module keys — no segment view is replayed. The site's kind
+# comes from the introducer table of its own module segment, seeded
+# with the base kinds.
+
+#[doc("One habitant declaration site: home module, name, `pub` flag, resolved kind, and whether it is an alias declaration.")]
+pub type UnitSite = USite(String, String, Bool, String, Bool)
+
+#[doc("The home module of a site.")]
+pub fn usite_home(s: UnitSite) : String = match s { USite(h, _, _, _, _) -> h }
+
+#[doc("The declared habitant name of a site.")]
+pub fn usite_name(s: UnitSite) : String = match s { USite(_, n, _, _, _) -> n }
+
+#[doc("The resolved kind of a site's declaration.")]
+pub fn usite_kind(s: UnitSite) : String = match s { USite(_, _, _, k, _) -> k }
+
+#[doc("The kind an introducer word declares habitants into; `Measure` when it is not a registered introducer.")]
+pub fn unit_intro_kind(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) {
+    Some(k) -> k
+    None -> measure_kind_name()
+  }
+
+#[doc("Every habitant declaration site of `decls`, in stream order, with boundary-stamped homes (`target` names the root module).")]
+pub fn nu_unit_sites(decls: [Decl], target: String) : [UnitSite] =
+  list_reverse(nus_loop(decls, target, target, [], []))
+
+fn nus_loop(ds: [Decl], cur: String, target: String,
+      kis: [KindIntro], acc: [UnitSite]) : [UnitSite] = match ds {
+  [] -> acc
+  [d, ...rest] -> {
+    let home = nus_home(d, cur, target)
+    let kis1 = if home == cur { kis } else { [] }
+    match d {
+      DKind(_, name, _, _, hab, _, _, _) ->
+        nus_loop(rest, home, target, [KI(kind_hab_intro(hab), name), ...kis1], acc)
+      _ -> nus_loop(rest, home, target, kis1, nus_one(d, home, kis1, acc))
+    }
+  }
+}
+
+fn nus_home(d: Decl, cur: String, target: String) : String = match d {
+  DUnit(_, _, _, _, _, _, mo)    -> nus_mo(mo, target)
+  DKind(_, _, _, _, _, _, _, mo) -> nus_mo(mo, target)
+  DDoc(_, _, inner, _, _) -> nus_home(inner, cur, target)
+  DAttr(_, inner, _, _)   -> nus_home(inner, cur, target)
+  _ -> decl_home_hint_reset(d, cur, target)
+}
+
+fn nus_mo(mo: Option[String], target: String) : String = match mo {
+  Some(m) -> m
+  None    -> target
+}
+
+fn nus_one(d: Decl, home: String, kis: [KindIntro],
+      acc: [UnitSite]) : [UnitSite] = match d {
+  DUnit(p, name, ub, intro, _, _, _) -> {
+    let is_alias = match ub { UBAlias(_) -> true _ -> false }
+    [USite(home, name, p, nus_intro_kind(kis, intro), is_alias), ...acc]
+  }
+  DDerive(_, inner, _, _)    -> nus_one(inner, home, kis, acc)
+  DUnstable(inner, _, _)     -> nus_one(inner, home, kis, acc)
+  DProtoLaws(_, inner, _, _, _) -> nus_one(inner, home, kis, acc)
+  DImplAxiom(_, inner, _, _, _) -> nus_one(inner, home, kis, acc)
+  DConstructor(inner, _, _)  -> nus_one(inner, home, kis, acc)
+  DDoc(_, _, inner, _, _)    -> nus_one(inner, home, kis, acc)
+  DAttr(_, inner, _, _)      -> nus_one(inner, home, kis, acc)
+  _ -> acc
+}
+
+# An introducer resolves against the kinds its own module segment
+# declared plus the base kinds; the parser rejects a habitant decl
+# whose word the segment does not register, so no cross-module
+# introducer table is needed.
+fn nus_intro_kind(kis: [KindIntro], intro: String) : String =
+  match kind_of_introducer(KReg(list_append(kis, nus_base_kis())), intro) {
+    Some(k) -> k
+    None -> measure_kind_name()
+  }
+
+fn nus_base_kis() : [KindIntro] = match kind_reg_base() { KReg(bs) -> bs }
+
+#[doc("Every site declaring `name`, in stream order.")]
+pub fn unit_sites_for(sites: [UnitSite], name: String) : [UnitSite] =
+  list_reverse(usf_loop(sites, name, []))
+
+fn usf_loop(sites: [UnitSite], name: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] ->
+      usf_loop(rest, name, if usite_name(s) == name { [s, ...acc] } else { acc })
+  }
+
+#[doc("The distinct home modules of the given sites, in first-seen order.")]
+pub fn unit_sites_homes(sites: [UnitSite]) : [String] =
+  list_reverse(ush_loop(sites, []))
+
+fn ush_loop(sites: [UnitSite], acc: [String]) : [String] = match sites {
+  [] -> acc
+  [s, ...rest] ->
+    ush_loop(rest, if list_has(acc, usite_home(s)) { acc }
+                   else { [usite_home(s), ...acc] })
+}
+
+#[doc("The sites among `sites` whose home is `home`.")]
+pub fn unit_sites_own(sites: [UnitSite], home: String) : [UnitSite] =
+  list_reverse(uso_loop(sites, home, []))
+
+fn uso_loop(sites: [UnitSite], home: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] ->
+      uso_loop(rest, home, if usite_home(s) == home { [s, ...acc] } else { acc })
+  }
+
+#[doc("The sites among `sites` whose home is one of `homes`.")]
+pub fn unit_sites_in(sites: [UnitSite], homes: [String]) : [UnitSite] =
+  list_reverse(usi_loop(sites, homes, []))
+
+fn usi_loop(sites: [UnitSite], homes: [String], acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] ->
+      usi_loop(rest, homes, if list_has(homes, usite_home(s)) { [s, ...acc] } else { acc })
+  }
+
+#[doc("The exported sites among `sites` living outside `home`.")]
+pub fn unit_sites_pub_foreign(sites: [UnitSite], home: String) : [UnitSite] =
+  list_reverse(usp_loop(sites, home, []))
+
+fn usp_loop(sites: [UnitSite], home: String, acc: [UnitSite]) : [UnitSite] =
+  match sites {
+    [] -> acc
+    [s, ...rest] -> {
+      let keep = match s { USite(h, _, p, _, _) -> p and not (h == home) }
+      usp_loop(rest, home, if keep { [s, ...acc] } else { acc })
+    }
+  }
+
+#[doc("The distinct kinds of the non-alias sites, in first-seen order.")]
+pub fn unit_sites_kinds(sites: [UnitSite]) : [String] =
+  list_reverse(usk_loop(sites, []))
+
+fn usk_loop(sites: [UnitSite], acc: [String]) : [String] = match sites {
+  [] -> acc
+  [s, ...rest] -> match s {
+    USite(_, _, _, k, is_alias) ->
+      usk_loop(rest, if is_alias or list_has(acc, k) { acc } else { [k, ...acc] })
+  }
+}
+
+#[doc("True when every site is an alias declaration.")]
+pub fn unit_sites_all_alias(sites: [UnitSite]) : Bool = match sites {
+  [] -> true
+  [s, ...rest] -> match s {
+    USite(_, _, _, _, is_alias) -> is_alias and unit_sites_all_alias(rest)
+  }
+}
+
+#[doc("True when any site is an alias declaration.")]
+pub fn unit_sites_any_alias(sites: [UnitSite]) : Bool = match sites {
+  [] -> false
+  [s, ...rest] -> match s {
+    USite(_, _, _, _, is_alias) -> is_alias or unit_sites_any_alias(rest)
+  }
+}
+
+#[doc("""
+True when `name` is declared at kind `kind` by two or more modules,
+counting alias sites for `Measure` (an alias expands by bare name, so
+it can capture a Measure atom of its name). A true result is what
+makes resolution spell the atom with its home module.
+""")]
+pub fn unit_name_multi_at(sites_for_name: [UnitSite], kind: String) : Bool =
+  list_length(unit_sites_homes(unma_matching(sites_for_name, kind, []))) >= 2
+
+fn unma_matching(sites: [UnitSite], kind: String,
+      acc: [UnitSite]) : [UnitSite] = match sites {
+  [] -> acc
+  [s, ...rest] -> match s {
+    USite(_, _, _, k, is_alias) -> {
+      let hit = if is_alias { kind == measure_kind_name() } else { k == kind }
+      unma_matching(rest, kind, if hit { [s, ...acc] } else { acc })
+    }
+  }
+}
+
+#[doc("The non-alias sites declaring at kind `kind`.")]
+pub fn unit_sites_of_kind(sites: [UnitSite], kind: String) : [UnitSite] =
+  match sites {
+    [] -> []
+    [s, ...rest] -> match s {
+      USite(_, _, _, k, is_alias) ->
+        if not is_alias and k == kind { [s, ...unit_sites_of_kind(rest, kind)] }
+        else { unit_sites_of_kind(rest, kind) }
+    }
+  }
+
+#[doc("The atom spelling for a resolution at `home`: module-qualified when the name is contested across modules, unchanged otherwise.")]
+pub fn unit_spell(sym: String, home: String, multi: Bool) : String =
+  if multi { mod_qualify_sym(home, sym) } else { sym }
+
+#[doc("Result of taking the next declaration site for a name off the site queue.")]
+pub type UnitPop = UPop(Option[UnitSite], [UnitSite])
+
+#[doc("Pop the first site named `name`: the site plus the remaining queue; None when the queue has none.")]
+pub fn unit_sites_pop(queue: [UnitSite], name: String) : UnitPop =
+  usq_loop(queue, name, [])
+
+fn usq_loop(queue: [UnitSite], name: String, seen: [UnitSite]) : UnitPop =
+  match queue {
+    [] -> UPop(None, list_reverse(seen))
+    [s, ...rest] ->
+      if usite_name(s) == name {
+        UPop(Some(s), list_append(list_reverse(seen), rest))
+      } else { usq_loop(rest, name, [s, ...seen]) }
+  }
