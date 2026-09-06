@@ -1,0 +1,24 @@
+# m7b #3a smoke test — single trailing lambda parses cleanly.
+#
+# Both forms are exercised:
+#   apply_to(x, () => body)     ≡ apply_to(x) { body }
+#   call_one(x => body)         ≡ call_one { x -> body }
+#   call_zero(() => body)       ≡ call_zero { body }    (no `x ->`, zero arity)
+#
+# Parser-level coverage only: no resolution / type-check needed
+# beyond the existing infrastructure for lambdas.
+
+fn apply_to(n: Int, f: (Int) -> Int) : Int = f(n)
+
+fn call_one(f: (Int) -> Int) : Int = f(7)
+
+fn call_zero(f: () -> Int) : Int = f()
+
+fn main(): Int / Console {
+  let a = apply_to(3) { x -> x + 1 }    # 4
+  let b = call_one { x -> x * 2 }       # 14
+  let c = call_zero { 5 }               # 5  (zero-arity, body is `5`)
+  let d = call_zero { -> 6 }            # 6  (explicit zero-arity arrow)
+  print("#{a + b + c + d}")             # expected: 29
+  0
+}

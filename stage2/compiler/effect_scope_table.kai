@@ -1,0 +1,136 @@
+# compiler/effect_scope_table.kai — which effect names are contested,
+# and what a name means from one module's viewpoint.
+#
+# Two modules may each declare `effect Emit`. Everything downstream —
+# the row typer, the handler typing, the evidence struct, the runtime
+# label the perform looks up — keys an effect on its spelling alone,
+# so a contested name is given a home-spelled one per declaring module
+# (`Emit__ea`) before any of that runs. Core and root declarations
+# keep the bare spelling: the core is the implicit prelude, the root
+# is the program.
+
+import compiler.util
+import compiler.ast
+import compiler.modules
+import compiler.home_spell
+
+#[doc("One effect declaration: `ESE(name, home, pub)`. Root declarations carry the target module as home.")]
+pub type ESEntry = ESE(String, String, Bool)
+
+#[doc("What one module sees: the contested declarations, its own home, the root's, the core homes, the tagged names of its imports, and its qualifier table.")]
+pub type ESCtx = { coll: [ESEntry], home: String, target: String, cores: [String],
+                   imports: [String], mt: [ModuleEntry] }
+
+#[doc("The effect declarations of `decls` whose name another home also declares, in stream order.")]
+pub fn es_collect(decls: [Decl], target: String) : [ESEntry] = {
+  let all = es_entries(decls, target, [])
+  es_keep_contested(all, all, [])
+}
+
+fn es_entries(ds: [Decl], target: String, acc: [ESEntry]) : [ESEntry] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> es_entries(rest, target, es_entry(d, target, acc))
+}
+
+fn es_entry(d: Decl, target: String, acc: [ESEntry]) : [ESEntry] = match d {
+  DEffect(p, n, _, _, _, _, _, mo) ->
+    [ESE(n, match mo { Some(m) -> m  None -> target }, p), ...acc]
+  DDoc(_, _, inner, _, _) -> es_entry(inner, target, acc)
+  DAttr(_, inner, _, _)   -> es_entry(inner, target, acc)
+  DUnstable(inner, _, _)  -> es_entry(inner, target, acc)
+  _ -> acc
+}
+
+fn es_keep_contested(all: [ESEntry], todo: [ESEntry], acc: [ESEntry]) : [ESEntry] = match todo {
+  [] -> list_reverse(acc)
+  [e, ...rest] -> match e {
+    ESE(n, home, _) ->
+      if es_other_home(all, n, home) { es_keep_contested(all, rest, [e, ...acc]) }
+      else { es_keep_contested(all, rest, acc) }
+  }
+}
+
+fn es_other_home(t: [ESEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [ESE(n, h, _), ...rest] ->
+    if n == name and h != home { true } else { es_other_home(rest, name, home) }
+}
+
+#[doc("The spelling of effect `name` declared by `home`: home-spelled when contested and neither core nor root, else bare.")]
+pub fn es_spell(cx: ESCtx, name: String, home: String) : String =
+  if home == cx.target or list_has(cx.cores, home) or not es_declares(cx.coll, name, home) { name }
+  else { hs_spell(name, home) }
+
+fn es_declares(t: [ESEntry], name: String, home: String) : Bool = match t {
+  [] -> false
+  [ESE(n, h, _), ...rest] ->
+    if n == name and h == home { true } else { es_declares(rest, name, home) }
+}
+
+#[doc("The spelling a bare `name` denotes from the context's home, by the name ladder: the module's own declaration, else the one visible import that exports it, else the bare name (core, root, ambiguous or unknown).")]
+pub fn es_resolve(cx: ESCtx, name: String) : String =
+  if es_declares(cx.coll, name, cx.home) { es_spell(cx, name, cx.home) }
+  else if es_core_declares(cx, name) { name }
+  else { match es_imported(cx.coll, name, cx.imports, []) {
+    [h] -> es_spell(cx, name, h)
+    _   -> name
+  } }
+
+# The core is the implicit prelude: a bare name it declares keeps the
+# bare spelling, which is the fixed runtime label. Without this rung a
+# module's homonym of a builtin effect captures the root file's uses of
+# the builtin, and nothing can be written to mean the builtin again.
+fn es_core_declares(cx: ESCtx, name: String) : Bool =
+  es_declares_any(cx.coll, name, cx.cores)
+
+fn es_declares_any(t: [ESEntry], name: String, homes: [String]) : Bool = match homes {
+  [] -> false
+  [h, ...rest] -> if es_declares(t, name, h) { true } else { es_declares_any(t, name, rest) }
+}
+
+#[doc("The homes a bare `name` must choose between from the context's home, or `[]` when the ladder settles it.")]
+pub fn es_contested(cx: ESCtx, name: String) : [String] =
+  # A qualifier IS the choice: `with m.E` names which `E` is handled,
+  # so the name it carries cannot be contested by another module's.
+  if es_has_qualifier(name) { [] }
+  else if es_declares(cx.coll, name, cx.home) { [] }
+  else if es_core_declares(cx, name) { [] }
+  else { match es_imported(cx.coll, name, cx.imports, []) {
+    [_] -> []
+    homes -> list_reverse(homes)
+  } }
+
+fn es_has_qualifier(name: String) : Bool = match split_dotted_qualifier(name) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn es_imported(t: [ESEntry], name: String, imports: [String], acc: [String]) : [String] = match t {
+  [] -> acc
+  [ESE(n, h, p), ...rest] ->
+    if n == name and p and list_has(imports, h) and not list_has(acc, h) {
+      es_imported(rest, name, imports, [h, ...acc])
+    } else { es_imported(rest, name, imports, acc) }
+}
+
+#[doc("The spelling a qualified `mod.name` denotes, when `mod` is a visible module exporting `name`: home-spelled when contested, bare otherwise. None leaves the qualifier for the qualifier passes.")]
+pub fn es_resolve_qualified(cx: ESCtx, mod: String, name: String) : Option[String] =
+  match mt_lookup(cx.mt, mod) {
+    None -> None
+    Some(me) -> {
+      let home = mt_tagged_name(cx.mt, mod)
+      if me_has_export(me, name) {
+        Some(es_spell(cx, name, home))
+      } else { None }
+    }
+  }
+
+#[doc("The spelling an effect reference denotes: `m.E` picks the home when it exports `E`, a bare `E` follows the ladder; an unresolvable qualifier stays verbatim for the qualifier passes.")]
+pub fn es_resolve_ref(cx: ESCtx, n: String) : String =
+  match split_dotted_qualifier(n) {
+    None -> es_resolve(cx, n)
+    Some(q) -> match q { QSplit(m, bare) -> match es_resolve_qualified(cx, m, bare) {
+      Some(s) -> s
+      None    -> n
+    } }
+  }

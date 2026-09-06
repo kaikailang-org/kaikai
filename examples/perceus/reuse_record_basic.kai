@@ -1,0 +1,29 @@
+# Issue #210 — Perceus reuse-in-place, record rebuild.
+#
+# `shift_x` consumes a `Point { x, y, z }` and rebuilds another
+# `Point { x: ..., y: ..., z: ... }` of the same arity. The typer-aware
+# shape predicate (issue #210) compares the scrutinee's resolved
+# `TyCon("Point", [])` to the rebuild expression's resolved type;
+# they match, so the recogniser emits `__perceus_reuse_record`. The
+# runtime helper `kai_reuse_or_alloc_record` (stage0/runtime.h) reuses
+# the scrutinee cell when its refcount is unique; otherwise it falls
+# back to `kai_record`.
+#
+# See `docs/perceus-hanga-roa-phase0-audit.md` §1.C for the motivating
+# sites (Parser / Lexer / FmtSt rebuilds; ~472 candidate sites in
+# stage 2 alone).
+
+type Point = { x: Int, y: Int, z: Int }
+
+fn shift_x(p: Point, dx: Int) : Point = match p {
+  { x: x0, y: y0, z: z0 } -> Point { x: x0 + dx, y: y0, z: z0 }
+}
+
+fn main() : Int / Console = {
+  let p = Point { x: 10, y: 20, z: 30 }
+  let q = shift_x(p, 5)
+  print(int_to_string(q.x))
+  print(int_to_string(q.y))
+  print(int_to_string(q.z))
+  0
+}
