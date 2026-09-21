@@ -1,0 +1,18 @@
+#[doc("""
+Handler-runner for the `Reader[T]` read-only ambient-value effect.
+The body invokes `Reader.ask()`; the handler decides what to serve,
+sparing users from inlining `handle ... with Reader[T] { ... }` at
+every call site.
+""")]
+
+#[doc("""
+Run `body` under a `Reader[T]` handler that serves `env` to
+every `Reader.ask()` call. Returns the body's result; the
+`Reader[T]` row is consumed entirely by the handler.
+""")]
+pub fn with_reader[T, S](env: T, body: () -> S / Reader[T]) : S = {
+  handle { body() } with Reader[T](env) {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+}

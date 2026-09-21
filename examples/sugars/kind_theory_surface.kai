@@ -1,0 +1,19 @@
+# Positive fixture: the `kind` declaration surface parses in user code
+# (classifying a user type against a catalog theory), and the existing
+# units-of-measure surface (`unit`, `Real<m>`, unit literals) keeps
+# working identically — v1 keeps Measure on its hardcoded path, so the
+# catalog decl is recognised but changes no runtime behaviour. The
+# `theory` decl itself lives only in the catalog (core/kinds.kai), so
+# user code names an existing theory rather than declaring one.
+
+kind Measure : AbelianGroup with unit
+
+unit m
+
+fn scale(d: Real<m>) : Real<m> = d
+
+fn main() : Unit / Console = {
+  let d : Real<m> = 5.0<m>
+  let _ = scale(d)
+  print("kind surface ok")
+}

@@ -1,0 +1,341 @@
+# Namespace collision coverage matrix.
+#
+# One row per cell of (name class × collision shape × use position ×
+# polarity) that the model in docs/namespaces-design.md makes meaningful.
+# `tests/namespace_matrix.sh` fails when a row has neither a fixture nor
+# a written reason, so coverage stops depending on anyone's judgement
+# about what is worth testing.
+#
+# Columns: class <TAB> shape <TAB> position <TAB> polarity <TAB> fixture-or-reason <TAB> axes
+#
+# The fifth column is either a directory under
+# examples/namespace-collisions/ or one of:
+#   N/A: <reason>    — the cell cannot be expressed in the language
+#   TODO             — a real gap; the gate fails on these
+#
+# The sixth column lists the execution axes the row's fixtures run on,
+# comma-separated; `-` on N/A rows. This is the ONLY place the corpus
+# harness reads its fixture lists from — the `test-namespace-collisions*`
+# targets in stage2/Makefile derive them through
+# `tests/namespace_matrix_axes.sh <axis>` — so a fixture counted here is
+# a fixture executed. Every fixture row carries at least one axis with a
+# harness behind it. Each axis runs in CI under a per-axis failure
+# ratchet (tools/nscol-baseline.txt, tools/nscol-ratchet.sh): the C-only
+# axes in tier1, native/neg-native in tier1-native, asan in tier1-asan.
+# Labels:
+#   c           whole-program C build, stdout vs main.out.expected
+#   native      same, native backend
+#   asan        C build under ASAN+UBSAN, gated on sanitizer diagnostics
+#   neg         must fail to compile; stderr contains main.err.expected line 1
+#   neg-native  same, native backend
+#   diag        every line of DIAG.expected is a stderr substring (exit ignored)
+#   testsym     `kai test`; main.test.expected line 1 is an output substring
+#   check       `kai check`; main.check.expected line 1 is an output substring
+#   modular     separate compilation (`--emit=c-modular`, one TU per module,
+#               `KAI_MODULAR=1`), stdout vs main.out.expected
+#   neg-modular same, must fail to compile; main.err.expected line 1 in stderr
+# Each label requires the golden it names to be on disk.
+#
+# A cell carries at least TWO fixtures. One example proves the shape
+# reproduces once, which is how a cell goes green while its variants stay
+# untested — the single fixture is always the benign arrangement, because
+# that is the one you reach for first. A cell that genuinely admits only
+# one arrangement writes `shallow: <reason>` in the polarity column.
+#
+# Adding a class to §2 of the design means adding its rows here.
+
+# ---- functions ----
+function	two-modules	bare	diagnose	neg_ambiguous_fn_bare	neg,neg-native,diag
+function	two-modules	qualified	resolve	green_fn_homonym	c,native
+function	two-modules	bare-generic	diagnose	neg_import_order_cannot_decide,neg_import_order_alias_ties	neg,neg-native,diag
+function	two-modules	qualified-generic	resolve	import_order_stable_qualified,import_order_stable_alias	c,native
+function	two-modules	local-binder	resolve	local_binder_shadows_homonyms,local_binder_derive_field	c,native
+function	two-modules	bare	quality	neg_names_candidates	neg,neg-native,diag
+function	uppercase	declaration	diagnose	uppercase_fn_rejected	neg,neg-native
+function	vs-builtin	bare	diagnose	neg_shadow_prelude_fn	neg,neg-native
+function	vs-local	bare	resolve	shadow_local_over_module	c,native
+function	vs-local	interpolation	resolve	shadow_local_over_module_interp,shadow_local_over_module_interp_arm	c,native,modular
+function	vs-nullary-op	bare	resolve	import_fn_shadows_nullary_op,import_fn_shadows_nullary_op_third	c,native
+function	vs-core	bare	resolve	import_beats_core_bare,import_beats_core_bare_arity,import_beats_core_bare_both_arity	c,native,modular
+type	vs-core-shadow	root-decl	resolve	root_type_shadows_core_type,root_type_shadows_core_result	c,native,modular
+effect	vs-core-default	root-shadow	resolve	root_effect_shadows_core_default,root_effect_shadows_core_default_sig	neg
+effect	vs-module-default	root-shadow	shallow: the prelude arrangement is its own row; this one pins that the rule is about which declaration answers, not about the prelude	root_effect_shadows_module_default	neg
+function	vs-core-generic	root-bare	resolve	generic_root_vs_core_bare,generic_root_bound_vs_core	c,native,modular
+function	vs-core-generic	module-qualified	resolve	generic_module_vs_core_bare,generic_module_vs_module_bare	c,native,modular
+function	vs-core-generic	mono-control	resolve	generic_root_vs_core_mono,generic_root_vs_core_mono_target	c,native,modular
+function	local-shadows-generic	spec-self-call	resolve	generic_local_shadows_self,generic_arm_binder_shadows_self	c,native,modular
+function	vs-stdlib	lambda-body	resolve	own_fn_from_lambda_body,own_fn_from_lambda_body_two_modules	c,native,modular
+function	vs-stdlib	clause-body	resolve	own_fn_from_handler_clause,own_fn_from_handler_clause_two_modules	c,native,modular
+function	vs-stdlib	finally-body	resolve	own_fn_from_finally_clause,own_fn_from_finally_clause_two_modules	c,native,modular
+function	vs-stdlib	call-forms	resolve	own_fn_call_forms_matrix,own_fn_call_forms_matrix_nested	c,native,modular
+function	unimported	qualified	diagnose	neg_qualify_unimported	neg,neg-native
+function	private	qualified	diagnose	neg_qualify_private_symbol	neg,neg-native
+
+# ---- constants ----
+constant	two-modules	qualified	resolve	green_const_homonym	c,native
+constant	two-modules	interpolation	resolve	green_const_interp	c,native
+constant	two-modules	bare	diagnose	neg_ambiguous_const_bare	neg,neg-native,neg-modular
+constant	two-modules	bare	quality	diag_const_candidates	diag
+constant	vs-function	qualified	resolve	cross_const_vs_fn	c,native
+constant	two-modules	pattern	resolve	const_pattern_qualified,const_pattern_qualified_nested	c,native,modular
+
+# ---- nominal types ----
+type	two-modules	qualified	resolve	green_type_homonym	c,native
+type	two-modules	interpolation	resolve	green_type_interp,green_type_interp_module_home	c,native
+type	two-modules	cross-call	diagnose	type_homonym_cross_call_rejected,type_homonym_record_cross_call_rejected	neg,neg-native
+type	two-modules	bare	diagnose	neg_ambiguous_type_bare,type_bare_contested_at_call_site,diag_type_candidates	neg,neg-native,neg-modular
+type	two-modules	pipe	shallow: the head is the value's own type, one home decides; a second arrangement adds no rung	pipe_head_homonym	c,native,modular
+type	two-modules	bare	quality	diag_type_candidates,diag_contested_type_display,type_bare_contested_at_call_site	diag
+type	two-modules	declaration	resolve	const_annot_contested_type,effect_op_sig_contested_type	c,native,modular
+type	vs-stdlib	qualified	resolve	shadow_stdlib_type_name	c,native
+type	vs-protocol	same-module	resolve	cross_protocol_vs_type	c,native,modular
+type	lowercase	declaration	diagnose	N/A: the parser already requires an uppercase type name	-
+type	two-modules	protocol-op-sig	resolve	proto_op_sig_contested_type,proto_op_sig_contested_both_homes	c,native,modular
+type	two-modules	axiom-sig	resolve	axiom_sig_contested_type,axiom_sig_contested_both_homes	c,native,modular
+type	two-modules	compound	resolve	type_nested_in_compound,type_nested_in_compound_deep	c,native,modular
+type	two-modules	import-visibility	resolve	type_import_visibility_bare,type_import_visibility_order_stable	c,native
+type	generic	qualified	resolve	type_generic_qualified,type_generic_qualified_nested	c,native
+type	recursive	qualified	resolve	type_recursive_qualified,type_recursive_qualified_mutual	c,native
+type	three-modules	qualified	resolve	type_three_modules,type_three_modules_divergent	c,native
+type	eight-modules	qualified	resolve	type_scale_eight_modules,type_scale_eight_modules_divergent	c,native
+type	transitive	qualified	resolve	type_transitive_three_modules,type_transitive_four_layers	c,native
+type	diamond	qualified	resolve	type_diamond_shared_base,type_diamond_colliding_branches	c,native
+type	reexport	qualified	resolve	type_reexport_same_home,type_reexport_two_levels	c,native
+type	reexport-conflict	qualified	resolve	type_reexport_conflict,type_reexport_conflict_qualified	c,native
+type	vs-core	qualified	resolve	type_vs_core_qualified,type_vs_core_qualified_result	c,native
+type	named-like-ctor	qualified	resolve	type_named_like_foreign_ctor,type_named_like_own_ctor	c,native
+type	module-named-like-type	qualified	resolve	type_module_named_like_type,type_module_named_like_type_qualified	c,native
+type	inside-fiber	qualified	resolve	type_inside_fiber,type_inside_fiber_crossing	c,native
+type	inside-region	qualified	resolve	type_inside_region,type_inside_region_two_modules	c,native
+type	vs-effect	same-module	resolve	type_vs_effect_same_module,type_vs_effect_two_modules	c,native
+type	wrong-module	qualified	diagnose	neg_type_qualify_wrong_module,neg_type_qualify_wrong_module_homonym	neg,neg-native
+type	private	qualified	diagnose	neg_type_qualify_private,neg_type_qualify_private_homonym	neg,neg-native
+type	unimported	qualified	diagnose	neg_type_qualify_unimported,neg_type_qualify_unimported_homonym	neg,neg-native
+type	type-param	bare	resolve	type_param_vs_contested_import,type_param_vs_contested_import_return	c,native
+type	imported-module	bare	diagnose	type_bare_contested_in_imported_module,type_bare_contested_in_imported_module_return	neg,neg-native
+type	imported-module	diagnostic	quality	diag_type_position_owner,diag_type_position_owner_return	diag
+type	vs-builtin	qualified	diagnose	type_shadows_builtin_int,type_shadows_builtin_string	neg,neg-native
+type	vs-builtin	declaration	diagnose	neg_type_redeclares_builtin_int,neg_type_redeclares_builtin_byte	neg,neg-native
+type	union-member	qualified	resolve	type_union_member_qualified,type_union_member_qualified_mixed	c,native
+type	type-param	declaration	resolve	type_param_vs_contested_import_on_type,type_param_vs_contested_import_nested	c,native
+type	uppercase	declaration	diagnose	N/A: an uppercase initial is the required form for a type, so there is nothing to reject; the inverse case is the `lowercase` row above	-
+type	named-like-op	declaration	diagnose	N/A: effect operation names must start lowercase and type names uppercase, so the two can never share a spelling	-
+type	vs-function	qualified	resolve	N/A: function names must start lowercase and type names uppercase, so no function can contest a type's spelling	-
+type	vs-nullary-op	bare	resolve	N/A: a nullary protocol operation is reached in expression position, where a type name never appears	-
+type	vs-local	bare	resolve	N/A: a `let` or parameter binder names a value; the type-position binder is a type parameter, covered by the `type-param` rows	-
+type	alias	import	resolve	N/A: `import` names a module path, so an alias renames the module, never a type it exports	-
+type	alias-shadow	import	diagnose	N/A: `import ... as` binds a module name; a type is not a candidate for the alias to shadow	-
+type	basename	import	resolve	N/A: the basename in an import path selects a module file; a type never appears in that position	-
+type	cycle	import	diagnose	N/A: an import cycle is a relation between module files, not between the types they declare	-
+type	keyword	import	diagnose	N/A: the keyword check applies to the module name an import parses, and a type is never that name	-
+type	mangling	import	resolve	N/A: the import-path mangling that can collide is over module paths; a type's emitted symbol is covered by the `emitted symbols` rows	-
+type	missing	import	diagnose	N/A: a missing import names a module that does not resolve; a type absent from a module that does resolve is the `wrong-module` row	-
+type	selective-missing	import	diagnose	N/A: `import m.{X}` naming an absent symbol is one diagnostic over every class, owned by the module rows	-
+type	unused	import	quality	N/A: the unused-import warning is about the module binding, which a type use satisfies like any other reference	-
+type	vs-stdlib	import	resolve	N/A: shadowing a stdlib module is a property of the module binding; a type contesting a stdlib type's spelling is the `vs-core` row	-
+
+# ---- type aliases ----
+alias	two-modules	qualified	resolve	green_type_alias_homonym,alias_stdlib_money_import	c,native
+alias	three-modules	qualified	resolve	alias_qualified_third_module,alias_qualified_own_imports	c,native,modular
+alias	vs-nominal	cross-module	resolve	alias_vs_nominal_cross_module,alias_vs_nominal_own_main	c,native,modular
+alias	vs-core	two-modules	resolve	alias_vs_core_stdlib,alias_vs_core_result	c,native,modular
+alias	private	bare-cross-module	diagnose	neg_private_alias_bare,neg_private_alias_bare_homonym	neg,neg-native
+
+# ---- variant constructors ----
+constructor	two-modules	qualified-expr	resolve	ctor_qualified_pattern,ctor_qualified_expr_nested	c,native,asan
+constructor	two-modules	qualified-pattern	resolve	ctor_qualified_pattern,ctor_qualified_pattern_mixed	c,native,asan
+constructor	two-modules	bare	deep	neg_ambiguous_ctor_bare,neg_ambiguous_ctor_payload	neg,diag
+constructor	two-modules	bare	quality	diag_ctor_candidates,diag_ctor_candidates_three	diag
+
+constructor	divergent-payload	qualified	deep	ctor_payload_divergent,ctor_payload_record_vs_scalar,ctor_payload_list_vs_scalar,ctor_payload_bool_vs_string	c,native,asan
+constructor	same-arity-diff-types	qualified	resolve	ctor_same_arity_diff_types,ctor_same_arity_same_payload	c,native
+constructor	three-modules	qualified	resolve	ctor_nullary_three_modules,ctor_nullary_own_bare_arg	c,native
+constructor	eight-modules	qualified	resolve	scale_eight_modules,scale_eight_modules_divergent	c,native
+constructor	vs-core	qualified	resolve	ctor_vs_stdlib_some,ctor_vs_core_result	c,native
+constructor	generic	qualified	resolve	ctor_generic_homonym,ctor_generic_same_arity	c,native
+constructor	recursive	qualified	resolve	ctor_recursive_homonym,ctor_recursive_mutual	c,native
+constructor	clause-block	pattern	resolve	ctor_clause_block_arm,ctor_clause_block_two_modules	c,native
+constructor	vs-function	qualified	resolve	cross_ctor_vs_fn,ctor_vs_fn_three_modules	c,native
+constructor	bogus-qualifier	pattern	diagnose	ctor_pattern_bogus_qualifier,ctor_pattern_qualifier_is_local	neg,neg-native
+constructor	record-variant	qualified-pattern	deep	ctor_record_pattern_qualified,ctor_record_pattern_qualified_foreign	neg,neg-native
+constructor	record-variant	qualified-pattern-core	deep	ctor_record_pattern_qualified_core,ctor_record_pattern_qualified_homonym	c,native
+constructor	wrong-module	qualified	diagnose	neg_qualify_wrong_module,neg_qualify_wrong_module_homonym	neg,neg-native
+constructor	wrong-arity	qualified-expr	diagnose	neg_ctor_wrong_arity,neg_ctor_wrong_arity_homonym	neg,neg-native
+constructor	wrong-arity	qualified-pattern	diagnose	neg_pattern_wrong_arity,neg_pattern_wrong_arity_homonym	neg,neg-native
+constructor	inside-fiber	qualified	resolve	ortho_spawn_ctor,ortho_spawn_ctor_crossing	c,native
+constructor	inside-region	qualified	resolve	ortho_region_ctor,ortho_region_ctor_two_modules	c,native
+constructor	tag-pressure	qualified	resolve	adv_ctor_tag_hash_pressure,ctor_tag_pressure_reordered	c,native
+constructor	emitted-tag	emission	resolve	emit_variant_tag_distinct,emit_variant_tag_derived	c,native
+constructor	vs-binder	pattern	resolve	shadow_binder_over_ctor,shadow_binder_nested_pattern	c,native
+constructor	diamond	qualified	resolve	diamond_colliding_branches,diamond_reexported_apex	c,native
+constructor	transitive	qualified	resolve	transitive_three_modules,transitive_four_layers	c,native
+constructor	false-cause	bare	quality	diag_no_false_cause,diag_no_false_cause_arity	diag
+
+
+# ---- record fields ----
+field	two-modules	projection	resolve	green_record_field_homonym	c,native
+field	vs-ufcs	projection	resolve	dot_field_beats_ufcs	c,native
+field	vs-effect-op	projection	resolve	cross_effect_op_vs_field	c,native
+
+# ---- effects ----
+effect	two-modules	row	resolve	effect_name_homonym,effect_name_homonym_both_rows	c,native,modular
+effect	two-modules	bare	diagnose	neg_ambiguous_effect_bare,neg_ambiguous_effect_bare_handler	neg,neg-native,neg-modular
+effect	two-modules	bare	quality	diag_effect_candidates,diag_effect_candidates_three	diag,neg,neg-native,neg-modular
+effect	two-modules	qualified-row	resolve	effect_qualified_row,effect_qualified_row_three	c,native,modular
+effect	qualified-row	declaration	resolve	effect_row_qualified,effect_row_qualified_two_homes	c,native,modular
+effect	vs-type	same-module	resolve	type_effect_same_name,type_effect_same_name_cross_module	c,native
+effect	vs-type	bare	diagnose	disambig_type_effect_bare,disambig_type_effect_bare_two_effects	neg,neg-native
+effect	vs-stdlib	row	resolve	shadow_stdlib_effect_name,shadow_stdlib_effect_stdout	c,native
+effect	vs-builtin-in-main	row	resolve	builtin_effect_homonym_in_main,builtin_effect_homonym_two_rows	c,native,modular
+effect	vs-module	dot	resolve	dot_module_named_like_effect,dot_module_named_like_own_effect	c,native
+effect	vs-local	dot	resolve	dot_local_shadows_effect,dot_local_shadows_effect_in_handler	c,native,modular
+effect	raw-c	row	quality	diag_no_raw_c,diag_no_raw_c_handled	diag
+effect	nested-handlers	row	resolve	handler_nested_same_effect,handler_nested_homonym_effects,effect_homonym_inner_handler_not_captured	c,native
+effect	evidence-label	emission	resolve	emit_evidence_label_homed,emit_evidence_label_across_call	c,native
+
+effect	vs-fiber-local	handler	resolve	fiber_local_effect_homonym,fiber_local_op_names_shared,fiber_local_ops_vs_user_fns	c,native,modular
+effect	vs-fiber-local-cancel	handler	resolve	fiber_local_cancel_homonym,fiber_local_cancel_op_shared	c,native,modular
+effect	vs-fiber-local-link	handler	resolve	fiber_local_link_homonym,fiber_local_link_op_shared	c,native,modular
+effect	vs-fiber-local-monitor	handler	resolve	fiber_local_monitor_homonym,fiber_local_monitor_op_shared	c,native,modular
+
+# ---- effect operations ----
+effect-op	two-modules	qualified	resolve	effect_op_qualified	c,native
+effect-op	two-modules	interpolation	resolve	green_effect_op_interp,green_effect_op_interp_handler	c,native
+effect-op	two-effects	opened	diagnose	adv_use_two_effects_same_op	neg,neg-native,diag
+effect-op	uppercase	declaration	diagnose	uppercase_effect_op_rejected	neg,neg-native
+effect-op	capability	dispatch	resolve	N/A: moved to examples/effects/ when the capability RC defect was fixed	-
+
+# ---- handlers ----
+handler	same-position	emission	deep	handler_symbol_same_position,handler_two_clauses_same_position,handler_string_op_same_position	c,native,asan
+handler	import-order	emission	resolve	handler_symbol_import_order	c,native,asan
+handler	qualified-head	interpolation	resolve	green_handler_head_qualified_interp,green_handler_head_alias_interp	c,native,modular
+handler	unparsable-body	interpolation	diagnose	neg_interp_parse_error,neg_interp_parse_error_triple	neg,neg-native
+handler	three-modules	emission	resolve	adv_three_handlers_same_position	c,native
+handler	nested-two-modules	row	resolve	handler_nested_two_modules,handler_nested_two_modules_swapped	c,native,modular
+handler	nested-two-modules	escape	diagnose	handler_nested_escape_rejected,handler_wrong_module_rejected	neg,neg-native,neg-modular
+
+# ---- protocols ----
+protocol	two-modules	dispatch	diagnose	neg_ambiguous_protocol_bare	neg,neg-native,neg-modular
+protocol	two-modules	dispatch	resolve	proto_homonym_scope_chain,proto_homonym_vs_stdlib	c,native,modular
+protocol	two-modules	bare	quality	diag_protocol_candidates	diag
+protocol	shared-op	dispatch	resolve	protocol_op_dispatcher	c,native,modular
+protocol	vs-effect-op	dispatch	resolve	cross_proto_op_vs_effect_op	c,native,modular
+protocol	laws	dispatch	resolve	protocol_laws_homonym	c,native,asan,modular
+protocol	cross-module-impl	dispatch	resolve	protocol_laws_cross_exempt	c,native,check,modular
+
+# ---- impls ----
+impl	same-pair	dispatch	resolve	impl_same_pair_distinct_homes	c,native,modular
+impl	genuine-duplicate	declaration	diagnose	neg_duplicate_impl_genuine	neg,neg-native
+impl	orphan-two-modules	declaration	diagnose	adv_orphan_impl_two_modules	neg,neg-native
+impl	derive-show	declaration	resolve	derive_homonym_types	c,native,modular
+impl	derive-eq	declaration	deep	derive_eq_homonym_types,derive_two_protocols_homonym	c,native,modular
+impl	vs-function	dispatch	resolve	cross_impl_vs_fn	c,native
+impl	qualified	declaration	resolve	impl_qualified	c,native
+impl	derive-qualified	declaration	resolve	derive_qualified_stdlib_protocol,derive_qualified_module_protocol	c,native,modular
+impl	derive-ambiguous	declaration	diagnose	derive_ambiguous_protocol,derive_ambiguous_protocol_crash	neg,neg-native,neg-modular
+impl	derive-json	declaration	resolve	derive_json_homonym_types,derive_json_homonym_decode	c,native,modular
+
+# ---- units and habitants ----
+unit	two-modules	suffix	resolve	unit_homonym_two_modules	c,native
+unit	two-modules	combined	resolve	unit_homonym_product,unit_homonym_cancel	c,native,modular
+unit	two-modules	combined	diagnose	unit_homonym_sum_rejected,unit_homonym_call_rejected	neg,neg-native,neg-modular
+habitant	multi-kind	qualified	resolve	disambig_habitant_multi_kind	c,native
+habitant	multi-kind	use-kind	resolve	disambig_habitant_use_kind	c,native
+habitant	multi-kind	bare	diagnose	disambig_habitant_bare_ambiguous	neg,neg-native
+habitant	vs-const	suffix	resolve	cross_habitant_vs_const	c,native
+habitant	vs-type	declaration	resolve	N/A: habitants are lowercase and types uppercase, so the spelling cannot collide	-
+habitant	use-kind	suffix	resolve	use_kind_per_module,use_kind_not_leaked	c,native
+habitant	use-kind	bare	diagnose	neg_use_kind_not_leaked	neg,neg-native
+habitant	module-qualifier	suffix	diagnose	habitant_module_qualifier_type,habitant_module_qualifier_literal	neg,neg-native
+habitant	currency	cross-module	resolve	currency_homonym_module_scoped,currency_homonym_own_wins	c,native,modular
+habitant	currency	bare	diagnose	currency_homonym_bare_ambiguous,currency_homonym_bare_in_annotation	neg,neg-native,neg-modular
+habitant	perm	cross-module	resolve	perm_homonym_module_scoped,perm_homonym_own_wins	c,native,modular
+habitant	perm	bare	diagnose	perm_homonym_bare_ambiguous,perm_homonym_bare_joined	neg,neg-native,neg-modular
+habitant	layout	cross-module	resolve	layout_homonym_types_qualified,layout_homonym_qualified_construction	c,native,modular
+habitant	layout	cross-module	diagnose	layout_homonym_cross_call_rejected,layout_be_vs_le_rejected	neg,neg-native,neg-modular
+
+# ---- kinds ----
+kind	two-modules	declaration	diagnose	neg_kind_theory_conflict	neg,neg-native
+kind	two-modules	bare	quality	diag_kind_candidates	diag
+introducer	duplicate	declaration	diagnose	neg_introducer_duplicate	neg,neg-native
+
+# ---- extern ----
+extern-type	two-modules	declaration	diagnose	neg_extern_type_layout_conflict	neg,neg-native
+extern-type	two-modules	bare	quality	diag_extern_type_candidates	diag
+extern-fn	two-modules	qualified	resolve	extern_fn_homonym	c,native
+extern-fn	same-symbol	declaration	diagnose	extern_fn_signature_conflict,extern_fn_arity_conflict	neg,neg-native,neg-modular
+extern-fn	override	declaration	diagnose	extern_fn_symbol_override_conflict,extern_fn_override_arity_conflict	neg,neg-native,neg-modular
+extern-fn	override	declaration	resolve	extern_fn_override_distinct_symbols,extern_fn_override_same_symbol_ok	c,native,modular
+extern-fn	same-symbol	declaration	resolve	extern_fn_same_symbol_two_modules,extern_fn_same_symbol_three_modules	c,native,modular
+
+# ---- axioms ----
+axiom	two-modules	qualified	resolve	axiom_homonym	c,native
+
+# ---- constructor attribute ----
+ctor-attr	two-modules	declaration	resolve	ctor_attr_two_modules_ok,constructor_attr_homonym	c,native
+
+# ---- tests ----
+test	same-position	emission	resolve	test_symbol_same_position	testsym
+test	same-label	declaration	resolve	test_name_homonym	c,native
+
+# ---- modules ----
+module	basename	import	resolve	module_basename_clash,module_home_same_basename	c,native,modular
+module	vs-stdlib	import	resolve	adv_module_shadows_stdlib,module_home_local_core_clash,module_shadows_stdlib_log,module_named_like_builtin_effect	c,native,modular
+module	alias-shadow	import	diagnose	adv_alias_shadows_module	neg,neg-native,neg-modular
+module	alias	import	resolve	import_alias_disambiguates	c,native
+module	selective	import	resolve	selective_import_no_collision,selective_import_qualified_ctor,selective_import_settles_contested_const,selective_import_settles_contested_type,selective_import_settles_contested_effect	c,native,modular
+module	selective-missing	import	diagnose	neg_selective_missing_symbol	neg,neg-native,neg-modular
+module	missing	import	diagnose	neg_import_missing_module	neg,neg-native
+module	cycle	import	diagnose	neg_import_cycle	neg,neg-native
+module	unused	import	quality	import_unused_warning,import_unused_alias_and_module	diag,c,native,modular
+module	reexport	qualified	resolve	reexport_same_home	c,native
+module	reexport-two-levels	qualified	resolve	reexport_two_levels	c,native
+module	reexport-conflict	qualified	resolve	adv_reexport_conflict	c,native
+module	diamond	qualified	resolve	diamond_shared_base	c,native
+module	named-like-type	dot	resolve	adv_module_named_like_its_type,module_named_like_foreign_type	c,native,modular
+module	named-bit	dot	resolve	dot_module_named_bit	c,native,modular
+module	mangling	import	resolve	adv_mangling_collision	c,native
+module	keyword	import	diagnose	N/A: a module named after a keyword is rejected at the import	-
+module	position-owner	diagnostic	quality	diag_position_owner	diag
+
+# ---- privacy ----
+privacy	private-type-leak	qualified	diagnose	neg_private_type_leak	neg,neg-native
+
+# ---- emitted symbols ----
+symbol	internal-prefix	emission	resolve	adv_name_internal_prefix	c,native
+symbol	user-collides-emitted	emission	resolve	adv_user_name_hits_emitted_symbol	c,native
+symbol	case-only	emission	resolve	adv_case_only_difference	c,native
+
+# ---- three-segment paths ----
+path	record-of-record	dot	resolve	dot_three_segment_record	c,native
+path	module-record-field	dot	resolve	dot_three_segment_module_field,dot_three_segment_module_const	c,native,modular
+
+# ---- build-level properties ----
+cache	warm	compilation	resolve	cache_warm_same_result	c,native
+cache	after-rename	compilation	resolve	adv_cache_after_rename	c,native
+tags	insertion-stability	compilation	resolve	sepcomp_tag_stability	c,native
+fmt	qualified-roundtrip	formatting	resolve	fmt_qualified_roundtrip	c,native
+
+# ---- rows added when the gate reported them unclaimed ----
+constructor	same-payload	bare	diagnose	ctor_same_payload,ctor_same_payload_nullary	neg,diag
+constructor	vs-core-variant	qualified	resolve	ctor_vs_prelude_ok,ctor_vs_prelude_option	c,native
+constructor	named-like-type	qualified	resolve	adv_ctor_named_like_type,ctor_named_like_own_type	c,native
+constructor	payload-matrix	qualified	resolve	adv_ctor_payload_matrix,ctor_payload_matrix_arity	c,native
+constructor	consequence	bare	quality	diag_states_consequence,diag_states_consequence_nullary	diag
+effect	named-like-op	declaration	diagnose	adv_effect_named_like_op,adv_effect_op_named_like_own_effect	neg,neg-native,neg-modular
+
+extern-type	two-modules	qualified	resolve	extern_type_homonym	neg,neg-native
+introducer	duplicate	declaration	resolve	introducer_duplicate	neg,neg-native
+kind	import-order	declaration	resolve	kind_theory_import_order	neg,neg-native
+function	vs-param	dot	resolve	shadow_param_over_module	c,native
+
+# ---- resolution ladder (§4), each rung exercised end to end ----
+ladder	local-over-opened	bare	resolve	ladder_local_over_opened	c,native
+ladder	own-over-imported	bare	resolve	ladder_own_over_imported	c,native
+ladder	qualified-over-own	qualified	resolve	ladder_qualified_over_own	c,native
+ladder	unique-across-imports	bare	resolve	ladder_unique_across_imports	c,native
+ladder	nothing-resolves	bare	diagnose	ladder_ambiguous_errors	diag
+constructor	match-from-third-module	pattern	resolve	ctor_match_from_third_module,ctor_nested_pattern_from_third_module	c,native
+function	two-modules	import-visibility	resolve	import_visibility_bare_call,import_visibility_order_stable	c,native
+function	module-named-like-value	qualified	resolve	module_qualifier_over_contested_fn,module_qualifier_alias_over_contested_fn	c,native
+function	combinator-vs-stdlib	call	resolve	loop_combinator_contested_name,loop_combinator_contested_qualified	c,native
