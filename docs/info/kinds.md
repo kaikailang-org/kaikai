@@ -1,0 +1,473 @@
+# kinds
+
+Kinds classify types the way types classify values — one closed
+catalog of unification theories, each with a decidable engine.
+
+## Description
+
+A *value* `42` has a *type* `Int`; a *type* `Int` has a *kind*
+`Type`. Most languages expose only `Type`, so the concept stays
+invisible. kaikai exposes more kinds so the type system can keep
+units, currencies, memory regions, and binary layouts separate from
+ordinary types — each with its own compile-time algebra, all erased at
+runtime.
+
+Three words carry the whole system:
+
+- A **theory** is a *decidable unification algebra* — one hardcoded
+  engine per theory, drawn from a closed catalog. It decides type
+  equality at compile time and is erased at runtime.
+- A **kind** is a name *classified by a theory* (`Measure` is
+  classified by `AbelianGroup`). A kind's members are its
+  **habitants**.
+- The **habitant→theory contract**: each theory says what it needs
+  from a habitant. `AbelianGroup` treats habitants as opaque symbols
+  it multiplies and divides; `Composition` asks each habitant for a
+  measure it can sum. A habitant fulfils the contract by its
+  declaration.
+
+Theories are a *closed* catalog because E-unification over arbitrary
+equational theories is undecidable. The compiler owns a terminating
+engine for each recognised theory; there is no way to write the
+equations of a new one. This is the same discipline that forbids
+Haskell-style type-class resolution (CLAUDE.md Tier 1 #3).
+
+## The catalog
+
+Every kind is declared in `stdlib/core/kinds.kai` over a theory:
+
+| Kind | Theory | Habitants |
+|---|---|---|
+| `Type` | `HindleyMilner` | ordinary types (`Int`, `[T]`, records, sums) |
+| `Effect` | `EffectRow` | effect labels (`Stdout`, `State`, `Spawn`) |
+| `Measure` | `AbelianGroup` | units of measure (`m`, `kg`, `m/s`) |
+| `Currency` | `Module` | currencies (`USD`, `EUR`) |
+| `Perm` | `Semilattice` | typed capabilities (`read`, `write`, user perms) |
+| `Region` | `Nominal` | memory arenas (each `region { r -> }` mints one) |
+| `Layout` | `Composition` | byte-order modifiers (`be`, `le`) |
+| `Dim` | `HindleyMilner` | static shape indices (`<3>`, any `Int` value) |
+| `Shape` | `ConstructorApp` | arity-1 constructors (`List`, `Vec`, `Option`, user `Tree[a]`) |
+
+One theory names one unification engine. A theory is never a label over
+a guard that reuses another theory's engine, so two kinds share a theory
+only when they genuinely share the engine.
+
+`Type` and `Effect` are `builtin`: their engine is the compiler core
+itself (HM unification, row unification), and they are closed — user
+code can neither redeclare them nor declare a new `builtin` theory. The
+same closure applies to `Nominal` and `ConstructorApp`.
+
+## The theories
+
+- `AbelianGroup = { assoc, commut, inverse, identity }` — habitants
+  multiply and divide (`m·s`, `m/s²`). The engine solves linear
+  integer equations to unify unit variables.
+- `Module = { assoc, commut, inverse, identity }` used additively:
+  habitants unify by nominal atom equality and have no product, so
+  `USD²` and `USD·EUR` are rejected at formation. Scaling lives in
+  operation signatures (`Money[t]<c> * t` keeps the currency), not
+  in the kind algebra.
+- `Nominal = builtin` — identity alone: two habitants unify iff they
+  are the same habitant. No product, no sum. The engine for regions,
+  where each arena is distinct.
+- `ConstructorApp = builtin` — witness-binding of arity-1 type
+  constructors: `List ~ List` holds, `List ~ Vec` fails, and a shape
+  variable binds against an applied head (`s[a] ~ List[Int]`). The
+  engine for `Shape`, distinct from `Nominal`'s closed-identity
+  comparison.
+- `Semilattice = { assoc, commut, idempotent }` — an idempotent join
+  with no inverse: habitants union with `+` (`read + write`,
+  `read + read = read`) and nothing subtracts. Unification is
+  subsumption along the lattice order: the required set must be a
+  subset of the provided set, so more capabilities flow where fewer
+  are demanded, never the reverse. Products, inverses, and powers
+  are formation errors.
+- `Composition = { assoc, measure }` — composes elements in
+  declaration order (associative, **not** commutative — order is
+  load-bearing) and sums a per-element measure. A habitant is a
+  single identity symbol, so `be·le` and `be²` are rejected at
+  formation, exactly the `Module` shape.
+
+## Units — the `Measure` kind
+
+```kaikai
+unit m
+unit s
+
+fn speed(d: Real<m>, t: Real<s>) : Real<m/s> = d / t
+
+fn main() : Unit / Stdout = {
+  let v = speed(100.0<m>, 9.5<s>)      # Real<m/s>
+  Stdout.print("ok")
+}
+```
+
+## Layout — the `Composition` kind
+
+`Layout` classifies the binary representation of a fixed-width field.
+The width comes from the base type (`U32` is 4 bytes); the `<be>` /
+`<le>` habitant is the byte-order modifier. `U32<be>` and `U32<le>`
+are the same base type but distinct representations, so they never
+unify:
+
+```kaikai
+type Header = {
+  magic: U32<be>,        # big-endian, network order
+  port:  U16<be>,
+  flags: U16<le>,        # little-endian
+}
+
+fn main() : Unit / Stdout = {
+  let h = Header { magic: 0<be>, port: 0<be>, flags: 0<le> }
+  Stdout.print("ok")
+}
+```
+
+Serialization is opt-in via `#[derive(Layout)]`, which generates
+`to_bytes` plus a `<lower(T)>_from_bytes` shim. The bytes are
+positional and byte-exact: each field at its declared width in its
+declared order, nothing else. (`#[derive(BinSerialize)]` is the sibling
+for kaikai's own structural format.)
+
+```kaikai
+#[derive(Layout)]
+type Packet = { magic: U32<be>, port: U16<be> }
+
+fn main() : Unit / Stdout = {
+  let bytes = Packet { magic: 0<be>, port: 0<be> }.to_bytes()
+  match packet_from_bytes(bytes, 0) {
+    Ok(c)  -> Stdout.print("port #{c.value.port}")
+    Err(m) -> Stdout.print(m)
+  }
+}
+```
+
+A big-endian value cannot be passed where little-endian is expected —
+the habitant rides the type and the typer keeps them apart:
+
+```kaikai-neg
+fn take_be(x: U32<be>) : U32<be> = x
+
+fn main() : Unit / Stdout = {
+  let le_val : U32<le> = 5<le>
+  let bad = take_be(le_val)            # U32<le> ≠ U32<be>
+  Stdout.print("no")
+}
+```
+
+A `Composition` habitant stands alone: it has no product or power, so
+a composed annotation is rejected at the spot that writes it:
+
+```kaikai-neg
+fn bad(x: U32<be^2>) : Int = 0        # be^2 does not exist
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+## Perm — the `Semilattice` kind
+
+`Perm` classifies typed capabilities. The stdlib file API carries
+them: `open_read` returns `FileHandle<read>`, `open_write` returns
+`FileHandle<read + write>`, and each op requires only what it uses.
+Subsumption lets the joined handle flow into both:
+
+```kaikai
+fn first_chunk(h: FileHandle<read>) : String / File =
+  match File.read_chunk(h, 64) { Ok(s) -> s Err(e) -> e }
+
+fn main() : Unit / Stdout + File = {
+  match File.open_write("/tmp/kai_info_perm.txt") {
+    Ok(h) -> {
+      let _ = File.write_chunk(h, "hi")   # <read + write> ⊇ <write>
+      let _ = first_chunk(h)              # <read + write> ⊇ <read>
+      File.close_file(h)
+      Stdout.print("ok")
+    }
+    Err(e) -> Stdout.print(e)
+  }
+}
+```
+
+Writing through a read-only handle is a compile-time mismatch —
+`<read>` does not subsume into `<write>`:
+
+```kaikai-neg
+fn main() : Unit / Stdout + File = {
+  match File.open_read("/tmp/nope.txt") {
+    Ok(h)  -> { let _ = File.write_chunk(h, "x"); Stdout.print("no") }
+    Err(e) -> Stdout.print(e)
+  }
+}
+```
+
+The capability is what the code *declared* at open time, not the OS's
+runtime permission — a vanished file or a chmod still surfaces
+through each op's `Result`. Perm habitants are open: `perm read` /
+`perm write` ship with the file API, and each domain declares its own
+(`perm get`, `perm admin`, ...). Handler implementations and test
+doubles mint handles with `file_handle(fd)`, whose capability is
+chosen by the context's expected type.
+
+## Dim — the shape-index kind
+
+`Dim` classifies **static shape indices**. Its habitants are `Int`
+**values** written directly in `<>` (form (b), `with Int`): `<3>` is
+a habitant because `3 : Int`. The engine is the HM core's first-order
+equality — `<3>` unifies with `<3>`, never `<4>` — and the index is
+erased at runtime. A list literal against a `Vec[t]<n>` annotation
+must have exactly `n` elements; a `[n: Dim]` type parameter threads
+the index through calls:
+
+```kaikai
+fn head_of[n: Dim](v: Vec[Real]<n>) : Real = v[0]
+
+fn main() : Unit / Stdout = {
+  let a : Vec[Real]<3> = [1.0, 2.0, 3.0]
+  Stdout.print(real_to_string(head_of(a)))
+}
+```
+
+`Matrix[t]<m, n>` (in `stdlib/math/linalg.kai`) carries **two**
+positional habitants — the `<>` slot is a comma-separated list that
+unifies point to point, so shape rules live in operation signatures:
+`matmul(a: Matrix[Real]<m,n>, b: Matrix[Real]<n,p>) : Matrix[Real]<m,p>`
+cancels the inner index by value equality.
+
+```kaikai
+import math.linalg
+
+fn main() : Unit / Stdout = {
+  let a : linalg.Matrix[Real]<2, 3> = linalg.of([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+  let b : linalg.Matrix[Real]<3, 2> = linalg.of([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+  let c : linalg.Matrix[Real]<2, 2> = linalg.matmul(a, b)
+  Stdout.print(real_to_string(linalg.at(c, 0, 0)))
+}
+```
+
+A wrong-length literal, a mismatched inner index, or a habitant of
+another kind in an index slot are all compile errors:
+
+```kaikai-neg
+fn main() : Unit / Stdout = {
+  let a : Vec[Real]<3> = [1.0, 2.0]     # 2 elements cannot inhabit <3>
+  Stdout.print("no")
+}
+```
+
+`Dim` is atomic — a value index has no products or powers (`<3*4>`
+and `<3^2>` do not exist). Type-level arithmetic (`concat` as `n+k`,
+`reshape` as `m*n = p*q`) is deliberately outside the theory.
+
+## Shape — the kind of arity-1 constructors
+
+`Shape` classifies **arity-1 type constructors** — `List`, `Vec`,
+`Option`, or a user `Tree[a]`. Its habitants are *derived*: every
+`type T[a] = ...` of exactly one type parameter is automatically a
+`Shape` habitant (its bare constructor `T`), so `Shape` takes no
+`with` introducer. `ConstructorApp` binds constructor witnesses — two
+shapes unify iff they are the same constructor.
+
+A `[s: Shape]` type parameter is applied as `s[A]`, letting a protocol
+quantify over the container itself — the expressiveness a functor
+gives, without HKT's cost. `s[A] ~ List[Int]` unifies first-order
+(`s := List, A := Int`); after monomorphisation the dispatch is an
+`O(1)` static call, no runtime indirection:
+
+```kaikai
+protocol Container[s: Shape] {
+  first(xs: s[Int]) : Int
+}
+
+type Box[a] = Box(a)
+
+impl Container for Box {
+  fn first(xs: Box[Int]) : Int = match xs {
+    Box(v) -> v
+  }
+}
+
+impl Container for List {
+  fn first(xs: [Int]) : Int = match xs {
+    []          -> 0
+    [h, ..._t]  -> h
+  }
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(int_to_string(first(Box(7))))
+  Stdout.print(int_to_string(first([3, 4, 5])))
+}
+```
+
+A shape is atomic: it applies to exactly one type. Arity-2 (`Map`) is
+not a `Shape`, and composition `s[t[..]]` (two stacked shape variables)
+is rejected at formation — the cases that would reintroduce
+higher-order unification:
+
+```kaikai-neg
+fn bad[s: Shape, t: Shape](xs: s[t[Int]]) : Int = 0   # composition
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+A Shape protocol may declare a **law set** in its header to state which
+laws its ops obey. `Sequence[s: Shape] : Functorial` names the functor
+laws (`map(xs, id) = xs`, `map(map(xs, f), g) = map(xs, g∘f)`). A law
+set is not a theory: it decides no type equality and touches no
+unifier, so it lives in its own namespace — a theory name in a protocol
+header, or `Functorial` on a `kind`, is an error. `kai check` /
+`kai test` then autogenerate
+property checks per impl, and a `map`-into-`foldl` pipeline over any
+lawful container fuses to a single traversal. An impl asserts
+`axiom Functorial` after its body to opt out of the checks:
+
+```kaikai
+protocol Sequence[s: Shape] : Functorial {
+  map(xs: s[Int], f: (Int) -> Int) : s[Int]
+  foldl(xs: s[Int], init: Int, f: (Int, Int) -> Int) : Int
+}
+
+type Chain[a] = Empty | Link(a, Chain[a])
+
+impl Sequence for Chain {
+  fn map(xs: Chain[Int], f: (Int) -> Int) : Chain[Int] = match xs {
+    Empty      -> Empty
+    Link(h, t) -> Link(f(h), map(t, f))
+  }
+  fn foldl(xs: Chain[Int], init: Int, f: (Int, Int) -> Int) : Int = match xs {
+    Empty      -> init
+    Link(h, t) -> foldl(t, f(init, h), f)
+  }
+}
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+```
+
+## User-declared kinds
+
+`Measure`, `Currency`, and `Layout` are not special — declare your own
+kind over any public theory and its habitant introducer word. An
+abelian kind (isolated from `Measure`, so `metric` and `imperial`
+never mix):
+
+```kaikai
+kind Metric   : AbelianGroup with metric
+kind Imperial : AbelianGroup with imperial
+
+metric m
+imperial ft
+
+fn area[u: Metric](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
+
+fn main() : Unit / Stdout = {
+  let a = area(3.0<m>, 4.0<m>)         # Real<m^2>, Metric kind
+  Stdout.print("ok")
+}
+```
+
+A kind over `Composition` — the public theory `Layout` is built on —
+gets the summed-measure algebra and the atomic-habitant guard:
+
+```kaikai
+kind Frame : Composition with frame
+
+frame hdr
+frame body
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+```
+
+## Habitant forms — one `with`, four shapes
+
+The `with` clause declares what a habitant *is*. Four forms, selected
+by the token after `with` (uppercase = value domain, lowercase =
+introducer word, `{` after the word = closed set):
+
+- **(a) introducer → symbol** — `with metric` ⇒ `metric m`. An
+  opaque, user-declared symbol, open set. `Measure` (`unit`),
+  `Currency` (`currency`), and every example above.
+- **(b) type → value** — `with Int` or `with String`. Habitants are
+  **values** of that domain written directly in `<>` (`<3>`,
+  `<"tag">`), never declared; the domain restricts validity. `<3>`
+  unifies with `<3>` and never with `<4>` — first-order value
+  equality.
+- **(c) introducer → symbol-with-measure** — `with pct` ⇒
+  `pct pct70 = 70`. A declared symbol carrying an exact numeric
+  measure, legal only on a kind whose theory sums one
+  (`Composition`). The measure is a single integer literal, never an
+  expression — the sum the theory verifies must be exact.
+- **(d) closed set** — `with layout { be le }`. Habitants are a
+  **fixed** set of atoms the theory's engine ships with built-in
+  semantics; the user adds none. `Layout` is declared exactly this
+  way in the catalog. Naming an atom the engine does not know, or
+  declaring a habitant into a closed kind, is a compile error.
+
+A form-(b) kind in action — the value domain checks the habitant:
+
+```kaikai
+kind Slot : AbelianGroup with Int
+
+fn hold(x: Real<3>) : Real<3> = x
+
+fn main() : Unit / Stdout = {
+  let a : Real<3> = 5.0<3>
+  let _ = hold(a)
+  Stdout.print("ok")
+}
+```
+
+```kaikai-neg
+kind Slot : AbelianGroup with Int
+
+fn bad(x: Real<Slot.USD>) : Int = 0     # `Int` values only, `<3>`-style
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+A closed set may name only engine-known atoms, and admits no habitant
+declarations:
+
+```kaikai-neg
+kind Frame : Composition over Int with fr { be le xyz }   # xyz unknown
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+```kaikai-neg
+layout xyz          # Layout is closed: be, le are fixed
+
+fn main() : Unit / Stdout = Stdout.print("no")
+```
+
+## Worked example — a `Waterfall` kind (form c)
+
+`Composition` being public means a user can build the
+*measure-in-the-habitant* shape too — a fintech waterfall where a
+CDO's tranches must sum to 100%, verified in the type. Each habitant
+declares its measure and `Composition` sums it:
+
+```kaikai
+kind Waterfall : Composition over Int with pct
+
+pct senior = 70
+pct mezz   = 20
+pct equity = 10
+
+fn main() : Unit / Stdout = Stdout.print("ok")
+```
+
+The surface parses, registers, and validates the measures; the engine
+that *sums* them (the closes-to-100 check) is not wired yet.
+
+Because the measure must verify a total exactly, `Composition`
+measures are integer, never float: `0.1 + 0.2 ≠ 0.3` in IEEE-754
+would fail a legitimate waterfall on a rounding artefact — so
+`pct bad = 70 * 2` (an expression) and `unit km = 1000` (a measure on
+an opaque theory) are both rejected at the declaration.
+
+## See also
+
+- `kai info units` — the `Measure` kind in full.
+- `docs/kinds.md` — the kind-system primer.
+- `docs/kind-system-design.md` — theories, habitant resolution,
+  the closed property menu.
+- `docs/layout-kind-design.md` — the `Layout` spec (`#[derive(Layout)]`,
+  TLV, nesting).

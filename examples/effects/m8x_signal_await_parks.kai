@@ -1,0 +1,62 @@
+# Issue #671 — Phase R4 reactor proof: Signal.await() parks the
+# fiber, not the OS thread.
+#
+# Two fibers concurrent through a nursery: one parked in
+# Signal.await(), one counting compute steps through Spawn.yield().
+# Pre-R4, Signal.await()'s sigwait() body froze the entire OS thread —
+# the compute fiber's yields never ran, so the nursery never joined
+# and the run hung. Post-R4 the await parks on the reactor's signal
+# self-pipe and the compute fiber keeps being resumed; completing all
+# its steps is the starvation proof.
+#
+# The fixture is harness-driven (tests/sigharness.c): a parent process
+# spawns this binary, waits for the "ready" marker, then sends
+# SIGTERM. How many compute steps run before the signal lands is
+# OS-timing-dependent, so the compute fiber prints nothing; its step
+# count is reported by main after the join, giving an output that is
+# identical at any KAI_THREADS and any signal-delivery timing.
+
+import spawn
+
+fn name_of(s: Sig) : String = match s {
+  SigInt   -> "SigInt"
+  SigTerm  -> "SigTerm"
+  SigHup   -> "SigHup"
+  SigUsr1  -> "SigUsr1"
+  SigUsr2  -> "SigUsr2"
+  SigWinch -> "SigWinch"
+}
+
+# Each yield hands the CPU away; a step counts only when the scheduler
+# resumes this fiber, so the returned total witnesses real round-trips.
+fn compute_loop(step: Int, total: Int) : Int / Spawn = {
+  if step < total {
+    Spawn.yield()
+    compute_loop(step + 1, total)
+  } else {
+    step
+  }
+}
+
+fn await_loop() : Unit / Signal + Stdout = {
+  # Arm the handler BEFORE the "ready" marker: the harness sends the
+  # signal as soon as it sees "ready", and a SIGTERM landing before
+  # `Signal.on` would hit the default disposition and kill the child.
+  Signal.on(SigTerm)
+  Stdout.print("ready")
+  let s = Signal.await()
+  Stdout.print(string_concat("got ", name_of(s)))
+  Signal.off(SigTerm)
+}
+
+fn main() : Int / Spawn + Signal + Stdout = {
+  let steps = nursery { n ->
+    let f1 = n.spawn(await_loop)
+    let f2 = n.spawn(() => compute_loop(0, 3))
+    n.await(f1)
+    n.await(f2)
+  }
+  Stdout.print("compute steps: #{int_to_string(steps)}")
+  Stdout.print("ok")
+  0
+}
