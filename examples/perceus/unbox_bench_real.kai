@@ -1,0 +1,86 @@
+# Unboxing Phase 2 — Real-arithmetic performance benchmark
+# (Tongariki Real-unboxing extension).
+#
+# Tight floating-point inner loop. Pre-Real-unboxing every `+` /
+# `*` heap-allocated a `Real`; post-extension the chain inside
+# `pure_chain_real` collapses to raw `double` arithmetic.
+#
+# The companion `unbox_bench_real.c.ref` is the equivalent C
+# loop. The wall-clock ratio between this fixture and the C
+# reference is the user-facing performance gap targeted by the
+# Real-unboxing extension. Acceptance: within ~5–10× of the C
+# reference under `-O2`. The pre-extension gap on `Real`-heavy
+# code was ~50–100× because every iteration heap-allocated a
+# `Real` box.
+#
+#   $ time ./build/perceus-unbox_bench_real
+#   $ time ./build/unbox_bench_real_c_ref
+#
+# This is a coverage-ratchet input, not a hard tier1 gate.
+
+fn pure_chain_real(seed: Real) : Real {
+  # Same shape as `unbox_bench.kai::pure_chain` but on `Real`
+  # operands. `seed` is intentionally consumed only once — Phase 2
+  # keeps function parameters boxed (non-goal #1) so a chain that
+  # started from `seed` would mix MBoxed and MUnboxed and the
+  # conservative rule would demote it. The body is intentionally
+  # long so each iteration carries a meaningful unboxed `double`
+  # arithmetic payload that dominates the per-call overhead of
+  # the loop driver.
+  #
+  # `%` is unavailable on `double` in C, so the shape uses
+  # multiplication by reciprocals (`* 0.01`, `* 0.001`, `* 0.0001`)
+  # in place of the `% 100` / `% 257` / `% 1009` reductions used by
+  # the integer counterpart.
+  let a = 1.0 + 2.0
+  let b = a * 7.0
+  let c = b - a
+  let d = c + a + b
+  let e = d * 0.01
+  let f = e * e
+  let g = f + d
+  let h = g - 1.0
+  let i_ = h + 3.0
+  let j = i_ * 5.0
+  let k = j + a + b + c
+  let l = k * 0.001
+  let m_ = l + e + f
+  let n_ = m_ + j - h
+  let o_ = n_ * 3.0 + a
+  let p_ = o_ - b + c
+  let q_ = p_ + d + e
+  let r_ = q_ * 2.0 - f
+  let s_ = r_ + g + h
+  let t_ = s_ - i_ + j
+  let u_ = t_ + k - l
+  let v_ = u_ * 7.0 + m_
+  let w_ = v_ * 0.0001
+  let x_ = w_ + n_ + o_
+  let y_ = x_ - p_ + q_
+  let z_ = y_ + r_ - s_
+  z_ + t_ + u_ + v_ + w_ + x_ + y_
+}
+
+fn bench_loop(iters: Int, acc: Real) : Real {
+  if iters > 0 {
+    let r = pure_chain_real(int_to_real(iters))
+    bench_loop(iters - 1, acc + r)
+  } else {
+    acc
+  }
+}
+
+fn main() {
+  # Issue #89: regression fixture for self-tail-call TCO inside
+  # a perceus-wrapped block on a `Real` accumulator. Mirrors the
+  # Int-typed driver in `unbox_bench.kai`. Pre-fix the loop
+  # overflowed past ~50k iterations because the goto-loop rewrite
+  # missed the tail position once perceus nested the body in
+  # `EBlock([SLet("__pcs_ret", ...), exit_drops], Some(...))`.
+  # The fix that landed via issues #42 / #102 runs the TCO
+  # rewrite BEFORE perceus, so the sentinel survives perceus's
+  # wrap. N is now 1_000_000 — well past the pre-fix overflow
+  # point — to honour the regression-fixture discipline.
+  let r = bench_loop(1000000, 0.0)
+  print(real_to_string(r))
+}

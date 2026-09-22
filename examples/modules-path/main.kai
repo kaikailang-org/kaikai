@@ -1,0 +1,9 @@
+# Module-search-path smoke test (M6.2). `shared.helpers` lives
+# outside this directory; the build step passes `--path
+# ../modules-path-lib` so the resolver can find it.
+import shared.helpers
+
+fn main() {
+  print(int_to_string(double(21)))   # 42
+  print(shout("kai"))                # KAI!
+}

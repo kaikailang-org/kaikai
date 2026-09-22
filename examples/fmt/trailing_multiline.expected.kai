@@ -1,0 +1,20 @@
+# Trailing comments after a multi-line construct (record literal,
+# function call) stay on the construct's closing token. The writer
+# keeps the author's expanded layout, so the comment stays two spaces
+# past the closing `}` / `)`.
+
+type Point = { x: Int, y: Int }
+
+fn main() {
+  let r = Point {
+    x: 1,
+    y: 2
+  }  # the origin
+  let s = sum(
+    r.x,
+    r.y
+  )  # x + y
+  print(int_to_string(s))
+}
+
+fn sum(a: Int, b: Int) : Int = a + b
