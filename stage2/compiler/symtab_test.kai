@@ -1,0 +1,323 @@
+#[doc("""
+In-process gates for the symbol table, run behind `--symtab-selftest`.
+
+These properties are what stands in for a downstream regression:
+
+1. **Identity separates homonyms.** Two declarations of one bare name in
+   different homes get different ids, and each id reports its own home.
+   This is the property string comparison cannot hold.
+2. **Class separates namespaces.** A `type Log` and an `effect Log` are
+   two habitants, so a class-filtered lookup returns one, never both.
+3. **The index agrees with a scan.** For every name in the table, the
+   bucket lookup returns exactly what a linear walk over the columns
+   returns. A hash that dropped an entry would silently resolve a name
+   to `None`.
+4. **Ids are dense and stream-ordered.** Every id in `0 .. count - 1`
+   reads back the entry that occupied that position.
+5. **A module is a symbol, and an owner is its id.** Every declaration
+   is owned by the module symbol spelling its home; a module is owned by
+   nothing. Two homonymous declarations report two owner ids.
+6. **Resolution reads the owners.** A use at one home reaches that
+   home's declaration, not the other's, deciding by id.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.resolve_use
+import compiler.scope_view
+import compiler.proto_key
+
+# Two homes declaring `map`, plus a type/effect pair sharing `Log`.
+fn stt_fixture() : [NEnt] = [
+  NEnt(NCFn,     "map",  "collections", true),
+  NEnt(NCFn,     "map",  "iter",        true),
+  NEnt(NCType,   "Log",  "logging",     true),
+  NEnt(NCEffect, "Log",  "logging",     true),
+  NEnt(NCConst,  "MAX",  "limits",      false)
+]
+
+# Two ids are distinct declarations when neither the id nor the home
+# coincides.
+fn stt_distinct_homes(t: SymTab, a: SymId, b: SymId, ha: String, hb: String) : Bool {
+  let ids_differ = sym_raw(a) != sym_raw(b)
+  let homes_match = sym_home(t, a) == ha and sym_home(t, b) == hb
+  ids_differ and homes_match
+}
+
+fn stt_homonyms_are_distinct(t: SymTab) : Bool =
+  match st_candidates(t, NCFn, "map") {
+    [] -> false
+    [a, ...rest] -> match stt_only(rest) {
+      None    -> false
+      Some(b) -> stt_distinct_homes(t, a, b, "collections", "iter")
+    }
+  }
+
+fn stt_classes_are_separate(t: SymTab) : Bool =
+  match stt_only(st_candidates(t, NCType, "Log")) {
+    None -> false
+    Some(a) -> match stt_only(st_candidates(t, NCEffect, "Log")) {
+      None    -> false
+      Some(b) -> stt_distinct_scoped(t, a, b, "logging")
+    }
+  }
+
+# Two ids in different classes, both owned by the module named `home`.
+fn stt_distinct_scoped(t: SymTab, a: SymId, b: SymId, home: String) : Bool {
+  let ids_differ = sym_raw(a) != sym_raw(b)
+  ids_differ and stt_owned_by_module(t, a, home)
+}
+
+# `s` is owned by a module symbol, and that symbol spells `home`.
+fn stt_owned_by_module(t: SymTab, s: SymId, home: String) : Bool {
+  let m = sym_owner(t, s)
+  ncls_same(sym_class(t, m), NCModule) and sym_name(t, m) == home
+}
+
+# The single element of a one-element list, or None.
+fn stt_only(xs: [SymId]) : Option[SymId] = match xs {
+  [] -> None
+  [x, ...rest] -> match rest {
+    [] -> Some(x)
+    _  -> None
+  }
+}
+
+fn stt_lookup_is_exact(t: SymTab) : Bool = match st_module(t, "iter") {
+  None    -> false
+  Some(m) -> match st_lookup(t, NCFn, "map", m) {
+    None    -> false
+    Some(s) -> sym_home(t, s) == "iter" and stt_is_none(st_lookup(t, NCFn, "map", sym_none()))
+  }
+}
+
+fn stt_is_none(o: Option[SymId]) : Bool = match o {
+  None    -> true
+  Some(_) -> false
+}
+
+# The index must answer what a walk over the columns answers, for every
+# name the table holds.
+fn stt_index_matches_scan(t: SymTab, i: Int) : Bool =
+  if i >= st_count(t) { true }
+  else {
+    let name = sym_name(t, SymId(i))
+    if stt_ids_eq(st_by_name(t, name), stt_scan(t, name, 0, [])) {
+      stt_index_matches_scan(t, i + 1)
+    } else { false }
+  }
+
+fn stt_scan(t: SymTab, name: String, i: Int, acc: [Int]) : [Int] =
+  if i >= st_count(t) { list_reverse(acc) }
+  else if sym_name(t, SymId(i)) == name { stt_scan(t, name, i + 1, [i, ...acc]) }
+  else { stt_scan(t, name, i + 1, acc) }
+
+fn stt_ids_eq(xs: [SymId], ys: [Int]) : Bool = match xs {
+  [] -> match ys { [] -> true  _ -> false }
+  [x, ...xr] -> match ys {
+    []         -> false
+    [y, ...yr] -> if sym_raw(x) == y { stt_ids_eq(xr, yr) } else { false }
+  }
+}
+
+fn stt_dense(t: SymTab, es: [NEnt], i: Int) : Bool = match es {
+  [] -> i == st_count(t)
+  [e, ...rest] ->
+    if stt_row_matches(t, SymId(i), e) { stt_dense(t, rest, i + 1) } else { false }
+}
+
+# A module owns nothing and every declaration is owned by the module
+# spelling its home — the invariant that makes `sym_home` derived rather
+# than stored.
+fn stt_owners_are_modules(t: SymTab, i: Int) : Bool =
+  if i >= st_count(t) { true }
+  else {
+    let s = SymId(i)
+    let ok = if ncls_same(sym_class(t, s), NCModule) {
+      sym_raw(sym_owner(t, s)) == sym_raw(sym_none())
+    } else { stt_owned_by_module(t, s, sym_home(t, s)) }
+    if ok { stt_owners_are_modules(t, i + 1) } else { false }
+  }
+
+# Every column of row `s` reads back the entry that occupied its slot.
+fn stt_row_matches(t: SymTab, s: SymId, e: NEnt) : Bool = match e {
+  NEnt(cls, name, home, exp) -> {
+    let ident = sym_name(t, s) == name and sym_home(t, s) == home
+    let shape = ncls_same(sym_class(t, s), cls) and sym_exported(t, s) == exp
+    st_valid(t, s) and ident and shape
+  }
+}
+
+# A function declaration named `n`, homed in `mo`.
+fn stt_fn(n: String, mo: Option[String]) : Decl =
+  DFn(true, n, [], [], None, REmpty, mk_expr(EUnit, 0, 0), 0, 0, mo, sym_none())
+
+# The decl walker must reach the same table the entry stream does, and
+# must give two homonymous decls two ids with their own homes.
+fn stt_build_walks_decls() : Bool {
+  let decls = [stt_fn("run", Some("alpha")), stt_fn("run", Some("beta")),
+               stt_fn("solo", None)]
+  let t = st_build(decls, "root")
+  # three declarations plus the three module symbols owning them
+  if st_count(t) != 6 { false }
+  else { stt_build_homes_ok(t) }
+}
+
+fn stt_build_homes_ok(t: SymTab) : Bool =
+  match st_candidates(t, NCFn, "run") {
+    [] -> false
+    [a, ...rest] -> match stt_only(rest) {
+      None    -> false
+      Some(b) -> stt_both_homed(t, a, b)
+    }
+  }
+
+fn stt_both_homed(t: SymTab, a: SymId, b: SymId) : Bool {
+  let tagged = stt_distinct_homes(t, a, b, "alpha", "beta")
+  tagged and stt_untagged_takes_target(t)
+}
+
+# A decl the parser left untagged is homed in the target module.
+fn stt_untagged_takes_target(t: SymTab) : Bool =
+  match stt_only(st_candidates(t, NCFn, "solo")) {
+    None    -> false
+    Some(s) -> sym_home(t, s) == "root"
+  }
+
+# Two homonymous modules are two ids, and each owns its own `f`. This
+# is the shape a `home` string cannot represent: the two spell alike, so
+# only the ids tell them apart.
+fn stt_homonym_modules() : [NEnt] = [
+  NEnt(NCFn, "f", "pkg.a", true),
+  NEnt(NCFn, "g", "pkg.b", true),
+  NEnt(NCFn, "f", "pkg.a", true)
+]
+
+# The stream mentions `pkg.a` twice with `pkg.b` between them, so a
+# builder keying on the previous entry alone would mint a second
+# `pkg.a`. One module symbol per distinct home, whatever the order.
+fn stt_homes_are_one_symbol_each(t: SymTab) : Bool {
+  let mods = stt_modules(t, 0, [])
+  if list_length(mods) != 2 { false } else { stt_f_rows_share_an_owner(t) }
+}
+
+fn stt_modules(t: SymTab, i: Int, acc: [Int]) : [Int] =
+  if i >= st_count(t) { list_reverse(acc) }
+  else if ncls_same(sym_class(t, SymId(i)), NCModule) { stt_modules(t, i + 1, [i, ...acc]) }
+  else { stt_modules(t, i + 1, acc) }
+
+# Both `f` rows are two ids owned by the one `pkg.a` symbol.
+fn stt_f_rows_share_an_owner(t: SymTab) : Bool =
+  match st_candidates(t, NCFn, "f") {
+    [a, b] -> sym_raw(a) != sym_raw(b) and sym_same_owner(t, a, b)
+    _      -> false
+  }
+
+# A use of `f` written in `pkg.b` reaches nothing of its own, and a use
+# written in `pkg.a` reaches one of `pkg.a`'s two — decided by owner id.
+fn stt_resolution_reads_owners() : Bool {
+  let t = st_of_entries([NEnt(NCFn, "f", "pkg.a", true), NEnt(NCFn, "f", "pkg.b", true)])
+  match st_module(t, "pkg.a") {
+    None -> false
+    Some(ma) -> match st_module(t, "pkg.b") {
+      None -> false
+      Some(mb) -> stt_two_homes_resolve(t, ma, mb)
+    }
+  }
+}
+
+fn stt_two_homes_resolve(t: SymTab, ma: SymId, mb: SymId) : Bool {
+  let ra = ru_value(t, "f", ma, false)
+  let rb = ru_value(t, "f", mb, false)
+  match stt_sym_of(ra) {
+    None -> false
+    Some(a) -> match stt_sym_of(rb) {
+      None    -> false
+      Some(b) -> a != b and sym_home(t, SymId(a)) == "pkg.a" and sym_home(t, SymId(b)) == "pkg.b"
+    }
+  }
+}
+
+fn stt_sym_of(r: UseRes) : Option[Int] = match r {
+  URSym(i) -> Some(i)
+  _        -> None
+}
+
+# A contested protocol name spells its home into the dispatch key; an
+# uncontested one keeps the bare name. A core keeps the bare name even
+# when contested — the runtime keys stdlib protocols by fixed ids.
+fn stt_proto_keys() : Bool {
+  let t = st_of_entries([NEnt(NCProtocol, "P", "pkg.a", true),
+                         NEnt(NCProtocol, "P", "pkg.b", true),
+                         NEnt(NCProtocol, "Q", "pkg.a", true),
+                         NEnt(NCProtocol, "P", "core", true)])
+  match st_module(t, "core") {
+    None -> false
+    Some(c) -> stt_keys_are(t, sv_new(sym_none(), [], [], [c]))
+  }
+}
+
+fn stt_keys_are(t: SymTab, v: ScopeView) : Bool =
+  stt_key_of(t, v, "P", "pkg.a") == "pkg.a__P" and
+  stt_key_of(t, v, "P", "pkg.b") == "pkg.b__P" and
+  stt_key_of(t, v, "Q", "pkg.a") == "Q" and
+  stt_key_of(t, v, "P", "core") == "P"
+
+fn stt_key_of(t: SymTab, v: ScopeView, name: String, home: String) : String =
+  match st_module(t, home) {
+    None -> ""
+    Some(m) -> match st_lookup(t, NCProtocol, name, m) {
+      None    -> ""
+      Some(s) -> pk_of(t, v, s)
+    }
+  }
+
+# A core resolves only against other cores: user code loaded alongside
+# the prelude never answers a name used inside it.
+fn stt_core_sees_only_cores() : Bool {
+  let t = st_of_entries([NEnt(NCFn, "helper", "user", true),
+                         NEnt(NCFn, "other", "core", true)])
+  match st_module(t, "core") {
+    None -> false
+    Some(c) -> stt_core_view_blocks(t, sv_new(c, [], [], [c]))
+  }
+}
+
+fn stt_core_view_blocks(t: SymTab, v: ScopeView) : Bool =
+  match ru_value_in(t, v, "helper", false) {
+    URSym(_) -> false
+    _        -> true
+  }
+
+#[doc("Runs every symbol-table gate. Returns a line starting `OK` on success, `FAIL:` otherwise.")]
+pub fn symtab_selftest() : String {
+  let es = stt_fixture()
+  let t = st_of_entries(es)
+  let hm = st_of_entries(stt_homonym_modules())
+  if st_count(t) != list_length(es) + list_length(stt_homes_of(es)) {
+    "FAIL: count does not match the entry stream plus its modules"
+  }
+  else if stt_homonyms_are_distinct(t) == false { "FAIL: homonymous fns share an id or a home" }
+  else if stt_classes_are_separate(t) == false { "FAIL: type and effect collapsed into one class" }
+  else if stt_lookup_is_exact(t) == false { "FAIL: home-qualified lookup picked the wrong row" }
+  else if stt_index_matches_scan(t, 0) == false { "FAIL: bucket index disagrees with a column scan" }
+  else if stt_owners_are_modules(t, 0) == false { "FAIL: a symbol is not owned by its home's module" }
+  else if stt_dense(t, es, list_length(stt_homes_of(es))) == false { "FAIL: ids are not dense in stream order" }
+  else if stt_homes_are_one_symbol_each(hm) == false { "FAIL: one home minted more than one module symbol" }
+  else if stt_resolution_reads_owners() == false { "FAIL: resolution did not decide by owner id" }
+  else if stt_build_walks_decls() == false { "FAIL: the decl walker lost a home or an id" }
+  else if stt_proto_keys() == false { "FAIL: a protocol dispatch key ignored contestedness or its core home" }
+  else if stt_core_sees_only_cores() == false { "FAIL: a core resolved a name against user code" }
+  else { "OK symtab (#{int_to_string(st_count(t))} symbols, 11 gates)" }
+}
+
+# The distinct homes of an entry stream, in first-mention order.
+fn stt_homes_of(es: [NEnt]) : [String] = match es {
+  [] -> []
+  [NEnt(_, _, h, _), ...rest] -> {
+    let seen = stt_homes_of(rest)
+    if list_has(seen, h) { seen } else { [h, ...seen] }
+  }
+}

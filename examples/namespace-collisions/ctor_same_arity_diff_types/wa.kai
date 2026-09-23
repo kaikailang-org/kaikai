@@ -1,0 +1,1 @@
+pub type W1 = Cell(Int)
