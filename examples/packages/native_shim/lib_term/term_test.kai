@@ -1,0 +1,15 @@
+# The library's own tests link its shim, and a test body may cross
+# the Ffi boundary directly: a test block absorbs the compiler-
+# synthesised `Ffi` capability the program entry may declare.
+
+import term
+
+test "clamp_width bounds" {
+  assert term.clamp_width(10) == 20
+  assert term.clamp_width(80) == 80
+  assert term.clamp_width(999) == 200
+}
+
+test "shim answers" {
+  assert term.cols() == 80
+}

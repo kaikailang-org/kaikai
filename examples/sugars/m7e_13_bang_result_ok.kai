@@ -1,0 +1,19 @@
+# m7e §13 — `expr!` on `Result[T, E]`, success path. Both callees
+# return `Ok(...)` so each `!` unwraps and the function returns
+# `Ok(sum)`.
+
+fn parse_a() : Result[Int, String] = Ok(40)
+fn parse_b() : Result[Int, String] = Ok(2)
+
+fn sum_them() : Result[Int, String] {
+  let a = parse_a()!
+  let b = parse_b()!
+  Ok(a + b)
+}
+
+fn main() : Unit / Console {
+  match sum_them() {
+    Ok(n)  -> print(int_to_string(n))
+    Err(e) -> print(e)
+  }
+}
