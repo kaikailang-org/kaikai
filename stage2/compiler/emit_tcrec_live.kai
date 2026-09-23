@@ -1,0 +1,191 @@
+#[doc("""
+Live-release ledger for the tcrec goto-tail path.
+
+A TCO'd self-tail-call lowers to a rebind-and-goto block that jumps out
+of every enclosing match statement-expression, skipping their trailing
+`kai_decref(_scr)` releases and any not-yet-consumed pattern-binder
+bind-increfs. The emit threads a ledger of those pending releases down
+to the goto site, which emits them just before the jump.
+
+Ledger entries are strings: `@scr:<cvar>` names a C alias of an
+enclosing owned match scrutinee (always released at the goto); any
+other entry is a kaikai pattern-binder name whose bind-incref is
+released at the goto unless the goto path already consumed it.
+
+Consumption is judged syntactically over the post-perceus AST: a bare
+`EVar(name)` read transfers the binding's ref (Perceus discipline), a
+`__perceus_dup(name)` wrap does not, and neither does a lambda capture —
+building the closure increfs each capture. The scan is otherwise
+conservative — any mention that MIGHT consume (interpolation span,
+either branch of an already-evaluated conditional) counts as consumed,
+so a stale entry can only under-release (a bounded leak), never
+over-release (a double-free).
+""")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.util
+import compiler.fnreg
+import compiler.modules
+import compiler.emit_shared
+
+#[doc("Ledger entry for an owned-scrutinee C alias `cvar`.")]
+pub fn tcl_scr_entry(cvar: String) : String = cat2("@scr:", cvar)
+
+#[doc("True when a ledger entry names a scrutinee alias (never filtered).")]
+pub fn tcl_is_scr(e: String) : Bool = string_starts_with_q(e, "@scr:")
+
+#[doc("The bare name a ledger entry releases: the scrutinee register, or the binder name.")]
+pub fn tcl_reg(e: String) : String =
+  if tcl_is_scr(e) { string_slice(e, 5, string_length(e) - 5) } else { e }
+
+#[doc("The C lvalue a ledger entry releases: the alias itself, or `kaiv_<binder>`.")]
+pub fn tcl_cname(e: String) : String =
+  if tcl_is_scr(e) { tcl_reg(e) } else { c_local(e) }
+
+#[doc("Number of scrutinee-alias entries in the ledger — the next alias suffix.")]
+pub fn tcl_scr_count(pend: [String]) : Int = tcl_scr_count_loop(pend, 0)
+
+fn tcl_scr_count_loop(pend: [String], acc: Int) : Int = match pend {
+  [] -> acc
+  [e, ...rest] -> tcl_scr_count_loop(rest, if tcl_is_scr(e) { acc + 1 } else { acc })
+}
+
+#[doc("Append binder entries, dropping same-name earlier entries a new binder shadows.")]
+pub fn tcl_push_binders(pend: [String], names: [String]) : [String] = match names {
+  [] -> pend
+  [n, ...rest] -> tcl_push_binders(list_append(tcl_remove(pend, n), [n]), rest)
+}
+
+fn tcl_remove(pend: [String], n: String) : [String] = match pend {
+  [] -> []
+  [e, ...rest] -> if e == n { tcl_remove(rest, n) } else { [e, ...tcl_remove(rest, n)] }
+}
+
+fn tcl_remove_all(pend: [String], names: [String]) : [String] = match names {
+  [] -> pend
+  [n, ...rest] -> tcl_remove_all(tcl_remove(pend, n), rest)
+}
+
+#[doc("Drop the binder entries that expression `e` consumes (or might consume).")]
+pub fn tcl_filter(pend: [String], e: Expr) : [String] = match pend {
+  [] -> []
+  [p, ...rest] ->
+    if not tcl_is_scr(p) and tcl_consumes(e, p) { tcl_filter(rest, e) }
+    else { [p, ...tcl_filter(rest, e)] }
+}
+
+#[doc("`tcl_filter` over a statement list, also dropping entries a `let`/`var` rebinds.")]
+pub fn tcl_filter_stmts(pend: [String], stmts: [Stmt]) : [String] = match stmts {
+  [] -> pend
+  [s, ...rest] -> tcl_filter_stmts(tcl_filter_stmt(pend, s), rest)
+}
+
+fn tcl_filter_stmt(pend: [String], s: Stmt) : [String] = match s {
+  SLet(pat, _, rhs)        -> tcl_remove_all(tcl_filter(pend, rhs), pat_binders(pat, []))
+  SAssert(c, om)           -> match om {
+    Some(m) -> tcl_filter(tcl_filter(pend, c), m)
+    None    -> tcl_filter(pend, c)
+  }
+  SExprStmt(e)             -> tcl_filter(pend, e)
+  SIndexAssign(a, i, v, _, _) -> tcl_filter(tcl_filter(tcl_filter(pend, a), i), v)
+  SAssign(a, v, _, _)      -> tcl_filter(tcl_filter(pend, a), v)
+  SVar(n, _, init, _, _)   -> tcl_remove(tcl_filter(pend, init), n)
+  SUse(_, _, _)            -> pend
+}
+
+#[doc("""
+Ledger entries the goto site must release: every scrutinee entry, plus
+every binder entry the tail-call arguments do not themselves consume.
+""")]
+pub fn tcl_goto_entries(pend: [String], args: [Expr]) : [String] = match pend {
+  [] -> []
+  [p, ...rest] ->
+    if tcl_is_scr(p) or not tcl_args_consume(args, p) { [p, ...tcl_goto_entries(rest, args)] }
+    else { tcl_goto_entries(rest, args) }
+}
+
+#[doc("C release statements for the goto site, one per `tcl_goto_entries` entry.")]
+pub fn tcl_goto_drops(pend: [String], args: [Expr]) : String =
+  concat_all(map(tcl_goto_entries(pend, args), (p) => concat_all(["kai_decref(", tcl_cname(p), "); "])))
+
+fn tcl_args_consume(args: [Expr], nm: String) : Bool = match args {
+  [] -> false
+  [a, ...rest] -> tcl_consumes(a, nm) or tcl_args_consume(rest, nm)
+}
+
+#[doc("""
+True when evaluating `e` consumes (or might consume) binder `nm`'s ref:
+a bare `EVar(nm)` read anywhere in `e` outside a lambda body, or a
+mention in an interpolation span. A `__perceus_dup(nm)` wrap or a
+closure capture alone does not consume. Shadowing inside `e` is
+ignored — that only biases toward "consumed", the safe direction.
+""")]
+pub fn tcl_consumes(e: Expr, nm: String) : Bool = match e.kind {
+  EVar(n)       -> n == nm
+  ECall(f, xs)  -> tcl_consumes_call(f, xs, nm)
+  EStr(span, _) -> has_interp(span, 0, string_length(span)) and tcl_span_mentions(span, nm)
+  _             -> tcl_consumes_ps(xp_positions(e), nm)
+}
+
+fn tcl_consumes_ps(ps: [XPos], nm: String) : Bool = match ps {
+  [] -> false
+  [XP(r, c), ...rest] ->
+    (match r { XLam -> false _ -> tcl_consumes(c, nm) }) or tcl_consumes_ps(rest, nm)
+}
+
+# A bare callee read of the binder (a closure held in a local) consumes
+# like any EVar. A guard-fail drop runs only on a guard's falsy edge,
+# which never shares a path with the body's goto — filtering its binder
+# here would starve the success-path goto release.
+fn tcl_consumes_call(f: Expr, xs: [Expr], nm: String) : Bool = match f.kind {
+  EVar(cn) -> if cn == "__perceus_dup" { false } else { cn == nm or tcl_consumes_list(xs, nm) }
+  EMark(MkGuardDrop) -> false
+  _ -> tcl_consumes(f, nm) or tcl_consumes_list(xs, nm)
+}
+
+fn tcl_consumes_list(xs: [Expr], nm: String) : Bool = match xs {
+  [] -> false
+  [x, ...rest] -> tcl_consumes(x, nm) or tcl_consumes_list(rest, nm)
+}
+
+# An interpolation span is raw source; a substring hit is the
+# conservative stand-in for "the span reads this binder".
+fn tcl_span_mentions(span: String, nm: String) : Bool =
+  tcl_contains_loop(span, nm, 0, string_length(span), string_length(nm))
+
+fn tcl_contains_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =
+  if i + nn > hn { false }
+  else if string_slice(hay, i, nn) == needle { true }
+  else { tcl_contains_loop(hay, needle, i + 1, hn, nn) }
+
+#[doc("""
+True when `body` contains a tcrec/TRMC goto sentinel anywhere — the gate
+for seeding the ledger on an arm body. Recurses into every sub-expression,
+not just tail position, matching the C emitter's goto-label recogniser.
+""")]
+pub fn tcl_has_goto(body: Expr) : Bool = tcl_goto_scan_kind(body.kind)
+
+fn tcl_goto_scan_kind(k: ExprKind) : Bool = match k {
+  ECall(f, xs) -> match f.kind {
+    EVar(callee) ->
+      if es_tcrec_is_sentinel(callee) { true }
+      else if es_trmc_is_step_sentinel(callee) { true }
+      else { tcl_goto_scan_exprs(xs) }
+    _ -> if tcl_has_goto(f) { true } else { tcl_goto_scan_exprs(xs) }
+  }
+  # Deferred bodies (lambda / handler clauses) never hold this
+  # function's goto sentinels — only inline positions are scanned.
+  _ -> tcl_goto_scan_ps(xp_positions_kind(k))
+}
+
+fn tcl_goto_scan_ps(ps: [XPos]) : Bool = match ps {
+  [] -> false
+  [XP(r, c), ...rest] ->
+    (xrole_inline(r) and tcl_has_goto(c)) or tcl_goto_scan_ps(rest)
+}
+
+fn tcl_goto_scan_exprs(es: [Expr]) : Bool = match es {
+  [] -> false
+  [h, ...rest] -> if tcl_has_goto(h) { true } else { tcl_goto_scan_exprs(rest) }
+}

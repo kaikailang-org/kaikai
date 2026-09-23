@@ -1,0 +1,38 @@
+# Issue #210 — Perceus reuse-in-place, variant rebuild.
+#
+# `rotate_right` consumes a `TNode(...)` cell and rebuilds another
+# `TNode(...)` of the same arity over the same `Tree` type. Both
+# the scrutinee and the rebuild expression resolve to `TyCon("Tree", [])`,
+# so the typer-aware shape predicate (issue #210) admits the rewrite
+# and the recogniser emits `__perceus_reuse_variant`. The runtime
+# helper `kai_reuse_or_alloc_variant` (stage0/runtime.h) reuses the
+# scrutinee cell in place when its refcount is unique; otherwise it
+# falls back to `kai_variant`.
+#
+# See `docs/perceus-hanga-roa-phase0-audit.md` §1.B for the motivating
+# sites (AVL tree rotations in `stdlib/collections/map.kai`).
+
+type Tree = TLeaf | TNode(Int, Int, Tree, Tree)
+
+fn rotate_right(t: Tree) : Tree = match t {
+  TNode(k, v, l, r) -> TNode(k, v + 1, r, l)
+  TLeaf             -> TLeaf
+}
+
+fn key_of(t: Tree) : Int = match t {
+  TLeaf            -> 0
+  TNode(k, _, _, _) -> k
+}
+
+fn val_of(t: Tree) : Int = match t {
+  TLeaf            -> 0
+  TNode(_, v, _, _) -> v
+}
+
+fn main() : Int / Console = {
+  let t  = TNode(7, 3, TLeaf, TLeaf)
+  let t1 = rotate_right(t)
+  print(int_to_string(key_of(t1)))
+  print(int_to_string(val_of(t1)))
+  0
+}

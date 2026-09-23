@@ -1,0 +1,73 @@
+# Mini fintech ledger. Exercises the audit-trail-compile-time pitch:
+# record spread (#326) for functional update + an explicit `Audit`
+# effect for the cross-account `transfer` op + refinement-typed
+# transaction counters that cannot go negative.
+#
+# Issue #465: the prior version used `{ acc with field = v }`, which
+# is not part of kaikai. The official record-update form is
+# `T { ...src, field: v }` per `docs/syntax-sugars.md` §10.
+
+type Account = {
+  id:           String,
+  balance:      Int,
+  transactions: Int where >= 0,
+}
+
+effect Audit {
+  log(msg: String) : Unit
+}
+
+fn deposit(acc: Account, amount: Int) : Account
+  requires amount > 0
+  ensures  result.balance == acc.balance + amount
+  ensures  result.transactions == acc.transactions + 1
+{
+  Account { ...acc,
+    balance:      acc.balance + amount,
+    transactions: acc.transactions + 1,
+  }
+}
+
+fn transfer(
+  from:   Account,
+  to:     Account,
+  amount: Int,
+) : Pair[Account, Account] / Audit
+  requires amount > 0
+  requires from.balance >= amount
+  ensures  result.fst.balance + result.snd.balance == from.balance + to.balance
+  ensures  result.fst.transactions == from.transactions + 1
+  ensures  result.snd.transactions == to.transactions + 1
+{
+  Audit.log("transfer #{from.id} -> #{to.id}")
+  let from2 = Account { ...from,
+    balance:      from.balance - amount,
+    transactions: from.transactions + 1,
+  }
+  let to2 = Account { ...to,
+    balance:      to.balance + amount,
+    transactions: to.transactions + 1,
+  }
+  (from2, to2)
+}
+
+fn main() : Unit / Stdout {
+  let alice = Account { id: "acc_alice", balance: 100, transactions: 0 }
+  let bob   = Account { id: "acc_bob",   balance: 50,  transactions: 0 }
+
+  let pair = handle {
+    transfer(alice, bob, 30)
+  } with Audit {
+    log(msg, resume) -> {
+      Stdout.print("[audit] #{msg}")
+      resume(())
+    }
+    return(x) -> x
+  }
+  let alice2 = pair.fst
+  let bob2   = pair.snd
+  Stdout.print("alice: #{alice2.balance}")
+  Stdout.print("bob:   #{bob2.balance}")
+  Stdout.print("alice tx: #{alice2.transactions}")
+  Stdout.print("bob   tx: #{bob2.transactions}")
+}
