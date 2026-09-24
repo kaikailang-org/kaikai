@@ -1,0 +1,12 @@
+# The binder `sg` shadows the module `sg` in its arm body, yet the
+# qualified pattern `sg.Ping(n)` beside it still names the module's
+# constructor: a pattern qualifier is never a local.
+import sg
+
+fn describe(pair: (Int, sg.Signal)) : String = match pair {
+  (sg, sg.Ping(n)) -> "binder=#{sg} ping=#{n}"
+  (sg, sg.Pong)    -> "binder=#{sg} pong"
+}
+
+fn main() : Unit / Stdout =
+  Stdout.print("#{describe((1, sg.Ping(2)))} #{describe((3, sg.Pong))}")

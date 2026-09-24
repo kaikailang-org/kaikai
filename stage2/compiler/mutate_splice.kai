@@ -1,0 +1,264 @@
+# compiler/mutate_splice.kai — turning a mutation site into source.
+#
+# The AST says WHAT to break and WHERE; this module rewrites exactly
+# that span in the ORIGINAL source and leaves every other byte alone.
+#
+# The alternative — re-printing the mutated AST through the formatter —
+# was measured and rejected: `stage2/compiler/perceus.kai` is 5918
+# lines and formats to 7626, so a reprinted mutant would carry ~1700
+# lines of cosmetic reflow around the one line that matters. A diff
+# nobody can read is a diff nobody acts on, and an operator's effect
+# must be the only difference between a mutant and its parent.
+#
+# Spans come from the token stream, which carries absolute byte offsets
+# (`start` + `length`). A site's line/col locates its anchor token; the
+# operator decides how far the span reaches from there.
+
+import compiler.lex
+import compiler.mutate
+import compiler.mutate_ops
+
+# --- token lookup -----------------------------------------------------
+
+# The first token at or after (line, col). Sites are anchored on a real
+# token, so the equal case is the hit; the "after" case only carries a
+# zero-width insertion whose anchor is the following token.
+fn tok_at(toks: [Token], line: Int, col: Int) : Option[Token] {
+  match toks {
+    [] -> None
+    [t, ...rest] ->
+      if t.line == line and t.col == col { Some(t) }
+      else { tok_at(rest, line, col) }
+  }
+}
+
+fn toks_from(toks: [Token], line: Int, col: Int) : [Token] {
+  match toks {
+    [] -> []
+    [t, ...rest] ->
+      if t.line == line and t.col == col { toks } else { toks_from(rest, line, col) }
+  }
+}
+
+fn tok_end(t: Token) : Int = t.start + t.length
+
+# --- span model -------------------------------------------------------
+
+#[doc("A source position: 1-based line and column, 0-based byte offset.")]
+pub type MutPoint = MPoint(Int, Int, Int)
+
+#[doc("Line of a source position, 1-based.")]
+pub fn mpoint_line(p: MutPoint) : Int = match p { MPoint(l, _, _) -> l }
+
+#[doc("Column of a source position, 1-based, counted in bytes.")]
+pub fn mpoint_col(p: MutPoint) : Int = match p { MPoint(_, c, _) -> c }
+
+#[doc("Byte offset of a source position, 0-based.")]
+pub fn mpoint_byte(p: MutPoint) : Int = match p { MPoint(_, _, b) -> b }
+
+#[doc("A resolved mutation: the half-open span `[start, end)` it rewrites and the text written in its place.")]
+pub type MutEdit = MEdit(MutPoint, MutPoint, String)
+
+#[doc("Start of the rewritten span.")]
+pub fn medit_start(e: MutEdit) : MutPoint = match e { MEdit(a, _, _) -> a }
+
+#[doc("End of the rewritten span, exclusive.")]
+pub fn medit_end(e: MutEdit) : MutPoint = match e { MEdit(_, b, _) -> b }
+
+#[doc("The text the mutation writes over the span. Empty deletes it.")]
+pub fn medit_text(e: MutEdit) : String = match e { MEdit(_, _, t) -> t }
+
+type MutRange = MRange(MutPoint, MutPoint)
+
+fn point_before(t: Token) : MutPoint = MPoint(t.line, t.col, t.start)
+
+# The position just past a token. Only a multi-line string literal
+# spans a newline, so the column is recounted from the last one inside.
+fn point_after(t: Token, src: String) : MutPoint =
+  match last_newline(src, t.start, tok_end(t) - 1) {
+    None -> MPoint(t.line, t.col + t.length, tok_end(t))
+    Some(nl) -> MPoint(t.line + count_newlines(src, t.start, nl), tok_end(t) - nl, tok_end(t))
+  }
+
+fn last_newline(src: String, lo: Int, i: Int) : Option[Int] =
+  if i < lo { None }
+  else if char_at(src, i) == Some('\n') { Some(i) }
+  else { last_newline(src, lo, i - 1) }
+
+fn count_newlines(src: String, i: Int, hi: Int) : Int =
+  if i > hi { 0 }
+  else if char_at(src, i) == Some('\n') { 1 + count_newlines(src, i + 1, hi) }
+  else { count_newlines(src, i + 1, hi) }
+
+# --- per-operator span resolution -------------------------------------
+
+fn mut_range_of(site: MutSite, toks: [Token], src: String) : Option[MutRange] {
+  let rest = toks_from(toks, ms_line(site), ms_col(site))
+  match rest {
+    [] -> None
+    [t, ..._] -> match ms_op(site) {
+      MOpArm -> mut_arm_range(site, toks, t)
+      MOpCall -> mut_call_range(rest, src, t)
+      MOpNegate -> mut_cond_range(site, toks, src, t)
+      # Comparison, connective and literal all rewrite one token, and
+      # the anchor IS that token: a binop node's line/col point at the
+      # operator, a literal's at the literal.
+      _ -> Some(MRange(point_before(t), point_after(t, src)))
+    }
+  }
+}
+
+# An arm runs from its own pattern's first token up to where the NEXT
+# arm's pattern begins, a boundary the site carries because a token scan
+# cannot find it: nothing in the token stream distinguishes an arm
+# boundary from a nested `match`, and two arms written on one line have
+# no newline between them at all.
+#
+# Ending the span at the next arm's first token consumes the whitespace
+# and newline between them, so the deletion leaves neither a blank line
+# nor a stray indent.
+fn mut_arm_range(site: MutSite, toks: [Token], first: Token) : Option[MutRange] =
+  match mut_parse_pos(ms_end(site)) {
+    None -> None
+    Some(MPos2(l, c)) -> match tok_at(toks, l, c) {
+      None -> None
+      Some(nxt) -> Some(MRange(point_before(first), point_before(nxt)))
+    }
+  }
+
+# `if c { … }` -> `if not (c) { … }`: one span covering the whole
+# condition. The parentheses are not cosmetic — `not` binds tighter
+# than every binary operator, so `not v == 0` reparses as
+# `(not v) == 0` and the mutant fails to typecheck for a reason that
+# has nothing to do with the mutation.
+#
+# The condition's extent comes from the `if` body's `{`, which the site
+# carries: the AST is the only authority on where a condition stops,
+# since the same token run could belong to a nested `if`. Ending on the
+# LAST token before that brace keeps the trailing whitespace outside
+# the span, so the closing paren lands against the condition.
+fn mut_cond_range(site: MutSite, toks: [Token], src: String, first: Token) : Option[MutRange] =
+  match mut_parse_pos(ms_end(site)) {
+    None -> None
+    Some(MPos2(l, c)) -> match mut_last_before(toks_from(toks, first.line, first.col), l, c, None) {
+      None -> None
+      Some(last) -> Some(MRange(point_before(first), point_after(last, src)))
+    }
+  }
+
+# The last token before (line, col), or None when the run reaches that
+# position with nothing behind it.
+fn mut_last_before(toks: [Token], line: Int, col: Int, last: Option[Token]) : Option[Token] {
+  match toks {
+    [] -> last
+    [t, ...more] ->
+      if t.line == line and t.col == col { last }
+      else { mut_last_before(more, line, col, Some(t)) }
+  }
+}
+
+# A `line:col` cue as the walk encodes it. None for a malformed or
+# empty key, which fails the site rather than mutating a guessed span.
+type MutPos2 = MPos2(Int, Int)
+
+fn mut_parse_pos(key: String) : Option[MutPos2] = {
+  let i = string_index_of_char(key, ':')
+  if i < 0 { None }
+  else {
+    let l = string_to_int(string_slice(key, 0, i))
+    let c = string_to_int(string_slice(key, i + 1, string_length(key) - i - 1))
+    match l {
+      None -> None
+      Some(lv) -> match c {
+        None -> None
+        Some(cv) -> Some(MPos2(lv, cv))
+      }
+    }
+  }
+}
+
+# `f(x)` -> `x`: one span covering the whole call, from the callee's
+# first token through the `)` that closes its argument list. The
+# replacement is the argument's own source, so the elision keeps the
+# argument exactly as the author wrote it.
+fn mut_call_range(rest: [Token], src: String, first: Token) : Option[MutRange] =
+  match mut_call_close(rest, 0, false) {
+    None -> None
+    Some(close) -> Some(MRange(point_before(first), point_after(close, src)))
+  }
+
+fn tok_depth_delta(t: Token) : Int = match t.kind {
+  TkLparen -> 1  TkLbracket -> 1  TkLbrace -> 1
+  TkRparen -> 0 - 1  TkRbracket -> 0 - 1  TkRbrace -> 0 - 1
+  _ -> 0
+}
+
+# The `)` closing this call, or None when the token run does not close.
+# `opened` guards the callee tokens that precede the argument list so
+# the scan does not stop before it begins.
+fn mut_call_close(toks: [Token], depth: Int, opened: Bool) : Option[Token] {
+  match toks {
+    [] -> None
+    [t, ...more] -> {
+      let d = depth + tok_depth_delta(t)
+      if opened and d == 0 { Some(t) }
+      else if d < 0 { None }
+      else { mut_call_close(more, d, opened or d > 0) }
+    }
+  }
+}
+
+# --- applying a mutation ----------------------------------------------
+
+#[doc("Resolve a mutation site to the span it rewrites and its replacement text. None when the site's anchor token cannot be found.")]
+pub fn mut_edit_of(site: MutSite, toks: [Token], src: String) : Option[MutEdit] =
+  match mut_range_of(site, toks, src) {
+    None -> None
+    Some(MRange(a, b)) ->
+      Some(MEdit(a, b, mut_replacement(site, toks, src, mpoint_byte(a), mpoint_byte(b))))
+  }
+
+#[doc("The mutated source for one site: the original with the site's span replaced. None when the site cannot be resolved against the token stream.")]
+pub fn mut_apply(site: MutSite, toks: [Token], src: String) : Option[String] =
+  match mut_edit_of(site, toks, src) {
+    None -> None
+    Some(ed) -> Some(mut_splice(src, ed))
+  }
+
+fn mut_splice(src: String, ed: MutEdit) : String = {
+  let b = mpoint_byte(medit_end(ed))
+  concat_all([string_slice(src, 0, mpoint_byte(medit_start(ed))), medit_text(ed),
+              string_slice(src, b, string_length(src) - b)])
+}
+
+#[doc("The source text of `[a, b)`.")]
+pub fn mut_span_text(src: String, a: Int, b: Int) : String =
+  if b > a { string_slice(src, a, b - a) } else { "" }
+
+# Call elision writes its argument back and negation writes its
+# condition back, both reconstructed from the original source so the
+# mutant keeps the author's spelling. Every other operator's
+# replacement is fixed by the site itself.
+fn mut_replacement(site: MutSite, toks: [Token], src: String, a: Int, b: Int) : String =
+  match ms_op(site) {
+    MOpCall -> mut_call_arg_text(toks_from(toks, ms_line(site), ms_col(site)), src, b)
+    MOpNegate -> concat_all(["not (", mut_span_text(src, a, b), ")"])
+    _ -> ms_to(site)
+  }
+
+fn mut_call_arg_text(rest: [Token], src: String, b: Int) : String =
+  match mut_call_open(rest) {
+    0 -> ""
+    open -> mut_span_text(src, open, b - 1)
+  }
+
+# Offset just past the `(` that opens this call's argument list.
+fn mut_call_open(toks: [Token]) : Int {
+  match toks {
+    [] -> 0
+    [t, ...more] -> match t.kind {
+      TkLparen -> tok_end(t)
+      _ -> mut_call_open(more)
+    }
+  }
+}
