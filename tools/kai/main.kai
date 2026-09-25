@@ -1,0 +1,103 @@
+#[doc("The `kai` command: core verbs run here; any other verb runs a `kai-<verb>` plugin.")]
+
+import os.env
+import cli_build
+import cli_doc
+import cli_env
+import cli_fmt
+import cli_info
+import cli_install
+import cli_layout
+import cli_lsp
+import cli_migrate
+import cli_mutate
+import cli_pkgcmd
+import cli_plugin
+import cli_runners
+import cli_sys
+import cli_test
+import cli_toolchain
+import cli_usage
+import cli_watch
+
+
+fn unknown(l: Layout, verb: String) : Int / Stderr + File {
+  Stderr.eprint("kai: error: unknown command: #{verb}")
+  Stderr.eprint(cli_usage.text(l))
+  2
+}
+
+# The verbs that compile: the deep-recursing compiler needs a 32 MiB stack, and
+# every child resolves the stdlib this kai does.
+fn core(
+  l: Layout,
+  args: [String],
+  verb: (Toolchain, [String]) -> Result[Int, Int] / e
+) : Int / Env + File + Ffi + e {
+  cli_sys.raise_stack(33554432)
+  let _ = env.set("KAIKAI_STDLIB_PATH", l.stdlib)
+  match verb(cli_toolchain.resolve(l), args) {
+    Ok(code) -> code
+    Err(code) -> code
+  }
+}
+
+# The runtime prints these reports at exit; they belong to the user's program, not to kai.
+fn quiet_exit_reports() : Unit / Env {
+  let _ = env.unset("KAI_TRACE_RC")
+  let _ = env.unset("KAI_PROFILE_RC")
+}
+
+fn dispatch(l: Layout, argv: [String]) : Int / Stdout + Stderr + Env + File + Ffi =
+  match argv {
+    [] -> {
+      Stderr.eprint(cli_usage.text(l))
+      2
+    }
+    [v, ..._] if v == "help" or v == "-h" or v == "--help" -> {
+      Stdout.print(cli_usage.text(l))
+      0
+    }
+    ["env", ...rest] -> cli_env.run(l, rest)
+    ["build", ...rest] -> core(l, rest, cli_build.build)
+    ["run", ...rest] -> core(l, rest, cli_build.run)
+    ["test", ...rest] -> core(l, rest, cli_test.test_verb)
+    ["bench", ...rest] -> core(l, rest, cli_runners.bench_verb)
+    ["check", ...rest] -> core(l, rest, cli_runners.check_verb)
+    ["typecheck", ...rest] -> core(l, rest, cli_runners.typecheck_verb)
+    ["init", ...rest] -> core(l, rest, cli_pkgcmd.init_verb)
+    ["fetch", ...rest] -> core(l, rest, cli_pkgcmd.fetch_verb)
+    ["install", ...rest] -> core(l, rest, cli_install.install_verb)
+    ["add", ...rest] -> core(l, rest, cli_pkgcmd.add_verb)
+    ["update", ...rest] -> core(l, rest, cli_pkgcmd.update_verb)
+    ["show", ...rest] -> core(l, rest, cli_pkgcmd.show_verb)
+    ["lint", ...rest] -> core(l, rest, cli_runners.lint_verb)
+    ["fmt", ...rest] -> core(l, rest, cli_fmt.fmt_verb)
+    ["migrate", ...rest] -> core(l, rest, cli_migrate.migrate_verb)
+    ["info", ...rest] -> core(l, rest, cli_info.info_verb)
+    ["doc", ...rest] -> core(l, rest, cli_doc.doc_verb)
+    ["mutate", ...rest] -> core(l, rest, cli_mutate.mutate_verb)
+    ["watch", ...rest] -> core(l, rest, cli_watch.watch_verb)
+    ["lsp", ...rest] -> core(l, rest, cli_lsp.lsp_verb)
+    [v, ...rest] if v == "--version" or v == "-V" -> core(l, rest, cli_usage.version)
+    [v, ...rest] -> match cli_plugin.find(l, v) {
+      Some(prog) -> cli_plugin.launch(l, prog, rest)
+      None -> unknown(l, v)
+    }
+  }
+
+fn main() : Int / Stdout + Stderr + Env + File + Ffi =
+  match cli_layout.resolve(program_name()) {
+    Ok(l) -> {
+      let code = dispatch(l, Env.args())
+      quiet_exit_reports()
+      code
+    }
+    Err(root) -> {
+      Stderr.eprint("kai: error: cannot find kaikai installation under #{root}")
+      Stderr.eprint(
+        "  expected dev layout (stage0/, stdlib/) or installed layout (libexec/kaikai/, share/kaikai/)"
+      )
+      2
+    }
+  }
