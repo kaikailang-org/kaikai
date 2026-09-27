@@ -1,0 +1,7 @@
+fn pick(flag: Bool) : String {
+  if flag { ?same } else { ?same }
+}
+
+fn main() {
+  print(pick(true))
+}
