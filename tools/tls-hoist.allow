@@ -1,0 +1,93 @@
+# Thread-local hoist allow-list — every thread-local the hot runtime bitcode
+# (stage0/runtime_llvm.bc, stage0/runtime_inline.bc) is permitted to reference.
+#
+# The hot bitcode is merged into the program module before O2, so its functions
+# inline into emitted kaikai frames. Those frames span parks, and a park can
+# resume the fiber on a different OS thread — so a thread-local slot address
+# materialised in such a frame is stale by the time it is used again. The gate
+# `tools/tls-hoist-gate.sh` classifies every reference and fails the build on
+# any symbol not listed here, on any listed symbol whose class no longer
+# matches, and on any entry the bitcode no longer references.
+#
+# Format: `<symbol> <class>`, one per line. `#` starts a comment.
+#
+# Classes:
+#   accessor  Every function that materialises the address is `noinline` and
+#             keeps the address to itself, so it is resolved and consumed
+#             inside one activation — where thread identity is constant — and
+#             no caller can cache it across a switch. The gate VERIFIES this,
+#             so the entry cannot rot into a claim.
+#   exposed   At least one materialising function is inlinable, so the address
+#             CAN be folded into a park-spanning frame. Listed as tracked debt,
+#             not as a safety claim: the entry exists so that a NEW exposure
+#             fails the build. Each of these is closed by routing the access
+#             through a `noinline` accessor, after which the gate demands the
+#             entry be promoted to `accessor`.
+
+# ── accessor — the active-fiber pair ───────────────────────────────────
+# Read only via kai_current_fiber and written only via kai_set_active_fiber,
+# both noinline; kai_active_fiber_anchor is the noinline initialiser that binds
+# each thread's slot to its own kai_main_fiber. The accessors return values
+# loaded THROUGH the slot, never the slot address, so nothing escapes the frame.
+kai_active_fiber                  accessor
+kai_main_fiber                    accessor
+
+# ── accessor — free-list pools + slab bump allocator ───────────────────
+# The pool pop/push and the slab bump/teardown are routed through noinline
+# accessors (kai_cell_pool_pop/_push, kai_var_block_pool_pop/_push,
+# kai_pending_free_set/_take, kai_slab_alloc/_teardown), each materialising the
+# thread-local address inside one activation and exchanging only the value — so
+# a work-stolen fiber can never push a freed cell onto, or pop from, the parking
+# thread's free list, nor bump-allocate into its slabs.
+kai_cell_pool                     accessor
+kai_cell_pool_n                   accessor
+kai_var_block_pool                accessor
+kai_var_block_pool_n              accessor
+kai_pending_free                  accessor
+kai_slab_cur                      accessor
+kai_slab_off                      accessor
+kai_slab_list                     accessor
+kai_slab_count                    accessor
+kai_slab_cap                      accessor
+kai_slab_atexit                   accessor
+
+# ── exposed — region arena stack ───────────────────────────────────────
+# kai_arena_top returns &kai_arena_stack[sp-1] BY CONTRACT — the active region
+# pointer passed to the arena allocators — so the accessor rule (never return
+# the address) cannot apply. Soundness rests on the pinned-region invariant
+# instead: a region never spans a yield, so the arena TLS is empty at every
+# suspension point and no materialised address outlives a park. That invariant
+# lives in the typer, not the bitcode, so THIS gate cannot verify it — these
+# stay exposed (an inlinable materialiser IS present) rather than claiming a
+# safety this gate did not check.
+#
+# The invariant IS enforced, just on a different axis: the pinned-region gate
+# (compiler/region_yield.kai) fails the compile if any `region { }` body can
+# reach a suspending effect (Spawn/Actor/Cancel/Link/Monitor), directly or
+# through a call, so no region push can span a park. The backing these entries
+# rest on is a checked property now, not only an argued one.
+kai_arena_stack                   exposed
+kai_arena_sp                      exposed
+kai_arena_alloc_total             exposed
+kai_arena_free_total              exposed
+
+# ── accessor — RC / vec trace ledgers ──────────────────────────────────
+# Summed at exit, so a stale slot mis-attributes counts between threads rather
+# than corrupting the heap — the least damaging members of the class. The
+# per-event bookkeeping is routed through noinline accessors (kai_rc_count_alloc
+# /_free/_live_inc/_live_sub/_reuse, kai_vec_count_inplace/_cow) that update the
+# slot inside one activation, so a summed count is attributed to the thread that
+# ran the op, not the one that parked before it.
+kai_rc_alloc_total                accessor
+kai_rc_alloc_by_tag               accessor
+kai_rc_free_total                 accessor
+kai_rc_live_now                   accessor
+kai_rc_live_peak                  accessor
+kai_rc_reuse_total                accessor
+kai_vec_inplace_total             accessor
+kai_vec_cow_total                 accessor
+
+# ── accessor — per-thread heap accounting ──────────────────────────────
+# kai_heap_charge is the sole hot-path writer and is noinline, so the ceiling
+# accumulator is charged against the running thread's ledger, never a stale one.
+kai_heap_committed                accessor

@@ -1,0 +1,250 @@
+# compiler/fmt_shape.kai — the questions `kai fmt` asks about a node
+# before it picks a layout.
+#
+# Every entry here is a pure query over the AST: does this expression
+# print as an atom, does it start with a `{`, how many trailing block
+# lambdas does an argument list end in, which source line does a
+# statement sit on. The writer branches on the answers; nothing here
+# emits, so nothing here belongs in the mutually-recursive walker
+# (compiler/fmt_expr.kai) that does.
+#
+# The walker's recursion cycle survives the split because no query
+# calls back into it. The width model (compiler/fmt_layout.kai) asks
+# its shape questions here too: where an expression starts, whether it
+# opens a block, whether a list packs into rows.
+
+import compiler.ast
+import compiler.ast_map
+import compiler.parse
+
+#[doc("The literal suffix that reproduces an `EFixed` node's width type.")]
+pub fn fmt_fixed_suffix(ty: Ty) : String = match ty {
+  TyByte   -> "u8"
+  TyInt32  -> "i32"
+  TyUInt32 -> "u32"
+  TyUInt64 -> "u64"
+  _        -> "i128"
+}
+
+#[doc("True when the expression is a single literal or name: the kind of element a broken list packs into rows.")]
+pub fn fmt_is_scalar(e: Expr) : Bool = match e.kind {
+  EInt(_, _) -> true
+  EReal(_, _) -> true
+  EIntLit(_) -> true
+  EDecimalLit(_) -> true
+  EFixed(_, _) -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  EStr(_, _) -> true
+  EUnit -> true
+  EVar(_) -> true
+  ESym(_, _) -> true
+  ELitUnit(inner, _) -> fmt_is_scalar(inner)
+  ESurface(sf) -> match sf { SfBigIntLit(_) -> true  _ -> false }
+  _ -> false
+}
+
+# A unit annotation binds by lexical adjacency to its literal, so
+# `3<m>` is self-delimiting exactly when its interior is.
+#[doc("True when the expression prints as a self-delimiting form, so an enclosing operator needs no parentheses around it.")]
+pub fn expr_is_atomic(e: Expr) : Bool {
+  match e.kind {
+    ELitUnit(inner, _) -> expr_is_atomic(inner)
+    EUnder -> true
+    EPlaceholder -> true
+    EHole(_) -> true
+    ETodo(_) -> true
+    EExternBody(_) -> true
+    ECall(_, _) -> true
+    EField(_, _) -> true
+    EModCall(_, _) -> true
+    EIndex(_, _) -> true
+    ERecordLit(_, _) -> true
+    EList(_) -> true
+    EBlock(_, _) -> true
+    ERange(_, _, _) ->
+    # `[lo..hi]` form prints as a self-bounded literal, no paren needed.
+    true
+    # A block lambda prints as its own `{ ... }` delimiters.
+    ESurface(sf) -> match sf { SfLamBlock(_, _) -> true  _ -> false }
+    _ -> fmt_is_scalar(e)
+  }
+}
+
+# Postfix and infix forms inherit the answer from their leftmost
+# operand; everything else opens with its own token and is safe.
+#[doc("Leftmost-constituent descent: true when the expression prints starting with a `Name {` record literal.")]
+pub fn fmt_head_is_record_lit(e: Expr) : Bool = match e.kind {
+  ERecordLit(_, _)   -> true
+  EBlock(_, _)       -> true
+  ESurface(sf)       -> match sf { SfLamBlock(_, _) -> true  _ -> false }
+  EField(obj, _)     -> fmt_head_is_record_lit(obj)
+  EIndex(obj, _)     -> fmt_head_is_record_lit(obj)
+  ECall(callee, _)   -> fmt_head_is_record_lit(callee)
+  EBang(inner)       -> fmt_head_is_record_lit(inner)
+  EBinop(_, l, _)    -> fmt_head_is_record_lit(l)
+  EPipe(l, _)        -> fmt_head_is_record_lit(l)
+  EMapPipe(l, _)     -> fmt_head_is_record_lit(l)
+  EFlatMapPipe(l, _) -> fmt_head_is_record_lit(l)
+  EFilterPipe(l, _)  -> fmt_head_is_record_lit(l)
+  ELitUnit(inner, _) -> fmt_head_is_record_lit(inner)
+  _ -> false
+}
+
+#[doc("The arm behind a `{ pat -> body }` block lambda: the synthetic position-keyed binder matched by a single irrefutable arm, or None for a lambda the author wrote in full.")]
+pub fn lam_block_wrap_arm(params: [Param], body: Expr) : Option[Arm] = match params {
+  [pm] -> match body.kind {
+    EMatch(scrut, arms) -> match arms {
+      [Arm(pat, None, abody)] -> match scrut.kind {
+        EVar(n) ->
+          if n == pm.pname and n == lam_pat_binder_name(pat.line, pat.col) {
+            Some(Arm(pat, None, abody))
+          } else { None }
+        _ -> None
+      }
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+# The pipe-placeholder desugar (`lhs |> f(_, y)` into
+# `((__pipe) => f(__pipe, y))(lhs)`) and the point-free argument
+# desugar (`f(. < 3)` into `f((__pl) => __pl < 3)`) both mint a fixed
+# reserved binder, so the writer restores the author's spelling by
+# structure: the parser is the only producer of those binders.
+#[doc("The body of a point-free section with its `__pl` binder restored to `.`, or None when the lambda is the author's own.")]
+pub fn fmt_placeholder_body(params: [Param], body: Expr) : Option[Expr] =
+  match params {
+    [prm] ->
+      if prm.pname == "__pl" { Some(fmt_subst_var(body, "__pl", EPlaceholder)) }
+      else { None }
+    _ -> None
+  }
+
+#[doc("Replace every free occurrence of the variable `name` in `e` with the expression kind `to`.")]
+pub fn fmt_subst_var(e: Expr, name: String, to: ExprKind) : Expr = match e.kind {
+  EVar(v) ->
+    if v == name { Expr { kind: to, line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+    else { e }
+  # A nested lambda re-binding the same name shadows it; stop there.
+  ELambda(ps, _) ->
+    if fsv_binds(ps, name) { e }
+    else { Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+                  line: e.line, col: e.col, ty: e.ty, mode: e.mode } }
+  _ -> Expr { kind: prc_map_expr_kind(e.kind, (x) => fmt_subst_var(x, name, to)),
+              line: e.line, col: e.col, ty: e.ty, mode: e.mode }
+}
+
+fn fsv_binds(ps: [Param], name: String) : Bool = match ps {
+  [] -> false
+  [prm, ...rest] -> prm.pname == name or fsv_binds(rest, name)
+}
+
+# ---- width-model queries ---------------------------------------------
+
+# Anything that opens a delimiter and lays its contents out below it.
+#[doc("True when the expression prints as its own block — a literal, block or clause form that breaks inside its delimiters — so it may hug an enclosing call's parenthesis.")]
+pub fn fmt_is_block_like(e: Expr) : Bool = match e.kind {
+  EList(_) -> true
+  ERecordLit(_, _) -> true
+  EBlock(_, _) -> true
+  EMatch(_, _) -> true
+  EIf(_, _, _) -> true
+  EHandle(_, _, _, _, _, _, _, _) -> true
+  ELambda(_, body) -> match body.kind { EBlock(_, _) -> true  _ -> false }
+  ESurface(sf) -> match sf {
+    SfLamBlock(_, _) -> true
+    SfMapLit(_, _) -> true
+    SfSetLit(_, _) -> true
+    SfCaseBlock(_) -> true
+    SfMultiMatch(_, _) -> true
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("True when every expression is a single literal or name.")]
+pub fn fmt_all_scalar(es: [Expr]) : Bool = match es {
+  [] -> true
+  [x, ...rest] -> fmt_is_scalar(x) and fmt_all_scalar(rest)
+}
+
+#[doc("True when every list element is a plain literal or name; a spread is not.")]
+pub fn fmt_all_scalar_elems(elems: [ListElem]) : Bool = match elems {
+  [] -> true
+  [ElPlain(x), ...rest] -> fmt_is_scalar(x) and fmt_all_scalar_elems(rest)
+  [ElSpread(_), ..._rest] -> false
+}
+
+#[doc("True when the last expression of the list is block-like.")]
+pub fn fmt_last_is_block_like(es: [Expr]) : Bool = match es {
+  [] -> false
+  [x] -> fmt_is_block_like(x)
+  [_, ...rest] -> fmt_last_is_block_like(rest)
+}
+
+# Contract clauses and case-blocks bring their own opener.
+#[doc("The token that opens a function body on the signature line: ` {` for a block, ` =` for an expression, nothing for a form that opens itself.")]
+pub fn fmt_fn_opener(body: Expr) : String = match body.kind {
+  EBlock(_, _) -> " {"
+  ESurface(sf) -> match sf {
+    SfContract(_, _, _) -> ""
+    SfCaseBlock(_) -> ""
+    _ -> " ="
+  }
+  _ -> " ="
+}
+
+# A run counter: an interior block arg (`f({ x -> x }, y)`) resets it.
+#[doc("Length of the suffix of `args` written as trailing blocks (`f(a) { .. } { .. }`), at most two by the grammar.")]
+pub fn fmt_count_trailing(args: [Expr], run: Int) : Int = match args {
+  [] -> run
+  [a, ...rest] -> fmt_count_trailing(rest, match a.kind {
+    ESurface(sf) -> match sf { SfLamBlock(_, true) -> run + 1  _ -> 0 }
+    _ -> 0
+  })
+}
+
+#[doc("The first `n` arguments, or all of them when `n` exceeds the list.")]
+pub fn fmt_args_take(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { [] } else { match args {
+    [] -> []
+    [a, ...rest] -> [a, ...fmt_args_take(rest, n - 1)]
+  } }
+
+#[doc("The arguments after the first `n`.")]
+pub fn fmt_args_drop(args: [Expr], n: Int) : [Expr] =
+  if n <= 0 { args } else { match args {
+    [] -> []
+    [_, ...rest] -> fmt_args_drop(rest, n - 1)
+  } }
+
+# Both spellings fill one AST slot; the clause form arrives wrapped in
+# `SfHandleInit`, which is what tells them apart.
+#[doc("The body of a handler's `initially { }` clause, or None when the state was written as `(init)` or omitted.")]
+pub fn handle_init_clause(init_opt: Option[Expr]) : Option[Expr] = match init_opt {
+  None -> None
+  Some(ie) -> match ie.kind {
+    ESurface(sf) -> match sf {
+      SfHandleInit(inner) -> Some(inner)
+      _ -> None
+    }
+    _ -> None
+  }
+}
+
+# Mirror of the typer's shape rule: the lifecycle form carries no
+# params, while an op clause always has at least `resume`.
+#[doc("True for a handler's `initially`/`finally` clause, as opposed to an operation clause.")]
+pub fn fmt_is_lifecycle_clause(name: String, params: [Param]) : Bool =
+  if name == "finally" or name == "initially" {
+    match params { [] -> true _ -> false }
+  } else { false }
+
+#[doc("Source line of the first type in the list, 0 when empty: the opener line a row label's arguments are measured against.")]
+pub fn fmt_first_type_line(tys: [TypeExpr]) : Int = match tys {
+  [] -> 0
+  [t, ..._rest] -> t.line
+}

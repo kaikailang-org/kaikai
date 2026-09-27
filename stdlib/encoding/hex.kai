@@ -1,0 +1,104 @@
+#[doc("""
+Hexadecimal encoding/decoding. Pure functional. Encoders emit
+lowercase; decoders accept both cases. No `0x` prefix is added or
+required.
+
+`encode` / `decode` operate on `[Int]` byte lists. `from_int` /
+`to_int` operate on a non-negative Int and its hex string. `to_int`
+returns None on empty or non-hex input, and silently wraps on
+values exceeding 64 bits.
+""")]
+
+# ---- Alphabet ----------------------------------------------------
+
+fn hex_alpha() : String = "0123456789abcdef"
+
+fn hex_digit(n: Int) : String = string_slice(hex_alpha(), n, 1)
+
+# ---- Byte encoding -----------------------------------------------
+
+fn encode_loop(bs: [Int], acc: String) : String = match bs {
+  []           -> acc
+  [b, ...rest] -> {
+    let hi = hex_digit((b / 16) % 16)
+    let lo = hex_digit(b % 16)
+    encode_loop(rest, string_concat(acc, string_concat(hi, lo)))
+  }
+}
+
+#[doc("Encodes a byte list to a lowercase hex string, two digits per byte.")]
+pub fn encode(bs: [Int]) : String = encode_loop(bs, "")
+
+# ---- Byte decoding -----------------------------------------------
+
+# Decode a single hex character to a 4-bit value. Accepts both
+# `0-9 a-f A-F`. None on anything else.
+fn hex_char_value(c: Char) : Option[Int] = {
+  if char.is_digit(c) { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+}
+
+# Walk the input string two chars at a time. Odd-length strings
+# return None — there is no convention for which side gets the
+# implicit zero, so we refuse to guess.
+fn decode_loop(s: String, i: Int, acc: [Int]) : Option[[Int]] = {
+  let n = string_length(s)
+  if i >= n { Some(list_reverse(acc)) }
+  else if i + 1 >= n { None }
+  else {
+    match char_at(s, i) {
+      None     -> None
+      Some(ch) -> match hex_char_value(ch) {
+        None     -> None
+        Some(hi) -> match char_at(s, i + 1) {
+          None     -> None
+          Some(cl) -> match hex_char_value(cl) {
+            None     -> None
+            Some(lo) -> decode_loop(s, i + 2, [(hi * 16) + lo, ...acc])
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("Decodes a hex string (mixed case) to bytes; `None` on odd length or any non-hex character.")]
+pub fn decode(s: String) : Option[[Int]] = decode_loop(s, 0, [])
+
+# ---- Int <-> hex string ------------------------------------------
+
+# Convert a non-negative Int to a lowercase hex string with no
+# leading zeros (0 renders as "0"). Negative inputs return "0".
+fn from_int_loop(n: Int, acc: String) : String = {
+  if n == 0 { acc }
+  else { from_int_loop(n / 16, string_concat(hex_digit(n % 16), acc)) }
+}
+
+#[doc("Renders a non-negative integer as a lowercase hex string with no leading zeros; non-positive input gives `\"0\"`.")]
+pub fn from_int(n: Int) : String = {
+  if n <= 0 { "0" }
+  else { from_int_loop(n, "") }
+}
+
+# Parse a hex string (either case) into an Int. None on any invalid
+# character. Inputs exceeding Int's range silently wrap.
+fn to_int_loop(s: String, i: Int, acc: Int) : Option[Int] = {
+  if i >= string_length(s) { Some(acc) }
+  else {
+    match char_at(s, i) {
+      None    -> None
+      Some(c) -> match hex_char_value(c) {
+        None    -> None
+        Some(v) -> to_int_loop(s, i + 1, (acc * 16) + v)
+      }
+    }
+  }
+}
+
+#[doc("Parses a hex string (mixed case) to an integer; `None` on empty input or any non-hex character.")]
+pub fn to_int(s: String) : Option[Int] = {
+  if string_length(s) == 0 { None }
+  else { to_int_loop(s, 0, 0) }
+}
