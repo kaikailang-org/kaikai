@@ -1,0 +1,24 @@
+# Issue #174: multi-bound impl-site constraint. Family 2 supports
+# `T : Show + Eq + Ord` via `+`-separated protocol names. The parser
+# must accept the form; the bounds are stripped before the methods
+# are typed. This fixture's job is purely syntactic — verifying that
+# the multi-bound annotation parses and typechecks without error.
+#
+# The single-bound case is exercised by stdlib's own `impl[T : Show]
+# Show for [T]` (stdlib/protocols.kai). Multi-bound has no other
+# fixture in the tree, so this one carries the cobertura by itself.
+# The bound on `Eq` is purely syntactic (no Eq method is called
+# inside the body) — the original Issue #174 fixture made the same
+# choice.
+
+type Wrap[T] = { inner: T }
+
+impl[T : Show + Eq] Show for Wrap[T] {
+  fn show(w: Wrap[T]) : String = "Wrap(" ++ show(w.inner) ++ ")"
+}
+
+fn main() : Int {
+  let w = Wrap { inner: 42 }
+  print(show(w))
+  0
+}

@@ -1,0 +1,18 @@
+# Transitive purity. A contract predicate may call a pure fn that
+# itself calls another pure fn — purity is a property of each fn's
+# effect row, so it composes: `is_valid` (empty row) calls `nonzero`
+# (empty row), and `requires is_valid(b)` is admitted. No annotation
+# anywhere; the old `[<refinement_pure>]` attribute is gone.
+
+fn nonzero(n: Int) : Bool = n != 0
+
+fn is_valid(n: Int) : Bool = nonzero(n) and n > 0
+
+fn divide(a: Int, b: Int) : Int
+  requires is_valid(b)
+  = a / b
+
+fn main() : Unit / Stdout {
+  Stdout.print("q=#{int_to_string(divide(10, 5))}")
+  Stdout.print("q=#{int_to_string(divide(20, 4))}")
+}

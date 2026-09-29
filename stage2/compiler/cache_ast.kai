@@ -1,0 +1,80 @@
+#[doc("""
+The `[Decl]` payload of a KAB2 blob, encoded by the `BinSerialize` derive
+on the AST types.
+
+Declaration-level `SymId`s are dropped on the way in. They index the
+symbol table of the build that stamped them, and the typed cut keys on
+these bytes, so carrying them would re-key every module whenever an
+unrelated declaration shifts the table. An `ESym` keeps its id: the key
+covers it, so a hit restores the ids this build resolved.
+""")]
+
+import compiler.ast
+import compiler.cache
+
+#[doc("A deserialised post-parse blob: the decls plus the key sha echoed from its header.")]
+pub type CacheDeserialized = CDs([Decl], String)
+
+#[doc("The decl-list payload: a 4-byte count, then each decl, with declaration-level `SymId`s dropped.")]
+pub fn cache_decls_bytes(ds: [Decl]) : Array[Byte] =
+  bin_list_to_bytes(decls_unstamped(ds), cache_decl_bytes)
+
+fn cache_decl_bytes(d: Decl) : Array[Byte] = to_bytes(d)
+
+#[doc("Decode a decl-list payload at `pos`, returning the decls and the cursor past them.")]
+pub fn cache_decls_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[[Decl]], String] =
+  bin_list_from_bytes(buf, pos, decl_from_bytes)
+
+#[doc("Serialise decls plus their 64-char key sha into a KAB2 blob.")]
+pub fn cache_serialize_module(decls: [Decl], source_sha: String) : Array[Byte] =
+  cache_blob(source_sha, cache_decls_bytes(decls))
+
+#[doc("Deserialise a KAB2 blob back into decls + sha; `None` on any header or payload mismatch, which the caller treats as a miss.")]
+pub fn cache_deserialize_module(buf: Array[Byte]) : Option[CacheDeserialized] = match cache_read_header(buf) {
+  None -> None
+  Some(hdr) -> match hdr {
+    CHdr(sha, pos) -> match cache_decls_from_bytes(buf, pos) {
+      Ok(c)  -> if c.pos == array_length(buf) { Some(CDs(c.value, sha)) } else { None }
+      Err(_) -> None
+    }
+  }
+}
+
+#[doc("The decls with every declaration-level `SymId` reset to `sym_none()`, nested decls included.")]
+pub fn decls_unstamped(ds: [Decl]) : [Decl] = map(ds, decl_unstamped)
+
+fn decl_unstamped(d: Decl) : Decl = match d {
+  DFn(p, n, tps, ps, r, row, b, l, c, mo, _) -> DFn(p, n, tps, ps, r, row, b, l, c, mo, sym_none())
+  DType(p, n, tps, b, l, c, mo, sl, _)       -> DType(p, n, tps, b, l, c, mo, sl, sym_none())
+  DEffect(p, n, tps, ops, db, l, c, mo, _)   -> DEffect(p, n, tps, ops, db, l, c, mo, sym_none())
+  DProtocol(p, n, tps, ops, l, c, mo, _)     -> DProtocol(p, n, tps, ops, l, c, mo, sym_none())
+  DImpl(pn, tas, t, ds, l, c, itps, _)       -> DImpl(pn, tas, t, decls_unstamped(ds), l, c, itps, sym_none())
+  DConst(p, n, ty, b, mo, l, c, _)           -> DConst(p, n, ty, b, mo, l, c, sym_none())
+  DDerive(ps, inner, l, c)                   -> DDerive(ps, decl_unstamped(inner), l, c)
+  DUnstable(inner, l, c)                     -> DUnstable(decl_unstamped(inner), l, c)
+  DConstructor(inner, l, c)                  -> DConstructor(decl_unstamped(inner), l, c)
+  DProtoLaws(s, inner, l, c, mo)             -> DProtoLaws(s, decl_unstamped(inner), l, c, mo)
+  DImplAxiom(s, inner, l, c, mo)             -> DImplAxiom(s, decl_unstamped(inner), l, c, mo)
+  DDoc(a, b, inner, l, c)                    -> DDoc(a, b, decl_unstamped(inner), l, c)
+  DAttr(s, inner, l, c)                      -> DAttr(s, decl_unstamped(inner), l, c)
+  _ -> d
+}
+
+#[doc("Round-trip `decls` through a blob and report `OK <decls> decls, <bytes> bytes` when re-encoding the restored decls reproduces the blob byte for byte, or a `FAIL` line naming the first drift.")]
+pub fn cache_roundtrip_check(decls: [Decl]) : String {
+  let sha = "0000000000000000000000000000000000000000000000000000000000000000"
+  let blob1 = cache_serialize_module(decls, sha)
+  match cache_deserialize_module(blob1) {
+    None -> "FAIL: deserialize returned None"
+    Some(cds) -> match cds {
+      CDs(restored, sha2) -> {
+        let n = array_length(blob1)
+        let blob2 = cache_serialize_module(restored, sha)
+        if sha2 != sha { "FAIL: sha mismatch" }
+        else if not cache_bytes_eq(blob1, blob2) { "FAIL: re-encoded blob differs" }
+        else { concat_all(["OK ", int_to_string(list_length(restored)), " decls, ",
+                           int_to_string(n), " bytes"]) }
+      }
+    }
+  }
+}

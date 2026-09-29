@@ -1,0 +1,11 @@
+import pa
+import pb
+import pc
+
+fn main() : Unit / Stdout = {
+  let m1 = pa.Tok(1, 2)
+  let m2 = pa.Tok(1, 3)
+  let s1 = pb.Tok(1, 2)
+  let s2 = pb.Tok(1, 3)
+  Stdout.print("#{m1 == m2} #{s1 == s2} #{[m1] == [m2]} #{[s1] == [s2]}")
+}

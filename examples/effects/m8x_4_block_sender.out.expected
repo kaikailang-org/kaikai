@@ -1,0 +1,4 @@
+consumer: got msg1
+consumer: got msg2
+consumer: got msg3
+main: done
