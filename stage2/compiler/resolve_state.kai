@@ -1,0 +1,163 @@
+#[doc("""
+The resolution the resolver accumulates as it walks: the symbol table
+it resolves against, the module symbol the declaration it is inside
+belongs to, and the use table it fills.
+
+The home is that module's `SymId`, resolved once when the walk enters
+the module. Two homonymous modules hold two ids, so the home a use site
+carries cannot be confused with another module's by spelling.
+
+It rides the resolver's `Env` as one field rather than three so the
+seven `Env` literals keep saying what they are about — scope, error
+flag, diagnostics — and the resolution stays one thing that can be
+lifted out whole when a consumer starts reading it.
+
+`rs_off` carries the case where nothing is resolving: an empty symbol
+table and no rows, so a caller that only wants the resolver's existing
+scope check pays one `Bool` test per use site and nothing else.
+
+Rows accumulate newest-first, the same shape the diagnostic list
+already uses, and become columns once at the end of the walk. Keeping
+the walk over a list is what lets the columns be built inside a single
+function, where `Mutable` is masked.
+""")]
+
+import compiler.symtab
+import compiler.decl_names
+import compiler.resolve_use
+import compiler.scope_view
+import compiler.scope_file
+
+#[doc("Resolution accumulated across a resolver walk. `view` is the scope view of the file the walk is inside.")]
+pub type ResState = { tab: SymTab, home: SymId, on: Bool,
+                      views: FileViews, view: ScopeView, prelude: [String] }
+
+#[doc("An inert resolution state: use sites are walked but nothing is recorded.")]
+pub fn rs_off() : ResState =
+  ResState { tab: st_empty(), home: sym_none(), on: false,
+             views: fv_empty(), view: sv_of_home(sym_none()), prelude: [] }
+
+#[doc("A resolution state recording against `tab`, starting in the module named `home`, with every file seeing only its own declarations.")]
+pub fn rs_on(tab: SymTab, home: String) : ResState =
+  rs_on_views(tab, fv_empty(), home, [])
+
+#[doc("A resolution state recording against `tab`, whose files resolve under `views`, starting in the module named `home`. `prelude` names the builtins every file sees without importing them.")]
+pub fn rs_on_views(tab: SymTab, views: FileViews, home: String,
+      prelude: [String]) : ResState =
+  ResState { tab: tab, home: rs_home_sym(tab, home), on: true,
+             views: views, view: fv_of(tab, views, home), prelude: prelude }
+
+#[doc("The same state moved into the module named `home`, the one the next declaration belongs to. The view follows: a declaration resolves under the imports of the file that declares it.")]
+pub fn rs_at_home(r: ResState, home: String) : ResState =
+  ResState { tab: r.tab, home: rs_home_sym(r.tab, home), on: r.on,
+             views: r.views, view: fv_of(r.tab, r.views, home),
+             prelude: r.prelude }
+
+# A home the table does not know declares nothing, so no declaration is
+# owned by it and every contested use stays a candidate set.
+fn rs_home_sym(tab: SymTab, home: String) : SymId = match st_module(tab, home) {
+  Some(m) -> m
+  None    -> sym_none()
+}
+
+#[doc("How the state's current home is spelled. The walker that computes the next home reads names, not ids.")]
+pub fn rs_home_name(r: ResState) : String = sym_name(r.tab, r.home)
+
+#[doc("""
+The id `name` reaches when declared in class `cls` inside the state's
+current home. A registration site asks this to bind the chain to the
+same identity the table already minted, rather than a placeholder the
+chain would have to re-resolve at every use.
+
+`sym_none()` when the state is not recording, the home is unknown to
+the table (a lint or test path with no whole-program build), or the
+class genuinely has no such declaration there — the chain still binds
+the name for shadowing, just with no identity behind it.
+""")]
+pub fn rs_decl_owner_sym(r: ResState, cls: NCls, name: String) : SymId =
+  match st_lookup(r.tab, cls, name, r.home) {
+    Some(s) -> s
+    None    -> sym_none()
+  }
+
+#[doc("""
+The effect a handler head names: a qualifier picks that module's
+declaration outright, a bare name resolves against the state's own home
+first and the whole table after.
+
+`sym_none()` when nothing declares it, or when two modules do and the
+head names neither — the contested case a diagnostic already reports.
+""")]
+pub fn rs_effect_sym(r: ResState, name: String) : SymId =
+  match split_dotted_qualifier(name) {
+    Some(QSplit(m, bare)) -> match st_module(r.tab, m) {
+      Some(mh) -> rs_sym_or_none(st_lookup(r.tab, NCEffect, bare, mh))
+      None     -> sym_none()
+    }
+    None -> match st_lookup(r.tab, NCEffect, name, r.home) {
+      Some(s) -> s
+      None    -> rs_sole_effect(st_candidates(r.tab, NCEffect, name))
+    }
+  }
+
+fn rs_sym_or_none(o: Option[SymId]) : SymId = match o {
+  Some(s) -> s
+  None    -> sym_none()
+}
+
+# One declaration answers; two or more leave the head contested, which
+# is not this function's call to settle.
+fn rs_sole_effect(cands: [SymId]) : SymId = match cands {
+  [s] -> s
+  _   -> sym_none()
+}
+
+#[doc("True when the state is recording.")]
+pub fn rs_recording(r: ResState) : Bool = r.on
+
+#[doc("""
+The declaration `name` reaches from this state's home, or `None` when
+nothing declares it, the bare name is contested, or the name is one the
+type decides rather than the scope.
+
+A prelude builtin stays unstamped for a neighbouring reason: it is
+bound with no identity, so the table does not hold it and the chain
+cannot see it competing. Stamping the name would hand the use to an
+imported homonym the builtin should have won.
+
+A constructor stays unstamped on purpose: which variant a bare `Ok`
+names is decided by the type its use site sits under — a return type, an
+annotation, a scrutinee — and the builtin constructors it competes with
+are not declarations this table holds. Fixing an answer here would
+settle, from a partial candidate set, a question the typer answers from
+the full one.
+
+A protocol dispatcher is the same shape. One `__proto_show` stands for
+every `show` any protocol declares, and which impl a call reaches is
+decided by its receiver's type. Binding it to the declaration the
+scope walk happened to reach would answer, from the scope, a question
+only the type can settle.
+""")]
+pub fn rs_decl_sym(r: ResState, name: String) : Option[SymId] =
+  if rs_type_decides(name) or list_has(r.prelude, name) { None }
+  else {
+    match ru_value_in(r.tab, r.view, name, false) {
+      URSym(i) -> rs_stampable(r.tab, SymId(i))
+      _        -> None
+    }
+  }
+
+# The synthesised dispatcher a protocol op lowers to. It is one
+# declaration standing for every impl, so the scope has no answer to
+# give about it.
+fn rs_type_decides(name: String) : Bool = {
+  let p = "__proto_"
+  let n = string_length(p)
+  string_length(name) > n and string_slice(name, 0, n) == p
+}
+
+fn rs_stampable(tab: SymTab, s: SymId) : Option[SymId] =
+  match sym_class(tab, s) {
+    NCCtor -> None
+    _      -> Some(s)
+  }
