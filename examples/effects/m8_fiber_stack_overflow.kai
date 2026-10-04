@@ -1,0 +1,50 @@
+# Fibers Tier 1 #2 — guard page coverage. Recursing non-tail-deeply
+# inside a spawned fiber must hit the guard page (PROT_NONE at the
+# bottom of the fiber's private mmap stack) and terminate with a
+# legible diagnostic on stderr instead of corrupting the heap.
+#
+# Without the guard, the overflow would silently scribble into
+# whatever malloc placed under the stack — UB that only surfaces as
+# a delayed crash. With the guard, the kernel raises SIGSEGV at the
+# moment of overflow; the runtime's SIGSEGV handler prints
+#   `kai: fiber stack overflow at <ptr>`
+# before re-raising with the default disposition so the process
+# exits with the standard signal-killed status.
+#
+# `deep` keeps a per-frame `scratch` Array alive ACROSS the recursive
+# call and reads it AFTER the call returns. This defeats every fold
+# that would shrink the stack: kaikai's mandatory TCO cannot fire
+# (the `array_get` read is in non-tail position), and — crucially —
+# the C backend's optimiser cannot collapse the chain into a loop at
+# `-O2` either, because the live local array forces each frame to
+# persist. The earlier `deep(n-1) + 1` form regressed the moment
+# kaic2 moved to `-O2`: clang turned the bare integer recursion into
+# an accumulator loop, the stack never grew, and the guard page was
+# never touched. 50_000 of these frames comfortably exceed the
+# default 64 KiB private fiber stack.
+#
+# The harness runs this at several KAI_THREADS values: the diagnostic
+# depends on the faulting thread owning an alternate signal stack, and
+# only a high enough thread count forces the fiber onto a worker rather
+# than the thread that initialised the handler.
+
+import spawn
+
+fn deep(n: Int) : Int = {
+  if n == 0 {
+    0
+  } else {
+    let scratch = array_make(4, n)
+    let r = deep(n - 1)
+    r + array_get(scratch, 0)
+  }
+}
+
+fn worker() : Int = deep(50000)
+
+fn main() : Int / Console + Spawn = {
+  let fib = spawn.spawn(worker)
+  let v   = spawn.await(fib)
+  Stdout.print(int_to_string(v))
+  0
+}

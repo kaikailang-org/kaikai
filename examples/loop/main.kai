@@ -1,0 +1,18 @@
+# Smoke test for stdlib/loop.kai — exercises `repeat` end-to-end.
+#
+# Uses paren+trailing form: `repeat(3) { Stdout.print("hi") }`. The
+# body is a trailing-lambda block (m7b #3); its row is `Console`,
+# which propagates out via `repeat`'s row variable `e` (m7b #12)
+# into `main`'s row.
+#
+# Wire-up: invoked with `--path stdlib`, so `import loop` resolves
+# to `stdlib/loop.kai`. `import` brings names into scope without a
+# namespace prefix (consistent with `examples/modules/`).
+
+import loop
+
+fn main() : Int / Console = {
+  repeat(3) { Stdout.print("hi") }
+  Stdout.print("done")
+  0
+}
