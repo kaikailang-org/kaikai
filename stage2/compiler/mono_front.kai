@@ -1,0 +1,76 @@
+# compiler/mono_front.kai — the passes from the typed program to the
+# monomorphised decls, with the diagnostics they raise.
+#
+# A bound or a protocol dispatch is decided at each concrete
+# instantiation, so some errors exist only once mono has run. Every
+# mode that reports a verdict on the program runs this one prefix, which
+# keeps a check-only run's verdict identical to a build's.
+
+import compiler.ast
+import compiler.diag
+import compiler.diag_file
+import compiler.util
+import compiler.infer
+import compiler.protos
+import compiler.proto_resolve
+import compiler.tycon_home
+import compiler.fwd_inline
+import compiler.closure_spec
+import compiler.monomorph
+import compiler.verdicts
+import compiler.fn_bounds
+
+#[doc("The program fed to mono, the specialised decls, and the verdict of the post-mono checks.")]
+pub type MonoFront = { prog: TypedProgram, decls: [Decl], verdict: Verdict }
+
+#[doc("Run the passes from the typed program through monomorphisation and report the bound, leak and dispatch errors found on the specialised decls. A `check_only` run reports the same errors but leaves the non-spec call sites unrewritten.")]
+pub fn mono_front(typed: TypedProgram, reg: ProtocolReg, local_arities: [OpAr],
+                  fn_bounds: [SymBounds], ps: PScope, target_mod: String,
+                  file: String, df: DiagFiles, check_only: Bool) : MonoFront / Console + File {
+  # The typer leaves a nominal type's `module_origin` empty when its
+  # name alone does not settle the home; stamp it once so every
+  # consumer of `Expr.ty` reads a type's home.
+  let homed = typed_prog_with_decls(typed, tag_tycon_modules(typed.decls))
+  # Spec closes each env-empty higher-order stage to pure before mono,
+  # so mono grounds it to concrete types.
+  let fwd0 = inline_trivial_forwarders(homed)
+  let fwd = typed_prog_with_decls(fwd0, closure_spec_pass(fwd0.decls))
+  match monomorphise(fwd, reg, local_arities, fn_bounds, ps, target_mod, check_only) {
+    MonoOut(ds, leaks, viols) -> {
+      let bounds = vd_render(map(viols, (v) => bound_diag(file, v)))
+      let leak_errs = report_mono_leaks(file, leaks)
+      # A dispatcher call left on a concrete receiver is a polymorphic
+      # body instantiated at a type with no impl.
+      let dispatch = finalize_diags(validate_resolved_decls(ds, reg, df, []))
+      MonoFront { prog: fwd, decls: ds, verdict: vd_merge([bounds, vd_count(leak_errs), vd_rendered(dispatch)]) }
+    }
+  }
+}
+
+fn bound_diag(file: String, v: BoundViolation) : Diagnostic = match v {
+  BV(msg, line, col) -> mk_diag(SevError, file, line, col, msg, [])
+}
+
+# A leak is a spec body node whose type still names a tyvar the spec
+# substituted: the spec would run as a polymorphic copy.
+fn report_mono_leaks(file: String, rs: [MLeakRecord]) : Int / Console + File {
+  match rs {
+    [] -> 0
+    [r, ...rest] -> match r {
+      MLeakRec(name, n, loc) -> {
+        let loc_s = match loc {
+          Some(MLeakAt(line, col, ty_s)) ->
+            concat_all([" first at ", int_to_string(line), ":",
+                        int_to_string(col), " ty=", ty_s])
+          None -> ""
+        }
+        diag_error(file, 0, 0,
+          concat_all(["m4c Phase 3 invariant: spec '", name,
+                       "' has ", int_to_string(n),
+                       " TyVarT/UVar leak(s) in body Expr.ty",
+                       loc_s]))
+        n + report_mono_leaks(file, rest)
+      }
+    }
+  }
+}
