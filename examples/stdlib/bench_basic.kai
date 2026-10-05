@@ -1,0 +1,42 @@
+# bench v1.x (issues #40 + #437) — smoke fixture for `kai bench`.
+#
+# Run with:
+#
+#   bin/kai bench examples/stdlib/bench_basic.kai
+#   bin/kai bench --iters 5000 examples/stdlib/bench_basic.kai
+#   KAI_BENCH_ITERS=2000 KAI_BENCH_WARMUP=100 bin/kai bench …
+#
+# Each `bench "name" { body }` block runs KAI_BENCH_WARMUP untimed
+# iterations (default 50) then KAI_BENCH_ITERS timed iterations
+# (default 1000) under clock_gettime(CLOCK_MONOTONIC). Per-iteration
+# nanoseconds are collected into a sample buffer; on exit the runner
+# sorts the samples and prints
+#
+#   <name>: <N> iter / median <X> ns / MAD <Y> ns / mean <Z> ns / range [<lo>, <hi>]
+#
+# per block, followed by a `3 benches` summary line. The numbers vary
+# per run; `make test-bench` greps for the format rather than diffing
+# against a golden file.
+
+fn fib(n: Int) : Int {
+  if n < 2 { n }
+  else { fib(n - 1) + fib(n - 2) }
+}
+
+# Tier 1 — primitive arithmetic. No allocation; expected to be the
+# cheapest of the three.
+bench "arith: 2 + 3 * 4" {
+  2 + 3 * 4
+}
+
+# Tier 2 — list construction + traversal. Exercises cons / record
+# allocations and the linear-pass length walker.
+bench "allocs: list.repeat(1, 16) length" {
+  list_length(list.repeat(1, 16))
+}
+
+# Tier 3 — recursion + arithmetic. fib(10) doubles as a smoke for
+# self-tail-call rewrite + recursive call accounting.
+bench "recursive: fib(10)" {
+  fib(10)
+}

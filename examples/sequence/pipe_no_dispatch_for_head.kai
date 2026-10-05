@@ -1,0 +1,16 @@
+# issue #201 Constraint #2, refined by issue #594 — a user-defined
+# head type that no module claims must reject `|` / `||` with a
+# typed error.
+#
+# `Box[T]` is declared locally in the root file (not exported by any
+# module the convention-based dispatch could find), so the typer's
+# head-owner cache lookup returns `HLNone` and the diagnostic says
+# "no module declaring type `Box` is in scope".
+
+type Box[T] = MkBox(T)
+
+fn main() : Int {
+  let b = MkBox(5)
+  let r = b | (v) => v + 1
+  0
+}

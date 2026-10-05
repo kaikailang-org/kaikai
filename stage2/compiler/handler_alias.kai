@@ -1,0 +1,49 @@
+# compiler/handler_alias.kai — the handler-state aliases a stateful handler's clauses bind and read.
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.util
+
+#[doc("The handler-state aliases a user writes; an enclosing binding of either name takes precedence inside the clauses.")]
+pub fn user_state_aliases() : [String] = ["state", "log"]
+
+#[doc("The alias a `var` cell's synthetic clauses reach their slot through; no enclosing binding takes it over.")]
+pub fn var_cell_alias() : String = "__var_cell"
+
+#[doc("The aliases a stateful handler binds in its clauses, given which names the enclosing scope already binds.")]
+pub fn clause_state_aliases(bound_outside: (String) -> Bool) : [String] =
+  list_append(filter(user_state_aliases(), (nm) => not bound_outside(nm)), [var_cell_alias()])
+
+#[doc("The handler-state aliases a stateful handler actually binds, given the enclosing local scope.")]
+pub fn live_state_aliases(stateful: Bool, local_scope: [String]) : [String] =
+  if stateful { clause_state_aliases((nm) => list_has(local_scope, nm)) } else { [] }
+
+#[doc("The state aliases a handle binds in its clauses: a handle carries state exactly when it has an initial value.")]
+pub fn handle_live_aliases(init_opt: Option[Expr], local_scope: [String]) : [String] = match init_opt {
+  Some(_) -> live_state_aliases(true, local_scope)
+  None    -> []
+}
+
+#[doc("The names in `names` that some clause or the return clause of a handler mentions.")]
+pub fn aliases_read_by_clauses(names: [String], cs: [HClause], ret_opt: Option[HReturn]) : [String] =
+  filter(names, (nm) => clauses_mention(nm, cs) or return_mentions(nm, ret_opt))
+
+fn clauses_mention(nm: String, cs: [HClause]) : Bool = match cs {
+  []                              -> false
+  [HC(_, _, body, _, _), ...rest] -> expr_mentions(nm, body) or clauses_mention(nm, rest)
+}
+
+fn return_mentions(nm: String, ret_opt: Option[HReturn]) : Bool = match ret_opt {
+  Some(HR(_, body, _, _)) -> expr_mentions(nm, body)
+  None                    -> false
+}
+
+fn expr_mentions(nm: String, e: Expr) : Bool = match e.kind {
+  EVar(u) -> u == nm
+  _       -> positions_mention(nm, xp_positions(e))
+}
+
+fn positions_mention(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> expr_mentions(nm, c) or positions_mention(nm, rest)
+}

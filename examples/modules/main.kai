@@ -1,0 +1,13 @@
+# Smoke test for M6.1 module resolution. `main` imports both
+# `arith` and `shapes`, and `shapes` in turn imports `arith`
+# (diamond-shaped graph). The resolver loads each module once and
+# concatenates their decls into a single program, so calls like
+# `add1`, `mul2`, and `area` all resolve.
+import arith
+import shapes
+
+fn main() {
+  print(int_to_string(add1(41)))          # 42  (from arith)
+  print(int_to_string(mul2(21)))          # 42  (from arith)
+  print(int_to_string(area(3, 4)))        # 12  (from shapes, uses arith)
+}
