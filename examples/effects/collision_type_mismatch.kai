@@ -1,0 +1,29 @@
+# Repro 2 from #789 (verbatim). Same by-name op-collision path as
+# collision_value_corruption, but the corrupt `@remaining` (resolved to
+# the enclosing State[[Int]] runner — a list) fed arithmetic: `@remaining
+# - 1` subtracted an Int from a list and the runtime aborted. The L2
+# op-name-collision diagnostic now rejects this at compile time, before
+# any wrong evidence is ever bound. The sibling `.err.expected` pins the
+# diagnostic and keeps this fixture out of the backend-parity glob.
+effect Tick { tick() : Unit }
+
+fn with_list[R, e](body: () -> R / e) : R / e = {
+  handle { body() } with State[[Int]]([]) {
+    get(resume) -> resume(state)
+    set(v, resume) -> resume((), v)
+    return(x) -> x
+  }
+}
+
+fn main() : Unit / Stdout = {
+  var remaining := 10
+  with_list() {
+    handle { Tick.tick() } with Tick {
+      tick(resume) -> {
+        remaining := remaining - 1
+        resume(())
+      }
+    }
+  }
+  Stdout.print("done")
+}

@@ -1,0 +1,144 @@
+# Hash index over the function registry.
+#
+# The unbox, Perceus and emit walks ask for a fn's entry or unboxed
+# signature once per decl and per call site, against one entry per
+# top-level fn in the whole program. The index buckets the registry by
+# bare name so a lookup runs over one name's entries instead of all of
+# them.
+#
+# A chain is newest-first, and two modules sharing a basename register
+# the same (name, module) pair twice, so a reader states which of the two
+# it answers. A hash collision mixes foreign names into a chain; the
+# reader re-tests both name and module, so it costs a comparison, never
+# an answer.
+
+import compiler.infer_index
+import compiler.fnreg
+import compiler.symtab_build
+
+#[doc("A function registry plus a hash index from bare name to the entries sharing it.")]
+pub type FnIndex = { ix: NameIndex[EFn], sx: NameIndex[EFn], all: [EFn] }
+
+#[doc("The index over an empty registry.")]
+pub fn fnx_empty() : FnIndex = FnIndex { ix: idx_empty(), sx: idx_empty(), all: [] }
+
+#[doc("Index a function registry so a signature lookup does not scan it.")]
+pub fn fnx_build(fns: [EFn]) : FnIndex =
+  FnIndex { ix: fnx_add(fns, idx_empty()), sx: fnx_add_sym(fns, idx_empty()), all: fns }
+
+fn fnx_add(fns: [EFn], ix: NameIndex[EFn]) : NameIndex[EFn] = match fns {
+  []           -> ix
+  [f, ...rest] -> match f {
+    EFn(n, _, _, _, _) -> fnx_add(rest, idx_prepend(ix, n, f))
+  }
+}
+
+# The same registry keyed by the declaration each entry instantiates. A
+# bucket holds one declaration and its specialisations, told apart by
+# instance index — the name index needs a `(name, module)` test precisely
+# because a name bucket cannot tell two homonyms apart.
+fn fnx_add_sym(fns: [EFn], ix: NameIndex[EFn]) : NameIndex[EFn] = match fns {
+  []           -> ix
+  [f, ...rest] -> match f {
+    EFn(_, _, _, _, s) ->
+      if fnx_stamped(fnid_sym(s)) { fnx_add_sym(rest, idx_prepend_sym(ix, fnid_sym(s), f)) }
+      else { fnx_add_sym(rest, ix) }
+  }
+}
+
+fn fnx_stamped(s: SymId) : Bool = sym_raw(s) >= 0
+
+#[doc("The unboxed-signature classification of the fn instance `s` names, if it has one. The id answers alone: no name, no module, no tie to break.")]
+pub fn fnx_ufn_sig_sym(fx: FnIndex, s: FnId) : Option[UFnSig] = match fnx_of_sym(fx, s) {
+  Some(EFn(_, _, _, sig, _)) -> sig
+  None -> None
+}
+
+#[doc("""
+The entry a call site names, decided by identity when the site carries
+one and by the name over `fns` only when it does not.
+
+An identity answers exactly one entry, so two homonymous declarations
+never trade places here, and it needs no module rotation of the table.
+The name path stays for the references no resolver stamped — a
+synthesised callee, a spelling minted downstream — which is also why it
+keeps its first-match fallback.
+""")]
+pub fn fnx_resolve(fx: FnIndex, fns: [EFn], s: FnId, target: String, root_mod: Option[String]) : Option[EFn] =
+  match fnx_of_sym(fx, s) {
+    Some(e) -> Some(e)
+    None    -> fnx_by_name(fx, fns, target, root_mod)
+  }
+
+#[doc("The declaration a call to `target` carrying identity `s` reaches. An unstamped reference to a name `is_builtin` claims is the builtin, so a declaration spelled like a builtin never captures a call the resolver left to the builtin.")]
+pub fn fnx_callee(fx: FnIndex, fns: [EFn], s: FnId, target: String, root_mod: Option[String],
+      is_builtin: (String) -> Bool) : Option[EFn] =
+  match fnx_of_sym(fx, s) {
+    Some(e) -> Some(e)
+    None    -> if is_builtin(target) { None } else { fnx_by_name(fx, fns, target, root_mod) }
+  }
+
+# `fns` is `fx.all` or a module rotation of it; a rotation prunes only names
+# the registry holds more than once, so a unique name answers from its bucket
+# and only homonyms walk `fns` for the tie-break.
+fn fnx_by_name(fx: FnIndex, fns: [EFn], target: String, root_mod: Option[String]) : Option[EFn] =
+  match efn_collect_matching(idx_chain(fx.ix, target), target, []) {
+    []  -> None
+    [e] -> Some(e)
+    _   -> efn_resolve(fns, target, root_mod)
+  }
+
+#[doc("The fn `home` declares as `name`: a qualified reference names its declaration, never a homonym of another home.")]
+pub fn fnx_qualified(fx: FnIndex, home: String, name: String) : Option[EFn] =
+  fnx_of_sym(fx, fnid_decl(sym_derive(NCFn, name, home)))
+
+#[doc("The registry entry for the fn instance `s`: the declaration itself or one of its specialisations.")]
+pub fn fnx_of_sym(fx: FnIndex, s: FnId) : Option[EFn] = fnx_inst(idx_chain_sym(fx.sx, fnid_sym(s)), s)
+
+fn fnx_inst(chain: [EFn], s: FnId) : Option[EFn] = match chain {
+  []           -> None
+  [f, ...rest] -> if fnid_eq(efn_sym(f), s) { Some(f) } else { fnx_inst(rest, s) }
+}
+
+#[doc("The unboxed-signature classification of the declaration `fid` names; a declaration no resolver stamped answers by `name` and `mo`.")]
+pub fn fnx_decl_sig(fx: FnIndex, fid: FnId, name: String, mo: Option[String]) : Option[UFnSig] =
+  if fnx_stamped(fnid_sym(fid)) { fnx_ufn_sig_sym(fx, fid) } else { fnx_ufn_sig(fx, name, mo) }
+
+#[doc("The unboxed-signature classification of the fn a call head names, resolved like `fnx_resolve` without a root module.")]
+pub fn fnx_callee_sig(fx: FnIndex, callee: Expr) : Option[UFnSig] = match callee.kind {
+  ESym(s, inst, name) -> efn_sig_of(fnx_resolve(fx, fx.all, FnId(s, inst), name, None))
+  EVar(name)          -> efn_sig_of(fnx_by_name(fx, fx.all, name, None))
+  EModCall(mo, name)  -> fnx_ufn_sig(fx, name, Some(mo))
+  _                   -> None
+}
+
+fn efn_sig_of(e: Option[EFn]) : Option[UFnSig] = match e {
+  Some(EFn(_, _, _, sig, _)) -> sig
+  None                       -> None
+}
+
+#[doc("The unboxed-signature classification of the fn declared as `name` by `mo`, if it has one; of a pair registered twice, the later.")]
+pub fn fnx_ufn_sig(fx: FnIndex, name: String, mo: Option[String]) : Option[UFnSig] =
+  fnx_sig_chain(idx_chain(fx.ix, name), name, mo)
+
+fn fnx_sig_chain(chain: [EFn], name: String, mo: Option[String]) : Option[UFnSig] = match chain {
+  []           -> None
+  [f, ...rest] -> match f {
+    EFn(n, _, m2, sig, _) ->
+      if n == name and mo_eq(mo, m2) { sig } else { fnx_sig_chain(rest, name, mo) }
+  }
+}
+
+#[doc("The unboxed-signature classification of the first registry entry declared as `name` by `mo`: the one a scan of the registry in order finds.")]
+pub fn fnx_ufn_sig_first(fx: FnIndex, name: String, mo: Option[String]) : Option[UFnSig] =
+  fnx_sig_oldest(idx_chain(fx.ix, name), name, mo, None)
+
+fn fnx_sig_oldest(chain: [EFn], name: String, mo: Option[String], found: Option[UFnSig]) : Option[UFnSig] = match chain {
+  []           -> found
+  [f, ...rest] -> match f {
+    EFn(n, _, m2, sig, _) -> fnx_sig_oldest(rest, name, mo, if n == name and mo_eq(mo, m2) { sig } else { found })
+  }
+}
+
+#[doc("The whole registry, in its original order — for the readers that need order or every entry.")]
+pub fn fnx_all(fx: FnIndex) : [EFn] = fx.all
