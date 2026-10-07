@@ -1,0 +1,177 @@
+#[doc("""
+Symbol table: one opaque `SymId` per declaration, resolved to its
+`{class, name, owner}` row in O(1).
+
+Identity is the id, not the spelling. Two declarations of the same
+bare name in different homes are different ids, so a consumer that
+holds a `SymId` cannot re-derive a different candidate than the one
+resolve picked — the failure mode that string comparison keeps
+reproducing across passes.
+
+A `SymId` is derived from `(home, class, name)` and nothing else: two
+tables built over different streams give a declaration the same id, and
+adding a declaration never moves another. Two keys that hash to one id
+abort the build rather than share a row.
+
+Storage is open addressing keyed by id: one `Array` per field, indexed
+by the slot the id probes to, so a row costs no cons cell and a lookup
+never walks the table. `Vec` would be the value-typed choice, but the
+bootstrap compiler that builds this bundle has no `Vec` primitives.
+
+A module is itself a symbol, and a declaration's owner is that
+module's id rather than its spelling, so asking which module owns a
+declaration is an integer comparison.
+""")]
+
+import compiler.ast
+import compiler.decl_names
+
+#[doc("Symbol table keyed by `SymId`: one slot buffer per field, plus a hash index from bare name to ids.")]
+pub type SymTab = { count: Int,
+                    cap: Int,
+                    ids: Array[Int],
+                    names: Array[String],
+                    owners: Array[Int],
+                    classes: Array[NCls],
+                    exported: Array[Bool],
+                    buckets: Array[[Int]] }
+
+#[doc("""
+The empty table: no symbols, and no slots either.
+
+Every read checks `cap` before it probes, so a table with zero slots
+answers every lookup empty without allocating. A caller holding an
+inert table — a resolver walking with recording off — pays nothing.
+""")]
+pub fn st_empty() : SymTab = st_with_cap(0)
+
+#[doc("A table with `cap` empty slots and no symbols. `cap` is zero or a power of two.")]
+pub fn st_with_cap(cap: Int) : SymTab =
+  SymTab { count: 0,
+           cap: cap,
+           ids: array_make(cap, 0 - 1),
+           names: array_make(cap, ""),
+           owners: array_make(cap, 0 - 1),
+           classes: array_make(cap, NCFn),
+           exported: array_make(cap, false),
+           buckets: array_make(cap, []) }
+
+#[doc("How many symbols the table holds.")]
+pub fn st_count(t: SymTab) : Int = t.count
+
+#[doc("True when `s` names a row of `t`.")]
+pub fn st_valid(t: SymTab, s: SymId) : Bool = st_row(t, s) >= 0
+
+# The slot holding `s`, or -1. Ids are never negative, so a negative
+# raw value (none, or a local binder) answers absent without probing.
+fn st_row(t: SymTab, s: SymId) : Int {
+  let id = sym_raw(s)
+  if t.cap == 0 or id < 0 { 0 - 1 }
+  else {
+    let i = st_probe(t, id, id % t.cap)
+    if array_get(t.ids, i) == id { i } else { 0 - 1 }
+  }
+}
+
+#[doc("The slot holding `id`, or the empty slot where it would go. Load stays at or below one half, so the walk always meets an empty slot.")]
+pub fn st_probe(t: SymTab, id: Int, i: Int) : Int {
+  let k = array_get(t.ids, i)
+  if k == id or k < 0 { i } else { st_probe(t, id, (i + 1) % t.cap) }
+}
+
+#[doc("The declared name of `s`, or the empty string when `t` does not hold `s`.")]
+pub fn sym_name(t: SymTab, s: SymId) : String {
+  let i = st_row(t, s)
+  if i >= 0 { array_get(t.names, i) } else { "" }
+}
+
+#[doc("The module symbol that owns `s`. A module owns nothing, so its own owner is `sym_none()`.")]
+pub fn sym_owner(t: SymTab, s: SymId) : SymId {
+  let i = st_row(t, s)
+  if i >= 0 { SymId(array_get(t.owners, i)) } else { sym_none() }
+}
+
+#[doc("The home module that declares `s`, or the empty string when `t` does not hold `s` or nothing owns it.")]
+pub fn sym_home(t: SymTab, s: SymId) : String = sym_name(t, sym_owner(t, s))
+
+#[doc("True when `a` and `b` are owned by the same module symbol.")]
+pub fn sym_same_owner(t: SymTab, a: SymId, b: SymId) : Bool =
+  sym_raw(sym_owner(t, a)) == sym_raw(sym_owner(t, b))
+
+#[doc("True when the module symbol `m` owns `s`.")]
+pub fn sym_owned_by(t: SymTab, s: SymId, m: SymId) : Bool =
+  sym_raw(sym_owner(t, s)) == sym_raw(m)
+
+#[doc("The name class of `s`. An absent id reports `NCFn`, which no caller reaches without first checking `st_valid`.")]
+pub fn sym_class(t: SymTab, s: SymId) : NCls {
+  let i = st_row(t, s)
+  if i >= 0 { array_get(t.classes, i) } else { NCFn }
+}
+
+#[doc("True when `s` is exported from its home.")]
+pub fn sym_exported(t: SymTab, s: SymId) : Bool {
+  let i = st_row(t, s)
+  if i >= 0 { array_get(t.exported, i) } else { false }
+}
+
+#[doc("Every id the table holds, in slot order.")]
+pub fn st_ids(t: SymTab) : [SymId] = st_ids_from(t, t.cap - 1, [])
+
+fn st_ids_from(t: SymTab, i: Int, acc: [SymId]) : [SymId] =
+  if i < 0 { acc }
+  else {
+    let k = array_get(t.ids, i)
+    st_ids_from(t, i - 1, if k >= 0 { [SymId(k), ...acc] } else { acc })
+  }
+
+#[doc("Bucket for `name`. `string_hash` may be negative; the result lands in `[0, n)` for any sign.")]
+pub fn st_slot(name: String, n: Int) : Int {
+  let h = string_hash(name)
+  ((h % n) + n) % n
+}
+
+#[doc("Every id declared under the bare name `name`, in declaration order. Empty when nothing declares it.")]
+pub fn st_by_name(t: SymTab, name: String) : [SymId] =
+  if t.cap == 0 { [] }
+  else { st_filter_name(t, array_get(t.buckets, st_slot(name, t.cap)), name, []) }
+
+# A bucket chain is built newest-first and may hold foreign names that
+# hashed alike, so the read re-applies exact equality and re-reverses.
+fn st_filter_name(t: SymTab, chain: [Int], name: String, acc: [SymId]) : [SymId] = match chain {
+  [] -> acc
+  [id, ...rest] ->
+    if sym_name(t, SymId(id)) == name { st_filter_name(t, rest, name, [SymId(id), ...acc]) }
+    else { st_filter_name(t, rest, name, acc) }
+}
+
+#[doc("The module symbol named `name`, or `None`.")]
+pub fn st_module(t: SymTab, name: String) : Option[SymId] =
+  st_first_class(t, st_by_name(t, name), NCModule)
+
+fn st_first_class(t: SymTab, cands: [SymId], cls: NCls) : Option[SymId] = match cands {
+  [] -> None
+  [s, ...rest] ->
+    if ncls_same(sym_class(t, s), cls) { Some(s) } else { st_first_class(t, rest, cls) }
+}
+
+#[doc("The single id declaring `name` in class `cls`, owned by the module symbol `owner`, or `None`.")]
+pub fn st_lookup(t: SymTab, cls: NCls, name: String, owner: SymId) : Option[SymId] =
+  st_pick(t, st_by_name(t, name), cls, owner)
+
+fn st_pick(t: SymTab, cands: [SymId], cls: NCls, owner: SymId) : Option[SymId] = match cands {
+  [] -> None
+  [s, ...rest] ->
+    if sym_owned_by(t, s, owner) and ncls_same(sym_class(t, s), cls) { Some(s) }
+    else { st_pick(t, rest, cls, owner) }
+}
+
+#[doc("The ids declaring `name` in class `cls`, across every home. More than one means the bare use is contested.")]
+pub fn st_candidates(t: SymTab, cls: NCls, name: String) : [SymId] =
+  st_keep_class(t, st_by_name(t, name), cls)
+
+fn st_keep_class(t: SymTab, cands: [SymId], cls: NCls) : [SymId] = match cands {
+  [] -> []
+  [s, ...rest] ->
+    if ncls_same(sym_class(t, s), cls) { [s, ...st_keep_class(t, rest, cls)] }
+    else { st_keep_class(t, rest, cls) }
+}
