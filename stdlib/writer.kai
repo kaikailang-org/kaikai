@@ -1,0 +1,21 @@
+#[doc("""
+Handler-runner for the `Writer[W]` write-only accumulating-output
+effect. The body invokes `Writer.tell(w)`; the handler accumulates
+each value in an internal `[W]` log, sparing users from inlining
+`handle ... with Writer[W]([]) { ... }` at every call site.
+""")]
+
+#[doc("""
+Run `body` under a `Writer[W]` handler that accumulates every
+`Writer.tell(w)` call into a `[W]` log, returned when the body
+completes. To keep the body's own return value, capture it via
+`var` or a closure.
+""")]
+pub fn with_writer[W](body: () -> Unit / Writer[W]) : [W] = {
+  handle {
+    body()
+  } with Writer[W]([]) {
+    tell(w, resume) -> resume((), list_append(log, [w]))
+    return(x)       -> { let _ = x; log }
+  }
+}
