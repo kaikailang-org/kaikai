@@ -1,0 +1,532 @@
+#[doc("""
+Arbitrary-precision signed integers, pure kaikai — no GMP, no C
+dependency, no compiler primitive.
+
+The carrier is a sign-magnitude sum type:
+
+  `Small(Int)`        the value fits a 64-bit signed `Int` and is held
+                      inline — no heap allocation.
+  `Big(sign, mag)`    `sign` is `-1` or `+1`; `mag` is the magnitude as
+                      little-endian base-2^32 limbs (`mag[0]` is least
+                      significant) with no high zero limbs.
+
+A value above `Int` range promotes to `Big`; it never demotes inside a
+loop. The one demotion is canonical: `make` collapses a `Big` whose
+value fits `Int` back to `Small`, so every integer has exactly one
+representation. That biyection is what makes `Eq`/`Hash` direct: equal
+values share an identical shape.
+
+Zero is always `Small(0)`. `i64::MIN` has magnitude 2^63 (not an
+`Int`), so it is the one `Int`-range value held as `Big` — keeping it
+out of `Small` removes the `negate(i64::MIN)` overflow trap from every
+arithmetic path.
+
+The magnitude layer (carry discipline, schoolbook multiply, limb
+division) lives in `bigint_limbs`.
+""")]
+
+import math.bits
+import math.bigint_limbs.{sig_len, mag_cmp, mag_add, mag_sub, mag_mul, limb_lo, limb_hi, mag_divmod_limb}
+import protocols
+
+# ---- Representation ----------------------------------------------
+
+#[doc("An arbitrary-precision signed integer. `Small` holds an inline 64-bit value; `Big` holds sign-magnitude with little-endian base-2^32 limbs.")]
+pub type BigInt = Small(Int) | Big(Int, Array[Int])
+
+# Largest magnitude representable inline as `Small`: 2^63 - 1. The value
+# 2^63 (the magnitude of `i64::MIN`) does not fit a signed Int, so it
+# lives as `Big`.
+fn small_mag_max() : Int = 9223372036854775807
+
+# True when a magnitude of significant length `n` is within `Small`
+# range. (2^31-1)*2^32 + (2^32-1) == 2^63-1 exactly, so a 2-limb value
+# fits iff its high limb is below 2^31.
+fn fits_small(mag: Array[Int], n: Int) : Bool =
+  if n <= 1 { true }
+  else if n == 2 { mag[1] <= bit_shl(1, 31) - 1 }
+  else { false }
+
+# Fold a magnitude known to fit `Int` range to its value.
+fn mag_to_int(mag: Array[Int], n: Int) : Int = mag_to_int_from(mag, n - 1, 0)
+
+fn mag_to_int_from(mag: Array[Int], i: Int, acc: Int) : Int =
+  if i < 0 { acc }
+  else { mag_to_int_from(mag, i - 1, acc * bit_shl(1, 32) + mag[i]) }
+
+# ---- Canonical constructor (the single normalization choke point) ----
+
+#[doc("""
+Builds a BigInt from a sign (`<0` negative, else non-negative) and a
+possibly non-canonical magnitude: trims high zero limbs, returns
+`Small(0)` on zero, demotes to `Small` when the value fits `Int`, else
+keeps a canonical `Big`. Every arithmetic op routes its result through
+this, so the one-representation-per-integer invariant holds everywhere.
+""")]
+pub fn make(sign: Int, mag: Array[Int]) : BigInt = {
+  let n = sig_len(mag)
+  if n == 0 { Small(0) }
+  else if fits_small(mag, n) {
+    let v = mag_to_int(mag, n)
+    Small(if sign < 0 { 0 - v } else { v })
+  }
+  else { Big(if sign < 0 { 0 - 1 } else { 1 }, mag) }
+}
+
+# ---- Constructors ------------------------------------------------
+
+#[doc("The BigInt `0`.")]
+pub fn zero() : BigInt = Small(0)
+
+#[doc("The BigInt `1`.")]
+pub fn one() : BigInt = Small(1)
+
+#[constructor]
+#[doc("Lifts a 64-bit `Int`. Values in `[-(2^63-1), 2^63-1]` stay inline; `i64::MIN` promotes to `Big` (its magnitude 2^63 does not fit a signed Int).")]
+pub fn from_int(n: Int) : BigInt =
+  if n == 0 - small_mag_max() - 1 { Big(0 - 1, min_i64_mag()) }
+  else { Small(n) }
+
+# Magnitude of `i64::MIN` (2^63) as base-2^32 limbs: [0, 2^31].
+fn min_i64_mag() : Array[Int] = {
+  let mag = array_make(2, 0)
+  mag[1] := bit_shl(1, 31)
+  mag
+}
+
+#[doc("Builds a BigInt from a decimal digit string (`_` separators allowed). For `n`-literal desugaring: the lexer already validated the run as digits, so this folds them exactly with no i64 intermediate. Non-digit characters other than `_` contribute nothing.")]
+pub fn from_literal(digits: String) : BigInt =
+  from_literal_loop(digits, 0, string_length(digits), Small(0))
+
+fn from_literal_loop(s: String, i: Int, n: Int, acc: BigInt) : BigInt =
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      None    -> acc
+      Some(c) ->
+        if c == '_' { from_literal_loop(s, i + 1, n, acc) }
+        else {
+          let d = char_to_int(c) - char_to_int('0')
+          if d >= 0 and d <= 9 {
+            from_literal_loop(s, i + 1, n, add(mul(acc, from_int(10)), from_int(d)))
+          } else { acc }
+        }
+    }
+  }
+
+# ---- Sign / magnitude views --------------------------------------
+
+#[doc("The sign of `x` as `-1`, `0`, or `1`.")]
+pub fn sign(x: BigInt) : Int = match x {
+  Small(n) -> if n < 0 { 0 - 1 } else if n > 0 { 1 } else { 0 }
+  Big(s, _) -> s
+}
+
+#[doc("The magnitude of `x` as canonical base-2^32 limbs.")]
+pub fn magnitude(x: BigInt) : Array[Int] = match x {
+  Small(n) -> int_magnitude(n)
+  Big(_, mag) -> mag
+}
+
+# Magnitude of an `Int` (never `i64::MIN`, always `Big`) as 1-2 limbs.
+# The buffer is built and returned inline, so `Mutable` masks.
+fn int_magnitude(n: Int) : Array[Int] = {
+  let m = if n < 0 { 0 - n } else { n }
+  let hi = limb_hi(m)
+  if hi == 0 {
+    let out = array_make(1, 0)
+    out[0] := limb_lo(m)
+    out
+  } else {
+    let out = array_make(2, 0)
+    out[0] := limb_lo(m)
+    out[1] := hi
+    out
+  }
+}
+
+# ---- Predicates --------------------------------------------------
+
+#[doc("True when `x` is zero.")]
+pub fn is_zero(x: BigInt) : Bool = match x {
+  Small(n) -> n == 0
+  Big(_, _) -> false
+}
+
+#[doc("True when `x` is strictly negative.")]
+pub fn is_negative(x: BigInt) : Bool = sign(x) < 0
+
+#[doc("True when `x` is strictly positive.")]
+pub fn is_positive(x: BigInt) : Bool = sign(x) > 0
+
+# ---- Sign manipulation -------------------------------------------
+
+#[doc("Negates `x`. `neg(zero())` is `zero()`.")]
+pub fn neg(x: BigInt) : BigInt = match x {
+  Small(n) -> Small(0 - n)
+  Big(s, mag) -> Big(0 - s, mag)
+}
+
+#[doc("The absolute value of `x`.")]
+pub fn abs(x: BigInt) : BigInt = match x {
+  Small(n) -> if n < 0 { from_int(0 - n) } else { Small(n) }
+  Big(_, mag) -> Big(1, mag)
+}
+
+# ---- Conversion to Int -------------------------------------------
+
+#[doc("`Some(n)` when `x` fits a 64-bit signed `Int`, else `None`. By canonical form the only `Big` that fits is `i64::MIN`.")]
+pub fn to_int(x: BigInt) : Option[Int] = match x {
+  Small(n) -> Some(n)
+  Big(s, mag) ->
+    if s < 0 and sig_len(mag) == 2 and mag[0] == 0 and mag[1] == bit_shl(1, 31) {
+      Some(0 - small_mag_max() - 1)
+    } else { None }
+}
+
+# ====================================================================
+# High-level arithmetic. Each op tries the inline `Small` fast path
+# first (no allocation), promoting to magnitude arithmetic only when an
+# operand is `Big` or the result overflows `Int`.
+# ====================================================================
+
+#[doc("Compares `a` and `b`: `-1` if `a < b`, `0` if equal, `1` if `a > b`.")]
+pub fn compare(a: BigInt, b: BigInt) : Int = match a {
+  Small(x) -> match b {
+    Small(y) -> if x < y { 0 - 1 } else if x > y { 1 } else { 0 }
+    _ -> compare_signed(a, b)
+  }
+  _ -> compare_signed(a, b)
+}
+
+fn compare_signed(a: BigInt, b: BigInt) : Int = {
+  let sa = sign(a)
+  let sb = sign(b)
+  if sa < sb { 0 - 1 }
+  else if sa > sb { 1 }
+  else if sa == 0 { 0 }
+  else {
+    let c = mag_cmp(magnitude(a), magnitude(b))
+    if sa < 0 { 0 - c } else { c }
+  }
+}
+
+#[doc("Sum of `a` and `b`.")]
+pub fn add(a: BigInt, b: BigInt) : BigInt = match a {
+  Small(x) -> match b {
+    Small(y) -> add_small(x, y)
+    _ -> add_general(a, b)
+  }
+  _ -> add_general(a, b)
+}
+
+# Inline `Small + Small`. The sum overflows `Int` exactly when both
+# operands share a sign and the wrapped sum flips it; otherwise
+# `from_int` settles it (promoting `i64::MIN`).
+fn add_small(x: Int, y: Int) : BigInt = {
+  let s = x + y
+  if x >= 0 and y >= 0 and s < 0 { add_general(Small(x), Small(y)) }
+  else if x < 0 and y < 0 and s >= 0 { add_general(Small(x), Small(y)) }
+  else { from_int(s) }
+}
+
+# Magnitude add/subtract driven by signs: like signs add magnitudes;
+# unlike signs subtract the smaller from the larger, taking its sign.
+fn add_general(a: BigInt, b: BigInt) : BigInt =
+  if is_zero(a) { b }
+  else if is_zero(b) { a }
+  else { add_nonzero(a, b) }
+
+fn add_nonzero(a: BigInt, b: BigInt) : BigInt = {
+  let sa = sign(a)
+  let ma = magnitude(a)
+  let mb = magnitude(b)
+  if sa == sign(b) { make(sa, mag_add(ma, mb)) }
+  else {
+    let c = mag_cmp(ma, mb)
+    if c == 0 { Small(0) }
+    else if c > 0 { make(sa, mag_sub(ma, mb)) }
+    else { make(sign(b), mag_sub(mb, ma)) }
+  }
+}
+
+#[doc("Difference `a - b`.")]
+pub fn sub(a: BigInt, b: BigInt) : BigInt = add(a, neg(b))
+
+#[doc("Product of `a` and `b`.")]
+pub fn mul(a: BigInt, b: BigInt) : BigInt = match a {
+  Small(x) -> match b {
+    Small(y) -> mul_small(x, y)
+    _ -> mul_general(a, b)
+  }
+  _ -> mul_general(a, b)
+}
+
+# Inline `Small * Small`. Zero short-circuits; the product overflows
+# `Int` exactly when dividing it back does not recover an operand (or it
+# is `i64::MIN`, which `Small` cannot hold).
+fn mul_small(x: Int, y: Int) : BigInt =
+  if x == 0 or y == 0 { Small(0) }
+  else {
+    let p = x * y
+    if p / x == y and p != 0 - small_mag_max() - 1 { Small(p) }
+    else { mul_general(Small(x), Small(y)) }
+  }
+
+fn mul_general(a: BigInt, b: BigInt) : BigInt =
+  if is_zero(a) or is_zero(b) { Small(0) }
+  else { make(sign(a) * sign(b), mag_mul(magnitude(a), magnitude(b))) }
+
+# ====================================================================
+# Decimal text and truncating division. Rendering divides the magnitude
+# by 10^9 repeatedly; division is schoolbook binary long division.
+# ====================================================================
+
+# 10^9 — the largest power of ten below 2^31, so `mag_divmod_limb`'s
+# `rem * 2^32` term stays within signed `Int` range.
+fn chunk_base() : Int = 1000000000
+
+# ---- to_string ---------------------------------------------------
+
+#[doc("Renders `x` in base 10, with a leading `-` for negatives.")]
+pub fn to_string(x: BigInt) : String =
+  if is_zero(x) { "0" }
+  else {
+    let body = mag_decimal(magnitude(x))
+    if is_negative(x) { "-" ++ body } else { body }
+  }
+
+# Render a nonzero magnitude as decimal digits by repeated /10^9.
+fn mag_decimal(mag: Array[Int]) : String = mag_decimal_loop(mag, "")
+
+fn mag_decimal_loop(mag: Array[Int], acc: String) : String = {
+  let qr = mag_divmod_limb(mag, chunk_base())
+  let chunk = qr.snd
+  if sig_len(qr.fst) == 0 {
+    # Most significant chunk: no zero padding.
+    int_to_string(chunk) ++ acc
+  } else {
+    mag_decimal_loop(qr.fst, pad9(chunk) ++ acc)
+  }
+}
+
+# Left-pad a 9-digit chunk with zeros (it is a non-leading group).
+fn pad9(n: Int) : String = {
+  let s = int_to_string(n)
+  pad_zeros(s, 9 - string_length(s))
+}
+
+fn pad_zeros(s: String, k: Int) : String =
+  if k <= 0 { s } else { pad_zeros("0" ++ s, k - 1) }
+
+# ---- from_string -------------------------------------------------
+
+#[doc("""
+Parses a base-10 integer, with an optional leading `+` or `-`.
+`Some(big)` on success; `None` on an empty string, a lone sign, or any
+non-digit character. Values beyond `Int` range parse exactly.
+""")]
+pub fn from_string(s: String) : Option[BigInt] = {
+  let n = string_length(s)
+  if n == 0 { None }
+  else {
+    match char_at(s, 0) {
+      Some('-') -> parse_body(s, 1, n, 0 - 1)
+      Some('+') -> parse_body(s, 1, n, 1)
+      _         -> parse_body(s, 0, n, 1)
+    }
+  }
+}
+
+# Fold digits `[start, n)` into a BigInt with the given sign. Empty span
+# (a lone sign) is `None`.
+fn parse_body(s: String, start: Int, n: Int, sign: Int) : Option[BigInt] =
+  if start >= n { None }
+  else { parse_digits(s, start, n, sign, zero()) }
+
+fn parse_digits(s: String, i: Int, n: Int, sign: Int, acc: BigInt) : Option[BigInt] =
+  if i >= n {
+    Some(if sign < 0 { neg(acc) } else { acc })
+  } else {
+    match digit_value(s, i) {
+      None    -> None
+      Some(d) -> parse_digits(s, i + 1, n, sign,
+                   add(mul(acc, from_int(10)), from_int(d)))
+    }
+  }
+
+fn digit_value(s: String, i: Int) : Option[Int] =
+  match char_at(s, i) {
+    Some(c) -> {
+      let v = char_to_int(c) - char_to_int('0')
+      if v >= 0 and v <= 9 { Some(v) } else { None }
+    }
+    None -> None
+  }
+
+# ---- divmod (binary long division) -------------------------------
+
+#[doc("""
+Truncating division with remainder: `Some(Pair(q, r))` where
+`a == q*b + r`, `r` has the sign of `a` (truncation toward zero), and
+`abs(r) < abs(b)`. `None` when `b` is zero.
+""")]
+pub fn divmod(a: BigInt, b: BigInt) : Option[Pair[BigInt, BigInt]] =
+  if is_zero(b) { None }
+  else if is_zero(a) { Some(Pair { fst: zero(), snd: zero() }) }
+  else {
+    let qm = divmod_mag(magnitude(a), magnitude(b))
+    let q = make(sign(a) * sign(b), qm.fst)
+    let r = make(sign(a), qm.snd)
+    Some(Pair { fst: q, snd: r })
+  }
+
+#[doc("Quotient of truncating division, or `None` when `b` is zero.")]
+pub fn div(a: BigInt, b: BigInt) : Option[BigInt] =
+  match divmod(a, b) { Some(p) -> Some(p.fst) None -> None }
+
+#[doc("""
+Total truncating quotient. Backs the `/` operator. Traps on a zero
+divisor — the same failure class as an out-of-range index; use `div`
+for the `Option`-returning variant that handles the zero case.
+""")]
+pub fn op_div(a: BigInt, b: BigInt) : BigInt =
+  match div(a, b) {
+    Some(q) -> q
+    None    -> protocols.trap_divide_by_zero()
+  }
+
+#[doc("Remainder of truncating division (sign of `a`), or `None` when `b` is zero.")]
+pub fn rem(a: BigInt, b: BigInt) : Option[BigInt] =
+  match divmod(a, b) { Some(p) -> Some(p.snd) None -> None }
+
+# Magnitude division returning `Pair(quotient_mag, remainder_mag)`. The
+# quotient and remainder are each produced by an independent inline
+# shift-subtract sweep so neither buffer crosses a call boundary and
+# `Mutable` masks in both producers. (Two sweeps trade a constant factor
+# for pure signatures; division is not a BigInt hot path.)
+fn divmod_mag(num: Array[Int], den: Array[Int]) : Pair[Array[Int], Array[Int]] =
+  Pair { fst: div_quotient_mag(num, den), snd: div_remainder_mag(num, den) }
+
+# Quotient magnitude by shift-subtract: walk dividend bits most-
+# significant first, shifting the running remainder left one bit and
+# subtracting the divisor when it fits, recording the set quotient bit.
+fn div_quotient_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
+  let nbits = sig_len(num) * 32
+  let nq = sig_len(num)
+  let q = array_make(if nq <= 0 { 1 } else { nq }, 0)
+  var rem := array_make(1, 0)
+  var i := nbits - 1
+  while { i >= 0 } {
+    rem := shl1_or(rem, mag_bit(num, i))
+    if mag_cmp(rem, den) >= 0 {
+      rem := mag_sub(rem, den)
+      let limb = i / 32
+      q[limb] := bit_or(q[limb], bit_shl(1, i % 32))
+    }
+    i := i - 1
+  }
+  q
+}
+
+# Remainder magnitude by the same sweep, returning the leftover instead
+# of the quotient bits.
+fn div_remainder_mag(num: Array[Int], den: Array[Int]) : Array[Int] = {
+  let nbits = sig_len(num) * 32
+  var rem := array_make(1, 0)
+  var i := nbits - 1
+  while { i >= 0 } {
+    rem := shl1_or(rem, mag_bit(num, i))
+    if mag_cmp(rem, den) >= 0 { rem := mag_sub(rem, den) }
+    i := i - 1
+  }
+  rem
+}
+
+# The `i`-th bit of a magnitude (0 or 1).
+fn mag_bit(mag: Array[Int], i: Int) : Int = {
+  let limb = i / 32
+  if limb >= array_length(mag) { 0 }
+  else { bit_and(bit_ushr(mag[limb], i % 32), 1) }
+}
+
+# `mag << 1 | bit`, returning a fresh magnitude. Built and returned
+# inline, so `Mutable` masks.
+fn shl1_or(mag: Array[Int], bit: Int) : Array[Int] = {
+  let n = array_length(mag)
+  let out = array_make(n + 1, 0)
+  var i := 0
+  var carry := bit
+  while { i < n } {
+    let v = mag[i] * 2 + carry
+    out[i] := limb_lo(v)
+    carry := limb_hi(v)
+    i := i + 1
+  }
+  out[n] := carry
+  out
+}
+
+# ====================================================================
+# Protocol impls
+# ====================================================================
+
+impl Show for BigInt {
+  fn show(x: BigInt) : String = to_string(x)
+}
+
+impl Serialize for BigInt {
+  fn to_string(x: BigInt) : String = to_string(x)
+  fn from_string(s: String) : Result[BigInt, String] = match from_string(s) {
+    Some(v) -> Ok(v)
+    None    -> Err("not a base-10 integer")
+  }
+}
+
+impl Eq for BigInt {
+  fn eq(a: BigInt, b: BigInt) : Bool = compare(a, b) == 0
+}
+
+impl Ord for BigInt {
+  fn cmp(a: BigInt, b: BigInt) : Int = compare(a, b)
+  fn min(a: BigInt, b: BigInt) : BigInt =
+    if compare(a, b) <= 0 { a } else { b }
+  fn max(a: BigInt, b: BigInt) : BigInt =
+    if compare(a, b) >= 0 { a } else { b }
+}
+
+impl Hash for BigInt {
+  fn hash(x: BigInt) : Int = bigint_hash(x)
+}
+
+impl Add for BigInt {
+  fn add(self: BigInt, rhs: BigInt) : BigInt = add(self, rhs)
+}
+
+impl Sub for BigInt {
+  fn sub(self: BigInt, rhs: BigInt) : BigInt = sub(self, rhs)
+}
+
+impl Mul for BigInt {
+  fn mul(self: BigInt, rhs: BigInt) : BigInt = mul(self, rhs)
+}
+
+impl Div for BigInt {
+  fn div(self: BigInt, rhs: BigInt) : BigInt = op_div(self, rhs)
+}
+
+# Multiplicative fold over sign and canonical limbs. The sign seeds the
+# accumulator so `n` and `-n` hash apart; the limbs mix in least-
+# significant first. Operates on the canonical magnitude, so equal
+# values (which share one representation) always agree. Arithmetic wraps
+# in `Int`, which is fine for a hash.
+fn bigint_hash(x: BigInt) : Int = {
+  let mag = magnitude(x)
+  hash_limbs(mag, 0, sig_len(mag), hash_seed(sign(x)))
+}
+
+fn hash_seed(sign: Int) : Int = if sign < 0 { 0 - 2654435761 } else { 2654435761 }
+
+fn hash_limbs(mag: Array[Int], i: Int, n: Int, acc: Int) : Int =
+  if i >= n { acc }
+  else { hash_limbs(mag, i + 1, n, (acc + mag[i]) * 1099511628211) }

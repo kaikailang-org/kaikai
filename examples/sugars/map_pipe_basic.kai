@@ -1,0 +1,10 @@
+# m7b #9 — basic map pipe with paren-form lambda RHS.
+#
+# `xs | f` lowers at parse time to `map(xs, f)`. Verifies the simplest
+# end-to-end shape: list literal on the left, lambda on the right.
+
+fn main() : Int {
+  let doubled = [1, 2, 3] | (x) => x * 2
+  each(doubled, (x) => print(int_to_string(x)))
+  0
+}
