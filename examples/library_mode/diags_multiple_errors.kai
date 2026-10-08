@@ -1,0 +1,12 @@
+# Multiple diagnostics collected from a single compile, in source order:
+# a wrong arity, then a type mismatch. The fixture pins that order so an
+# LSP client can rely on a stable list.
+
+fn add(x: Int, y: Int) : Int = x + y
+
+fn main() : Int / Console {
+  print(int_to_string(add(1)))
+  let s: String = add(1, 2)
+  print(s)
+  0
+}

@@ -1,0 +1,20 @@
+# m12.8 phase 2 / m4c Phase 3: `#{x}` interpolation on a `Real<u>`
+# value runs the user's parametric `impl[u: Measure] Show for Real<u>`
+# body specialised per concrete unit. The impl below omits the
+# suffix on purpose, so the bare numeric appears. `unit_name(x)`
+# still works as a standalone reflection helper (last two prints).
+# Pre-Phase-3 a special-case rewrite forced the suffix even when
+# the impl body skipped it; Phase 3 retired the rewrite.
+
+unit USD
+unit EUR
+
+fn main() : Int {
+  let a : Real<USD> = 100.0<USD>
+  let b : Real<EUR> = 50.5<EUR>
+  print("a = #{a}")
+  print("b = #{b}")
+  print(unit_name(a))
+  print(unit_name(b))
+  0
+}

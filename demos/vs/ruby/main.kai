@@ -1,0 +1,71 @@
+# vs Ruby — DSLs via effect handlers, not open classes
+#
+# Ruby's DSL ergonomics rely on monkey-patching: open the test
+# framework's class, override `it`, `describe`, `expect`. The DSL
+# escapes its file — every other Ruby file inherits the modified
+# class. Tracking what `it` means at any call site requires reading
+# every monkey-patcher loaded.
+#
+# kaikai: a DSL is a custom effect with a custom handler. The handler
+# is scoped (`handle { ... } with Test { ... }`); the DSL operations
+# only mean the handler's interpretation inside that scope. A reader
+# sees the effect in the row and the handler in the same file.
+#
+# === Ruby equivalent (RSpec-style) ===
+#
+#   describe "Math" do
+#     it "adds" do
+#       expect(1 + 1).to eq(2)
+#     end
+#   end
+#
+# === kaikai equivalent (target syntax) ===
+
+type TestCase = TC(String, Int, Int)
+type Suite    = Sui(String, [TestCase])
+
+effect Test {
+  run_suite(s: Suite) : Int
+}
+
+# kaikai's DSL story: an effect declares the operations (run_suite),
+# and the *handler* picks the interpretation. The test runner is the
+# handler — a verbose reporter, a silent counter, a structured-JSON
+# emitter all share the same DSL. In Ruby, switching reporter style
+# means monkey-patching the test framework; in kaikai it means
+# swapping the `with Test { ... }` block.
+fn suite() : Suite = Sui("Math", [
+  TC("adds",       1 + 1, 2),
+  TC("multiplies", 2 * 3, 6),
+])
+
+fn run_one(tc: TestCase) : Int / Stdout = match tc {
+  TC(name, actual, expected) -> if actual == expected {
+    Stdout.print("  ok: " ++ name)
+    1
+  } else {
+    Stdout.print("  FAIL: " ++ name ++ " (expected " ++ int_to_string(expected) ++ ", got " ++ int_to_string(actual) ++ ")")
+    0
+  }
+}
+
+fn run_each(tcs: [TestCase], passed: Int) : Int / Stdout = match tcs {
+  []           -> passed
+  [t, ...rest] -> run_each(rest, passed + run_one(t))
+}
+
+fn main() : Int / Stdout = {
+  let passed = handle {
+    Test.run_suite(suite())
+  } with Test {
+    run_suite(s, resume) -> match s {
+      Sui(name, tcs) -> {
+        Stdout.print(name)
+        let p = run_each(tcs, 0)
+        resume(p)
+      }
+    }
+  }
+  Stdout.print("passed: " ++ int_to_string(passed))
+  0
+}

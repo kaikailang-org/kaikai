@@ -1,0 +1,12 @@
+# m7a #4a negative test — passing the wrong argument type to a
+# declared op produces a type-mismatch diagnostic referring to the
+# op call site (not to a generic function call).
+
+effect Io {
+  print(s: String) : Unit
+}
+
+fn main() : Int / Io {
+  Io.print(42)
+  0
+}

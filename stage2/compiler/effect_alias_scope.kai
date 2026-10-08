@@ -1,0 +1,92 @@
+#[doc("""Resolver-side settling of an effect head that names no declaration as written: an op call on a row alias, and a head spelled for a contested effect.
+
+A row alias (`type Console = Stdout + Stderr + Stdin`) is an `NCType`, so
+an op call written on one finds no effect declaration to stamp and the
+perform reaches KIR with no identity. The tables here name each alias's
+components and the ops each effect declares, which is what settles
+`Console.print` to the component that declares `print`.
+
+The settled head carries that component's name and identity, not the
+alias's: a row label must be atomic, and the component was settled where
+the alias was written, not where it is used.
+""")]
+
+import compiler.ast
+import compiler.util
+
+#[doc("A row alias and the effect labels its body sums, in written order.")]
+pub type RowAlias = RA(String, [RowLabel])
+
+#[doc("An effect, the declaration it is, and the op names it declares.")]
+pub type EffOps = EO(String, SymId, [String])
+
+#[doc("An effect declaration as spelled in the stream, and the declaration it is.")]
+pub type EffSpelling = ESp(String, SymId)
+
+#[doc("`spellings` with `name` added when its declaration already carries an id: a contested effect, stamped where its spelling was minted.")]
+pub fn es_note(spellings: [EffSpelling], name: String, s: SymId) : [EffSpelling] =
+  if sym_raw(s) < 0 { spellings } else { [ESp(name, s), ...spellings] }
+
+#[doc("The declaration an effect spelled `spelled` is, or `sym_none()` when no stamped declaration is spelled that way.")]
+pub fn es_lookup(spellings: [EffSpelling], spelled: String) : SymId = match spellings {
+  [] -> sym_none()
+  [ESp(n, s), ...rest] -> if n == spelled { s } else { es_lookup(rest, spelled) }
+}
+
+#[doc("The op names an effect declares.")]
+pub fn eff_op_names(ops: [EffectOp], acc: [String]) : [String] = match ops {
+  [] -> list_reverse(acc)
+  [o, ...rest] -> match o {
+    EOp(n, _, _, _, _, _) -> eff_op_names(rest, [n, ...acc])
+  }
+}
+
+#[doc("The components of row alias `head`, with a nested alias replaced by its own. `depth` bounds the walk: a cyclic alias is rejected elsewhere, and this must not hang before it is.")]
+pub fn alias_components(ras: [RowAlias], head: String, depth: Int) : [RowLabel] =
+  if depth > 8 { [] }
+  else { match ra_lookup(ras, head) {
+    None        -> []
+    Some(comps) -> alias_expand(ras, comps, depth, [])
+  } }
+
+fn alias_expand(ras: [RowAlias], comps: [RowLabel], depth: Int,
+                acc: [RowLabel]) : [RowLabel] = match comps {
+  [] -> list_reverse(acc)
+  [c, ...rest] -> match ra_lookup(ras, rl_name(c)) {
+    None    -> alias_expand(ras, rest, depth, [c, ...acc])
+    Some(_) -> alias_expand(ras, rest, depth,
+                            prepend_rev(alias_components(ras, rl_name(c), depth + 1), acc))
+  }
+}
+
+fn prepend_rev(xs: [RowLabel], acc: [RowLabel]) : [RowLabel] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_rev(rest, [x, ...acc])
+}
+
+#[doc("The components of the row alias named `name`, or `None` when it names no alias.")]
+pub fn ra_lookup(ras: [RowAlias], name: String) : Option[[RowLabel]] = match ras {
+  [] -> None
+  [ra, ...rest] -> match ra {
+    RA(n, comps) -> if n == name { Some(comps) } else { ra_lookup(rest, name) }
+  }
+}
+
+#[doc("Whether the effect `l` names declares an op named `op`: the declaration with its id, or its spelling while either id is unsettled.")]
+pub fn eff_declares_op(eos: [EffOps], l: RowLabel, op: String) : Bool = match eos {
+  [] -> false
+  [EO(n, s, ops), ...rest] -> match l {
+    RL(ln, _, ls) ->
+      if n == ln and (sym_raw(s) < 0 or sym_raw(ls) < 0 or sym_raw(s) == sym_raw(ls)) { list_has(ops, op) }
+      else { eff_declares_op(rest, l, op) }
+  }
+}
+
+#[doc("The leftmost component of `comps` that declares `op`, or `None`. Leftmost is the rule the typer's own alias resolution follows, so an op two components share settles the same way.")]
+pub fn alias_op_owner(eos: [EffOps], comps: [RowLabel], op: String) : Option[RowLabel] =
+  match comps {
+    [] -> None
+    [c, ...rest] ->
+      if eff_declares_op(eos, c, op) { Some(c) }
+      else { alias_op_owner(eos, rest, op) }
+  }
