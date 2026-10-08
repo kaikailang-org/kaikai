@@ -1,0 +1,66 @@
+#[doc("""
+Which scrutinee binders a reuse rebuild reads, shared by both backends.
+
+A reuse arm donates the matched cell and overwrites its slots. A slot whose
+binder the rebuild takes keeps its old child alive through that read; any
+other slot's old child has no surviving owner once it is overwritten, so
+the unique branch must release it. Both emitters decide that from the same
+read set.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.infer
+import compiler.perceus_reads
+import compiler.perceus_read_walk
+import compiler.util
+import compiler.name_ix
+
+#[doc("""
+The multiset of reads of `gc` names the rebuild args reach, whatever shape
+carries them (a call arg, a nested ctor, a match scrutinee, an `if` branch,
+a block tail). `pcs_use_index` is the walker perceus's own dup discipline
+runs on.
+""")]
+pub fn reuse_gc_uses(cargs: [Expr], gc: [String]) : [String] / Console = match gc {
+  [] -> []
+  _  -> ru_exprs(cargs, gc, [])
+}
+
+#[doc("The reads of `gc` names in `cargs` that take a reference: a read lent to a borrowing call takes none.")]
+pub fn reuse_taken_uses(cargs: [Expr], gc: [String]) : [String] / Console =
+  reuse_gc_uses(map(cargs, reuse_unlent), gc)
+
+#[doc("`e` with every read under `__perceus_borrow` erased: a lent read takes no reference.")]
+pub fn reuse_unlent(e: Expr) : Expr = match e.kind {
+  ECall(f, _) -> match f.kind {
+    EMark(MkBorrow) -> Expr { ...e, kind: EUnit }
+    _               -> ru_map(e)
+  }
+  _ -> ru_map(e)
+}
+
+fn ru_map(e: Expr) : Expr = Expr { ...e, kind: prc_map_expr_kind(e.kind, reuse_unlent) }
+
+fn ru_exprs(es: [Expr], gc: [String], acc: [String]) : [String] / Console = match es {
+  []           -> acc
+  [e, ...rest] -> {
+    let ix = pcs_use_index(e, gc)
+    ru_exprs(rest, gc, ru_names(gc, ix, acc))
+  }
+}
+
+# The collector grows its scope with lambda params, so it indexes their
+# reads too: only the donor binders' reads count, one entry per read.
+fn ru_names(gc: [String], ix: UseIx, acc: [String]) : [String] = match gc {
+  []           -> acc
+  [g, ...rest] -> ru_names(rest, ix, ru_reads_of(g, ni_bucket(ix, g), acc))
+}
+
+fn ru_reads_of(g: String, us: [Read], acc: [String]) : [String] = match us {
+  [] -> acc
+  [Rd(nm, _, _, _, _), ...rest] -> ru_reads_of(g, rest, if nm == g { [g, ...acc] } else { acc })
+}
+
+#[doc("The binders among `gc` that the rebuild takes (`uses` lists its taking reads).")]
+pub fn reuse_taken_binders(gc: [String], uses: [String]) : [String] = filter(gc, (n) => list_has(uses, n))
