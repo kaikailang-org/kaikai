@@ -1,0 +1,104 @@
+# compiler/handler_alias.kai — the handler-state aliases a stateful handler's clauses bind and read.
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.util
+
+#[doc("The handler-state aliases a user writes; an enclosing binding of either name takes precedence inside the clauses.")]
+pub fn user_state_aliases() : [String] = ["state", "log"]
+
+#[doc("The alias a `var` cell's synthetic clauses reach their slot through; no enclosing binding takes it over.")]
+pub fn var_cell_alias() : String = "__var_cell"
+
+#[doc("The aliases a stateful handler binds in its clauses, given which names the enclosing scope already binds.")]
+pub fn clause_state_aliases(bound_outside: (String) -> Bool) : [String] =
+  list_append(filter(user_state_aliases(), (nm) => not bound_outside(nm)), [var_cell_alias()])
+
+#[doc("The handler-state aliases a stateful handler actually binds, given the enclosing local scope.")]
+pub fn live_state_aliases(stateful: Bool, local_scope: [String]) : [String] =
+  if stateful { clause_state_aliases((nm) => list_has(local_scope, nm)) } else { [] }
+
+#[doc("The state aliases a handle binds in its clauses: a handle carries state exactly when it has an initial value.")]
+pub fn handle_live_aliases(init_opt: Option[Expr], local_scope: [String]) : [String] = match init_opt {
+  Some(_) -> live_state_aliases(true, local_scope)
+  None    -> []
+}
+
+#[doc("The intrinsic a stateful segment clause wraps its body in: `$seg_state(s, body)` binds the state aliases to `s`.")]
+pub fn seg_state_intrinsic() : String = "seg_state"
+
+#[doc("The aliases `body` reads, of those a stateful clause binds, given which names the enclosing scope already binds.")]
+pub fn seg_state_aliases(bound_outside: (String) -> Bool, body: Expr) : [String] =
+  filter(user_state_aliases(), (nm) => not bound_outside(nm) and expr_mentions(nm, body))
+
+#[doc("`body` with each alias in `names` bound to `s`.")]
+pub fn seg_state_block(names: [String], s: Expr, body: Expr) : Expr =
+  Expr { kind: EBlock(map(names, (nm) => SLet(mk_pat(PBind(nm), s.line, s.col), None, s)), Some(body)),
+         line: body.line, col: body.col, ty: None, mode: body.mode }
+
+#[doc("The names in `names` that some clause or the return clause of a handler mentions.")]
+pub fn aliases_read_by_clauses(names: [String], cs: [HClause], ret_opt: Option[HReturn]) : [String] =
+  filter(names, (nm) => clauses_mention(nm, cs) or return_mentions(nm, ret_opt))
+
+fn clauses_mention(nm: String, cs: [HClause]) : Bool = match cs {
+  []                              -> false
+  [HC(_, _, body, _, _), ...rest] -> expr_mentions(nm, body) or clauses_mention(nm, rest)
+}
+
+fn return_mentions(nm: String, ret_opt: Option[HReturn]) : Bool = match ret_opt {
+  Some(HR(_, body, _, _)) -> expr_mentions(nm, body)
+  None                    -> false
+}
+
+fn expr_mentions(nm: String, e: Expr) : Bool = match e.kind {
+  EVar(u) -> u == nm
+  _       -> positions_mention(nm, xp_positions(e))
+}
+
+fn positions_mention(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> expr_mentions(nm, c) or positions_mention(nm, rest)
+}
+
+#[doc("The name the typer gives every call of a clause's continuation, whatever the clause calls it.")]
+pub fn canonical_continuation() : String = "resume"
+
+#[doc("The names a clause body binds: its params, and the canonical name its continuation calls carry.")]
+pub fn clause_bound_names(params: [Param]) : [String] = [canonical_continuation(), ...map(params, (p) => p.pname)]
+
+#[doc("A handler clause's op-argument params: every param but the continuation, which is always the last.")]
+pub fn clause_op_args(params: [Param]) : [Param] = match params {
+  []           -> []
+  [_]          -> []
+  [p, ...rest] -> [p, ...clause_op_args(rest)]
+}
+
+#[doc("The name a handler clause binds its continuation to: its last param, whatever it is called.")]
+pub fn clause_continuation(params: [Param]) : Option[String] = match params {
+  []           -> None
+  [p]          -> Some(p.pname)
+  [_, ...rest] -> clause_continuation(rest)
+}
+
+#[doc("The continuation a name read reaches: none, the enclosing clause's own, or that clause's from inside a lambda.")]
+pub type ClauseCont = CcNone | CcOwn(String) | CcInLambda(String)
+
+#[doc("The continuation an op clause's body reaches.")]
+pub fn clause_cont_of(params: [Param]) : ClauseCont = match clause_continuation(params) {
+  Some(k) -> CcOwn(k)
+  None    -> CcNone
+}
+
+#[doc("The continuation a lambda body reaches: the clause's, from inside the lambda, unless a lambda param shadows it.")]
+pub fn clause_cont_in_lambda(cc: ClauseCont, ps: [Param]) : ClauseCont = match cc {
+  CcOwn(k)      -> if any(ps, (p) => p.pname == k) { CcNone } else { CcInLambda(k) }
+  CcInLambda(k) -> if any(ps, (p) => p.pname == k) { CcNone } else { cc }
+  CcNone        -> CcNone
+}
+
+#[doc("True when `nm` names the continuation `cc` reaches.")]
+pub fn clause_cont_reaches(cc: ClauseCont, nm: String) : Bool = match cc {
+  CcOwn(k)      -> k == nm
+  CcInLambda(k) -> k == nm
+  CcNone        -> false
+}
