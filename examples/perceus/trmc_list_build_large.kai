@@ -1,0 +1,30 @@
+# TRMC for the builtin cons `[h, ...recur(t)]`: the rebuild lowers to a
+# constructor-context loop, so a 1M-deep list builds in constant stack on
+# both backends. `build` is the raw list literal and `map_inc` the Perceus
+# reuse-cons arm; `last` consumes the result one cell at a time, so freeing
+# it stays constant-stack too.
+
+fn build(n: Int) : [Int] =
+  if n == 0 { [] }
+  else { [n, ...build(n - 1)] }
+
+fn map_inc(xs: [Int]) : [Int] =
+  match xs {
+    [] -> []
+    [h, ...t] -> [h + 1, ...map_inc(t)]
+  }
+
+# Tail-recursive descent to the last element. Consumes `xs` one cell at a
+# time (each step moves the tail out, then drops the head cell), so the
+# 1M-deep spine is walked AND freed in O(1) stack.
+fn last(xs: [Int], d: Int) : Int =
+  match xs {
+    [] -> d
+    [h, ...t] -> last(t, h)
+  }
+
+fn main() : Unit / Stdout = {
+  let big = build(1000000)        # raw-EList TRMC: 1M cons, O(1) stack
+  let inc = map_inc(big)          # reuse-cons TRMC: rebuild 1M, O(1) stack
+  Stdout.print(int_to_string(last(inc, 0)))   # last of inc = 1+1 = 2
+}
