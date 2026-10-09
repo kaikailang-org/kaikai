@@ -1,0 +1,78 @@
+#[doc("""
+KAB2 blob framing shared by every cache layer: a fixed 76-byte header
+in front of a payload the `BinSerialize` derive encodes.
+
+Header layout:
+
+    magic           4 bytes  "KAB2"
+    format_version  4 bytes  u32 LE — bump on any payload layout change
+    kaikai_version  4 bytes  u32 LE
+    key sha        64 bytes  ASCII
+
+A blob whose header drifts on any field is a miss, never a misread: the
+payload of an older layout is not decoded at all.
+""")]
+
+import compiler.util
+
+fn cache_format_version() : Int = 16
+
+fn cache_magic() : String = "KAB2"
+
+# Cross-edition safety lives in each edition-sensitive layer's key; this
+# field is defense-in-depth against blobs copied between caches.
+fn cache_kaikai_version_hash() : Int = 2
+
+fn cache_header_len() : Int = 76
+
+#[doc("A validated blob header: the echoed key sha and the payload offset.")]
+pub type CacheHdr = CHdr(String, Int)
+
+#[doc("Frame `payload` as a KAB2 blob under the 64-char key `sha`.")]
+pub fn cache_blob(sha: String, payload: Array[Byte]) : Array[Byte] =
+  array_concat_bytes(cache_header(sha), payload)
+
+fn cache_header(sha: String) : Array[Byte] = {
+  let buf = array_make(cache_header_len(), bin_byte(0))
+  let _ = cache_put_text(buf, 0, cache_magic(), 0)
+  let _ = bin_write_len4(buf, 4, cache_format_version())
+  let _ = bin_write_len4(buf, 8, cache_kaikai_version_hash())
+  cache_put_text(buf, 12, sha, 0)
+}
+
+# Writes at most the 64 header bytes the sha slot has.
+fn cache_put_text(buf: Array[Byte], off: Int, s: String, i: Int) : Array[Byte] / Mutable =
+  if i >= string_length(s) or off + i >= cache_header_len() { buf }
+  else {
+    buf[off + i] := bin_byte(string_byte_at_int(s, i))
+    cache_put_text(buf, off, s, i + 1)
+  }
+
+#[doc("Validate a KAB2 blob header, returning the echoed sha plus the payload offset; `None` on magic, format, version, or length drift.")]
+pub fn cache_read_header(buf: Array[Byte]) : Option[CacheHdr] =
+  if array_length(buf) < cache_header_len() { None }
+  else if cache_bytes_text(buf, 0, 4) != cache_magic() { None }
+  else if not cache_u32_is(buf, 4, cache_format_version()) { None }
+  else if not cache_u32_is(buf, 8, cache_kaikai_version_hash()) { None }
+  else { Some(CHdr(cache_bytes_text(buf, 12, 64), cache_header_len())) }
+
+fn cache_u32_is(buf: Array[Byte], pos: Int, want: Int) : Bool = match bin_get_uint_le(buf, pos, 4) {
+  Some(n) -> n == want
+  None    -> false
+}
+
+#[doc("The `n` bytes of `buf` at `off` as a byte-exact String.")]
+pub fn cache_bytes_text(buf: Array[Byte], off: Int, n: Int) : String = bytes_get_string(buf, off, n)
+
+#[doc("Whether two byte buffers hold the same bytes.")]
+pub fn cache_bytes_eq(a: Array[Byte], b: Array[Byte]) : Bool =
+  array_length(a) == array_length(b) and cache_eq_from(a, b, 0)
+
+fn cache_eq_from(a: Array[Byte], b: Array[Byte], i: Int) : Bool =
+  if i >= array_length(a) { true }
+  else if byte_to_int(a[i]) != byte_to_int(b[i]) { false }
+  else { cache_eq_from(a, b, i + 1) }
+
+#[doc("FNV-1a digest of `prefix` followed by the bytes of `bs`: `string_hash` of their concatenation.")]
+pub fn cache_fnv_bytes(prefix: String, bs: Array[Byte]) : Int =
+  string_hash(concat_all([prefix, cache_bytes_text(bs, 0, array_length(bs))]))
