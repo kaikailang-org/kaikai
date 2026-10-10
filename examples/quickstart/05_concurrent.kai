@@ -1,0 +1,36 @@
+# Two cooperative fibers.
+#
+# `spawn.spawn { ... }` schedules a fiber but does not run it yet —
+# the scheduler picks it up at the next yield point. `spawn.yield`
+# is an explicit cooperation point: the current fiber suspends and
+# the scheduler picks the next one ready.
+#
+# Without yields, both workers would run in arbitrary chunks. With
+# yields, the scheduler interleaves them so the output rotates. The
+# strict rotation needs a single scheduler thread — hence the
+# KAI_THREADS=1 pin below; the sibling `.env` applies the same pin
+# for the test harnesses.
+#
+#   $ KAI_THREADS=1 kai run examples/quickstart/05_concurrent.kai
+#   A
+#   B
+#   A
+#   B
+#   A
+#   B
+
+import loop
+import spawn
+
+fn worker(tag: String, n: Int) : Unit / Stdout + Spawn {
+  loop.repeat(n) {
+    println(tag)
+    spawn.yield()
+  }
+}
+
+fn main() {
+  let f = spawn.spawn { worker("B", 3) }
+  worker("A", 3)
+  spawn.await(f)
+}

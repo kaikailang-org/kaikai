@@ -1,0 +1,4 @@
+worker: linked, opening nested mailbox
+worker: nested closed, returning
+supervisor got: Normal
+supervisor got: cell alive

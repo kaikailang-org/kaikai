@@ -1,0 +1,112 @@
+# compiler/refine_enforce.kai — the callee side of a refinement: a
+# refined parameter is checked once on entry, for every caller.
+#
+# Every other place a value flows into a refined type is decided by the
+# typer (`refine_coerce`), which knows each position's expected type.
+#
+# `__ref_pred_*` fns are skipped: match-arm narrowing calls them to
+# TEST a predicate, so an inserted check would turn a false guard into
+# a panic.
+
+import compiler.ast
+import compiler.refinements
+import compiler.desugar
+import compiler.refine_coerce
+
+# ---- shared helpers ----
+
+fn renf_preds_of(t: TypeExpr) : [Expr] = match t.tkind {
+  TyRefine(base, pred) -> [pred, ...renf_preds_of(base)]
+  _ -> []
+}
+
+fn renf_skip_fn(name: String) : Bool =
+  string_length(name) >= 11 and string_slice(name, 0, 11) == "__ref_pred_"
+
+# A refinement over a dimensioned base (`Real<USD> where >= 0.0`)
+# checks the bare numeric value: the inserted assert compares
+# `__strip_unit(self)`, since the predicate's literals carry no unit
+# and a dimensioned operand would be a unit mismatch in the typer.
+fn renf_ty_is_dim(t: TypeExpr) : Bool = match t.tkind {
+  TyRefine(base, _) -> renf_ty_is_dim(base)
+  TyDim(_, _) -> true
+  _ -> false
+}
+
+fn renf_asserts_for(name: String, preds: [Expr], ctx: String, strip: Bool) : [Stmt] =
+  map(preds, (p) => rc_assert(name, p, ctx, strip))
+
+#[doc("Check every refined fn and lambda parameter on entry.")]
+pub fn enforce_refinements_decls(decls: [Decl]) : [Decl] =
+  map(decls, renf_decl)
+
+fn renf_decl(d: Decl) : Decl = match d {
+  DFn(p, n, tps, params, ret, row, body, l, c, mo, fsym) ->
+    if renf_skip_fn(n) { d } else {
+      DFn(p, n, tps, params, ret, row, renf_add_param_checks(params, renf_walk(body, n), n), l, c, mo, fsym)
+    }
+  DTest(desc, body, l, c, mo) -> DTest(desc, renf_walk(body, desc), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, renf_walk(body, desc), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, renf_walk(body, desc), l, c, mo)
+  DUnstable(inner, l, c) -> DUnstable(renf_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, renf_decl(inner), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, renf_decl(inner), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(renf_decl(inner), l, c)
+  _ -> d
+}
+
+fn renf_walk(e: Expr, ctx: String) : Expr = match e.kind {
+  ELambda(ps, b) -> mk_expr(ELambda(ps, renf_add_param_checks(ps, renf_walk(b, ctx), ctx)), e.line, e.col)
+  _ -> mk_expr(dsg_map_expr_kind(e.kind, (s) => renf_walk(s, ctx)), e.line, e.col)
+}
+
+fn renf_add_param_checks(params: [Param], body: Expr, fnname: String) : Expr {
+  let asserts = renf_param_asserts(params, fnname)
+  if asserts == [] { body } else { renf_insert_after_requires(body, asserts) }
+}
+
+fn renf_param_asserts(params: [Param], fnname: String) : [Stmt] = match params {
+  [] -> []
+  [p, ...rest] -> match p.ptype {
+    Some(t) -> {
+      let live = renf_drop_trivial(renf_preds_of(t))
+      list_append(renf_asserts_for(p.pname, live, fnname, renf_ty_is_dim(t)),
+                  renf_param_asserts(rest, fnname))
+    }
+    None -> renf_param_asserts(rest, fnname)
+  }
+}
+
+fn renf_drop_trivial(preds: [Expr]) : [Expr] = match preds {
+  [] -> []
+  [p, ...rest] -> match try_eval_pred(p) {
+    Some(true) -> renf_drop_trivial(rest)
+    _ -> [p, ...renf_drop_trivial(rest)]
+  }
+}
+
+# Param checks slot in after the requires-assert prefix so
+# `extract_requires_asserts` (which stops at the first non-requires
+# statement) still sees every requires clause.
+fn renf_insert_after_requires(body: Expr, asserts: [Stmt]) : Expr = match body.kind {
+  EBlock(stmts, tail) -> match renf_split_requires(stmts, []) {
+    RenfRSP(reqs, rest) ->
+      mk_expr(EBlock(list_append(reqs, list_append(asserts, rest)), tail), body.line, body.col)
+  }
+  _ -> mk_expr(EBlock(asserts, Some(body)), body.line, body.col)
+}
+
+type RenfReqSplit = RenfRSP([Stmt], [Stmt])
+
+fn renf_split_requires(stmts: [Stmt], acc: [Stmt]) : RenfReqSplit = match stmts {
+  [] -> RenfRSP(list_reverse(acc), [])
+  [s, ...rest] -> match s {
+    SAssert(_, Some(m)) -> match m.kind {
+      EStr(span, _) ->
+        if assert_span_is_requires(span) { renf_split_requires(rest, [s, ...acc]) }
+        else { RenfRSP(list_reverse(acc), [s, ...rest]) }
+      _ -> RenfRSP(list_reverse(acc), [s, ...rest])
+    }
+    _ -> RenfRSP(list_reverse(acc), [s, ...rest])
+  }
+}

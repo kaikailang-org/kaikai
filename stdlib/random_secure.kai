@@ -1,0 +1,33 @@
+#[doc("""
+Cryptographically-secure randomness.
+
+`SecureRandom` is deliberately separate from `Random` so that a
+test handler stubbing `Random` does NOT affect security-sensitive
+code paths.
+
+Default handler (installed by the compiler when `SecureRandom`
+appears in `main`'s row):
+  - Linux: `getrandom(2)` — works pre-prng-init.
+  - macOS / *BSD: `arc4random_buf(3)`.
+
+The handler is **not seedable**: security-grade randomness must
+never be reproducible. Tests that need deterministic crypto bytes
+install their own `with SecureRandom` block.
+
+Modulo bias: `int(min, max)` reduces a 64-bit draw via `% span`.
+For span well under 2^63 the bias is negligible (1 part in 2^63);
+protocols needing a strictly-uniform integer should pull bytes and
+reduce with rejection sampling.
+""")]
+
+#[doc("Uniform random integer in `[min, max]` inclusive.")]
+pub fn int(min: Int, max: Int) : Int / SecureRandom =
+  SecureRandom.int_range(min, max)
+
+#[doc("""
+`n` cryptographically-random bytes, each in `[0, 256)`, as `[Int]`.
+`n <= 0` returns the empty list; `n` is silently capped at 1 MiB,
+so a larger request returns fewer bytes.
+""")]
+pub fn bytes(n: Int) : [Int] / SecureRandom =
+  SecureRandom.bytes(n)

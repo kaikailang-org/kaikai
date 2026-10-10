@@ -1,0 +1,127 @@
+#[doc("""
+Signature comparison for tail-call fusion.
+
+Fusing a mutually recursive group behind one entry only works when the
+members agree on what they return and which effects they perform, so
+this module answers whether a candidate group does, and which of the
+members' parameters may share a slot of the fused entry.
+
+The type comparison is deliberately narrow. It recognises named types,
+lists of them, and effect rows, and reports anything else as a
+mismatch: a return type it cannot compare keeps the group unfused, and
+a parameter type it cannot compare gets a slot of its own. Both are the
+safe direction.
+""")]
+
+import compiler.ast
+import compiler.util
+
+#[doc("True when every declaration in `ds` agrees with `lead` on return type and effect row, and every member annotates each parameter and has no type parameters. Parameter lists may differ.")]
+pub fn tfsig_members_match(ds: [Decl], lead: Decl) : Bool {
+  match ds {
+    [] -> tf_sig_is_plain(lead)
+    [d, ...rest] ->
+      if tf_sig_is_plain(d) and tf_sig_eq(d, lead) { tfsig_members_match(rest, lead) } else { false }
+    _ -> true
+  }
+}
+
+fn tf_sig_is_plain(d: Decl) : Bool = match d {
+  DFn(_, _, tparams, params, opt_ret, _, _, _, _, _, _) ->
+    list_is_empty(tparams) and tf_all_annotated(params) and tf_opt_ty_known(opt_ret)
+  _ -> false
+}
+
+fn tf_all_annotated(params: [Param]) : Bool = match params {
+  [] -> true
+  [p, ...rest] -> match p.ptype {
+    Some(_) -> tf_all_annotated(rest)
+    None    -> false
+  }
+}
+
+fn tf_opt_ty_known(t: Option[TypeExpr]) : Bool = match t {
+  None    -> false
+  Some(te) -> tf_ty_known(te)
+}
+
+fn tf_sig_eq(a: Decl, b: Decl) : Bool = match a {
+  DFn(_, _, ta, pa, ra, rowa, _, _, _, _, _) -> match b {
+    DFn(_, _, tb, pb, rb, rowb, _, _, _, _, _) ->
+      list_is_empty(ta) and list_is_empty(tb) and
+      tf_opt_ty_eq(ra, rb) and tf_row_eq(rowa, rowb)
+    _ -> false
+  }
+  _ -> false
+}
+
+fn tf_opt_ty_eq(a: Option[TypeExpr], b: Option[TypeExpr]) : Bool = match a {
+  None -> false
+  Some(ta) -> match b {
+    None     -> false
+    Some(tb) -> tf_ty_eq(ta, tb)
+  }
+}
+
+# Only the shapes a fusable signature is made of; anything else reports
+# unequal so the group stays unfused.
+fn tf_ty_eq(a: TypeExpr, b: TypeExpr) : Bool = match a.tkind {
+  TyName(_, na, argsa) -> match b.tkind {
+    TyName(_, nb, argsb) -> na == nb and tf_ty_list_eq(argsa, argsb)
+    _                 -> false
+  }
+  TyList(ea) -> match b.tkind {
+    TyList(eb) -> tf_ty_eq(ea, eb)
+    _          -> false
+  }
+  _ -> false
+}
+
+fn tf_ty_known(t: TypeExpr) : Bool = match t.tkind {
+  TyName(_, _, targs) -> tf_ty_all_known(targs)
+  TyList(e)       -> tf_ty_known(e)
+  _               -> false
+}
+
+fn tf_ty_all_known(ts: [TypeExpr]) : Bool = match ts {
+  [] -> true
+  [t, ...rest] -> if tf_ty_known(t) { tf_ty_all_known(rest) } else { false }
+  _ -> true
+}
+
+fn tf_ty_list_eq(a: [TypeExpr], b: [TypeExpr]) : Bool = match a {
+  [] -> list_is_empty(b)
+  [ta, ...arest] -> match b {
+    [] -> false
+    [tb, ...brest] -> if tf_ty_eq(ta, tb) { tf_ty_list_eq(arest, brest) } else { false }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn tf_row_eq(a: RowExpr, b: RowExpr) : Bool = match a {
+  REmpty -> match b { REmpty -> true  _ -> false }
+  RClosed(la) -> match b {
+    RClosed(lb) -> tf_labels_eq(la, lb)
+    _           -> false
+  }
+  ROpen(va, la) -> match b {
+    ROpen(vb, lb) -> va == vb and tf_labels_eq(la, lb)
+    _             -> false
+  }
+}
+
+fn tf_labels_eq(a: [RowLabel], b: [RowLabel]) : Bool = match a {
+  [] -> list_is_empty(b)
+  [RL(na, argsa, _), ...arest] -> match b {
+    [] -> false
+    [RL(nb, argsb, _), ...brest] ->
+      if na == nb and tf_ty_list_eq(argsa, argsb) { tf_labels_eq(arest, brest) } else { false }
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("True when parameters `a` and `b` can share a slot of the fused entry: same borrow mode and a type the comparison recognises as equal.")]
+pub fn tfsig_param_shares(a: Param, b: Param) : Bool =
+  a.pborrow == b.pborrow and tf_opt_ty_eq(a.ptype, b.ptype)

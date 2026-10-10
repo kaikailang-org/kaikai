@@ -1,0 +1,18 @@
+# A clause that resumes twice and combines the results (the collect-pair
+# shape of multi-shot languages). The continuation is one-shot, so the
+# compiler rejects the second call.
+
+effect Io { ask() : Int }
+
+fn main() : Int {
+  handle {
+    Io.ask()
+  } with Io {
+    ask(resume) -> {
+      let a = resume(1)
+      let b = resume(2)
+      a + b
+    }
+    return(x) -> x
+  }
+}
