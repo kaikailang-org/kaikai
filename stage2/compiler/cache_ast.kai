@@ -1,0 +1,60 @@
+#[doc("""
+The `[Decl]` payload of a KAB2 blob, encoded by the `BinSerialize` derive
+on the AST types.
+
+Every `SymId` is kept. An id is a function of `(home, class, name)`, so it
+moves only when its declaration does, and the key hashes it with the rest:
+the same source compiled under another home misses instead of restoring
+that home's ids.
+""")]
+
+import compiler.ast
+import compiler.cache
+import compiler.util
+
+#[doc("A deserialised post-parse blob: the decls plus the key sha echoed from its header.")]
+pub type CacheDeserialized = CDs([Decl], String)
+
+#[doc("The decl-list payload: a 4-byte count, then each decl.")]
+pub fn cache_decls_bytes(ds: [Decl]) : Array[Byte] =
+  bin_list_to_bytes(ds, cache_decl_bytes)
+
+fn cache_decl_bytes(d: Decl) : Array[Byte] = to_bytes(d)
+
+#[doc("Decode a decl-list payload at `pos`, returning the decls and the cursor past them.")]
+pub fn cache_decls_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[[Decl]], String] =
+  bin_list_from_bytes(buf, pos, decl_from_bytes)
+
+#[doc("Serialise decls plus their 64-char key sha into a KAB2 blob.")]
+pub fn cache_serialize_module(decls: [Decl], source_sha: String) : Array[Byte] =
+  cache_blob(source_sha, cache_decls_bytes(decls))
+
+#[doc("Deserialise a KAB2 blob back into decls + sha; `None` on any header or payload mismatch, which the caller treats as a miss.")]
+pub fn cache_deserialize_module(buf: Array[Byte]) : Option[CacheDeserialized] = match cache_read_header(buf) {
+  None -> None
+  Some(hdr) -> match hdr {
+    CHdr(sha, pos) -> match cache_decls_from_bytes(buf, pos) {
+      Ok(c)  -> if c.pos == array_length(buf) { Some(CDs(c.value, sha)) } else { None }
+      Err(_) -> None
+    }
+  }
+}
+
+#[doc("Round-trip `decls` through a blob and report `OK <decls> decls, <bytes> bytes` when re-encoding the restored decls reproduces the blob byte for byte, or a `FAIL` line naming the first drift.")]
+pub fn cache_roundtrip_check(decls: [Decl]) : String {
+  let sha = "0000000000000000000000000000000000000000000000000000000000000000"
+  let blob1 = cache_serialize_module(decls, sha)
+  match cache_deserialize_module(blob1) {
+    None -> "FAIL: deserialize returned None"
+    Some(cds) -> match cds {
+      CDs(restored, sha2) -> {
+        let n = array_length(blob1)
+        let blob2 = cache_serialize_module(restored, sha)
+        if sha2 != sha { "FAIL: sha mismatch" }
+        else if not cache_bytes_eq(blob1, blob2) { "FAIL: re-encoded blob differs" }
+        else { concat_all(["OK ", int_to_string(list_length(restored)), " decls, ",
+                           int_to_string(n), " bytes"]) }
+      }
+    }
+  }
+}
