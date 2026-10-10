@@ -1,0 +1,1 @@
+cannot derive `Eq` for `InList`: variant `A` field #0 has type `List[Pair[NoEq]]`; `NoEq` has no `impl Eq for NoEq`

@@ -1,0 +1,4 @@
+error: type mismatch in function call
+  = note: expected: (Unit) -> Int
+  = note: found:    (Int) -> ?t1
+  = note: in argument 1 of `resume`

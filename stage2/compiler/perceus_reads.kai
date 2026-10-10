@@ -1,0 +1,170 @@
+#[doc("""
+The read table: every read of every tracked binder in a body, collected once.
+
+Local binder names are unique within a function body
+(`compiler.unique_binders`), so a name keys exactly one binder and the
+table is keyed by binder identity. The rewriter's dup-or-move decision and
+every payer answer "how often is this binder read" and "which read is its
+last" from this one table; nothing else in the pass re-collects reads.
+
+A read inside a lambda body is a capture: it is flagged, and it blocks the
+last-use transfer. A raw read of a boxed binder copies the payload out and
+leaves the box alone, so it is flagged too: as the last read it hands
+nothing on. `compiler.perceus_read_walk` collects the table.
+""")]
+
+import compiler.ast
+import compiler.sym_read
+import compiler.expr_positions
+import compiler.handler_alias
+import compiler.infer
+import compiler.lex
+import compiler.interp_span
+import compiler.core_prims
+import compiler.name_ix
+
+#[doc("A function's reads, indexed by name.")]
+pub type UseIx = NameIx[Read]
+
+#[doc("One read of a tracked binder: name, line, column, inside a lambda, read raw.")]
+pub type Read = Rd(String, Int, Int, Bool, Bool)
+
+#[doc("""
+A clause's op-argument names, without the continuation.
+
+A call of the continuation is emitted by a special case and has no runtime
+value, so wrapping a read of it in `__perceus_dup` would reach an undeclared
+symbol.
+""")]
+pub fn pcs_filter_non_resume(params: [Param]) : [String] = map(clause_op_args(params), (p) => p.pname)
+
+# ---- the tracked binders of a pattern ----
+
+#[doc("The names a pattern binds that perceus tracks. An `_` rest binder is never bound, so it stays out.")]
+pub fn prc_pat_bindings(pat: Pattern, acc: [String]) : [String] = match pat.pkind {
+  PBind(name)                  -> [name, ...acc]
+  PList(pats, opt_rest)        -> {
+    let acc1 = prc_pats_bindings(pats, acc)
+    match opt_rest {
+      Some(rname) -> [rname, ...acc1]
+      None        -> acc1
+    }
+  }
+  PVariant(_, _, subs)         -> prc_pats_bindings(subs, acc)
+  PVariantRecord(_, _, fields) -> prc_pats_bindings(map(fields, prc_pfield_pat), acc)
+  PRecord(fields)              -> prc_pats_bindings(map(fields, prc_pfield_pat), acc)
+  PAs(name, sub)               -> prc_pat_bindings(sub, [name, ...acc])
+  PNarrow(name, _)             -> [name, ...acc]
+  PSurface(sp)                 -> prc_pats_bindings(patsurface_children(sp), acc)
+  _                            -> acc
+}
+
+#[doc("`prc_pat_bindings` of a `let`, except that a single `PBind` over an `MUnboxed` rhs is a raw C scalar with no refcount and stays out.")]
+pub fn prc_pat_bindings_skip_raw(pat: Pattern, rhs: Expr, acc: [String]) : [String] = match pat.pkind {
+  PBind(name) -> match rhs.mode {
+    MUnboxed -> acc
+    _        -> [name, ...acc]
+  }
+  _ -> prc_pat_bindings(pat, acc)
+}
+
+fn prc_pats_bindings(ps: [Pattern], acc: [String]) : [String] = match ps {
+  []           -> acc
+  [p, ...rest] -> prc_pats_bindings(rest, prc_pat_bindings(p, acc))
+}
+
+fn prc_pfield_pat(f: PField) : Pattern = match f { PField(_, p, _) -> p }
+
+# ---- queries ----
+
+#[doc("Last-use class of a name over a read table: never read, read inside a lambda (a capture blocks the last-use transfer), or last read at a position.")]
+pub fn last_use_for(nm: String, uses: UseIx) : LU = {
+  let reads = ni_bucket(uses, nm)
+  if prt_any_in_lam(reads, nm) { LUBlocked(nm) }
+  else {
+    match prt_latest(nm, reads, None) {
+      None         -> LUUnused(nm)
+      Some((l, c)) -> LUAt(nm, l, c)
+    }
+  }
+}
+
+fn prt_latest(nm: String, uses: [Read], best: Option[(Int, Int)]) : Option[(Int, Int)] = match uses {
+  [] -> best
+  [Rd(un, ln, cl, _, _), ...rest] ->
+    prt_latest(nm, rest, if un == nm and prt_after(ln, cl, best) { Some((ln, cl)) } else { best })
+}
+
+fn prt_after(ln: Int, cl: Int, best: Option[(Int, Int)]) : Bool = match best {
+  None         -> true
+  Some((l, c)) -> ln > l or (ln == l and cl > c)
+}
+
+#[doc("The reads of a name outside lambdas; a lambda read is a capture, paid by the closure's own incref.")]
+pub fn pcs_read_count(nm: String, uses: UseIx) : Int = prt_count(nm, ni_bucket(uses, nm), 0)
+
+fn prt_count(nm: String, uses: [Read], n: Int) : Int = match uses {
+  [] -> n
+  [Rd(un, _, _, in_lam, _), ...rest] -> prt_count(nm, rest, if un == nm and not in_lam { n + 1 } else { n })
+}
+
+#[doc("True when some read of `nm` sits inside a lambda.")]
+pub fn pcs_uses_have_in_lam(uses: UseIx, nm: String) : Bool = prt_any_in_lam(ni_bucket(uses, nm), nm)
+
+fn prt_any_in_lam(uses: [Read], nm: String) : Bool = match uses {
+  []                                 -> false
+  [Rd(un, _, _, in_lam, _), ...rest] -> (in_lam and un == nm) or prt_any_in_lam(rest, nm)
+}
+
+#[doc("True when the read of `nm` at `(l, c)` is raw, which leaves its box alone.")]
+pub fn pcs_read_raw_at(nm: String, uses: UseIx, l: Int, c: Int) : Bool = prt_raw_at(ni_bucket(uses, nm), nm, l, c)
+
+fn prt_raw_at(uses: [Read], nm: String, l: Int, c: Int) : Bool = match uses {
+  []                                -> false
+  [Rd(un, ln, cl, _, raw), ...rest] -> (raw and un == nm and ln == l and cl == c) or prt_raw_at(rest, nm, l, c)
+}
+
+#[doc("True when `nm` is read exactly once, outside any lambda.")]
+pub fn pcs_read_once(nm: String, uses: UseIx) : Bool =
+  pcs_read_count(nm, uses) == 1 and not pcs_uses_have_in_lam(uses, nm)
+
+#[doc("True when `nm` appears anywhere in `e`: lambda bodies, handler clauses and `#{...}` bodies included. An interpolation counts by identifier token, so a field name spelled like `nm` counts too.")]
+pub fn pcs_mentions(nm: String, e: Expr) : Bool = match sym_read_kind(e.kind) {
+  EVar(u)        -> u == nm
+  EStr(span, t3) -> pcs_interp_ident_count(nm, span, t3) > 0
+  _              -> prt_mentions_ps(nm, xp_positions(e))
+}
+
+fn prt_mentions_ps(nm: String, ps: [XPos]) : Bool = match ps {
+  []                  -> false
+  [XP(_, c), ...rest] -> pcs_mentions(nm, c) or prt_mentions_ps(nm, rest)
+}
+
+#[doc("Identifier tokens equal to `nm` inside the `#{...}` parts of a string span. Lexical, so it never sees fewer reads than the parsed table.")]
+pub fn pcs_interp_ident_count(nm: String, span: String, is_triple: Bool) : Int =
+  prt_iic_parts(nm, isp_parts(span, is_triple))
+
+fn prt_iic_parts(nm: String, parts: [IPart]) : Int = match parts {
+  []           -> 0
+  [p, ...rest] -> prt_iic_parts(nm, rest) + match p {
+    IpLit(_, _) -> 0
+    IpExp(esrc) -> prt_iic_toks(nm, esrc, tokenize(esrc))
+  }
+}
+
+fn prt_iic_toks(nm: String, esrc: String, toks: [Token]) : Int = match toks {
+  []           -> 0
+  [t, ...rest] -> prt_iic_toks(nm, esrc, rest) + match t.kind {
+    TkIdent -> if string_slice(esrc, t.start, t.length) == nm { 1 } else { 0 }
+    _       -> 0
+  }
+}
+
+#[doc("The expression a unit coercion wraps, peeled to the value Perceus reads; any other expression is itself.")]
+pub fn prc_peel_unit(e: Expr) : Expr = match e.kind {
+  ECall(f, xs) -> match sym_read_kind(f.kind) {
+    EVar(c) -> if core_is_unit_coercion(c) { match xs { [x] -> prc_peel_unit(x)  _ -> e } } else { e }
+    _       -> e
+  }
+  _ -> e
+}

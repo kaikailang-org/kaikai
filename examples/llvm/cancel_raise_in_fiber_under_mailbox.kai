@@ -1,0 +1,34 @@
+# Issue #582 regression: `Cancel.raise()` from a fiber spawned under a
+# mailboxed parent segfaulted on the LLVM backend because
+# `kai_main_install_defaults` did not push a default Cancel handler
+# evidence node, leaving `kaix_evidence_lookup_handler("Cancel")`
+# returning NULL. The `raise` op then dereferenced the null evidence
+# slot and crashed two frames deep in the trampoline. The fix installs
+# the Cancel default handler alongside the other builtin defaults.
+#
+# The child's `Cancel.raise()` unwinds its fiber, the parent stays
+# parked on `Actor.receive()`, and the runtime detects the deadlock
+# and exits with its banner — clean exit either way, SIGSEGV pre-fix.
+#
+# main prints BEFORE the spawn, so its line precedes the child's by
+# happens-before (a fiber cannot run before it exists), and the
+# deadlock banner requires the child to have finished; the output is
+# identical at any KAI_THREADS.
+
+import actor
+import spawn
+
+fn main_inner() : Unit / Actor[String] + Spawn + Cancel + Console = {
+  Stdout.print("main: spawning child, then parking on receive")
+  let _ = spawn.spawn(() => {
+    Stdout.print("child: about to raise")
+    Cancel.raise()
+  })
+  let r = Actor.receive()
+  Stdout.print("main: got " ++ r)
+}
+
+fn main() : Int / Console + Spawn + Cancel = {
+  with_mailbox { main_inner() }
+  0
+}
