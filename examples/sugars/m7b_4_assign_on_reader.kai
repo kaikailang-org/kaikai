@@ -1,0 +1,16 @@
+# m7b #4 — `cap := v` only applies to State.set. A Reader binding
+# has no `set` op; the parser still desugars to `cap.set(v)`, but
+# the inferencer's alias path looks up `Reader.set` and reports
+# the missing op. Doc B §`Syntax note: capability read/write
+# sugar` rule 2 (negative case).
+
+fn main() : Int {
+  let r = handle {
+    env := 0
+    env
+  } with Reader[Int](42) as env {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  r
+}
