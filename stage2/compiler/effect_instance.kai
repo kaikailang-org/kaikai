@@ -1,0 +1,150 @@
+#[doc("""
+Effect instances: the identity a handler installs, a frame slot carries
+and a perform reaches.
+
+An instance is an effect and, once it is pinned to concrete types, the key
+text of each type argument. An instance the compiler cannot pin (a
+polymorphic body, a phantom op) carries no argument and matches every
+instance of its effect; two pinned instances match only when equal.
+Instances are read from monomorphised types, so a handler and a perform
+agree exactly when the typer resolved them to the same instance.
+
+The run time finds a handler by a label, `Eff` or `Eff[A,B]`: the
+instance spelled with the name its effect is emitted under.
+""")]
+
+import compiler.ast
+import compiler.util
+import compiler.infer
+import compiler.scalar_ty
+import compiler.symtab
+import compiler.rt_name
+
+#[doc("An effect instance: the effect, and the key text of each type argument that pins it. No argument when the effect takes none or one of them is unpinned.")]
+pub type InstKey = { eff: SymId, args: [String] }
+
+#[doc("The instance of `eff` whose argument key texts are `texts`: unpinned when one of them is.")]
+pub fn inst_key(eff: SymId, texts: [String]) : InstKey =
+  InstKey { eff: eff, args: if any(texts, is_unpinned) { [] } else { texts } }
+
+#[doc("The instance of `eff` at the written type arguments `args`.")]
+pub fn inst_key_of_tes(eff: SymId, args: [TypeExpr]) : InstKey = inst_key(eff, map(args, te_text))
+
+#[doc("The instance of `eff` at the type arguments `targs`.")]
+pub fn inst_key_of_tys(eff: SymId, targs: [Ty]) : InstKey = inst_key(eff, map(targs, ty_text))
+
+#[doc("The instance a typed perform of `eff` reaches: its callee carries the resolved `Eff[args]` as its type.")]
+pub fn inst_key_of_callee(eff: SymId, callee_ty: Option[Ty]) : InstKey = match callee_ty {
+  Some(TyCon(_, args)) -> inst_key_of_tys(eff, args)
+  _                    -> inst_key(eff, [])
+}
+
+#[doc("The label the run time knows the instance `k` by; `tab` names its effect.")]
+pub fn inst_key_text(tab: SymTab, k: InstKey) : String = key_of(rt_name(tab, k.eff), k.args)
+
+#[doc("The effect's emitted name in an instance label.")]
+pub fn inst_key_eff(key: String) : String = {
+  let i = string_index_of_char(key, '[')
+  if i < 0 { key } else { string_slice(key, 0, i) }
+}
+
+#[doc("True when a site of instance `a` may resolve through evidence of instance `b`.")]
+pub fn inst_keys_match(a: InstKey, b: InstKey) : Bool = inst_key_index([b], a) >= 0
+
+#[doc("The index of the first instance in `keys` that `key` matches, an exact match first; -1 when none does.")]
+pub fn inst_key_index(keys: [InstKey], key: InstKey) : Int = key_scan(keys, key, 0, 0 - 1)
+
+fn key_scan(keys: [InstKey], key: InstKey, i: Int, first: Int) : Int = match keys {
+  []           -> first
+  [k, ...rest] ->
+    if not same_effect(k, key) { key_scan(rest, key, i + 1, first) }
+    else if k.args == key.args { i }
+    else { key_scan(rest, key, i + 1, if first < 0 and pairs_bare(k, key) { i } else { first }) }
+}
+
+#[doc("True when `a` and `b` are one instance: the same effect at the same arguments.")]
+pub fn inst_key_eq(a: InstKey, b: InstKey) : Bool = same_effect(a, b) and a.args == b.args
+
+# An unresolved effect is no instance of anything.
+fn same_effect(a: InstKey, b: InstKey) : Bool = sym_raw(a.eff) >= 0 and sym_raw(a.eff) == sym_raw(b.eff)
+
+# One of two instances of an effect is the unpinned one the other pins.
+fn pairs_bare(k: InstKey, key: InstKey) : Bool = list_is_empty(k.args) or list_is_empty(key.args)
+
+#[doc("The instances of the row labels `ls`.")]
+pub fn row_label_keys(ls: [RowLabel]) : [InstKey] =
+  map(ls, (l) => match l { RL(r, args) -> inst_key_of_tes(ref_sym(r), args) })
+
+#[doc("The label of the effect emitted as `eff` at the instance whose argument texts are `texts`; bare when one is unpinned.")]
+pub fn key_of(eff: String, texts: [String]) : String = match texts {
+  [] -> eff
+  _  -> if any(texts, is_unpinned) { eff } else { concat_all([eff, "[", join_with(texts, ","), "]"]) }
+}
+
+#[doc("True when a key text has a part no instance pins.")]
+pub fn is_unpinned(text: String) : Bool = string_index_of_char(text, '?') >= 0
+
+#[doc("A written type's key text, `?` where it names nothing concrete.")]
+pub fn te_text(te: TypeExpr) : String = match te.tkind {
+  TyName(r, args) -> ref_key(r, map(args, te_text))
+  TyList(inner)   -> cat3("[", te_text(inner), "]")
+  TyFn(ps, r, _)  -> fn_text(map(ps, te_text), te_text(r))
+  TyDim(b, _)     -> te_text(b)
+  TyRefine(b, _)  -> te_text(b)
+  _               -> "?"
+}
+
+# A settled name keys as its declaration, never its spelling: two types
+# that share a name are two instances. A name still written is a scalar,
+# or a type parameter, which pins nothing.
+fn ref_key(r: DeclRef, args: [String]) : String = match r {
+  DrSym(s)        -> con_text(id_text(s), args)
+  DrWritten(_, _) -> match scalar_ty_named(ref_spelled(r)) {
+    Some(t) -> prim_text(t)
+    None    -> "?"
+  }
+}
+
+fn id_text(s: SymId) : String = string_concat("#", int_to_string(sym_raw(s)))
+
+#[doc("A resolved type's key text, `?` where no instance pins it.")]
+pub fn ty_text(t: Ty) : String = match t {
+  TyListT(x)          -> cat3("[", ty_text(x), "]")
+  TyFnT(ps, r, _)     -> fn_text(map(ps, ty_text), ty_text(r))
+  TyCon(s, args)      -> con_text(id_text(s), map(args, ty_text))
+  TyDimT(b, _)        -> ty_text(b)
+  TyRefineT(b, _)     -> ty_text(b)
+  _                   -> prim_text(t)
+}
+
+#[doc("True when a part of `t` is unpinned: the holes `ty_text` spells `?`.")]
+pub fn ty_unpinned(t: Ty) : Bool = match t {
+  TyListT(x)           -> ty_unpinned(x)
+  TyFnT(ps, r, _)      -> any(ps, ty_unpinned) or ty_unpinned(r)
+  TyCon(_, args)       -> any(args, ty_unpinned)
+  TyDimT(b, _)         -> ty_unpinned(b)
+  TyRefineT(b, _)      -> ty_unpinned(b)
+  _                    -> match scalar_ty_name(t) {
+    Some(_) -> false
+    None    -> true
+  }
+}
+
+#[doc("The name of a primitive type, or `?` for any other.")]
+pub fn prim_text(t: Ty) : String = match scalar_ty_name(t) {
+  Some(n) -> n
+  None    -> "?"
+}
+
+fn con_text(n: String, args: [String]) : String = match args {
+  [] -> n
+  _  -> concat_all([n, "[", join_with(args, ","), "]"])
+}
+
+fn fn_text(ps: [String], r: String) : String = concat_all(["fn(", join_with(ps, ","), ")->", r])
+
+#[doc("The declared and implicit type parameters of a function.")]
+pub fn decl_tparams(d: Decl) : [String] = match d {
+  DFn(_, _, tps, _, _, _, _, _, _, _) -> list_append(tps, collect_implicit_tparams_in_decl(d, tps))
+  _ -> []
+}
