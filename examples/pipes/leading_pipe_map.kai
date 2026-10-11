@@ -1,0 +1,13 @@
+# issue #130 — `|` (map pipe, m7b #9) may also lead a continuation
+# line. Each `| f` continues the chain instead of terminating the
+# previous statement. Uses lambda-block RHS form for stylistic
+# parity with the multi-line layout; per issue #422 the arrow
+# form `(x) => x * 2 | ...` would chain correctly too, since the
+# arrow body terminates at the next pipe.
+
+fn main() : Unit / Console {
+  let doubled = [1, 2, 3]
+    | { x -> x * 2 }
+    | { x -> x + 1 }
+  each(doubled, (x) => print(int_to_string(x)))
+}

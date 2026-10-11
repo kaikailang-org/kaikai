@@ -1,0 +1,84 @@
+#[doc("Where the binary memo keeps its entries, and how a binary moves in and out of one.")]
+
+import os.env
+import cli_guard_memo
+import cli_memo_key
+import cli_proc
+import cli_sys
+
+#[doc("The memo directory: the package's user cache, else the shared core cache, or empty when the build has neither.")]
+pub fn dir(flags: [String]) : String =
+  match cli_memo_key.user_cache_dir(flags) {
+    "" -> under(core_cache_dir(flags))
+    d -> under(d)
+  }
+
+fn under(d: String) : String = if d == "" { "" } else { "#{d}/bins" }
+
+fn core_cache_dir(flags: [String]) : String =
+  match flags {
+    [] -> ""
+    ["--core-cache-dir", d, ..._] -> d
+    [_, ...rest] -> core_cache_dir(rest)
+  }
+
+#[doc("""
+The compiler's digest. Hashing the compiler costs more than a warm
+build, so the digest is kept in `dir` under the compiler's mtime and
+size, the identity every cache of the compiler is already keyed by.
+""")]
+pub fn toolchain_digest(dir: String, kaic2: String) : String / File + Ffi {
+  let id = "#{cli_sys.mtime(kaic2)}-#{cli_sys.size(kaic2)} "
+  let file = "#{dir}/toolchain"
+  match read_file(file) {
+    Ok(s) if string.starts_with(s, id) -> string_slice(s, string_length(id), string_length(s))
+    _ -> stored(file, id, cli_guard_memo.toolchain_digest(kaic2))
+  }
+}
+
+fn stored(file: String, id: String, d: String) : String / File + Ffi {
+  let part = "#{file}.#{cli_sys.getpid()}.part"
+  if write_file(part, "#{id}#{d}").is_ok() { let _ = file_rename(part, file) }
+  d
+}
+
+#[doc("""
+Put the binary `from` at `to`. A run's binary sits in a scratch
+directory nothing writes again, so it shares the file: macOS assesses
+every new executable file on its first exec, which costs more than a
+warm build, and a link to a file already run is not new. A test
+binary's path is rewritten by later builds, so it gets a copy.
+""")]
+pub fn put(verb: String, from: String, to: String) : Bool / Ffi =
+  (verb == "run" and quiet(["ln", "-f", from, to])) or copied(from, to)
+
+#[doc("Start keeping the compiler diagnostics a build replays, in a file under `tmp`; its path. `stop_diags` stops.")]
+pub fn record_diags(tmp: String) : String / Ffi {
+  let f = "#{tmp}/bin-memo.err"
+  let _ = cli_sys.remove_tree(f)
+  cli_sys.tee_compile_stderr(f)
+  f
+}
+
+#[doc("Stop what `record_diags` started.")]
+pub fn stop_diags() : Unit / Ffi = cli_sys.tee_compile_stderr("")
+
+#[doc("Put the diagnostics `record_diags` kept into the entry being staged in `part`, when the build printed any.")]
+pub fn keep_diags(diags: String, part: String) : Bool / Ffi =
+  (not cli_sys.is_file(diags)) or copied(diags, "#{part}/err")
+
+#[doc("Print the diagnostics kept in `entry`, as the build that made it printed them.")]
+pub fn replay_diags(entry: String) : Unit / Ffi = cli_sys.copy_to_stderr("#{entry}/err")
+
+#[doc("True when `KAI_BIN_MEMO=0`, or when the run asks for cache statistics, which describe a compile.")]
+pub fn off() : Bool / Env =
+  env.get("KAI_BIN_MEMO").unwrap_or("") == "0" or (STATS_ENV |> list.any(v => env.get(v).unwrap_or("") == "1"))
+
+const STATS_ENV : [String] = ["KAI_CORE_CACHE_STATS", "KAI_MODULAR_STATS"]
+
+#[doc("Copy `from` to `to`.")]
+pub fn copied(from: String, to: String) : Bool / Ffi = quiet(["cp", from, to])
+
+#[doc("Run `argv` with its output discarded; whether it succeeded.")]
+pub fn quiet(argv: [String]) : Bool / Ffi =
+  cli_proc.run(argv, cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null", err: "/dev/null" }) == 0
