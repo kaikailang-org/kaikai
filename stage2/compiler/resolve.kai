@@ -1,0 +1,664 @@
+#[doc("""
+Name resolution over expressions, statements, patterns and one
+declaration: every name becomes the id of the binder or declaration it
+reaches, or an unbound-name diagnostic.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.native_prims
+import compiler.resolve_state
+import compiler.name_hidden
+import compiler.scope_chain
+import compiler.handler_alias
+import compiler.resolve_callee
+import compiler.resolve_use
+import compiler.scope_view
+import compiler.written
+import compiler.refine_types
+import compiler.refine_slots
+import compiler.refine_names
+import compiler.resolve_env
+import compiler.resolve_pats
+import compiler.resolve_names
+
+fn bind_pat(e: Env, pat: Pattern) : RPat / Console + File = match bind_pat_kind(e, pat.pkind) {
+  RPatKind(e1, k) -> RPat(e1, Pattern { pkind: k, line: pat.line, col: pat.col })
+}
+
+fn bind_pat_kind(e: Env, k: PatKind) : RPatKind / Console + File {
+  match k {
+    PWild -> RPatKind(e, k)
+    PLit(lit) -> RPatKind(chk_literal_str(e, lit), k)
+    PRange(_, _) -> RPatKind(e, k)
+    PBind(b) -> match env_bind(e, b) { RBinder(e1, b1) -> RPatKind(e1, PBind(b1)) }
+    PList(pats, opt_rest) -> match bind_pats_loop(e, pats, []) {
+      RPats(e1, ps1) -> match opt_rest {
+        Some(r) -> match env_bind(e1, r) { RBinder(e2, r1) -> RPatKind(e2, PList(ps1, Some(r1))) }
+        None -> RPatKind(e1, PList(ps1, None))
+      }
+    }
+    PVariant(r, subs) -> match bind_pats_loop(e, subs, []) {
+      RPats(e1, ps1) -> RPatKind(e1, PVariant(r, ps1))
+    }
+    PVariantRecord(r, fields) -> match bind_pfields_loop(e, fields, []) {
+      RPFields(e1, fs1) -> RPatKind(e1, PVariantRecord(r, fs1))
+    }
+    PRecord(fields) -> match bind_pfields_loop(e, fields, []) {
+      RPFields(e1, fs1) -> RPatKind(e1, PRecord(fs1))
+    }
+    PHole(_) -> RPatKind(e, k)
+    PAs(b, sub) -> match env_bind(e, b) {
+      RBinder(e1, b1) -> match bind_pat(e1, sub) { RPat(e2, s1) -> RPatKind(e2, PAs(b1, s1)) }
+    }
+    PNarrow(b, t) -> match env_bind(e, b) { RBinder(e1, b1) -> RPatKind(e1, PNarrow(b1, t)) }
+    PSurface(sp) -> match bind_pats_loop(e, patsurface_children(sp), []) {
+      RPats(e1, ps1) -> RPatKind(e1, PSurface(patsurface_rebuild(sp, ps1)))
+    }
+  }
+}
+
+fn bind_pats_loop(e: Env, ps: [Pattern], acc: [Pattern]) : RPats / Console + File {
+  match ps {
+    [] -> RPats(e, list_reverse(acc))
+    [p, ...rest] -> match bind_pat(e, p) { RPat(e1, p1) -> bind_pats_loop(e1, rest, [p1, ...acc]) }
+  }
+}
+
+# Shorthand `{ x }` binds `x` directly; the parser already builds the
+# equivalent of `{ x: x }` so bind_pat handles both cases uniformly.
+fn bind_pfields_loop(e: Env, fs: [PField], acc: [PField]) : RPFields / Console + File {
+  match fs {
+    [] -> RPFields(e, list_reverse(acc))
+    [PField(n, sub, short), ...rest] -> match bind_pat(e, sub) {
+      RPat(e1, s1) -> bind_pfields_loop(e1, rest, [PField(n, s1, short), ...acc])
+    }
+  }
+}
+
+fn chk_expr(e: Env, x: Expr) : RExpr / Console + File {
+  match chk_kind(e, x) {
+    RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site })
+  }
+}
+
+fn rk_same(e: Env, k: ExprKind) : RKind = RKind(e, k)
+
+fn chk_kind(e: Env, x: Expr) : RKind / Console + File {
+  match x.kind {
+    EInt(_, _)    -> rk_same(e, x.kind)
+    EReal(_, _)   -> rk_same(e, x.kind)
+    EIntLit(_)    -> rk_same(e, x.kind)
+    EDecimalLit(_) -> rk_same(e, x.kind)
+    EFixed(_, _)  -> rk_same(e, x.kind)
+    EBool(_)   -> rk_same(e, x.kind)
+    EChar(_)   -> rk_same(e, x.kind)
+    EStr(_, _) -> rk_same(chk_literal_str(e, x), x.kind)
+    EUnit      -> rk_same(e, x.kind)
+    EUnder     -> rk_same(e, x.kind)
+    EPlaceholder -> rk_same(e, x.kind)
+    # Already resolved: an earlier walk over this tree, or the pass that
+    # minted the node, settled it, and re-deciding it here is exactly
+    # what identity exists to prevent.
+    ESym(_, _) -> rk_same(e, x.kind)
+    ELocal(_)  -> rk_same(e, x.kind)
+    EOp(_)     -> rk_same(e, x.kind)
+    EName(name) -> chk_var(e, written_text(name), x)
+    EMark(_) -> rk_same(e, x.kind)
+    ECall(f, xs) -> chk_call(e, f, xs, list_length(xs))
+    EField(base, fname) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> RKind(e1, EField(chk_op_base(e1, b1, fname), fname))
+    }
+    EIndex(base, idx) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, idx) {
+        RExpr(e2, i1) -> RKind(e2, EIndex(b1, i1))
+      }
+    }
+    EBinop(op, a, b) -> match chk_expr(e, a) {
+      RExpr(e1, a1) -> match chk_expr(e1, b) {
+        RExpr(e2, b1) -> RKind(e2, EBinop(op, a1, b1))
+      }
+    }
+    EUnop(op, inner) -> match chk_expr(e, inner) {
+      RExpr(e1, i1) -> RKind(e1, EUnop(op, i1))
+    }
+    EIf(c, a, opt_b) -> match chk_expr(e, c) {
+      RExpr(e1, c1) -> match chk_expr(e1, a) {
+        RExpr(e2, a1) -> match opt_b {
+          Some(b) -> match chk_expr(e2, b) {
+            RExpr(e3, b1) -> RKind(e3, EIf(c1, a1, Some(b1)))
+          }
+          None -> RKind(e2, EIf(c1, a1, None))
+        }
+      }
+    }
+    EMatch(scrut, arms) -> match chk_expr(e, scrut) {
+      RExpr(e1, s1) -> match chk_arms(e1, arms) {
+        RArms(e2, as1) -> RKind(e2, EMatch(s1, as1))
+      }
+    }
+    ELambda(params, body) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RKind(env_pop(e2), ELambda(ps1, b1))
+      }
+    }
+    ERecordLit(r, fields) -> match chk_field_inits(e, fields) {
+      RFields(e1, fs1) -> RKind(e1, ERecordLit(r, fs1))
+    }
+    EList(elems) -> match chk_list_elems(e, elems) {
+      RElems(e1, es1) -> RKind(e1, EList(es1))
+    }
+    ERange(a, b, opt_step) -> match chk_expr(e, a) {
+      RExpr(e1, a1) -> match chk_expr(e1, b) {
+        RExpr(e2, b1) -> match opt_step {
+          Some(st) -> match chk_expr(e2, st) {
+            RExpr(e3, s1) -> RKind(e3, ERange(a1, b1, Some(s1)))
+          }
+          None -> RKind(e2, ERange(a1, b1, None))
+        }
+      }
+    }
+    EBlock(stmts, opt_final) -> {
+      match chk_stmts(env_push(e), stmts) {
+        RStmts(e1, ss1) -> match opt_final {
+          Some(f) -> match chk_expr(e1, f) {
+            RExpr(e2, f1) -> RKind(env_pop(e2), EBlock(ss1, Some(f1)))
+          }
+          None -> RKind(env_pop(e1), EBlock(ss1, None))
+        }
+      }
+    }
+    EPipe(a, b) -> chk_apply_pipe(e, a, b)
+    EMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EMapPipe(l, r))
+    EFlatMapPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFlatMapPipe(l, r))
+    EFilterPipe(a, b) -> chk_pipe(e, a, b, (l, r) => EFilterPipe(l, r))
+    EHole(_) -> rk_same(e, x.kind)          # holes bind no names; checker lets them pass silently
+    ETodo(_) -> rk_same(e, x.kind)          # same posture as a hole
+    EExternBody(_, _) -> rk_same(e, x.kind)          # same posture as a hole
+    EBang(inner) -> match chk_expr(e, inner) {   # scope-walk the operand
+      RExpr(e1, i1) -> RKind(e1, EBang(i1))
+    }
+    EHandle(body, eff, ta, init_opt, alias_opt, clauses, ret_opt) -> match chk_tys(e, ta) {
+      RTys(e1, ta1) -> chk_handle(e1, x, body, eff, ta1, init_opt, alias_opt, clauses, ret_opt)
+    }
+    # literal carrying a unit annotation. Recurse into the inner
+    # numeric literal; the unit symbols themselves are validated at
+    # type-resolution time, not here.
+    ELitUnit(inner, u) -> match chk_expr(e, inner) {
+      RExpr(e1, i1) -> RKind(e1, ELitUnit(i1, u))
+    }
+    # `variants[T]()` carries no value-level sub-expressions.
+    # The TypeExpr is validated by the resolver (sum + nullary-only)
+    # in a later pass, not here.
+    EVariantsOf(_, _) -> rk_same(e, x.kind)
+    EModCall(m, f) -> RKind(e, chk_modcall(e, written_text(m), written_text(f), x.kind))
+    # intrinsic args are ordinary sub-expressions (a loop intrinsic
+    # carries its original callee plus the loop's lambdas); walk them so
+    # name-binding issues surface exactly as in the pre-lowering call.
+    EIntrinsic(InSegState, [s, body]) -> chk_seg_state(e, s, body, x)
+    EIntrinsic(nm, args_) -> chk_intrinsic(e, nm, args_)
+    # A surface node's children are walked for their diagnostics; the
+    # node itself is rebuilt from the original, since the surface forms
+    # are lowered before any consumer of identity runs.
+    ESurface(sf) -> rk_same(rx_envs(chk_exprs(e, surface_children(sf))), x.kind)
+  }
+}
+
+# The one place a bare name becomes an identity. A read of a binder is
+# its local id, so no pass can take it for a declaration that shares its
+# spelling; a declaration is the id the ladder reached. An unbound name
+# is reported and left as written, as is a name only the type settles.
+fn chk_var(e: Env, name: String, x: Expr) : RKind / Console + File =
+  match value_proto(env_call_cx(e), name) {
+    Some(d) -> RKind(e, disp_ref(d))
+    None    -> chk_name(e, name, x)
+  }
+
+fn chk_name(e: Env, name: String, x: Expr) : RKind / Console + File {
+  if env_has(e, name) {
+    match env_lookup(e, name) {
+      Some(BLocal(l)) -> RKind(e, ELocal(l))
+      Some(BDecl(s))  -> RKind(chk_hidden(e, name, x, s), ESym(s, spec_none()))
+      None            -> RKind(chk_hidden(e, name, x, sym_none()), x.kind)
+    }
+  } else { RKind(chk_unbound(e, name, x), x.kind) }
+}
+
+# Every file's declarations are registered for the whole unit, so a name
+# another file's import loaded is bound here too; the file's own view
+# says whether it may be written bare. A builtin answers before any
+# hidden declaration, and a minted `__` name is no user's to import.
+# `reached` is the declaration resolution settled on: one on a rung of
+# the file hides nothing. Every use that is not a local passes through
+# here, so the rarer reasons to stay silent are asked only once a hidden
+# declaration exists.
+fn chk_hidden(e: Env, name: String, x: Expr, reached: SymId) : Env / Console + File =
+  if not rs_recording(e.rs) or reached_in_view(e.rs, reached, name) { e }
+  else { match sv_hidden(e.rs.tab, e.rs.view, ru_value_classes(), name) {
+    [] -> e
+    ss ->
+      if env_shadowed(e, name) or starts_with(name, "__") or list_has(e.rs.prelude, name) { e }
+      else {
+        let d = nh_diag(e.rs.tab, e.rs.view, ss, e.file, x.line, x.col, name)
+        if env_reported(e.diags, e.file, x.line, x.col, diag_text(d)) { e } else {
+          render_diag(d)
+          env_mark_err(env_push_diag(e, d))
+        }
+      }
+  } }
+
+# A pipe stage named bare is called with the piped value alone.
+fn chk_pipe(e: Env, a: Expr, b: Expr,
+      mk: (Expr, Expr) -> ExprKind) : RKind / Console + File =
+  match chk_expr(e, a) {
+    RExpr(e1, a1) -> match chk_stage(e1, b) {
+      RExpr(e2, b1) -> RKind(e2, mk(a1, b1))
+    }
+  }
+
+fn chk_stage(e: Env, b: Expr) : RExpr / Console + File = match b.kind {
+  EName(name) -> chk_callee(e, written_text(name), b, 1)
+  _           -> chk_expr(e, b)
+}
+
+# `x |> f(a, b)` calls `f(x, a, b)`; a `_` among the arguments is the
+# slot the piped value fills instead.
+fn chk_apply_pipe(e: Env, a: Expr, b: Expr) : RKind / Console + File =
+  match chk_expr(e, a) {
+    RExpr(e1, a1) -> match b.kind {
+      ECall(f, xs) -> match chk_call(e1, f, xs, list_length(xs) + piped_slot(xs)) {
+        RKind(e2, k) -> RKind(e2, EPipe(a1, Expr { kind: k, line: b.line, col: b.col, ty: b.ty, mode: b.mode,  site: b.site }))
+      }
+      _ -> match chk_stage(e1, b) { RExpr(e2, b1) -> RKind(e2, EPipe(a1, b1)) }
+    }
+  }
+
+# A call `f(args)` with `n` arguments, the piped value counted. A bare
+# callee climbs the ladder with that arity; a method call reaches a
+# protocol operation when nothing nearer answers that arity.
+fn chk_call(e: Env, f: Expr, xs: [Expr], n: Int) : RKind / Console + File = {
+  let rf = match f.kind {
+    EName(name) -> chk_callee(e, written_text(name), f, n)
+    _           -> chk_expr(e, f)
+  }
+  match rf {
+    RExpr(e1, f1) -> match chk_exprs(e1, xs) {
+      RExprs(e2, xs1) -> method_call(e2, f1, xs1)
+    }
+  }
+}
+
+# A bare callee: the binding the ladder reaches at this arity, or, when
+# nothing fits, the name read as a value so the arity error names the
+# nearest binding.
+fn chk_callee(e: Env, name: String, x: Expr, n: Int) : RExpr / Console + File = {
+  let cx = env_call_cx(e)
+  let h = call_hit(cx, name, n)
+  let e1 = match skip_warning(cx, name, n, h) {
+    Some(msg) -> warn_skip(e, x, msg)
+    None      -> e
+  }
+  match h {
+    Hit(RLocal(l), _) -> RExpr(e1, at(ELocal(l), x))
+    Hit(RDecl(s), _)  -> RExpr(chk_hidden(e1, name, x, s), sym_ref(s, x))
+    Hit(RProto(d), _) -> RExpr(e1, at(disp_ref(d), x))
+    Hit(RBare, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), x)
+    Hit(RCore, _)     -> RExpr(chk_hidden(e1, name, x, sym_none()), core_ref(e1, name, x))
+    Hit(RNone, _)     -> chk_expr_named(e1, name, x)
+  }
+}
+
+fn chk_expr_named(e: Env, name: String, x: Expr) : RExpr / Console + File =
+  match chk_name(e, name, x) {
+    RKind(e1, k) -> RExpr(e1, Expr { kind: k, line: x.line, col: x.col, ty: x.ty, mode: x.mode,  site: x.site })
+  }
+
+# `Eff as log` makes `log` a binding that names the capability inside
+# the body, so it is pushed in a scope of its own and disappears with
+# it. The init expression (`with State[T](init)`) lives in the outer
+# scope — its free vars are the surrounding env.
+fn chk_handle(e: Env, x: Expr, body: Expr, eff: DeclRef, ta: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[Binder], clauses: [HClause],
+      ret_opt: Option[HReturn]) : RKind / Console + File {
+  let stateful = match init_opt { Some(_) -> true None -> false }
+  # A head an earlier pass settled while it still carried its qualifier
+  # keeps that declaration; one the resolver cannot settle stays written.
+  let esym = chk_effect_sym(e, eff)
+  let eff1 = if sym_raw(esym) >= 0 { DrSym(esym) } else { eff }
+  let after = match init_opt {
+    Some(ie) -> match chk_expr(e, ie) { RExpr(e1, i1) -> RExpr(e1, i1) }
+    None     -> RExpr(e, x)
+  }
+  let init1 = match init_opt { Some(_) -> match after { RExpr(_, i) -> Some(i) } None -> None }
+  let e0 = rx_env(after)
+  let aliased = match alias_opt {
+    Some(alias) -> match env_bind(env_push(e0), alias) { RBinder(ea, a1) -> RAlias(ea, Some(a1)) }
+    None        -> RAlias(e0, None)
+  }
+  match aliased {
+    RAlias(body_env, alias1) -> match chk_expr(body_env, body) {
+      RExpr(eb, body1) -> {
+        let restored = match alias_opt { Some(_) -> env_pop(eb) None -> eb }
+        if stateful {
+          warn_shadowed_aliases(restored, aliases_read_by_clauses(user_state_aliases(), clauses, ret_opt),
+                                x.line, x.col)
+        } else { () }
+        match chk_handler_clauses(restored, clauses, stateful) {
+          RClauses(ec, cs1) -> match ret_opt {
+            Some(r) -> match chk_handler_return(ec, r, stateful) {
+              RRet(er, r1) -> RKind(er, EHandle(body1, eff1, ta, init1, alias1, cs1, Some(r1)))
+            }
+            None -> RKind(ec, EHandle(body1, eff1, ta, init1, alias1, cs1, None))
+          }
+        }
+      }
+    }
+  }
+}
+
+fn chk_intrinsic(e: Env, nm: Intrinsic, args_: [Expr]) : RKind / Console + File = match chk_exprs(e, args_) {
+  RExprs(e1, as1) -> RKind(e1, EIntrinsic(nm, as1))
+}
+
+# A stateful segment clause: its state aliases are `let`s of the state it
+# was handed, under the same precedence a stateful handler's clause has.
+fn chk_seg_state(e: Env, s: Expr, body: Expr, x: Expr) : RKind / Console + File = {
+  warn_shadowed_aliases(e, seg_state_aliases((nm) => false, body), x.line, x.col)
+  match chk_expr(e, seg_state_block(seg_state_aliases((nm) => env_has(e, nm), body), s, body)) {
+    RExpr(e1, b1) -> RKind(e1, b1.kind)
+  }
+}
+
+fn chk_handler_clauses(e: Env, cs: [HClause],
+      stateful: Bool) : RClauses / Console + File = chk_clauses_loop(e, cs, stateful, [])
+
+fn chk_clauses_loop(e: Env, cs: [HClause], stateful: Bool,
+      acc: [HClause]) : RClauses / Console + File = match cs {
+  [] -> RClauses(e, list_reverse(acc))
+  [HC(nm, params, body, l, c), ...rest] -> {
+    let e1 = env_push(e)
+    let e1s = if stateful { bind_state_aliases(e1, e) } else { e1 }
+    match bind_params(e1s, params) {
+      RParams(e2, ps1) -> match chk_expr(e2, body) {
+        RExpr(e3, b1) -> chk_clauses_loop(env_pop(e3), rest, stateful, [HC(nm, ps1, b1, l, c), ...acc])
+      }
+    }
+  }
+}
+
+type RRet = RRet(Env, HReturn)
+
+fn chk_handler_return(e: Env, r: HReturn, stateful: Bool) : RRet / Console + File {
+  match r {
+    HR(b, body, l, c) -> match env_bind(env_push(e), b) {
+      RBinder(e2, b1) -> {
+        let e2s = if stateful { bind_state_aliases(e2, e) } else { e2 }
+        match chk_expr(e2s, body) {
+          RExpr(e3, r1) -> RRet(env_pop(e3), HR(b1, r1, l, c))
+        }
+      }
+    }
+  }
+}
+
+fn chk_exprs(e: Env, xs: [Expr]) : RExprs / Console + File = chk_exprs_loop(e, xs, [])
+
+fn chk_exprs_loop(e: Env, xs: [Expr], acc: [Expr]) : RExprs / Console + File = match xs {
+  [] -> RExprs(e, list_reverse(acc))
+  [h, ...rest] -> match chk_expr(e, h) {
+    RExpr(e1, h1) -> chk_exprs_loop(e1, rest, [h1, ...acc])
+  }
+}
+
+type RFields = RFields(Env, [FieldInit])
+
+fn chk_field_inits(e: Env, fs: [FieldInit]) : RFields / Console + File =
+  chk_fields_loop(e, fs, [])
+
+fn chk_fields_loop(e: Env, fs: [FieldInit], acc: [FieldInit]) : RFields / Console + File =
+  match fs {
+    [] -> RFields(e, list_reverse(acc))
+    [FI(n, val), ...rest] -> match chk_expr(e, val) {
+      RExpr(e1, v1) -> chk_fields_loop(e1, rest, [FI(n, v1), ...acc])
+    }
+  }
+
+type RElems = RElems(Env, [ListElem])
+
+fn chk_list_elems(e: Env, es: [ListElem]) : RElems / Console + File =
+  chk_elems_loop(e, es, [])
+
+fn chk_elems_loop(e: Env, es: [ListElem], acc: [ListElem]) : RElems / Console + File =
+  match es {
+    [] -> RElems(e, list_reverse(acc))
+    [ElPlain(xp), ...rest] -> match chk_expr(e, xp) {
+      RExpr(e1, x1) -> chk_elems_loop(e1, rest, [ElPlain(x1), ...acc])
+    }
+    [ElSpread(xs), ...rest] -> match chk_expr(e, xs) {
+      RExpr(e1, x1) -> chk_elems_loop(e1, rest, [ElSpread(x1), ...acc])
+    }
+  }
+
+type RArms = RArms(Env, [Arm])
+
+fn chk_arms(e: Env, arms: [Arm]) : RArms / Console + File = chk_arms_loop(e, arms, [])
+
+fn chk_arms_loop(e: Env, arms: [Arm], acc: [Arm]) : RArms / Console + File = match arms {
+  [] -> RArms(e, list_reverse(acc))
+  [Arm(pat, guard, body), ...rest] -> match bind_pat(env_push(e), pat) {
+    RPat(e2, p1) -> match chk_guard(chk_pat_repeats(e2, p1), guard) {
+      RGuard(e3, g1) -> match chk_expr(e3, body) {
+        RExpr(e4, b1) -> chk_arms_loop(env_pop(e4), rest, [Arm(p1, g1, b1), ...acc])
+      }
+    }
+  }
+}
+
+type RGuard = RGuard(Env, Option[Expr])
+
+fn chk_guard(e: Env, g: Option[Expr]) : RGuard / Console + File = match g {
+  Some(gx) -> match chk_expr(e, gx) { RExpr(e1, g1) -> RGuard(e1, Some(g1)) }
+  None     -> RGuard(e, None)
+}
+
+type RStmts = RStmts(Env, [Stmt])
+
+fn chk_stmts(e: Env, ss: [Stmt]) : RStmts / Console + File = chk_stmts_loop(e, ss, [])
+
+fn chk_stmts_loop(e: Env, ss: [Stmt], acc: [Stmt]) : RStmts / Console + File = match ss {
+  [] -> RStmts(e, list_reverse(acc))
+  [s, ...rest] -> match chk_stmt(e, s) {
+    RStmt(e1, s1) -> chk_stmts_loop(e1, rest, [s1, ...acc])
+  }
+}
+
+type RStmt = RStmt(Env, Stmt)
+
+fn chk_stmt(e: Env, s: Stmt) : RStmt / Console + File {
+  match s {
+    SLet(pat, ta, rhs) -> match chk_expr(e, rhs) {
+      RExpr(e1, r1) -> match chk_opt_ty(e1, ta) {
+        ROptTy(e1t, ta1) -> match bind_pat(e1t, pat) {
+          RPat(e2, p1) -> RStmt(note_arity(chk_pat_repeats(e2, p1), p1, binder_arity(Some(rhs), ta)), SLet(p1, ta1, r1))
+        }
+      }
+    }
+    SAssert(cond, opt_msg) -> match chk_expr(e, cond) {
+      RExpr(e1, c1) -> match opt_msg {
+        Some(m) -> match chk_expr(e1, m) {
+          RExpr(e2, m1) -> RStmt(e2, SAssert(c1, Some(m1)))
+        }
+        None -> RStmt(e1, SAssert(c1, None))
+      }
+    }
+    SExprStmt(x) -> match chk_expr(e, x) { RExpr(e1, x1) -> RStmt(e1, SExprStmt(x1)) }
+    # index-assign sugar — desugared away before this pass runs,
+    # but kept arm here so the match stays exhaustive if name resolution
+    # is invoked on the raw AST (e.g. from a future debug dump).
+    SIndexAssign(base, idx, val, l, c) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, idx) {
+        RExpr(e2, i1) -> match chk_expr(e2, val) {
+          RExpr(e3, v1) -> RStmt(e3, SIndexAssign(b1, i1, v1, l, c))
+        }
+      }
+    }
+    SAssign(base, val, l, c) -> match chk_expr(e, base) {
+      RExpr(e1, b1) -> match chk_expr(e1, val) {
+        RExpr(e2, v1) -> RStmt(e2, SAssign(b1, v1, l, c))
+      }
+    }
+    # `var name = init` is desugared away pre-resolve by
+    # `desugar_var_decls`. This arm is dead code in normal compilation;
+    # if a future debug mode skips the desugar, treat the binding like
+    # `let` so the match stays exhaustive and follow-on resolution
+    # still produces useful diagnostics.
+    SVar(b, ta, rhs, line, col) -> match chk_expr(e, rhs) {
+      RExpr(e1, r1) -> match env_bind(e1, b) {
+        RBinder(e2, b1) -> RStmt(e2, SVar(b1, ta, r1, line, col))
+      }
+    }
+    # `use Effect` stmt is stripped by desugar_use_decls before chk
+    # runs. Arm kept so the match is exhaustive in case of a future
+    # debug-only path that skips the desugar.
+    SUse(_, _, _) -> RStmt(e, s)
+  }
+}
+
+fn chk_tys(e: Env, ts: [TypeExpr]) : RTys / Console + File =
+  if not tys_refined(ts) { RTys(e, ts) }
+  else { match chk_preds(e, tys_preds(ts), []) {
+    RExprs(e1, ps) -> RTys(e1, tys_with_preds(ts, pn_settle_all(ps, tys_bases(ts), e1.rs.view, e1.preds)))
+  } }
+
+fn chk_preds(e: Env, ps: [Expr], acc: [Expr]) : RExprs / Console + File = match ps {
+  [] -> RExprs(e, list_reverse(acc))
+  [p, ...rest] -> match env_bind(env_push(e), pred_self_binder()) {
+    RBinder(inner, _) -> match chk_expr(inner, p) {
+      RExpr(e1, p1) -> chk_preds(env_pop(e1), rest, [p1, ...acc])
+    }
+  }
+}
+
+fn chk_opt_ty(e: Env, t: Option[TypeExpr]) : ROptTy / Console + File = match t {
+  None    -> ROptTy(e, None)
+  Some(x) -> match chk_tys(e, [x]) {
+    RTys(e1, [x1, ..._]) -> ROptTy(e1, Some(x1))
+    RTys(e1, [])         -> ROptTy(e1, t)
+  }
+}
+
+# Parameters are bound before their annotations are read: a parameter's
+# refinement may name any of them.
+fn bind_params(e: Env, ps: [Param]) : RParams / Console + File = match add_params(e, ps) {
+  RParams(e1, ps1) -> {
+    let ts = params_types(ps1)
+    if not tys_refined(ts) { RParams(e1, ps1) }
+    else { match chk_tys(e1, ts) { RTys(e2, ts1) -> RParams(e2, params_with_types(ps1, ts1)) } }
+  }
+}
+
+fn op_refined(op: EffectOp) : Bool = match op {
+  EffOp(_, _, ps, ret, _, _) -> tys_refined([ret, ...params_types(ps)])
+}
+
+# An operation's parameters are in scope of its own signature only.
+fn chk_effect_ops(e: Env, ops: [EffectOp], acc: [EffectOp]) : REffOps / Console + File = match ops {
+  [] -> REffOps(e, list_reverse(acc))
+  [op, ...rest] -> if not op_refined(op) { chk_effect_ops(e, rest, [op, ...acc]) } else { match op {
+    EffOp(nm, tps, ps, ret, l, c) -> match bind_params(env_push(e), ps) {
+      RParams(e1, ps1) -> match chk_tys(e1, [ret]) {
+        RTys(e2, [ret1, ..._]) -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret1, l, c), ...acc])
+        RTys(e2, [])           -> chk_effect_ops(env_pop(e2), rest, [EffOp(nm, tps, ps1, ret, l, c), ...acc])
+      }
+    }
+  } }
+}
+
+# ---- declaration walkers ----
+
+#[doc("A walked declaration: the env after it, and the tree with its resolved names stamped.")]
+pub type RDecl = RDecl(Env, Decl)
+
+#[doc("The declaration `d` resolved in the scope `e` opens for it.")]
+pub fn chk_decl(e: Env, d: Decl) : RDecl / Console + File {
+  match d {
+    DFn(p, fid, tp, params, rt, row, body, l, c, mo) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_opt_ty(e1, rt) {
+        ROptTy(e1t, rt1) -> match chk_expr(e1t, body) {
+          RExpr(e2, b1) -> RDecl(Env { ...env_pop(e2), params: [ParamIds(fnid_sym(fid), param_ids(ps1)), ...e2.params] },
+                                 DFn(p, fid, tp, ps1, rt1, row, b1, l, c, mo))
+        }
+      }
+    }
+    DType(pb, t, tps, body, l, c, mo, xs) -> {
+      let ts = body_types(body)
+      if not tys_refined(ts) { RDecl(e, d) }
+      else { match chk_tys(e, ts) {
+        RTys(e1, ts1) -> RDecl(e1, DType(pb, t, tps, body_with_types(body, ts1), l, c, mo, xs))
+      } }
+    }
+    DTest(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
+      RExpr(e1, b1) -> RDecl(e1, DTest(nm, b1, l, c, mo))
+    }
+    DBench(nm, body, l, c, mo) -> match chk_body_scope(e, body) {
+      RExpr(e1, b1) -> RDecl(e1, DBench(nm, b1, l, c, mo))
+    }
+    DCheck(nm, params, body, l, c, mo) -> match bind_params(env_push(e), params) {
+      RParams(e1, ps1) -> match chk_expr(e1, body) {
+        RExpr(e2, b1) -> RDecl(env_pop(e2), DCheck(nm, ps1, b1, l, c, mo))
+      }
+    }
+    DImport(_, _, _) -> RDecl(e, d)
+    DEffect(p, esym, tps, ops, dblk, l, c, mo) ->
+      if not any(ops, op_refined) { RDecl(e, d) }
+      else { match chk_effect_ops(e, ops, []) {
+        REffOps(e1, ops1) -> RDecl(e1, DEffect(p, esym, tps, ops1, dblk, l, c, mo))
+      } }
+    # protocol / impl / derive decls are stripped by `lower_protocols`
+    # before the resolver runs, so reaching one here means the
+    # pipeline was driven directly into `chk_decl` (e.g. via `--check`
+    # on a file that bypassed lowering, or a future caller that forgot
+    # to lower first). Treat as a no-op rather than a fatal error so
+    # the selfhost path continues to validate the post-lowering decl
+    # stream.
+    DProtocol(_, _, _, _, _, _, _) -> RDecl(e, d)
+    DImpl(_, _, _, _, _, _, _, _) -> RDecl(e, d)
+    DDerive(_, _, _, _) -> RDecl(e, d)
+    DUnstable(_, _, _) -> RDecl(e, d)
+    DProtoLaws(th, inner, l, c, mo) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DProtoLaws(th, i1, l, c, mo))
+    }
+    DImplAxiom(th, inner, l, c, mo) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DImplAxiom(th, i1, l, c, mo))
+    }
+    DConstructor(inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DConstructor(i1, l, c))
+    }
+    DUnit(_, _, _, _, _, _, _) -> RDecl(e, d)  # unit declarations introduce no value bindings
+    DUse(_, _, _) -> RDecl(e, d)               # stripped by desugar_use_decls before chk runs
+    DUseKind(_, _, _, _) -> RDecl(e, d)        # stripped by the kind-resolution pass before chk runs
+    DAxiom(_, _, _, _, _, _, _, _, _, _) -> RDecl(e, d)  # rewritten to DFn by lower_axioms before chk runs
+    DConst(p, csym, ta, body, mo, l, c) -> match chk_expr(env_add_decl(e, csym), body) {
+      RExpr(e1, b1) -> match chk_tys(e1, [ta]) {
+        RTys(e2, [ta1, ..._]) -> RDecl(e2, DConst(p, csym, ta1, b1, mo, l, c))
+        RTys(e2, [])          -> RDecl(e2, DConst(p, csym, ta, b1, mo, l, c))
+      }
+    }
+    DExternType(_, _, _, _, _) -> RDecl(e, d)  # FFI v2: a foreign type binds no value
+    DDoc(ds, dl, inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DDoc(ds, dl, i1, l, c))
+    }
+    DAttr(at, inner, l, c) -> match chk_decl(e, inner) {
+      RDecl(e1, i1) -> RDecl(e1, DAttr(at, i1, l, c))
+    }
+    DModuleDoc(_, _, _, _) -> RDecl(e, d)      # doc text only
+    DTheory(_, _, _, _, _) -> RDecl(e, d)      # catalog decl: stripped pre-resolve
+    DKind(_, _, _, _, _, _, _, _) -> RDecl(e, d)  # catalog decl: stripped pre-resolve
+  }
+}
+
+fn chk_body_scope(e: Env, body: Expr) : RExpr / Console + File =
+  match chk_expr(env_push(e), body) {
+    RExpr(e1, b1) -> RExpr(env_pop(e1), b1)
+  }
