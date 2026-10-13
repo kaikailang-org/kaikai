@@ -1,0 +1,2 @@
+1:1
+# Some(true) is the one immortal cached cell the fixture documents: no function the program runs reuses Some, on any backend or cache state.

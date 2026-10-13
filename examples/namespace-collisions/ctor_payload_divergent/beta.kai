@@ -1,0 +1,1 @@
+pub type BetaBox = Node(String, String)
