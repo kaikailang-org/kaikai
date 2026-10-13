@@ -1,0 +1,118 @@
+#[doc("""
+Amortised-O(1) two-list FIFO queue (Okasaki). Push goes onto the
+`back` list head; pop reads from the `front` list head. When `front`
+is empty, `back` is reversed into a new `front` once — each element
+moves at most once between lists, so push and pop are both O(1)
+amortised.
+
+Conventions:
+  - `push` returns a fresh queue with `x` enqueued at the tail.
+  - `pop` returns `Option[Pair[a, Queue[a]]]`: `None` when empty,
+    otherwise `Some(Pair { fst: head, snd: rest })`.
+  - `peek` returns `Option[a]` — same head, no consumption.
+  - `to_list` materialises in head-to-tail order.
+
+Rides the pipes (`|`, `||`, `|?`) with element type `a`; head → tail
+(FIFO) order is preserved through every pipe.
+""")]
+
+# ---- Carrier -----------------------------------------------------
+
+#[doc("A FIFO queue using Okasaki's amortised-O(1) two-list (`front`/`back`) representation.")]
+pub type Queue[a] = { front: [a], back: [a] }
+
+# ---- Empty / size ------------------------------------------------
+
+#[doc("Returns an empty queue.")]
+pub fn empty() : Queue[a] = Queue { front: [], back: [] }
+
+#[doc("Number of elements in the queue.")]
+pub fn size(q: Queue[a]) : Int =
+  list_length(q.front) + list_length(q.back)
+
+#[doc("True when the queue has no elements.")]
+pub fn is_empty(q: Queue[a]) : Bool =
+  list.is_empty(q.front) and list.is_empty(q.back)
+
+# ---- Push --------------------------------------------------------
+
+#[doc("""
+New element goes to the head of `back`. `back` accumulates in
+reverse insertion order; reversal happens at pop time.
+""")]
+pub fn push(q: Queue[a], x: a) : Queue[a] =
+  Queue { front: q.front, back: [x, ...q.back] }
+
+# ---- Pop / peek --------------------------------------------------
+
+# When `front` is empty we must move all of `back` over. We reverse
+# `back` once: the head of the reversed list is the next element to
+# pop, and the tail becomes the new `front`. Amortised O(1) because
+# each element is reversed at most once.
+fn q_normalise(q: Queue[a]) : Queue[a] =
+  if list.is_empty(q.front) {
+    Queue { front: list_reverse(q.back), back: [] }
+  } else {
+    q
+  }
+
+#[doc("Removes the head, returning `Some(Pair { head, rest })`, or `None` when empty.")]
+pub fn pop(q: Queue[a]) : Option[Pair[a, Queue[a]]] = {
+  let n = q_normalise(q)
+  match n.front {
+    []           -> None
+    [h, ...rest] -> Some(Pair { fst: h, snd: Queue { front: rest, back: n.back } })
+  }
+}
+
+#[doc("Returns the head without removing it, or `None` when empty.")]
+pub fn peek(q: Queue[a]) : Option[a] = {
+  let n = q_normalise(q)
+  match n.front {
+    []        -> None
+    [h, ...t] -> Some(h)
+  }
+}
+
+# ---- Iteration / construction -----------------------------------
+
+#[doc("""
+Materialise as a single list in head-to-tail order. `back` is
+reversed so the oldest element comes out first.
+""")]
+pub fn to_list(q: Queue[a]) : [a] =
+  list_append(q.front, list_reverse(q.back))
+
+#[doc("""
+Front is the input list as-is; back stays empty so iteration order
+matches the input.
+""")]
+pub fn from_list(xs: [a]) : Queue[a] =
+  Queue { front: xs, back: [] }
+
+# ---- Pipe convention exports ------------------------------------
+#
+# `Queue[a]` participates in `|`, `||`, `|?` via `map`, `flat_map`,
+# `filter`. Elements are `a`, walked head → tail; the result is a
+# fresh queue in the same FIFO order.
+
+#[doc("Transforms each element through `f`, preserving head → tail (FIFO) order.")]
+pub fn map(q: Queue[a], f: (a) -> b / e) : Queue[b] / e =
+  Queue { front: list.map(to_list(q), f), back: [] }
+
+#[doc("""
+Maps each element to a sub-queue and concatenates the results head →
+tail, so the first element's queue drains first.
+""")]
+pub fn flat_map(q: Queue[a], f: (a) -> Queue[b] / e) : Queue[b] / e =
+  Queue { front: queue_flat_map_loop(to_list(q), f), back: [] }
+
+# Threads `f`'s effect row that the pure `list.flat_map` would drop.
+fn queue_flat_map_loop(xs: [a], f: (a) -> Queue[b] / e) : [b] / e = match xs {
+  []           -> []
+  [h, ...rest] -> list_append(to_list(f(h)), queue_flat_map_loop(rest, f))
+}
+
+#[doc("Keeps the elements for which `p` returns true, preserving FIFO order.")]
+pub fn filter(q: Queue[a], p: (a) -> Bool / e) : Queue[a] / e =
+  Queue { front: list.filter(to_list(q), p), back: [] }
