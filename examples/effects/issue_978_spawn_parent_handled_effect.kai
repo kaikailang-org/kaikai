@@ -1,0 +1,32 @@
+# A fiber spawned inside a `nursery` performs an effect (`Note`) whose handler
+# is installed in the PARENT fiber, lexically enclosing the `spawn`. A child
+# fiber starts with an empty evidence stack, so the parent's handler lives on a
+# frame the child cannot reach.
+#
+# The spawn boundary is settled at COMPILE time: a thunk handed to a fiber must
+# carry no effect the child cannot resolve on its own. This program is rejected
+# by the typer; it does not build and does not reach the runtime.
+import spawn
+
+effect Note {
+  say(s: String) : Unit
+}
+
+# Performs Note.say; installs no Note handler itself.
+fn worker() : Unit / Note + Console = {
+  Stdout.print("worker: about to perform Note.say")
+  Note.say("hi from spawned fiber")
+  Stdout.print("worker: after Note.say")
+}
+
+fn main() : Int / Spawn + Console = {
+  handle {
+    nursery { n ->
+      let f = n.spawn(worker)   # spawn point is lexically inside the Note handler
+      n.await(f)
+    }
+    0
+  } with Note {
+    say(s, resume) -> { Stdout.print("parent-handler noted: " ++ s); resume(()) }
+  }
+}
