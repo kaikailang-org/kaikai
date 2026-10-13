@@ -1,0 +1,12 @@
+# test-effects-goldens skip list.
+#
+# Format: <relative-path>:#<issue>:<one-line-reason>
+#   Every entry carries the open issue that owns removing it; the skip
+#   is the bookmark, the issue is the work. This list tends to zero —
+#   an entry without an owner rots.
+# The harness (tools/test-effects-goldens.sh) enforces the format: an
+# entry without an issue number, or naming no golden fixture, fails the
+# run, and so does a stale entry whose fixture passes. Before reaching
+# for a skip, declare the fixture's contract instead — see the sidecar
+# forms (.status.expected / .out.sorted.expected / .driver) documented
+# in the harness header.
