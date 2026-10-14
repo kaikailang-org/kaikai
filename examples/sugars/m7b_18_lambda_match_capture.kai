@@ -1,0 +1,16 @@
+# m7b #18 — match-arm pattern bindings inside a lambda body. The
+# `Cons(h, t)` arm binds `h` and `t`; pre-fix the free-var
+# collector treated them as captures, generating undefined
+# `kai_h` / `kai_t` references at the construction site.
+# Exercises the `fv_arms` half of the fix (companion to
+# `fv_stmts_scoped` in `lambda_let_capture`).
+
+fn main() : Int {
+  let head_or_zero = (xs) => match xs {
+    [] -> 0
+    [h, ..._t] -> h
+  }
+  let r = head_or_zero([42, 7, 3])
+  assert r == 42
+  0
+}
