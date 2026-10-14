@@ -1,0 +1,229 @@
+# compiler/tycon_pat.kai — give a pattern's constructors, sub-patterns
+# included, the identity their expected type decides.
+#
+# A match arm or a `let` pattern is tested against a known type. A
+# sub-pattern is tested against a payload slot, whose type is the
+# constructor's declared payload with the outer type's arguments
+# substituted, so the declaration tables carry the type down without
+# re-running inference.
+
+import compiler.ast
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.symtab_build
+import compiler.scalar_ty
+import compiler.type_home
+import compiler.tbinder
+import compiler.infer_index
+
+#[doc("A declared payload shape: a constructor's slots, or a record type's fields, with the type parameters they mention and the module declaring them.")]
+pub type TPay = TPV(SymId, [TBinder], [TypeExpr], Option[String])
+              | TPR(SymId, [TBinder], [FieldDecl], Option[String])
+
+#[doc("The payload shapes of a program, each under the id of the constructor or the record type that declares it.")]
+pub type TPays = { ctors: NameIndex[TPay], recs: NameIndex[TPay] }
+
+#[doc("The payload shapes of every sum constructor and record type in `ds`, plus the builtin constructors no declaration carries.")]
+pub fn tpay_table(ds: [Decl]) : TPays =
+  tp_index(list_reverse(tp_collect(ds, tp_builtins())), TPays { ctors: idx_empty(), recs: idx_empty() })
+
+# Indexed from the last shape back, so a chain's head is the shape a
+# declaration gave, ahead of a builtin's.
+fn tp_index(rev: [TPay], ix: TPays) : TPays = match rev {
+  [] -> ix
+  [x, ...rest] -> match x {
+    TPV(c, _, _, _) -> tp_index(rest, TPays { ...ix, ctors: idx_prepend_sym(ix.ctors, c, x) })
+    TPR(t, _, _, _) -> tp_index(rest, TPays { ...ix, recs: idx_prepend_sym(ix.recs, t, x) })
+  }
+}
+
+fn tp_builtins() : [TPay] = {
+  let a = tbinder_minted("Option.a")
+  let t = tbinder_minted("Result.t")
+  let e = tbinder_minted("Result.e")
+  [TPV(tp_core_ctor("Some"), [a], [tb_use(a, 0, 0)], None),
+   TPV(tp_core_ctor("Ok"), [t, e], [tb_use(t, 0, 0)], None),
+   TPV(tp_core_ctor("Err"), [t, e], [tb_use(e, 0, 0)], None)]
+}
+
+fn tp_core_ctor(n: String) : SymId = sym_derive(NCCtor, n, core_type_home())
+
+fn tp_collect(ds: [Decl], acc: [TPay]) : [TPay] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tp_collect([inner, ...rest], acc)
+    None -> match d {
+      DType(_, _, tps, TBSum(vs), _, _, mo, _) -> tp_collect(rest, tp_variants(vs, mo, tps, acc))
+      DType(_, t, tps, TBRecord(fs), _, _, mo, _) -> tp_collect(rest, [TPR(t, tps, fs, mo), ...acc])
+      _ -> tp_collect(rest, acc)
+    }
+  }
+}
+
+fn tp_variants(vs: [Variant], mo: Option[String], tps: [TBinder], acc: [TPay]) : [TPay] = match vs {
+  [] -> acc
+  [Var(c, tys), ...rest] -> tp_variants(rest, mo, tps, [TPV(c, tps, tys, mo), ...acc])
+}
+
+#[doc("`p` with every constructor pattern it holds that still spells its constructor naming the one its expected type `ty` decides.")]
+pub fn tp_pat(p: Pattern, ty: Option[Ty], hs: TyHomeTab, pays: TPays) : Pattern = {
+  let k = match p.pkind {
+    PVariant(r, subs) -> {
+      let c = tp_ctor(hs.tab, r, ty)
+      PVariant(tp_ref(r, c), tp_subs(subs, tp_slot_tys(pays, hs, c, ty), hs, pays))
+    }
+    PVariantRecord(r, fs) -> PVariantRecord(tp_ref(r, tp_ctor(hs.tab, r, ty)), tp_fields(fs, ty, hs, pays))
+    PRecord(fs)           -> PRecord(tp_fields(fs, ty, hs, pays))
+    PList(subs, rest)     -> PList(tp_each(subs, tp_elem(ty), hs, pays), rest)
+    PAs(b, sub)           -> PAs(b, tp_pat(sub, ty, hs, pays))
+    other                 -> other
+  }
+  Pattern { pkind: k, line: p.line, col: p.col }
+}
+
+fn tp_each(ps: [Pattern], ty: Option[Ty], hs: TyHomeTab, pays: TPays) : [Pattern] = match ps {
+  [] -> []
+  [p, ...rest] -> [tp_pat(p, ty, hs, pays), ...tp_each(rest, ty, hs, pays)]
+}
+
+# A reference no constructor was found for stays as it was written.
+fn tp_ref(r: DeclRef, c: SymId) : DeclRef = if sym_raw(c) < 0 { r } else { DrSym(c) }
+
+# The constructor a pattern's reference names: its own once settled. A
+# written name is the constructor so spelled that the module of its
+# qualifier declares, or, written bare, the module declaring the
+# expected type: a constructor builds a type of its own module.
+fn tp_ctor(tab: SymTab, r: DeclRef, ty: Option[Ty]) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(q, n) -> match tp_home(tab, q, ty) {
+    Some(m) -> match st_lookup(tab, NCCtor, written_text(n), m) {
+      Some(c) -> c
+      None    -> sym_none()
+    }
+    None -> sym_none()
+  }
+}
+
+fn tp_home(tab: SymTab, q: Option[Written], ty: Option[Ty]) : Option[SymId] = match q {
+  Some(w) -> st_module(tab, written_text(w))
+  None    -> tp_ty_home(tab, ty)
+}
+
+fn tp_ty_home(tab: SymTab, t: Option[Ty]) : Option[SymId] = match t {
+  Some(TyCon(s, _))         -> tp_owner(tab, s)
+  Some(TyRefineT(inner, _)) -> tp_ty_home(tab, Some(inner))
+  Some(TyDimT(inner, _))    -> tp_ty_home(tab, Some(inner))
+  _                         -> None
+}
+
+# A type the runtime builds has no row; its constructors are the core's.
+fn tp_owner(tab: SymTab, s: SymId) : Option[SymId] =
+  if st_valid(tab, s) { Some(sym_owner(tab, s)) }
+  else { match core_type_name_of(s) {
+    Some(_) -> Some(st_module_id(core_type_home()))
+    None    -> None
+  } }
+
+fn tp_args(t: Option[Ty]) : [Ty] = match t {
+  Some(TyCon(_, args))      -> args
+  Some(TyRefineT(inner, _)) -> tp_args(Some(inner))
+  _                         -> []
+}
+
+fn tp_elem(t: Option[Ty]) : Option[Ty] = match t {
+  Some(TyListT(e)) -> Some(e)
+  _                -> None
+}
+
+fn tp_subs(ps: [Pattern], tys: [Option[Ty]], hs: TyHomeTab, pays: TPays) : [Pattern] = match ps {
+  [] -> []
+  [p, ...rest] -> match tys {
+    []           -> [tp_pat(p, None, hs, pays), ...tp_subs(rest, [], hs, pays)]
+    [t, ...more] -> [tp_pat(p, t, hs, pays), ...tp_subs(rest, more, hs, pays)]
+  }
+}
+
+fn tp_fields(fs: [PField], ty: Option[Ty], hs: TyHomeTab, pays: TPays) : [PField] = match fs {
+  [] -> []
+  [PField(fname, p, sh), ...rest] ->
+    [PField(fname, tp_pat(p, tp_field_ty(pays, hs, ty, fname), hs, pays), sh), ...tp_fields(rest, ty, hs, pays)]
+}
+
+# A slot's type is only known when the constructor is; anything else
+# leaves the slot untyped.
+fn tp_slot_tys(pays: TPays, hs: TyHomeTab, c: SymId, ty: Option[Ty]) : [Option[Ty]] =
+  match tp_find_ctor(pays, c) {
+    Some(TPV(_, tps, tes, mo)) -> map(tes, (te) => tp_te(te, tps, tp_args(ty), mo, hs))
+    _                          -> []
+  }
+
+fn tp_find_ctor(pays: TPays, c: SymId) : Option[TPay] =
+  if sym_raw(c) < 0 { None } else { tp_head(idx_chain_sym(pays.ctors, c)) }
+
+fn tp_head(chain: [TPay]) : Option[TPay] = match chain {
+  []        -> None
+  [x, ..._] -> Some(x)
+}
+
+fn tp_field_ty(pays: TPays, hs: TyHomeTab, ty: Option[Ty], fname: String) : Option[Ty] = match ty {
+  Some(TyCon(t, args)) -> match tp_find_rec(pays, t) {
+    Some(TPR(_, tps, fds, dmo)) -> match tp_fd(fds, fname) {
+      Some(te) -> tp_te(te, tps, args, dmo, hs)
+      None     -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+fn tp_find_rec(pays: TPays, t: SymId) : Option[TPay] =
+  if sym_raw(t) < 0 { None } else { tp_head(idx_chain_sym(pays.recs, t)) }
+
+fn tp_fd(fds: [FieldDecl], fname: String) : Option[TypeExpr] = match fds {
+  [] -> None
+  [FD(_, n, te, _), ...rest] -> if n == fname { Some(te) } else { tp_fd(rest, fname) }
+}
+
+# A payload type expression read in its declaring module: a type
+# parameter takes the scrutinee's argument, a scalar is itself, and any
+# other name is the declaration that module reads it as.
+fn tp_te(te: TypeExpr, tps: [TBinder], args: [Ty], cur: Option[String], hs: TyHomeTab) : Option[Ty] =
+  match te.tkind {
+    TyParam(p, _) -> tp_param_at(tps, args, p)
+    TyName(r, targs) -> match scalar_ty_named(ref_spelled(r)) {
+      Some(t) -> Some(t)
+      None    -> tp_nominal(tp_type_sym(hs, r, cur), tp_te_args(targs, tps, args, cur, hs))
+    }
+    TyList(inner) -> match tp_te(inner, tps, args, cur, hs) {
+      Some(t) -> Some(TyListT(t))
+      None    -> None
+    }
+    _ -> None
+  }
+
+fn tp_nominal(s: SymId, args: [Ty]) : Option[Ty] = if sym_raw(s) < 0 { None } else { Some(TyCon(s, args)) }
+
+fn tp_type_sym(hs: TyHomeTab, r: DeclRef, cur: Option[String]) : SymId = match type_home_entry(hs, r, cur) {
+  Some(TH(s, _, _)) -> s
+  None -> match r {
+    DrSym(s)        -> s
+    DrWritten(_, n) -> core_type_sym_or_none(written_text(n))
+  }
+}
+
+fn tp_te_args(tes: [TypeExpr], tps: [TBinder], args: [Ty], cur: Option[String], hs: TyHomeTab) : [Ty] = match tes {
+  [] -> []
+  [te, ...rest] -> match tp_te(te, tps, args, cur, hs) {
+    Some(t) -> [t, ...tp_te_args(rest, tps, args, cur, hs)]
+    None    -> [TyAny, ...tp_te_args(rest, tps, args, cur, hs)]
+  }
+}
+
+fn tp_param_at(tps: [TBinder], args: [Ty], n: TLocalId) : Option[Ty] = match tps {
+  [] -> None
+  [p, ...rest] -> match args {
+    [] -> None
+    [a, ...more] -> if tlocal_eq(p.id, n) { Some(a) } else { tp_param_at(rest, more, n) }
+  }
+}

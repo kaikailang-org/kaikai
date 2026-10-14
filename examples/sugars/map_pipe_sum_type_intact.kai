@@ -1,0 +1,25 @@
+# m7b #9 — `|` as variant separator coexists with `|` as map-pipe.
+#
+# Sum-type bodies are parsed by `parse_sum_body` (after a contextual
+# `looks_like_sum` lookahead), not by the expression grammar. This
+# program exercises both: the `Direction` declaration uses `|` as a
+# variant separator, and `main` uses `|` as a map pipe in the same
+# compilation unit. If the parser ever conflated the two, one of the
+# two productions would fail.
+
+type Direction = Up | Down
+
+fn flip(d: Direction) : Int {
+  match d {
+    Up   -> 1
+    Down -> -1
+  }
+}
+
+fn sum_all(xs: [Int]) : Int = reduce(xs, 0, (acc, x) => acc + x)
+
+fn main(): Int / Console {
+  let signs = [Up, Down, Up] | flip
+  print(int_to_string(sum_all(signs)))   # 1 + (-1) + 1 = 1
+  0
+}
