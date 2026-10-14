@@ -1,0 +1,37 @@
+# Issue #763 — spawn_actor_policy: a spawned actor with an explicit
+# Bounded(1, BlockSender) mailbox back-pressures its producer.
+#
+# The spawned-actor counterpart of m8x_4_block_sender.kai (where the
+# bounded mailbox belongs to the *current* fiber). The producer pushes
+# three messages into a capacity-1 consumer mailbox back-to-back, so the
+# second and third push each park the producer until the consumer frees
+# the slot. The proof is delivery, not order: a Drop policy would shed
+# two of the three messages; all three receipts arriving (in send order)
+# shows the producer parked instead of discarding.
+#
+# Every printed line is ordered by happens-before — the receipts by the
+# consumer's own program order, the producer's closing line by the
+# consumer's ack — so the output is identical at any KAI_THREADS.
+
+import actor
+
+fn consumer_actor(parent: Pid[String]) : Unit / Actor[String] + Console = {
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Actor.send(parent, "ack")
+}
+
+fn producer() : Unit / Actor[String] + Spawn + Console = {
+  let me       = Actor.self()
+  let consumer = spawn_actor_policy(Bounded(1, BlockSender), () => consumer_actor(me))
+  Actor.send(consumer, "msg1")
+  Actor.send(consumer, "msg2")
+  Actor.send(consumer, "msg3")
+  Stdout.print("producer: got " ++ Actor.receive())
+}
+
+fn main() : Int / Spawn + Console = {
+  with_mailbox { producer() }
+  0
+}

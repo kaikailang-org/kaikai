@@ -1,0 +1,246 @@
+#[doc("""
+The lexer: identifiers and keywords, punctuation, and the loop that
+turns a source text into tokens.
+""")]
+
+import compiler.lex_tokens
+import compiler.lex_bytes
+import compiler.lex_cursor
+import compiler.lex_numbers
+import compiler.lex_strings
+import compiler.lex_chars
+
+fn lex_scan_ident_rest(l: Lexer) : Lexer = lex_move(l, ident_end(l.src, l.pos))
+
+# The keyword an identifier spells, or `TkIdent`. Every keyword is 2..8
+# bytes long and starts with 'a'..'w', so a plain identifier is settled
+# without materialising a keyword literal to compare against.
+fn ident_kind(src: String, start: Int, n: Int) : TokKind {
+  let b = byte_at(src, start)
+  if n == 1 and b == B_UNDERSCORE { TkUnderscore }
+  else if n < 2 or n > 8 or b < 97 or b > 119 { TkIdent }
+  else { keyword_at(src, start, n, int_to_char(b)) }
+}
+
+#[doc("True when the `n` bytes of `src` at `start` spell `s`.")]
+pub fn kw(src: String, start: Int, n: Int, s: String) : Bool =
+  string_length(s) == n and src_has_at(src, start, s, 0)
+
+fn keyword_at(src: String, start: Int, n: Int, c: Char) : TokKind = match c {
+  'a' -> kw_a(src, start, n)
+  'b' -> kw_or_ident(src, start, n, "bench", TkBench)
+  'c' -> kw_c(src, start, n)
+  'e' -> kw_e(src, start, n)
+  'f' -> kw_f(src, start, n)
+  'h' -> kw_or_ident(src, start, n, "handle", TkHandle)
+  'i' -> kw_i(src, start, n)
+  'l' -> if kw(src, start, n, "lazy") { TkLazy } else { kw_or_ident(src, start, n, "let", TkLet) }
+  'm' -> kw_or_ident(src, start, n, "match", TkMatch)
+  'n' -> kw_or_ident(src, start, n, "not", TkNot)
+  'o' -> kw_or_ident(src, start, n, "or", TkOr)
+  'p' -> kw_p(src, start, n)
+  'r' -> kw_or_ident(src, start, n, "requires", TkRequires)
+  't' -> kw_t(src, start, n)
+  'u' -> kw_or_ident(src, start, n, "use", TkUse)
+  'v' -> kw_or_ident(src, start, n, "var", TkVar)
+  'w' -> kw_w(src, start, n)
+  _   -> TkIdent
+}
+
+fn kw_or_ident(src: String, start: Int, n: Int, s: String, k: TokKind) : TokKind =
+  if kw(src, start, n, s) { k } else { TkIdent }
+
+fn kw_a(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "and") { TkAnd }
+  else if kw(src, start, n, "as") { TkAs }
+  else if kw(src, start, n, "assert") { TkAssert }
+  else { kw_or_ident(src, start, n, "axiom", TkAxiom) }
+
+fn kw_c(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "case") { TkCase }
+  else if kw(src, start, n, "check") { TkCheck }
+  else { kw_or_ident(src, start, n, "const", TkConst) }
+
+fn kw_e(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "effect") { TkEffect }
+  else if kw(src, start, n, "else") { TkElse }
+  else if kw(src, start, n, "ensures") { TkEnsures }
+  else { kw_or_ident(src, start, n, "extern", TkExtern) }
+
+fn kw_f(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "false") { TkFalse }
+  else if kw(src, start, n, "fn") { TkFn }
+  else { kw_or_ident(src, start, n, "for", TkFor) }
+
+fn kw_i(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "if") { TkIf }
+  else if kw(src, start, n, "impl") { TkImpl }
+  else { kw_or_ident(src, start, n, "import", TkImport) }
+
+fn kw_p(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "priv") { TkPriv }
+  else if kw(src, start, n, "protocol") { TkProtocol }
+  else { kw_or_ident(src, start, n, "pub", TkPub) }
+
+fn kw_t(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "test") { TkTest }
+  else if kw(src, start, n, "theory") { TkTheory }
+  else if kw(src, start, n, "true") { TkTrue }
+  else { kw_or_ident(src, start, n, "type", TkType) }
+
+fn kw_w(src: String, start: Int, n: Int) : TokKind =
+  if kw(src, start, n, "when") { TkWhen }
+  else if kw(src, start, n, "where") { TkWhere }
+  else { kw_or_ident(src, start, n, "with", TkWith) }
+
+fn lex_ident(l: Lexer) : LexStep {
+  let start = l.pos
+  let end = ident_end(l.src, start)
+  let n = end - start
+  # `todo!` is one token, so the parser sees `TkTodoBang` and the bang
+  # stays free as a postfix operator elsewhere.
+  if n == 4 and src_has_at(l.src, start, "todo", 0) and byte_at(l.src, end) == char_to_int('!') {
+    Step(lex_move(l, end + 1), tok(TkTodoBang, l.line, l.col, start, end + 1))
+  } else {
+    Step(lex_move(l, end), tok(ident_kind(l.src, start, n), l.line, l.col, start, end))
+  }
+}
+
+fn lex_punct(l: Lexer) : LexStep {
+  let b = lex_peek(l)
+  if b < 0 { punct(l, l, TkEof) }
+  else {
+    let l1 = lex_advance(l)
+    match int_to_char(b) {
+      '(' -> punct(l, l1, TkLparen)
+      ')' -> punct(l, l1, TkRparen)
+      '[' -> punct(l, l1, TkLbracket)
+      ']' -> punct(l, l1, TkRbracket)
+      '{' -> punct(l, l1, TkLbrace)
+      '}' -> punct(l, l1, TkRbrace)
+      ',' -> punct(l, l1, TkComma)
+      '@' -> punct(l, l1, TkAt)
+      # `&x` takes a reference. `&` is not a binary operator, so a bare
+      # `&` only ever opens one.
+      '&' -> punct(l, l1, TkAmp)
+      # `$` opens a compiler-intrinsic call; the parser consumes the
+      # identifier and the arguments that follow.
+      '$' -> punct(l, l1, TkDollar)
+      # A unit exponent: only meaningful inside `<...>`, and the parser
+      # rejects it elsewhere.
+      '^' -> punct(l, l1, TkCaret)
+      ':' -> punct_pair(l, l1, '=', TkColonEq, TkColon)
+      ';' -> punct(l, l1, TkSemi)
+      # Two adjacent `+` fuse into the concatenation operator; a space
+      # breaks it.
+      '+' -> punct_pair(l, l1, '+', TkPlusPlus, TkPlus)
+      '*' -> punct(l, l1, TkStar)
+      '%' -> punct(l, l1, TkPercent)
+      '-' -> punct_pair(l, l1, '>', TkArrow, TkMinus)
+      '/' -> lex_slash(l, l1)
+      '=' -> lex_equals(l, l1)
+      '<' -> punct_pair(l, l1, '=', TkLe, TkLt)
+      '>' -> punct_pair(l, l1, '=', TkGe, TkGt)
+      '!' -> punct_pair(l, l1, '=', TkNeq, TkBang)
+      '?' -> lex_hole(l, l1)
+      '|' -> lex_bar(l, l1)
+      '.' -> lex_dots(l, l1)
+      '#' -> lex_hash(l, l1)
+      '~' -> lex_tilde(l, l1)
+      _   -> punct(l, l1, TkError(string_concat("unexpected character '", string_concat(int_to_byte_string(b), "'"))))
+    }
+  }
+}
+
+# The token of kind `k` that starts at `l` and ends at `end`.
+fn punct(l: Lexer, end: Lexer, k: TokKind) : LexStep = Step(end, tok(k, l.line, l.col, l.pos, end.pos))
+
+# `pair` when the byte after `l1` is `second`, else `single`.
+fn punct_pair(l: Lexer, l1: Lexer, second: Char, pair: TokKind, single: TokKind) : LexStep =
+  if lex_peek_is(l1, second) { punct(l, lex_advance(l1), pair) } else { punct(l, l1, single) }
+
+# `//` and `/*` are reserved as errors: comments start with `#`, and
+# neither is an operator.
+fn lex_slash(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, '/') {
+    punct(l, lex_advance(l1), TkError("kaikai uses `#` for comments, not `//` (and `//` is not an operator — `Int / Int` already truncates per #315)"))
+  } else if lex_peek_is(l1, '*') {
+    punct(l, lex_advance(l1), TkError("block comments are not supported — use `#` on each line (kaikai follows Elixir on this)"))
+  } else { punct(l, l1, TkSlash) }
+
+fn lex_equals(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, '=') { punct(l, lex_advance(l1), TkEqEq) }
+  else { punct_pair(l, l1, '>', TkFatArrow, TkEq) }
+
+# `?ident` is one `TkHoleName` token; `?` alone is `TkHole`.
+fn lex_hole(l: Lexer, l1: Lexer) : LexStep =
+  if b_is_alpha(lex_peek(l1)) {
+    let l_end = lex_scan_ident_rest(lex_advance(l1))
+    punct(l, l_end, TkHoleName(string_slice(l.src, l.pos + 1, l_end.pos - (l.pos + 1))))
+  } else { punct(l, l1, TkHole) }
+
+# `|>`, `||` and `|?` are each one token, so the parser sees one symbol
+# at the operator slot.
+fn lex_bar(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, '>') { punct(l, lex_advance(l1), TkPipeApply) }
+  else if lex_peek_is(l1, '|') { punct(l, lex_advance(l1), TkBarBar) }
+  else { punct_pair(l, l1, '?', TkPipeQuestion, TkPipe) }
+
+fn lex_dots(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, '.') and lex_peek2_is(l1, '.') { punct(l, lex_advance(lex_advance(l1)), TkEllipsis) }
+  else { punct_pair(l, l1, '.', TkDotDot, TkDot) }
+
+# `#[` opens an attribute. Whitespace skipping only leaves a `#` here
+# when it is followed by `[`, by a legacy `derive`/`unstable` keyword,
+# or in an error position.
+fn lex_hash(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, '[') { punct(l, lex_advance(l1), TkHashOpen) }
+  else if lex_match_word_at(l1, 0, "derive") {
+    punct(l, lex_advance_n(l1, 6), TkError("deprecated annotation syntax (issue #608) — write `#[derive(...)]` instead of `#derive(...)`"))
+  } else if lex_match_word_at(l1, 0, "unstable") {
+    punct(l, lex_advance_n(l1, 8), TkError("deprecated annotation syntax (issue #608) — write `#[unstable]` instead of `#unstable`"))
+  } else {
+    punct(l, l1, TkError("unexpected `#` — comments start with `#` followed by space; annotations use `#[...]`"))
+  }
+
+# `~r/pattern/` is the one sigil: a regex literal lexed as a single
+# token. Any other `~` is an error, so tildes do not become a
+# junk-drawer prefix.
+fn lex_tilde(l: Lexer, l1: Lexer) : LexStep =
+  if lex_peek_is(l1, 'r') and lex_peek_at(l1, 1) == char_to_int('/') { lex_regex(l) }
+  else { punct(l, l1, TkError("unexpected character '~' (only `~r/.../` regex sigil is supported)")) }
+
+fn lex_next(l: Lexer) : LexStep {
+  let l0 = lex_skip_ws(l)
+  let sl = l0.line
+  let sc = l0.col
+  let b = lex_peek(l0)
+  if b < 0 { Step(l0, tok(TkEof, sl, sc, l0.pos, l0.pos)) }
+  else if b == B_NL {
+    let l1 = lex_advance(l0)
+    Step(l1, tok(TkNewline, sl, sc, l0.pos, l1.pos))
+  }
+  else if b_is_alpha(b) { lex_ident(l0) }
+  else if b_is_digit(b) { lex_number(l0) }
+  else if b == B_DQUOTE { lex_string(l0) }
+  else if b == B_SQUOTE { lex_char(l0) }
+  else { lex_punct(l0) }
+}
+
+# Build the full token list. Accumulate in reverse for O(1) prepend, then
+# list_reverse once at the end.
+fn lex_loop(l: Lexer, acc: [Token]) : [Token] {
+  match lex_next(l) {
+    Step(l1, t) -> {
+      let acc1 = [t, ...acc]
+      match t.kind {
+        TkEof -> list_reverse(acc1)
+        _ -> lex_loop(l1, acc1)
+      }
+    }
+  }
+}
+
+pub fn tokenize(src: String) : [Token] {
+  lex_loop(lex_new(src), [])
+}

@@ -1,0 +1,21 @@
+# m7a #8 negative test — when a function performs an op whose
+# effect is not in its declared row, the typer points at the *op
+# call site* (not the function decl) and offers both fixes:
+# extend the signature or wrap in `handle ... with`. Doc C
+# §*Diagnostic quality* §*Effect not handled*.
+
+effect Fail {
+  fail(msg: String) : Nothing
+}
+
+fn process(x: Int) : Int {
+  if x < 0 {
+    Fail.fail("negative")
+  } else {
+    x * 2
+  }
+}
+
+fn main() : Int {
+  process(-1)
+}
