@@ -1,0 +1,15 @@
+# `program_name()` returns a non-empty String for any binary the harness
+# launches; the exact value depends on how it is invoked. The `args.`
+# wrapper is checked against the builtin too. The import is qualified so a
+# bare `program_name()` names the builtin, not the wrapper of the same type.
+
+import os.args as args
+
+fn main() : Unit / Stdout = {
+  let p = program_name()
+  if string_length(p) > 0 { Stdout.print("program_name: ok") }
+  else                    { Stdout.print("program_name: empty (expected non-empty)") }
+  let w = args.program_name()
+  if w == p { Stdout.print("args.program_name: ok") }
+  else      { Stdout.print("args.program_name: disagrees with the builtin") }
+}
