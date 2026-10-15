@@ -1,0 +1,9 @@
+# A tuple is `Eq` only when its components are; one holding a type
+# without `Eq` under a list is reported at the declaration with the path.
+
+type NoEq = { n: Int }
+
+#[derive(Eq)]
+type InList = A([(Int, NoEq)]) | B
+
+fn main() : Int = 0

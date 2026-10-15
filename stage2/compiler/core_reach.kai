@@ -1,0 +1,371 @@
+# compiler/core_reach.kai -- the core functions a build can
+# reach, so the rest are never typed, lowered or emitted.
+#
+# Runs on the resolved program, after protocol lowering has turned every
+# impl method into a `__pimpl_*` function and every protocol operation
+# into a `__proto_*` dispatcher. Every decl outside the core is a
+# root, and so is every core decl that is not a function. A reference the
+# resolver settled reaches the function it names. A name it left to the
+# typer reaches every core function spelled so, and so does a field
+# access, since `x.f(..)` may be method sugar the typer resolves to `f`. A
+# protocol is reached through an operation's name, its dispatcher or an
+# operator that is sugar for it, and keeps every impl, because the
+# dispatcher picks one at run time. An arithmetic operator or a negation
+# keeps every impl but the homogeneous `Int` and `Real` ones, which a
+# primitive operand never selects. Protocols declaring an operation of the
+# same name share one dispatcher, so the name reaches all of them. A pipe
+# keeps the core functions the typer inserts for it.
+
+import compiler.util
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_text
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.core_refs
+import compiler.core_protos
+import compiler.emit_shared
+import compiler.proto_op_index
+import compiler.impl_identity
+
+#[doc("A pruned program: the decls a build keeps, the core functions it dropped, and the functions an earlier cut emptied that it keeps.")]
+pub type CoreCut = CoreCut([Decl], [SymId], [SymId])
+
+#[doc("Drop the core functions nothing in `decls` can reach. `tab` is the table of `decls`; `core_mods` are the core modules; `reg` the protocol registry, whose impl entries map each `__pimpl_*` to its protocol; `emptied` the core functions an earlier cut left without a body.")]
+pub fn core_reach(decls: [Decl], tab: SymTab, core_mods: [String], reg: ProtocolReg, emptied: [SymId]) : CoreCut / Console = {
+  let core_fns = filter(decls, (d) => cr_is_core_fn(d, core_mods))
+  let st0 = CrSt { tab: tab, live: idx_empty(), fns: cr_index(core_fns, idx_empty()), impls: reg.impls,
+                   disps: reg.ids.shared, ops: op_index(reg.ops),
+                   protos: [], lite: [], inert: [], bps: [], trigs: [], work: [] }
+  let st = cr_drain(cr_decls(filter(decls, (d) => not cr_is_core_fn(d, core_mods)), st0))
+  let dropped = map(filter(core_fns, (d) => not cr_in(st.live, cr_sym(d))), cr_sym)
+  let gone = cr_sym_set(dropped, idx_empty())
+  CoreCut(filter(decls, (d) => not cr_is_core_fn(d, core_mods) or cr_in(st.live, cr_sym(d))),
+          dropped,
+          filter(emptied, (s) => not cr_in(gone, s)))
+}
+
+#[doc("The declared names of `ss`, for the note a cut prints.")]
+pub fn core_cut_names(tab: SymTab, ss: [SymId]) : [String] = map(ss, (s) => written_text(sym_name(tab, s)))
+
+#[doc("The names of the dropped core functions `decls` still reference, each a reachability rule pruning is missing. A specialisation is its template's id; a function some decl in `decls` declares is never a miss.")]
+pub fn core_cut_misses(decls: [Decl], tab: SymTab, dropped: [SymId]) : [String] / Console = {
+  let declared = cr_sym_set(map(filter(decls, cr_is_fn), cr_sym), idx_empty())
+  let ck = CrCheck { gone: cr_sym_set(dropped, idx_empty()), declared: declared, misses: [] }
+  list_uniq(map(cr_check_decls(decls, ck).misses, (s) => written_text(decl_name(tab, s))))
+}
+
+# ---- identities --------------------------------------------------------
+
+fn cr_is_core_fn(d: Decl, core_mods: [String]) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> match mo {
+    Some(m) -> list_has(core_mods, m)
+    None    -> false
+  }
+  _ -> false
+}
+
+fn cr_is_fn(d: Decl) : Bool = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> true
+  _ -> false
+}
+
+fn cr_sym(d: Decl) : SymId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
+  _ -> sym_none()
+}
+
+fn cr_index(fns: [Decl], ix: NameIndex[Decl]) : NameIndex[Decl] = match fns {
+  [] -> ix
+  [d, ...rest] -> cr_index(rest, idx_prepend_sym(ix, cr_sym(d), d))
+}
+
+fn cr_sym_set(ss: [SymId], ix: NameIndex[SymId]) : NameIndex[SymId] = match ss {
+  [] -> ix
+  [s, ...rest] -> cr_sym_set(rest, idx_prepend_sym(ix, s, s))
+}
+
+fn cr_in(ix: NameIndex[SymId], s: SymId) : Bool = match idx_chain_sym(ix, s) {
+  [] -> false
+  _  -> true
+}
+
+# ---- reachability ------------------------------------------------------
+
+# `live` holds the reached core functions; `work` the reached functions
+# whose bodies are still to scan. `disps` pairs each protocol with the
+# dispatchers of its operations: the typer calls one when it lowers an
+# operator, so a reached protocol reaches them too.
+type CrSt = { tab: SymTab, live: NameIndex[SymId], fns: NameIndex[Decl], impls: [ProtoImplReg],
+              disps: [ProtoDisp], ops: OpIndex, protos: [SymId], lite: [SymId], inert: [SymId], bps: [Int], trigs: [Int],
+              work: [Decl] }
+
+fn cr_op(st: CrSt, op: String) : CrSt = op_protocols_fold(st.ops, op, st, cr_proto)
+
+fn cr_disp_fns(ds: [ProtoDisp], p: SymId, acc: [SymId]) : [SymId] = match ds {
+  [] -> acc
+  [ProtoDisp(proto, s), ...rest] -> cr_disp_fns(rest, p, if sym_same(proto, p) { [s, ...acc] } else { acc })
+}
+
+fn cr_drain(st: CrSt) : CrSt / Console = match st.work {
+  [] -> st
+  [d, ...rest] -> cr_drain(cr_decl(d, cr_with_work(st, rest)))
+}
+
+fn cr_with_work(st: CrSt, w: [Decl]) : CrSt =
+  CrSt { ...st, work: w }
+
+# A name the typer may still settle reaches every core function spelled
+# so, and every protocol declaring an operation of that name.
+fn cr_ref(st: CrSt, n: String) : CrSt = cr_op(cr_ref_syms(st, st_by_name(st.tab, n)), n)
+
+# A reference to anything but an unreached core function costs two
+# lookups and no allocation.
+fn cr_ref_sym(st: CrSt, s: SymId) : CrSt =
+  if cr_in(st.live, s) { cr_wake(st, s) }
+  else { match idx_chain_sym(st.fns, s) {
+    [] -> st
+    ds -> CrSt { ...st, live: idx_prepend_sym(st.live, s, s), work: list_append(ds, st.work) }
+  } }
+
+# A dispatcher reached only by an operator is kept without its body: the
+# typer calls it and the rewrite after monomorphisation replaces the call,
+# so it never selects an impl. A real reference scans the body.
+fn cr_ref_inert(st: CrSt, s: SymId) : CrSt =
+  if cr_in(st.live, s) { st }
+  else { match idx_chain_sym(st.fns, s) {
+    [] -> st
+    _  -> CrSt { ...st, live: idx_prepend_sym(st.live, s, s), inert: [s, ...st.inert] }
+  } }
+
+fn cr_wake(st: CrSt, s: SymId) : CrSt =
+  if not cr_has_sym(st.inert, s) { st }
+  else { CrSt { ...st, inert: filter(st.inert, (t) => not sym_same(t, s)), work: list_append(idx_chain_sym(st.fns, s), st.work) } }
+
+fn cr_refs_inert(st: CrSt, ss: [SymId]) : CrSt = match ss {
+  [] -> st
+  [s, ...rest] -> cr_refs_inert(cr_ref_inert(st, s), rest)
+}
+
+fn cr_ref_syms(st: CrSt, ss: [SymId]) : CrSt = match ss {
+  [] -> st
+  [s, ...rest] -> cr_ref_syms(cr_ref_sym(st, s), rest)
+}
+
+fn cr_refs(st: CrSt, ns: [String]) : CrSt = match ns {
+  [] -> st
+  [n, ...rest] -> cr_refs(cr_ref(st, n), rest)
+}
+
+# A reached protocol reaches every impl and dispatcher of it.
+fn cr_proto(st: CrSt, p: SymId) : CrSt =
+  if sym_raw(p) < 0 or cr_has_sym(st.protos, p) { st }
+  else {
+    cr_ref_syms(CrSt { ...st, protos: [p, ...st.protos] }, cr_impl_fns(st.impls, p, cr_disp_fns(st.disps, p, [])))
+  }
+
+# A protocol reached through an operator on operands that may be
+# primitive: every impl a primitive does not select, and its dispatchers.
+fn cr_proto_ops(st: CrSt, p: SymId) : CrSt =
+  if sym_raw(p) < 0 or cr_has_sym(st.protos, p) or cr_has_sym(st.lite, p) { st }
+  else {
+    cr_refs_inert(cr_ref_syms(CrSt { ...st, lite: [p, ...st.lite] }, cr_impl_fns_if(st.impls, p, (i) => not cr_prim_impl(i), [])),
+                  cr_disp_fns(st.disps, p, []))
+  }
+
+fn cr_prim_impl(i: ProtoImplReg) : Bool = match i {
+  PIR(_, t, _, _, args, _, _) -> cr_prim_homogeneous(t, args, DhScalar(TyInt)) or cr_prim_homogeneous(t, args, DhScalar(TyReal))
+}
+
+fn cr_prim_homogeneous(t: DeclRef, args: [DeclRef], h: DispHead) : Bool =
+  dh_ref_is(t, h) and match args {
+    []  -> true
+    [a] -> dh_ref_is(a, h)
+    _   -> false
+  }
+
+fn cr_has_sym(ss: [SymId], s: SymId) : Bool = match ss {
+  [] -> false
+  [h, ...rest] -> sym_same(h, s) or cr_has_sym(rest, s)
+}
+
+fn cr_impl_fns(impls: [ProtoImplReg], p: SymId, acc: [SymId]) : [SymId] =
+  cr_impl_fns_if(impls, p, (i) => true, acc)
+
+fn cr_impl_fns_if(impls: [ProtoImplReg], p: SymId, keep: (ProtoImplReg) -> Bool, acc: [SymId]) : [SymId] = match impls {
+  [] -> acc
+  [i, ...rest] -> match i {
+    PIR(proto, _, _, f, _, _, _) ->
+      cr_impl_fns_if(rest, p, keep, if sym_same(proto, p) and keep(i) { [f, ...acc] } else { acc })
+  }
+}
+
+fn cr_binop(st: CrSt, op: BinOp) : CrSt = {
+  let bp = binop_proto(op)
+  let k = cr_bp_rank(bp)
+  if k == 0 or list_has_int(st.bps, k) { st }
+  else {
+    match op_proto_core(bp) {
+      Some(cp) -> cr_binop_proto(CrSt { ...st, bps: [k, ...st.bps] }, bp, core_proto_id(cp))
+      None     -> st
+    }
+  }
+}
+
+fn cr_binop_proto(st: CrSt, bp: BinopProto, p: SymId) : CrSt = match bp {
+  BpAdd -> cr_proto_ops(st, p)
+  BpSub -> cr_proto_ops(st, p)
+  BpMul -> cr_proto_ops(st, p)
+  BpDiv -> cr_proto_ops(st, p)
+  _     -> cr_proto(st, p)
+}
+
+fn cr_bp_rank(bp: BinopProto) : Int = match bp {
+  BpNone -> 0
+  BpAdd  -> 1
+  BpSub  -> 2
+  BpMul  -> 3
+  BpDiv  -> 4
+  BpRem  -> 5
+  BpEq   -> 6
+  BpOrd  -> 7
+}
+
+# A pipe reaches the core functions the typer inserts for it.
+fn cr_trig(st: CrSt, t: CoreTrigger) : CrSt = {
+  let k = cr_trig_rank(t)
+  if list_has_int(st.trigs, k) { st }
+  else {
+    cr_refs(CrSt { ...st, trigs: [k, ...st.trigs] },
+            map(filter(variants[CoreFn](), (cf) => core_fn_fires_on(cf, t)), core_fn_name))
+  }
+}
+
+fn cr_trig_rank(t: CoreTrigger) : Int = match t {
+  TrDispatchPipe(PoMap)     -> 1
+  TrDispatchPipe(PoFlatMap) -> 2
+  TrDispatchPipe(PoFilter)  -> 3
+  TrDispatchPipe(PoEach)    -> 6
+  TrRangeApply  -> 4
+  TrSteppedApply -> 5
+}
+
+fn list_has_int(xs: [Int], k: Int) : Bool = match xs {
+  [] -> false
+  [h, ...rest] -> h == k or list_has_int(rest, k)
+}
+
+fn cr_decls(ds: [Decl], st: CrSt) : CrSt / Console = match ds {
+  [] -> st
+  [d, ...rest] -> cr_decls(rest, cr_decl(d, st))
+}
+
+fn cr_decl(d: Decl, st: CrSt) : CrSt / Console =
+  cr_exprs(cr_decl_exprs(d), st)
+
+fn cr_exprs(es: [Expr], st: CrSt) : CrSt / Console = match es {
+  [] -> st
+  [e, ...rest] -> cr_exprs(rest, cr_expr(e, st))
+}
+
+fn cr_expr(e: Expr, st: CrSt) : CrSt / Console = match e.kind {
+  EName(n)       -> cr_ref(st, written_text(n))
+  ESym(s, _)     -> cr_ref_sym(st, s)
+  EModCall(_, n) -> cr_ref(st, written_text(n))
+  ETodo(_)       ->
+    if proto_dispatch_marker_in(e) { match proto_dispatch_parts(e) { PDP(_, op) -> cr_op(st, op) } }
+    else { st }
+  k -> cr_positions(xp_positions(e), cr_node(k, st))
+}
+
+# What a node reaches beyond its children's references.
+fn cr_node(k: ExprKind, st: CrSt) : CrSt = match k {
+  EField(_, n)       -> cr_ref(st, n)
+  EBinop(op, _, _)   -> cr_binop(st, op)
+  EUnop(UoNeg, x)    -> if cr_number_literal(x) { st } else { cr_proto_ops(st, core_proto_id(CpNeg)) }
+  EDispatchPipe(op, _, _) -> cr_trig(st, TrDispatchPipe(op))
+  EPipe(head, _)     -> cr_pipe_head(head, st)
+  _ -> st
+}
+
+# A negated number literal is a primitive: nothing mints it to a type
+# with an impl.
+fn cr_number_literal(e: Expr) : Bool = match e.kind {
+  EInt(_, _)   -> true
+  EReal(_, _)  -> true
+  EFixed(_, _) -> true
+  _            -> false
+}
+
+# A range heading an apply pipe, bare or under the statements that bind
+# its operands.
+fn cr_pipe_head(head: Expr, st: CrSt) : CrSt = match head.kind {
+  ERange(_, _, None)       -> cr_trig(st, TrRangeApply)
+  ERange(_, _, Some(step)) -> match try_int_literal(step) {
+    Some(_) -> cr_trig(st, TrRangeApply)
+    None    -> cr_trig(cr_trig(st, TrRangeApply), TrSteppedApply)
+  }
+  EBlock(_, Some(tail)) -> match tail.kind {
+    ERange(_, _, _) -> cr_pipe_head(tail, st)
+    _               -> st
+  }
+  _ -> st
+}
+
+fn cr_positions(ps: [XPos], st: CrSt) : CrSt / Console = match ps {
+  [] -> st
+  [XP(_, x), ...rest] -> cr_positions(rest, cr_expr(x, st))
+}
+
+#[doc("The expressions a decl evaluates: bodies, constant initialisers and the clauses of an effect's default handler.")]
+pub fn cr_decl_exprs(d: Decl) : [Expr] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _)      -> [body]
+  DTest(_, body, _, _, _)                   -> [body]
+  DBench(_, body, _, _, _)                  -> [body]
+  DCheck(_, _, body, _, _, _)               -> [body]
+  DConst(_, _, _, body, _, _, _)            -> [body]
+  DEffect(_, _, _, _, Some(DBlk(cs, ret, _, _)), _, _, _) ->
+    list_append(map(cs, cr_clause_body), cr_ret_body(ret))
+  DUnstable(inner, _, _)                    -> cr_decl_exprs(inner)
+  DConstructor(inner, _, _)                 -> cr_decl_exprs(inner)
+  DDoc(_, _, inner, _, _)                   -> cr_decl_exprs(inner)
+  DAttr(_, inner, _, _)                     -> cr_decl_exprs(inner)
+  _ -> []
+}
+
+fn cr_clause_body(c: HClause) : Expr = match c { HC(_, _, b, _, _) -> b }
+
+fn cr_ret_body(o: Option[HReturn]) : [Expr] = match o {
+  Some(HR(_, b, _, _)) -> [b]
+  None -> []
+}
+
+# ---- the post-lowering check -------------------------------------------
+
+type CrCheck = { gone: NameIndex[SymId], declared: NameIndex[SymId], misses: [SymId] }
+
+fn cr_check_decls(ds: [Decl], ck: CrCheck) : CrCheck / Console = match ds {
+  [] -> ck
+  [d, ...rest] -> cr_check_decls(rest, cr_check_exprs(cr_decl_exprs(d), ck))
+}
+
+fn cr_check_exprs(es: [Expr], ck: CrCheck) : CrCheck / Console = match es {
+  [] -> ck
+  [e, ...rest] -> cr_check_exprs(rest, cr_check_expr(e, ck))
+}
+
+fn cr_check_expr(e: Expr, ck: CrCheck) : CrCheck / Console = match e.kind {
+  ESym(s, _) -> cr_check_ref(ck, s)
+  _ -> cr_check_positions(xp_positions(e), ck)
+}
+
+fn cr_check_positions(ps: [XPos], ck: CrCheck) : CrCheck / Console = match ps {
+  [] -> ck
+  [XP(_, x), ...rest] -> cr_check_positions(rest, cr_check_expr(x, ck))
+}
+
+fn cr_check_ref(ck: CrCheck, s: SymId) : CrCheck =
+  if cr_in(ck.gone, s) and not cr_in(ck.declared, s) {
+    CrCheck { gone: ck.gone, declared: ck.declared, misses: [s, ...ck.misses] }
+  } else { ck }
