@@ -1,0 +1,14 @@
+# stage 2: the kaikai compiler, self-hosted, emitting C or LLVM.
+#
+# This file is only the entry point: the compiler is the `compiler/*.kai`
+# modules `compiler.driver` reaches through its import graph, which kaic1
+# and kaic2 both resolve from here. See `docs/stage2-design.md`.
+
+import compiler.driver
+import compiler.driver_cli
+
+fn main() {
+  let argv = args()
+  let code = parse_cli(argv) |> with_build_inputs(argv, Env.vars()) |> run
+  exit(code)
+}

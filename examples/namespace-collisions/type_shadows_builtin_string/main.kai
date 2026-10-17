@@ -1,0 +1,5 @@
+import ba
+
+fn width(s: ba.String) : Int = s.chars
+
+fn main() : Unit / Stdout = Stdout.print("#{width(ba.mk())}")
