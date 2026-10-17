@@ -1,0 +1,127 @@
+#[doc("""
+KIR operations lowered to LLVM values: `nemit_op` maps each `KOp` to the
+handle of the value it computes.
+""")]
+
+import compiler.util
+import compiler.kir
+import compiler.emit_native_fn
+import compiler.emit_native_slot
+import compiler.emit_native_fnix
+import compiler.emit_native_call
+import compiler.emit_native_ops_calls
+import compiler.emit_native_ops_prim
+import compiler.emit_native_ops_cons
+import compiler.emit_native_ops_seg
+
+# --- KOp → an LLVM value handle ----------------------------------------
+
+# Lower one op to a value handle. All results are boxed `ptr` except
+# `KTagOf` (raw i32). Effects (KPerform/KSetjmp) are later subsets — they
+# abort loudly and yield a null placeholder.
+pub fn nemit_op(ctx: Handle, op: KOp, fx: NFnIndex) : Handle / Console = match op {
+  KLitOp(v)            -> nemit_atom(ctx, v)
+  KPrim(p, cargs)      -> nemit_prim(ctx, p, cargs)
+  # P3: a direct call to a UFn with a raw signature passes each arg at its
+  # param slot + boxes a raw return; everything else stays the boxed funnel.
+  # The callee KFn (looked up by its mangled `sym` in `fx`) carries the
+  # raw param/return slots the lowering populated, so the call-site reads
+  # them off the KIR — never re-deriving the UFnSig (KSlot single source).
+  # `nemit_op` is the value-discarding / boxed-destination path (KDo, a
+  # boxed KLet): a raw call result is re-boxed (`dst = SBoxed`). A raw
+  # destination routes through `nemit_op_fx_slot`, which threads its slot.
+  KCall(sym, cargs)    -> nemit_call_direct(ctx, sym, cargs, fx, SBoxed)
+  KCallIndirect(fv, cargs) -> nemit_call_indirect(ctx, fv, cargs)
+  KCallIndirectBorrow(fv, cargs) -> nemit_call_indirect_borrow(ctx, fv, cargs)
+  KCon(nm, tag, mask, inits, rgn) -> nemit_con(ctx, nm, tag, mask, inits, rgn)
+  KRecord(fields, rgn, tag) -> nemit_stamp(ctx, nemit_record(ctx, fields, rgn), tag)
+  # A boxed read of a TYPED slot: the pure path has no ctor name to classify
+  # the kind, so it keeps the mask-consulting shim (which re-boxes a raw i64 /
+  # real correctly). The typed binder path (`nemit_proj_slot`) reads raw inline.
+  KProj(v, i)          -> ncall_sig2(ctx, "kaix_variant_arg", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), i))
+  # A known-pointer slot: inline `.ptr` load, no shim call and no mask branch —
+  # `GEP(&v->as)[i]` then `load ptr`, exactly the C backend's `slots[i].ptr`.
+  KProjBorrow(v, i)    -> nemit_projborrow_inline(ctx, v, i)
+  # A known-TYPED slot at a boxed destination: raw word load + the minimal
+  # re-box (`kai_variant_slot_box` unrolled at the static kind, no mask).
+  KProjKind(v, i, k)   -> nemit_projkind_boxed(ctx, v, i, k)
+  KTagOf(v)            -> nemit_tagof(ctx, v)
+  KClosure(sym, ar, caps) -> nemit_closure_call(ctx, sym, ar, nemit_atoms_buf(ctx, caps))
+  KConReuse(rk, d, nm, tag, inits) -> nemit_con_reuse(ctx, rk, d, tag, nm, inits)
+  KRecordReuse(d, fields, kept, tag) -> nemit_stamp(ctx, nemit_record_reuse(ctx, nemit_atom(ctx, d), fields, kept), tag)
+  KTokenSteal(v, n)    -> ncall_sig2(ctx, "kaix_drop_reuse_token", native_ctx_ptrt(ctx), native_ctx_ptrt(ctx), native_ctx_i32t(ctx), nemit_atom(ctx, v), llvm_const_i32(native_ctx_i32t(ctx), n))
+  # A KPerform reaching `nemit_op` (rather than the handler-aware
+  # `nemit_op_fx`) is one the walk did not route through `nemit_stmt` — a
+  # KPerform only appears as a KLet/KDo RHS, which DOES route through
+  # `nemit_op_fx`, so this arm is unreachable in practice; keep it loud.
+  KPerform(_, _, _, _, _) -> { nemit_unsupported(ctx, "KPerform reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
+  # Like `KPerform`, a resume op only appears as a `KLet`/`KDo` RHS, which the
+  # walk routes through the handler-aware `nemit_op_fx` (`emit_native_term`) —
+  # its emitter lives in `emit_native_fx2`, unreachable from this module
+  # without an import cycle. Reaching here is a compiler bug; keep it loud.
+  KResumeOp(_, _)      -> { nemit_unsupported(ctx, "KResumeOp reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
+  KResume2Op(_, _, _)  -> { nemit_unsupported(ctx, "KResume2Op reached pure nemit_op (compiler bug — route via nemit_op_fx)"); nemit_null(ctx) }
+  KSetjmp(_, sym)      -> nemit_setjmp_op(ctx, sym)
+}
+
+# The scrutinee atom is captured in a `let` before the inline `.ptr` load so
+# the handle stays off the RC regime across the call boundary (the same
+# handle-binder discipline the ctor/record emitters use).
+fn nemit_projborrow_inline(ctx: Handle, v: KVal, i: Int) : Handle / Console = {
+  let sv = nemit_atom(ctx, v)
+  nemit_slot_read_ptr(ctx, sv, i)
+}
+
+# The boxed view of a typed slot at its STATIC kind: one raw word load plus
+# the kind's own re-box — `kai_int` mints a tagged immediate (heap only past
+# 63 bits), `kai_real` a fresh owned box, `kai_enum_slot_box` the interned
+# immortal singleton. Same owned-view/no-incref contract as the dynamic
+# `kaix_variant_arg` typed path; only the mask lookup is gone. One flat
+# frame per kind: every handle is `let`-bound in the frame that consumes it
+# (the handle-binder exclusion — a handle crossing an `if` join is
+# RC-clobbered by the type-blind kaic1).
+fn nemit_projkind_boxed(ctx: Handle, v: KVal, i: Int, k: Int) : Handle / Console =
+  if k == 2 { nemit_projkind_real(ctx, v, i) }
+  else if k == 3 { nemit_projkind_enum(ctx, v, i) }
+  else { nemit_projkind_int(ctx, v, i) }
+
+fn nemit_projkind_int(ctx: Handle, v: KVal, i: Int) : Handle / Console = {
+  let sv = nemit_atom(ctx, v)
+  let w = nemit_slot_read_i64(ctx, sv, i)
+  ncall_sig1(ctx, "kaix_int", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
+}
+
+fn nemit_projkind_real(ctx: Handle, v: KVal, i: Int) : Handle / Console = {
+  let sv = nemit_atom(ctx, v)
+  let w = nemit_slot_read_real(ctx, sv, i)
+  ncall_sig1(ctx, "kaix_real", native_ctx_ptrt(ctx), native_ctx_f64t(ctx), w)
+}
+
+fn nemit_projkind_enum(ctx: Handle, v: KVal, i: Int) : Handle / Console = {
+  let sv = nemit_atom(ctx, v)
+  let w = nemit_slot_read_i64(ctx, sv, i)
+  ncall_sig1(ctx, "kaix_enum_slot_box", native_ctx_ptrt(ctx), native_ctx_i64t(ctx), w)
+}
+
+# `KSetjmp(eff, sym)` → `_setjmp(jmpbuf) : i32` (no signal mask: a mask-saving
+# setjmp is a syscall per handle entry on macOS), boxed as an Int so the boxed
+# `condbr` register reads it through `kaix_truthy`. The jmp_buf alloca was
+# reserved in the entry head by the install (pass 1), registered under
+# `__jmpbuf_<sym>` (per install-SITE — `nfx_jmpbuf_reg`'s name, inlined here
+# since fx imports ops, not the reverse, so ops cannot call `nfx_jmpbuf_reg`
+# without an import cycle; the `"__jmpbuf_"` prefix MUST stay in sync).
+# `setjmp` runs IN the handle frame directly (a longjmp into a returned frame
+# is UB); it's declared external (libc provides it at link). i32 0 (body) is
+# falsy → the KIR `condbr ? Ldiscard : Lbody` takes Lbody; i32 !=0 (longjmp
+# landing) is truthy → Ldiscard — matching the C-direct
+# `setjmp(_jmp) == 0 ? body : landing`.
+fn nemit_setjmp_op(ctx: Handle, sym: String) : Handle / Console = {
+  let jmpbuf = native_ctx_find_reg(ctx, cat2("__jmpbuf_", sym))
+  let i32t = native_ctx_i32t(ctx)
+  let raw = ncall_sig1(ctx, "_setjmp", i32t, native_ctx_ptrt(ctx), jmpbuf)
+  # Box the i32 as a BOOL (not an Int): the boxed `condbr` reads it via
+  # `kaix_truthy`/`kai_op_truthy`, which checks `tag == KAI_BOOL`. A tagged
+  # Int immediate (`0x1` for 0) would be dereferenced as a pointer and
+  # segfault. `kaix_bool_of_i32` does `kai_bool(i != 0)`.
+  ncall_sig1(ctx, "kaix_bool_of_i32", native_ctx_ptrt(ctx), i32t, raw)
+}

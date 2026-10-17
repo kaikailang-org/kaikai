@@ -1,0 +1,30 @@
+# mn-corpus-order-dependent.txt — fixtures whose output LINE ORDER is not a
+# language guarantee, consumed by tools/run-mn-corpus-determinism.sh.
+#
+#   <relative-path>:<issue-number>:<one-line reason the order is unspecified>
+#
+# A fixture listed here is still fully gated. Only the sequence comparison is
+# replaced by a MULTISET comparison: every line must still appear, exactly
+# once. Lost work, a duplicated message and a torn line all remain findings,
+# and the crash / hang / empty / exit-code checks are untouched. This file
+# forgives interleaving and nothing else.
+#
+# The bar for adding a line: the fixture must print from more than one fiber
+# with no synchronisation ordering the prints, so its N=1 sequence is an
+# artefact of the round-robin scheduler rather than a property of the
+# program. A fixture that prints a RESULT (a sum, a count, a final state)
+# does not belong here — that value must reproduce byte-for-byte, and if it
+# does not, the finding is real. Neither does a fixture that GAINS or LOSES
+# a line — that is a real divergence, not interleaving, so it is fixed (in
+# the runtime, or by making the fixture's delivery point deterministic)
+# rather than declared here.
+#
+# Every entry names an open issue. The declaration is the bookmark; the
+# issue is the work — these goldens also break tier1's own byte-for-byte
+# comparison once KAI_THREADS defaults to ncpu.
+#
+# A fixture whose documented property IS the one-thread rotation does not
+# belong here either: it pins KAI_THREADS in a sibling env file (see
+# kai_corpus_pinned_threads in tools/lib/corpus.sh) and stays byte-exact.
+#
+# The list is currently empty.
