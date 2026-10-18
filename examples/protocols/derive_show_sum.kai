@@ -1,0 +1,12 @@
+# m12.8: `#derive(Show)` on a sum type whose payload types already
+# implement Show.
+
+#[derive(Show)]
+type Shape = Circle(Int) | Square(Int) | None_
+
+fn main() : Int {
+  print(show(Circle(5)))
+  print(show(Square(7)))
+  print(show(None_))
+  0
+}

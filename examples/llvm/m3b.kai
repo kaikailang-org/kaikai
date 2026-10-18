@@ -1,0 +1,36 @@
+# Exercises every feature the LLVM backend's M3b milestone supports:
+# int/bool/string literals, fn params, let bindings, EVar reads,
+# user fn calls, arithmetic/comparison/logical binops, unary minus
+# and `not`, if/else (including nested else-if), and blocks.
+
+fn abs_val(n: Int) : Int = if n < 0 { -n } else { n }
+
+fn describe(n: Int) : String {
+  if n == 0 { "zero" }
+  else if n > 0 { "positive" }
+  else { "negative" }
+}
+
+fn in_range(n: Int, lo: Int, hi: Int) : Bool = n >= lo and n <= hi
+
+fn main() : Unit / Console {
+  let x = 7
+  let y = abs_val(-5)
+  let sum = x + y
+  let prod = x * y
+  let diff = x - y
+  let quot = x / y
+  let r = x % y
+  print(int_to_string(sum))
+  print(int_to_string(prod))
+  print(int_to_string(diff))
+  print(int_to_string(quot))
+  print(int_to_string(r))
+  print(describe(sum))
+  print(describe(0))
+  print(describe(-3))
+  let inside = in_range(sum, 0, 20)
+  let outside = not in_range(sum, 0, 5)
+  if inside { print("inside") } else { print("outside") }
+  if outside { print("outside") } else { print("inside") }
+}
