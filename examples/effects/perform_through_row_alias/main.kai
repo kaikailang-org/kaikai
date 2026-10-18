@@ -1,0 +1,58 @@
+# An op written on a row alias must reach the component that declares it,
+# carrying that effect's identity. `Chat` declares no ops of its own, so
+# `Chat.say` is `Loud.say`; `Wide` nests `Chat`, so `Wide.say` is too.
+# Before the resolver settled this, the alias-written perform reached KIR
+# with `sym_none()` while the directly written one carried its id — the
+# same effect, the same op, two different answers in one function.
+
+pub effect Loud {
+  say(s: String) : Unit
+}
+
+pub effect Quiet {
+  hush() : Unit
+}
+
+pub type Chat = Loud + Quiet
+
+fn spoken() : Unit / Chat = {
+  Chat.say("via alias")
+  Loud.say("written direct")
+}
+
+fn main() : Unit / Stdout = {
+  handle {
+    handle { spoken() } with Quiet {
+      hush(resume) -> resume(())
+    }
+  } with Loud {
+    say(s, resume) -> resume(())
+  }
+  capped()
+  named()
+  Stdout.print("ok")
+}
+
+# A capability passed as a value carries its effect's identity too: the
+# annotation on the parameter is a `TyCon` naming the effect declaration,
+# and the op dispatches against that binder's own evidence node.
+fn through_cap(l: Loud) : Unit = l.say("via capability")
+
+fn capped() : Unit / Stdout = {
+  handle { through_cap(h) } with Loud as h {
+    say(s, resume) -> resume(())
+  }
+  Stdout.print("capped")
+}
+
+# A named instance used inside the handle body: `n.say` dispatches against
+# that handle's own evidence node, and names the effect the head resolved
+# to — the same declaration the written and capability forms name.
+fn named() : Unit / Stdout = {
+  handle {
+    n.say("via named instance")
+  } with Loud as n {
+    say(s, resume) -> resume(())
+  }
+  Stdout.print("named")
+}

@@ -1,0 +1,119 @@
+# Hash index over the function registry.
+#
+# The unbox, Perceus and emit walks ask for a fn's entry or unboxed
+# signature once per decl and per call site, against one entry per
+# top-level fn in the whole program. The index buckets the registry by
+# declaration so a lookup runs over one declaration's instances instead
+# of every entry.
+#
+# A chain is newest-first, and two modules sharing a basename register
+# one identity twice, so a reader states which of the two it answers.
+
+import compiler.infer_index
+import compiler.fnreg
+import compiler.call_site_target
+import compiler.kai_builtin
+import compiler.ast
+import compiler.decl_names
+import compiler.core_builtin_sets
+import compiler.vec_raw
+
+#[doc("A function registry plus a hash index from a declaration to its entries, the declared core builtins among its fns, the declared effects, the raw core primitives, and whether Vec reads take the bare-word paths.")]
+pub type FnIndex = { sx: NameIndex[EFn], all: [EFn], kai: [KaiBuiltin], effs: [SymId], raws: SymSet, vraw: VecRawCx }
+
+#[doc("Index a function registry so a signature lookup does not scan it.")]
+pub fn fnx_build(fns: [EFn]) : FnIndex =
+  FnIndex { sx: fnx_add_sym(fns, idx_empty()), all: fns, kai: [], effs: [], raws: sym_set_empty(), vraw: VrOff }
+
+# Without the declared builtins a call to one still reaches it, through
+# the fn its declaration emits; with them the call binds the runtime symbol.
+#[doc("Index the fns of the post-desugar decls `ds`, the declared core builtins among them included.")]
+pub fn fnx_build_decls(ds: [Decl], fns: [EFn]) : FnIndex = {
+  let fx = fnx_build(fns)
+  FnIndex { ...fx, kai: kai_builtins(ds) }
+}
+
+#[doc("`fx` knowing the effects `ds` declares, so a perform is recognised by its effect's id.")]
+pub fn fnx_with_effects(fx: FnIndex, ds: [Decl]) : FnIndex = FnIndex { ...fx, effs: fnx_effect_ids(ds, []) }
+
+#[doc("`fx` taking bare-word Vec reads over the records `ds` declares, so the unbox pass marks them raw.")]
+pub fn fnx_with_vec_raw(fx: FnIndex, ds: [Decl]) : FnIndex = FnIndex { ...fx, vraw: VrOn(collect_records(ds)) }
+
+fn fnx_effect_ids(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
+  [] -> acc
+  [DEffect(_, s, _, _, _, _, _, _), ...rest] -> fnx_effect_ids(rest, [s, ...acc])
+  [_, ...rest] -> fnx_effect_ids(rest, acc)
+}
+
+#[doc("`fx` knowing the raw core primitives, so a call to one is recognised by its row's id.")]
+pub fn fnx_with_raw_prims(fx: FnIndex) : FnIndex = FnIndex { ...fx, raws: raw_prim_syms() }
+
+#[doc("True when `s` is the row of a raw core primitive, in an index built to know them.")]
+pub fn fnx_is_raw_prim(fx: FnIndex, s: SymId) : Bool = sym_set_has(fx.raws, s)
+
+#[doc("True when `s` is the id of a declared effect: a call whose callee carries it is a perform.")]
+pub fn fnx_is_effect(fx: FnIndex, s: SymId) : Bool = fnx_sym_in(fx.effs, sym_raw(s))
+
+fn fnx_sym_in(ss: [SymId], id: Int) : Bool = match ss {
+  [] -> false
+  [h, ...rest] -> sym_raw(h) == id or fnx_sym_in(rest, id)
+}
+
+#[doc("The declared core builtin a call to `s` binds, or None when `s` names any other fn.")]
+pub fn fnx_kai(fx: FnIndex, s: FnId) : Option[KaiBuiltin] = kai_builtin_find(fx.kai, s)
+
+# The registry keyed by the declaration each entry instantiates. A
+# bucket holds one declaration and its specialisations, told apart by
+# instance index.
+fn fnx_add_sym(fns: [EFn], ix: NameIndex[EFn]) : NameIndex[EFn] = match fns {
+  []           -> ix
+  [f, ...rest] -> match f {
+    EFn(_, _, _, _, s) ->
+      if fnx_stamped(fnid_sym(s)) { fnx_add_sym(rest, idx_prepend_sym(ix, fnid_sym(s), f)) }
+      else { fnx_add_sym(rest, ix) }
+  }
+}
+
+fn fnx_stamped(s: SymId) : Bool = sym_raw(s) >= 0
+
+#[doc("The unboxed-signature classification of the fn instance `s` names, if it has one. The id answers alone: no name, no module, no tie to break.")]
+pub fn fnx_ufn_sig_sym(fx: FnIndex, s: FnId) : Option[UFnSig] = match fnx_of_sym(fx, s) {
+  Some(EFn(_, _, _, sig, _)) -> sig
+  None -> None
+}
+
+#[doc("The declaration a reference carrying identity `s` reaches. A local carries none and a builtin's reaches no declaration, so two homonymous declarations never trade places here.")]
+pub fn fnx_callee(fx: FnIndex, s: FnId) : Option[EFn] = fnx_of_sym(fx, s)
+
+#[doc("The registry entry for the fn instance `s`: the declaration itself or one of its specialisations.")]
+pub fn fnx_of_sym(fx: FnIndex, s: FnId) : Option[EFn] = fnx_inst(idx_chain_sym(fx.sx, fnid_sym(s)), s)
+
+fn fnx_inst(chain: [EFn], s: FnId) : Option[EFn] = match chain {
+  []           -> None
+  [f, ...rest] -> if fnid_eq(efn_sym(f), s) { Some(f) } else { fnx_inst(rest, s) }
+}
+
+#[doc("The unboxed-signature classification of the declaration `fid` names.")]
+pub fn fnx_decl_sig(fx: FnIndex, fid: FnId) : Option[UFnSig] = fnx_ufn_sig_sym(fx, fid)
+
+#[doc("The unboxed-signature classification of the fn a call head names. A bare spelling is a local, never a declaration.")]
+pub fn fnx_callee_sig(fx: FnIndex, callee: Expr) : Option[UFnSig] = match callee_fnid(callee) {
+  Some(f) -> efn_sig_of(fnx_of_sym(fx, f))
+  None    -> None
+}
+
+fn efn_sig_of(e: Option[EFn]) : Option[UFnSig] = match e {
+  Some(EFn(_, _, _, sig, _)) -> sig
+  None                       -> None
+}
+
+#[doc("The unboxed-signature classification of the first registry entry of the fn instance `s`: the one a scan of the registry in order finds.")]
+pub fn fnx_ufn_sig_first(fx: FnIndex, s: FnId) : Option[UFnSig] =
+  fnx_sig_oldest(idx_chain_sym(fx.sx, fnid_sym(s)), s, None)
+
+fn fnx_sig_oldest(chain: [EFn], s: FnId, found: Option[UFnSig]) : Option[UFnSig] = match chain {
+  []           -> found
+  [f, ...rest] -> match f {
+    EFn(_, _, _, sig, id) -> fnx_sig_oldest(rest, s, if fnid_eq(id, s) { sig } else { found })
+  }
+}

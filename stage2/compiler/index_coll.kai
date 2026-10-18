@@ -1,0 +1,26 @@
+#[doc("""
+The collection of an index expression, typed once.
+
+`coll[ix]` lowers to a getter call whose scheme types the whole read.
+The typer walks `coll` first to pick the getter; the call is then typed
+against a placeholder bound to that type, and the already-typed `coll`
+is spliced back in its place. Walking `coll` a second time would report
+every diagnostic inside it twice.
+""")]
+
+import compiler.ast
+import compiler.ast_map
+import compiler.marks
+
+#[doc("The name the placeholder's type is bound under in the typing environment: the spelling of its mark, which holds a space, so no source identifier can shadow or reach it.")]
+pub fn ixc_name() : String = mark_name(MkIndexColl)
+
+#[doc("The placeholder at `at`'s position, so a diagnostic about the argument points at the collection.")]
+pub fn ixc_ref(at: Expr) : Expr = mk_expr(EMark(MkIndexColl), at.line, at.col)
+
+#[doc("`e` with every occurrence of the placeholder replaced by `typed`.")]
+pub fn ixc_splice(e: Expr, typed: Expr) : Expr = match e.kind {
+  EMark(MkIndexColl) -> typed
+  _ -> Expr { kind: prc_map_expr_kind(e.kind, (x) => ixc_splice(x, typed)),
+              line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+}
