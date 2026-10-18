@@ -1,0 +1,12 @@
+import pa
+import pb
+
+# `T` here is the function's OWN type parameter, bound by `[T]` two
+# columns to the left. Rung 1 of the ladder is local scope, so the
+# binder settles the name before any import is consulted: the imported
+# `pa.T`/`pb.T` are not candidates for this `T` at all. A parameter has
+# no module to qualify with, so a contested-import report on it names a
+# fix the user cannot write.
+fn ident[T](x: T) : T = x
+
+fn main() : Unit / Stdout = Stdout.print("#{ident(5)}")
