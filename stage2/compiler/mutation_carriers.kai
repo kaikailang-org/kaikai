@@ -1,0 +1,218 @@
+#[doc("""
+Which types carry mutation an outside observer can witness.
+
+`Array` and `Ref` carry a mutable cell directly; a record or a sum
+carries one when a field or a variant payload reaches an `Array`/`Ref`
+through any depth of type arguments (`HashMap`'s `buckets : Ref[..]`,
+`HashSet`'s `inner : HashMap`). The carrier set is the transitive
+closure over the program's records and sums, never a hard-coded
+container list, so a new mutable-backed user type is classified without
+touching this module.
+
+Callers use it to answer observability questions: whether a `/ Mutable`
+demand is local to its caller, and whether a value handed across a
+fiber boundary would be mutated as a copy.
+""")]
+
+import compiler.ast
+import compiler.written
+import compiler.symtab
+import compiler.decl_names
+import compiler.core_syms
+import compiler.core_effects
+import compiler.tycon_scheme_home
+import compiler.tycon_ref
+
+#[doc("A nominal type, the declarations the types its values store name (a record's field types, every payload of a sum's variants, through type arguments and list elements), and whether one of them is a closure whose row carries `Mutable`.")]
+pub type CarrierShape = CarrierShape(SymId, [SymId], Bool)
+
+#[doc("The nominal types whose mutation is observable to anyone sharing the value: every record or sum storing an `Array` or a `Ref`, directly or through another such type. `Array`/`Ref` seed the set. `mutating` is `mutating_type_names(shapes)`, which holds every such type, so only its shapes are scanned.")]
+pub fn cell_carrier_type_names(shapes: [CarrierShape], mutating: [SymId]) : [SymId] =
+  shape_fixpoint(shapes_of(shapes, mutating), carrier_seeds(), false, 0)
+
+fn shapes_of(shapes: [CarrierShape], keep: [SymId]) : [CarrierShape] = match shapes {
+  []           -> []
+  [s, ...rest] -> match s {
+    CarrierShape(ty, _, _) -> if carrier_has(keep, ty) { [s, ...shapes_of(rest, keep)] } else { shapes_of(rest, keep) }
+  }
+}
+
+#[doc("The nominal types whose values may reach a mutable cell: every record or sum storing an `Array`, a `Ref`, or a closure whose row carries `Mutable`, directly or through another such type. `Array`/`Ref` seed the set.")]
+pub fn mutating_type_names(shapes: [CarrierShape]) : [SymId] =
+  shape_fixpoint(shapes, carrier_seeds(), true, 0)
+
+fn carrier_seeds() : [SymId] = [core_ty_sym(CtRef), core_ty_sym(CtArray)]
+
+# An absent id is no type, so it is in no set.
+fn carrier_has(xs: [SymId], s: SymId) : Bool = match xs {
+  []           -> false
+  [x, ...rest] -> if sym_raw(s) >= 0 and sym_raw(x) == sym_raw(s) { true } else { carrier_has(rest, s) }
+}
+
+#[doc("The shape of a record, its field types read from the module declaring it. `v` is any view of the type-home table.")]
+pub fn record_shape(v: TyHomeView, r: RecInfo) : CarrierShape = match r {
+  RI(s, _, fields, mo) -> shape_of(tsh_at(v, mo), s, map(fields, field_type))
+}
+
+#[doc("The shape of the sum `s` module `mo` declares, its variant payloads read from that module. `v` is any view of the type-home table.")]
+pub fn sum_shape(v: TyHomeView, s: SymId, vs: [Variant], mo: Option[String]) : CarrierShape =
+  shape_of(tsh_at(v, mo), s, variant_payloads(vs))
+
+fn shape_of(v: TyHomeView, s: SymId, tes: [TypeExpr]) : CarrierShape =
+  CarrierShape(s, tes_named(v, tes, []), tes_hold_mutable_fn(tes))
+
+# The declarations `tes` name at their heads, in type arguments and in
+# list elements. A type parameter names none.
+fn tes_named(v: TyHomeView, tes: [TypeExpr], acc: [SymId]) : [SymId] = match tes {
+  []           -> acc
+  [t, ...rest] -> tes_named(v, rest, te_named(v, t, acc))
+}
+
+fn te_named(v: TyHomeView, te: TypeExpr, acc: [SymId]) : [SymId] = match te.tkind {
+  TyName(r, targs) -> tes_named(v, targs, [stored_ref_sym(v, r), ...acc])
+  TyParam(_, targs) -> tes_named(v, targs, acc)
+  TyList(elem)     -> te_named(v, elem, acc)
+  _                -> acc
+}
+
+# The type a stored reference names: its declaration once settled; while
+# it is written, what the name denotes from `v`, the module declaring the
+# type that stores it.
+fn stored_ref_sym(v: TyHomeView, r: DeclRef) : SymId = match r {
+  DrSym(s)        -> s
+  DrWritten(_, _) -> head_decl(tsh_tycon_at(v, r, []))
+}
+
+fn head_decl(t: Ty) : SymId = match t {
+  TyCon(s, _) -> s
+  _           -> sym_none()
+}
+
+fn variant_payloads(vs: [Variant]) : [TypeExpr] = match vs {
+  []           -> []
+  [v, ...rest] -> match v {
+    Var(_, tes) -> list_append(tes, variant_payloads(rest))
+  }
+}
+
+#[doc("""
+True iff a value of type `t` may reach a mutable cell its holder can observe.
+
+Wider than `ty_carries_mutation`: a carrier may sit in any type argument
+(`[Array[Int]]`, `Option[Array[Int]]`) or in a closure's captures when its
+row carries `Mutable`.
+""")]
+pub fn ty_may_carry_mutation(t: Ty, dmut: [SymId]) : Bool = match t {
+  TyCon(s, args)       -> if carrier_has(dmut, s) { true } else { tys_may_carry_mutation(args, dmut) }
+  TyListT(elem)        -> ty_may_carry_mutation(elem, dmut)
+  TyFnT(_, _, row)     -> labels_name_mutable(row.labels)
+  TyUnion(ts)          -> tys_may_carry_mutation(ts, dmut)
+  TyRefineT(base, _)   -> ty_may_carry_mutation(base, dmut)
+  # A type variable does not count: a callee holding a value only
+  # parametrically can mutate it only through a callback it was handed,
+  # and the pass classifies that callback where it is called.
+  _                    -> false
+}
+
+fn tys_may_carry_mutation(ts: [Ty], dmut: [SymId]) : Bool = match ts {
+  []           -> false
+  [t, ...rest] -> if ty_may_carry_mutation(t, dmut) { true } else { tys_may_carry_mutation(rest, dmut) }
+}
+
+fn labels_name_mutable(labels: [Label]) : Bool = match labels {
+  []           -> false
+  [l, ...rest] -> if effect_is(l.sym, CeMutable) { true } else { labels_name_mutable(rest) }
+}
+
+#[doc("True iff `t` carries mutation: head `Array`/`Ref`, or a record in `dmut`.")]
+pub fn ty_carries_mutation(t: Ty, dmut: [SymId]) : Bool =
+  if ty_is_mutable_ref(t) { true }
+  else { match t {
+    TyCon(s, _) -> carrier_has(dmut, s)
+    _           -> false
+  } }
+
+#[doc("""
+True iff `s` is a core builtin that writes into the `Array[Byte]` it
+takes first. It mutates only that argument: the source it copies from is
+read, and Bytes are copied by value.
+""")]
+pub fn is_bytes_writer(s: SymId) : Bool =
+  carrier_has([builtin_sym("bytes_blit"), builtin_sym("bytes_put_le"), builtin_sym("bytes_put_string")], s)
+
+#[doc("The name prefix of a derived `BinSerialize` writer, `fn <prefix><T>(buf: BinBuf, self: T) : BinBuf / Mutable`.")]
+pub fn derived_writer_prefix() : String = "__binser_put_"
+
+#[doc("""
+True iff the callee `s` mutates only its first argument: a core bytes
+writer, or a derived `BinSerialize` writer, which the compiler builds to
+append to its buffer and only read the value it encodes. The derive
+declares its writer as one, and `tab` holds that.
+""")]
+pub fn writes_only_first_arg(tab: SymTab, s: SymId) : Bool =
+  is_bytes_writer(s) or match sym_mint(tab, s) { NmBinWriter -> true  _ -> false }
+
+#[doc("True iff `t` is `Array[_]` or `Ref[_]` — the heads that carry a cell directly.")]
+pub fn ty_is_mutable_ref(t: Ty) : Bool = match t {
+  TyCon(tcs, _) -> core_ty_is(tcs, CtArray) or core_ty_is(tcs, CtRef)
+  _             -> false
+}
+
+# Iterate to a fixpoint so a type that only embeds another mutating
+# type (HashSet -> HashMap -> Ref) is caught. Bounded by the shape count:
+# each pass adds at least one type or stops. `fns` counts a closure
+# field whose row names `Mutable` as a carrier.
+fn shape_fixpoint(shapes: [CarrierShape], known: [SymId], fns: Bool, passes: Int) : [SymId] =
+  if passes > list_length(shapes) { known }
+  else {
+    let next = shape_scan(shapes, known, fns, known)
+    if list_length(next) == list_length(known) { known }
+    else { shape_fixpoint(shapes, next, fns, passes + 1) }
+  }
+
+fn shape_scan(shapes: [CarrierShape], known: [SymId], fns: Bool, acc: [SymId]) : [SymId] = match shapes {
+  []           -> acc
+  [s, ...rest] -> match s {
+    CarrierShape(ty, stored, mutable_fn) ->
+      if carrier_has(acc, ty) { shape_scan(rest, known, fns, acc) }
+      else if (fns and mutable_fn) or any_carrier(stored, known) { shape_scan(rest, known, fns, [ty, ...acc]) }
+      else { shape_scan(rest, known, fns, acc) }
+  }
+}
+
+fn any_carrier(stored: [SymId], known: [SymId]) : Bool = match stored {
+  []           -> false
+  [s, ...rest] -> if carrier_has(known, s) { true } else { any_carrier(rest, known) }
+}
+
+fn field_type(f: FieldDecl) : TypeExpr = match f {
+  FD(_, _, te, _) -> te
+}
+
+# A closure whose row names `Mutable`, at the head, in a type argument or
+# in a list element.
+fn te_holds_mutable_fn(te: TypeExpr) : Bool = match te.tkind {
+  TyName(_, targs) -> tes_hold_mutable_fn(targs)
+  TyParam(_, targs) -> tes_hold_mutable_fn(targs)
+  TyList(elem)     -> te_holds_mutable_fn(elem)
+  TyFn(_, _, row)  -> row_expr_names_mutable(row)
+  _                -> false
+}
+
+fn tes_hold_mutable_fn(tes: [TypeExpr]) : Bool = match tes {
+  []           -> false
+  [t, ...rest] -> if te_holds_mutable_fn(t) { true } else { tes_hold_mutable_fn(rest) }
+}
+
+fn row_expr_names_mutable(row: RowExpr) : Bool = match row {
+  REmpty         -> false
+  RClosed(ls)    -> row_labels_name_mutable(ls)
+  ROpen(_, ls)   -> row_labels_name_mutable(ls)
+}
+
+fn row_labels_name_mutable(ls: [RowLabel]) : Bool = match ls {
+  []           -> false
+  [l, ...rest] -> match l {
+    RL(r, _) -> if effect_is(ref_sym(r), CeMutable) { true } else { row_labels_name_mutable(rest) }
+  }
+}
