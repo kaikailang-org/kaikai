@@ -1,0 +1,257 @@
+# compiler/emit_cache.kai - persistent cache of the core module set's
+# emitted C translation units (the c-modular backend's per-TU bodies).
+#
+# The core's emitted C is a pure function of (core sources, toolchain,
+# edition, build mode): monomorphised instances of core generics land
+# in the root TU, protocol dispatch resolves through runtime impl
+# tables, and the modular emitter builds every TU body independently
+# from a shared immutable context. A warm entry therefore lets
+# `emit_program_modular` skip the body emission for every core TU and
+# splice the cached text into the stream unchanged; everything
+# downstream (linkage externalisation, header slicing, the wrapper's
+# content-hashed `.o` cache) runs identically, so a warm build is
+# byte-identical to a cold one.
+#
+# INVALIDATION mirrors core_cache.kai: the entry filename embeds a key
+# hashed over the core source contents, the toolchain id, the edition,
+# and the build mode; the header echoes the key as a second line of
+# defense. A stale entry can never be spliced: it would have to be a
+# valid entry for a DIFFERENT (core, toolchain) pair, and the key is
+# exactly what distinguishes them. Any IO or parse failure is a miss,
+# never an error - the cache is a performance layer only.
+
+import compiler.user_cache
+import compiler.util
+
+#[doc("One cached translation unit: the TU stem (module origin with dots as underscores), its pre-externalisation C body text, and the types and decls header slices the body is compiled against.")]
+pub type CTU = CTU(String, String, String, String)
+
+# A parsed header/stem line: the text and the position past its newline.
+type EcLine = EL(String, Int)
+
+#[doc("Bump on any change to the entry format or key derivation so old entries miss after an upgrade.")]
+pub fn ec_format_tag() : String = "KCT3"
+
+# ---- entry path ------------------------------------------------------
+
+#[doc("Absolute path of the emit-cache entry for a key, under the given cache directory.")]
+pub fn ec_entry_path(dir: String, key: String) : String =
+  concat_all([dir, "/core-emit-", key, ".kct"])
+
+# ---- serialisation ---------------------------------------------------
+
+# Entry layout (text header, length-prefixed bodies):
+#   KCT2\n<key>\n<n_tus>\n
+#   then per TU: <stem>\n<body_len>\n<types_len>\n<decls_len>\n<body><types><decls>
+# Length prefixes make the body split exact - no marker can collide
+# with emitted C.
+
+fn ec_render_tus(tus: [CTU], acc: [String]) : [String] = match tus {
+  [] -> list_reverse(acc)
+  [t, ...rest] -> match t {
+    CTU(stem, body, types_h, decls_h) ->
+      ec_render_tus(rest, [concat_all([stem, "\n",
+                                       int_to_string(string_length(body)), "\n",
+                                       int_to_string(string_length(types_h)), "\n",
+                                       int_to_string(string_length(decls_h)), "\n",
+                                       body, types_h, decls_h]), ...acc])
+  }
+}
+
+#[doc("Serialise the cached TU set into one entry blob for the given key.")]
+pub fn ec_serialize(key: String, tus: [CTU]) : String =
+  concat_all([ec_format_tag(), "\n", key, "\n",
+              int_to_string(list_length(tus)), "\n",
+              concat_all(ec_render_tus(tus, []))])
+
+# Read the line starting at `pos`. `EL("", -1)` on a missing
+# terminator - the -1 position poisons every downstream bounds check,
+# so a truncated blob decodes to None without per-call Option nesting.
+fn ec_read_line(buf: String, pos: Int) : EcLine =
+  if pos < 0 { EL("", 0 - 1) }
+  else { ec_scan_nl(buf, pos, pos, string_length(buf)) }
+
+fn ec_scan_nl(buf: String, start: Int, i: Int, n: Int) : EcLine =
+  if i >= n { EL("", 0 - 1) }
+  else if string_byte_at_int(buf, i) == 10 {
+    EL(string_slice(buf, start, i - start), i + 1)
+  }
+  else { ec_scan_nl(buf, start, i + 1, n) }
+
+# A non-negative int parsed from a line's text; -1 on malformation.
+fn ec_nat_of(s: String) : Int = match string_to_int(s) {
+  None -> 0 - 1
+  Some(n) -> if n < 0 { 0 - 1 } else { n }
+}
+
+fn ec_line_nat(l: EcLine) : Int = match l {
+  EL(s, p) -> if p < 0 { 0 - 1 } else { ec_nat_of(s) }
+}
+
+fn ec_line_pos(l: EcLine) : Int = match l { EL(_, p) -> p }
+
+fn ec_line_is(l: EcLine, want: String) : Bool = match l {
+  EL(s, p) -> p >= 0 and s == want
+}
+
+fn ec_parse_tus(buf: String, pos: Int, left: Int, acc: [CTU]) : Option[[CTU]] =
+  if pos < 0 { None }
+  else if left == 0 { Some(list_reverse(acc)) }
+  else { ec_parse_one(buf, ec_read_line(buf, pos), left, acc) }
+
+fn ec_parse_one(buf: String, stem_l: EcLine, left: Int, acc: [CTU]) : Option[[CTU]] = {
+  let blen_l = ec_read_line(buf, ec_line_pos(stem_l))
+  let tlen_l = ec_read_line(buf, ec_line_pos(blen_l))
+  let dlen_l = ec_read_line(buf, ec_line_pos(tlen_l))
+  let blen = ec_line_nat(blen_l)
+  let tlen = ec_line_nat(tlen_l)
+  let dlen = ec_line_nat(dlen_l)
+  let at = ec_line_pos(dlen_l)
+  if blen < 0 or tlen < 0 or dlen < 0 or at < 0 or at + blen + tlen + dlen > string_length(buf) { None }
+  else {
+    let stem = match stem_l { EL(s, _) -> s }
+    let tu = CTU(stem, string_slice(buf, at, blen), string_slice(buf, at + blen, tlen),
+                 string_slice(buf, at + blen + tlen, dlen))
+    ec_parse_tus(buf, at + blen + tlen + dlen, left - 1, [tu, ...acc])
+  }
+}
+
+#[doc("Deserialise an entry blob back into its TU set. None on any format drift, key mismatch, or truncation - the caller treats None as a miss.")]
+pub fn ec_deserialize(blob: String, key: String) : Option[[CTU]] = {
+  let tag_l = ec_read_line(blob, 0)
+  let key_l = ec_read_line(blob, ec_line_pos(tag_l))
+  let n_l = ec_read_line(blob, ec_line_pos(key_l))
+  if ec_line_is(tag_l, ec_format_tag()) and ec_line_is(key_l, key) {
+    ec_parse_tus(blob, ec_line_pos(n_l), ec_line_nat(n_l), [])
+  } else { None }
+}
+
+# ---- lookup / write --------------------------------------------------
+
+#[doc("Look up the emit cache: the deserialised TU set on a present, key-valid entry, or None on any miss.")]
+pub fn ec_lookup(dir: String, key: String) : Option[[CTU]] / Console + File =
+  match read_file(ec_entry_path(dir, key)) {
+    Err(_) -> None
+    Ok(blob) -> ec_deserialize(blob, key)
+  }
+
+#[doc("Publish the TU set atomically to its entry and return its content digest. IO failures are swallowed - an unwritable cache is a performance loss, never a correctness one.")]
+pub fn ec_write(dir: String, key: String, tus: [CTU]) : String / Console + File = {
+  let body = ec_render_body(ec_sort_tus(tus, []))
+  let _p = cache_publish(ec_entry_path(dir, key),
+                         concat_all([ec_format_tag(), "\n", key, "\n", int_to_string(list_length(tus)), "\n", body]))
+  uc_content_hex(body)
+}
+
+fn ec_render_body(tus: [CTU]) : String = concat_all(ec_render_tus(tus, []))
+
+#[doc("Find a cached TU body by stem. None when the stem is not in the set.")]
+pub fn ec_find(tus: [CTU], stem: String) : Option[String] = match ec_find_tu(tus, stem) {
+  Some(CTU(_, body, _, _)) -> Some(body)
+  None -> None
+}
+
+#[doc("Find a cached TU by stem, with its header slices.")]
+pub fn ec_find_tu(tus: [CTU], stem: String) : Option[CTU] = match tus {
+  [] -> None
+  [t, ...rest] -> match t {
+    CTU(s, _, _, _) -> if s == stem { Some(t) } else { ec_find_tu(rest, stem) }
+  }
+}
+
+#[doc("The stem of a cached TU.")]
+pub fn ec_stem(t: CTU) : String = match t { CTU(s, _, _, _) -> s }
+
+#[doc("A digest of a TU set that does not depend on the order the TUs were emitted in.")]
+pub fn ec_content_hex(tus: [CTU]) : String = uc_content_hex(ec_render_body(ec_sort_tus(tus, [])))
+
+fn ec_sort_tus(tus: [CTU], sorted: [CTU]) : [CTU] = match tus {
+  [] -> sorted
+  [t, ...rest] -> ec_sort_tus(rest, ec_insert_tu(t, sorted))
+}
+
+fn ec_insert_tu(t: CTU, sorted: [CTU]) : [CTU] = match sorted {
+  [] -> [t]
+  [h, ...rest] -> if string_lt(ec_stem(t), ec_stem(h)) { [t, h, ...rest] } else { [h, ...ec_insert_tu(t, rest)] }
+}
+
+# ---- pre-typing index -------------------------------------------------
+#
+# The entry key hashes the program's surface and so exists only after the
+# whole core was typed. Every other input of it forms a pre-key. A full
+# compile records which entry its pre-key and its variant produced, with a
+# digest of the entry's TUs: the variant is what of the program shapes the
+# core TUs. A later compile prunes the core only against a recorded entry
+# of its own variant, and a variant whose TUs digest differently across
+# full compiles is marked conflicting for good. A pre-key keeps at most
+# `ec_index_cap` variants, the newest first.
+
+#[doc("The pre-key of the core TU set: every input of the entry key except the program's surface.")]
+pub fn ec_pre_key(toolchain: String, edition: String, srcs_hex: String, inputs: String) : String =
+  uc_content_hex(concat_all([ec_format_tag(), "\nPRE\n", toolchain, "\n", edition, "\n", srcs_hex, "\n", inputs]))
+
+fn ec_index_path(dir: String, pre: String) : String = concat_all([dir, "/core-emit-pre-", pre])
+
+#[doc("How many variants one pre-key records.")]
+pub fn ec_index_cap() : Int = 8
+
+# A record line is `<variant> <content> <key>`, or `<variant> conflict`.
+fn ec_index_lines(dir: String, pre: String) : [String] / Console + File =
+  match read_file(ec_index_path(dir, pre)) {
+    Err(_) -> []
+    Ok(rec) -> filter(string_split(rec, "\n"), (l) => l != "")
+  }
+
+fn ec_line_fields(l: String) : [String] = string_split(l, " ")
+
+fn ec_line_variant(l: String) : String = match ec_line_fields(l) {
+  [v, ...rest] -> v
+  []           -> ""
+}
+
+#[doc("Whether `variant` has a record under `pre`.")]
+pub fn ec_index_has(dir: String, pre: String, variant: String) : Bool / Console + File =
+  match filter(ec_index_lines(dir, pre), (l) => ec_line_variant(l) == variant) { [] -> false  _ -> true }
+
+#[doc("Whether any non-conflicting variant is recorded under `pre`.")]
+pub fn ec_index_any(dir: String, pre: String) : Bool / Console + File =
+  match filter(ec_index_lines(dir, pre), (l) => list_length(ec_line_fields(l)) == 3) { [] -> false  _ -> true }
+
+#[doc("The entry key recorded under `pre` for `variant`, when the record is not conflicting and its entry still decodes.")]
+pub fn ec_index_pick(dir: String, pre: String, variant: String) : Option[String] / Console + File =
+  match filter(ec_index_lines(dir, pre), (l) => ec_line_variant(l) == variant) {
+    [l, ...more] -> match ec_line_fields(l) {
+      [_, _, key] -> match ec_lookup(dir, key) { Some(_) -> Some(key)  None -> None }
+      _ -> None
+    }
+    [] -> None
+  }
+
+#[doc("Record that a full compile under `pre` and `variant` produced the entry `key` whose TUs digest to `content`; a record of the variant with a different digest marks it as conflicting instead.")]
+pub fn ec_index_record(dir: String, pre: String, variant: String, key: String, content: String, stats: Bool) : Unit / Console + File =
+  if pre == "" { () } else {
+    let lines = ec_index_lines(dir, pre)
+    match filter(lines, (l) => ec_line_variant(l) == variant) {
+      [l, ...more] -> match ec_line_fields(l) {
+        [_, c, _] -> if c == content { () } else { ec_index_conflict(dir, pre, variant, lines, stats) }
+        _ -> ()
+      }
+      [] -> cache_publish(ec_index_path(dir, pre),
+              concat_all([string_join(ec_take([concat_all([variant, " ", content, " ", key]), ...lines], ec_index_cap()), "\n"), "\n"]))
+    }
+  }
+
+fn ec_take(xs: [String], n: Int) : [String] =
+  if n <= 0 { [] }
+  else {
+    match xs {
+      []           -> []
+      [h, ...rest] -> [h, ...ec_take(rest, n - 1)]
+    }
+  }
+
+fn ec_index_conflict(dir: String, pre: String, variant: String, lines: [String], stats: Bool) : Unit / Console + File = {
+  let _s = if stats { eprint("kaic2: core-emit-index: conflict, pruning disabled for this variant") } else { () }
+  cache_publish(ec_index_path(dir, pre),
+    concat_all([string_join(map(lines, (l) => if ec_line_variant(l) == variant { concat_all([variant, " conflict"]) } else { l }), "\n"), "\n"]))
+}
