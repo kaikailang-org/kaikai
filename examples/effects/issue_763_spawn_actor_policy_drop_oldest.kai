@@ -1,0 +1,37 @@
+# spawn_actor_policy installs its MailboxPolicy on the spawned actor's
+# mailbox: Bounded(2, DropOldest) there sheds the oldest messages.
+#
+# The overflow is forced, not timed: the consumer fills its OWN mailbox
+# before it reads, so no receive can drain a slot between the sends and
+# the result holds at any thread count. The producer prints only after
+# the ack, so the output order is fixed too.
+#
+#   push msg1 -> [msg1]          push msg2 -> [msg1, msg2]
+#   push msg3 -> [msg2, msg3]    push msg4 -> [msg3, msg4]
+#
+# Under spawn_actor's Unbounded default the consumer would print msg1
+# and msg2.
+
+import actor
+
+fn consumer_actor(parent: Pid[String]) : Unit / Actor[String] + Console = {
+  let me = Actor.self()
+  Actor.send(me, "msg1")
+  Actor.send(me, "msg2")
+  Actor.send(me, "msg3")
+  Actor.send(me, "msg4")
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Stdout.print("consumer: got " ++ Actor.receive())
+  Actor.send(parent, "ack")
+}
+
+fn producer() : Unit / Actor[String] + Spawn + Console = {
+  let me = Actor.self()
+  let _consumer = spawn_actor_policy(Bounded(2, DropOldest), () => consumer_actor(me))
+  Stdout.print("producer: got " ++ Actor.receive())
+}
+
+fn main() : Int / Spawn + Console = {
+  with_mailbox { producer() }
+  0
+}

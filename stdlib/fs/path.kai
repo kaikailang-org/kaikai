@@ -1,0 +1,9 @@
+#[doc("""
+Path helpers. Module path: `import fs.path`.
+
+The `path_*` helpers (`path_join`, `path_dirname`, `path_basename`,
+`path_ext`, `path_strip_ext`, `path_split`, `path_is_absolute`) live
+in `stdlib/path.kai`, which is auto-loaded so every program has them
+as flat names. Callers reach them as `path.join(a, b)` (qualified) or
+`path_join(a, b)` (flat); both resolve to the same implementation.
+""")]
