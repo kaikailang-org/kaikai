@@ -1,0 +1,726 @@
+#[doc("Which declarations and references reach a `pub` export, and the table it is checked against.")]
+
+# Declaration and expression reference enumeration for module-privacy
+# validation. `pa_decl_refs` yields every free name a declaration
+# references — value and type namespace, signature and body position —
+# so the privacy decision is made per symbol at a single point
+# (`validate_pub_access`), never per syntactic category. The matches
+# over `Decl`, `ExprKind`, `Stmt` and `PatKind` carry no catch-all arm
+# on purpose: a new AST form fails this file's compile until its
+# privacy story is decided.
+
+import compiler.util
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.modules_homes
+import compiler.handler_alias
+import compiler.written
+import compiler.chars
+import compiler.modules_segments
+import compiler.symtab
+
+type PaScope = { bound: [String], refs: [PaRef] }
+
+#[doc("Every free name referenced by `d`, in both namespaces and every syntactic position. Locals, pattern binders and type parameters are already excluded; qualified (dotted) references are excluded because the qualified resolver validates them.")]
+pub(pkg) fn pa_decl_refs(d: Decl) : [PaRef] / Console = match d {
+  DFn(_, _, tps, ps, ret, row, body, line, col, _) -> {
+    let a1 = par_params(ps, tps, pa_bound_refs(tps, line, col, []))
+    let a2 = par_opt_te(ret, tps, true, a1)
+    let a3 = par_row(row, tps, true, true, line, col, a2)
+    par_expr(body, fn_param_names(ps), tps, a3)
+  }
+  DAxiom(_, _, _, _, tps, ps, ret, row, line, col) -> {
+    let a1 = par_params(ps, tps, pa_bound_refs(tps, line, col, []))
+    par_row(row, tps, true, true, line, col, par_te(ret, tps, true, true, a1))
+  }
+  DConst(_, _, te, body, _, _, _) ->
+    par_expr(body, [], [], par_te(te, [], true, true, []))
+  DType(_, _, tps0, body, line, col, _, _) ->
+    par_typebody(body, tps0, line, col, [])
+  DEffect(_, _, tps0, ops, defblk, _, _, _) ->
+    par_default_opt(defblk, par_eops(ops, tps0, []))
+  DProtocol(_, _, tps0, ops, _, _, _) ->
+    par_pops(ops, tps0, [])
+  DImpl(proto, targs, target, subs, line, col, tps, _) -> {
+    let a1 = pa_bound_refs(tps, line, col, pa_head_ref(proto, line, col, []))
+    let a2 = par_te(target, tps, false, false, a1)
+    par_sub_decls(subs, par_te_list(targs, tps, false, false, a2))
+  }
+  DTest(_, body, _, _, _)  -> par_expr(body, [], [], [])
+  DBench(_, body, _, _, _) -> par_expr(body, [], [], [])
+  DCheck(_, ps, body, _, _, _) ->
+    par_expr(body, fn_param_names(ps), [], par_params(ps, [], []))
+  DUnit(_, _, ub, _, line, col, _) -> match ub {
+    UBAlias(u)   -> par_uexpr(u, [], true, true, line, col, [])
+    UBNone       -> []
+    UBMeasure(_) -> []
+  }
+  DUse(name, line, col) -> [pa_ref(name, true, false, false, line, col)]
+  DExternType(_, _, body, _, _, _) -> match body {
+    ETStruct(fs) -> par_fdecls(fs, [], [])
+    ETOpaque     -> []
+  }
+  DDerive(_, inner, _, _)    -> pa_decl_refs(inner)
+  DUnstable(inner, _, _)     -> pa_decl_refs(inner)
+  DConstructor(inner, _, _)  -> pa_decl_refs(inner)
+  DProtoLaws(_, inner, _, _, _) -> pa_decl_refs(inner)
+  DImplAxiom(_, inner, _, _, _) -> pa_decl_refs(inner)
+  DDoc(_, _, inner, _, _)    -> pa_decl_refs(inner)
+  DAttr(_, inner, _, _)      -> pa_decl_refs(inner)
+  DImport(_, _, _)       -> []
+  DModuleDoc(_, _, _, _) -> []
+  DUseKind(_, _, _, _)   -> []
+  DKind(_, _, _, _, _, _, _, _) -> []
+  DTheory(_, _, _, _, _)    -> []
+}
+
+fn par_sub_decls(ds: [Decl], acc: [PaRef]) : [PaRef] / Console = match ds {
+  [] -> acc
+  [d, ...rest] -> par_sub_decls(rest, list_append(pa_decl_refs(d), acc))
+}
+
+# ==== signature positions ====
+
+fn par_opt_te(t: Option[TypeExpr], tps: [TBinder], in_sig: Bool,
+      acc: [PaRef]) : [PaRef] = match t {
+  Some(te) -> par_te(te, tps, in_sig, in_sig, acc)
+  None     -> acc
+}
+
+fn par_params(ps: [Param], tps: [TBinder], acc: [PaRef]) : [PaRef] = match ps {
+  [] -> acc
+  [p, ...rest] -> par_params(rest, tps, par_opt_te(p.ptype, tps, true, acc))
+}
+
+fn par_params_body(ps: [Param], tps: [TBinder], acc: [PaRef]) : [PaRef] = match ps {
+  [] -> acc
+  [p, ...rest] -> par_params_body(rest, tps, par_opt_te(p.ptype, tps, false, acc))
+}
+
+fn par_typebody(b: TypeBody, tps: [TBinder], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match b {
+  TBAlias(te)  -> par_te(te, tps, true, true, acc)
+  TBRecord(fs) -> par_fdecls(fs, tps, acc)
+  TBSum(vs)    -> par_variants(vs, tps, acc)
+  TBEffectAlias(ls) -> par_row(RClosed(ls), [], true, true, line, col, acc)
+}
+
+# A `priv` field's type is still a cross-module reference, but it
+# never escapes to consumers — leakable clears.
+fn par_fdecls(fs: [FieldDecl], tps: [TBinder], acc: [PaRef]) : [PaRef] = match fs {
+  [] -> acc
+  [FD(is_pub_f, _, te, _), ...rest] ->
+    par_fdecls(rest, tps, par_te(te, tps, true, is_pub_f, acc))
+}
+
+fn par_variants(vs: [Variant], tps: [TBinder], acc: [PaRef]) : [PaRef] = match vs {
+  [] -> acc
+  [Var(_, tes), ...rest] -> par_variants(rest, tps, par_te_list(tes, tps, true, true, acc))
+}
+
+fn par_eops(ops: [EffectOp], tps: [TBinder], acc: [PaRef]) : [PaRef] = match ops {
+  [] -> acc
+  [EffOp(_, op_tps, ps, ret, _, _), ...rest] -> {
+    let local = list_append(tps, op_tps)
+    par_eops(rest, tps, par_te(ret, local, true, true, par_params(ps, local, acc)))
+  }
+}
+
+fn par_pops(ops: [ProtoOp], tps: [TBinder], acc: [PaRef]) : [PaRef] = match ops {
+  [] -> acc
+  [POp(_, op_tps, ps, ret, _, _), ...rest] -> {
+    let local = list_append(tps, op_tps)
+    par_pops(rest, tps, par_te(ret, local, true, true, par_params(ps, local, acc)))
+  }
+}
+
+fn par_default_opt(db: Option[DefaultBlock], acc: [PaRef]) : [PaRef] / Console =
+  match db {
+    Some(DBlk(clauses, ret, _, _)) ->
+      par_hreturn_opt(ret, [], [], par_hclauses(clauses, [], [], acc))
+    None -> acc
+  }
+
+# ==== expression / statement / pattern positions ====
+
+fn par_expr(e: Expr, locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match e.kind {
+  EName(w) ->
+    if list_has(locals, written_text(w)) or pa_dotted(written_text(w)) { acc }
+    else { [pa_ref(written_text(w), false, false, false, e.line, e.col), ...acc] }
+  # `locals` shadow a declaration, and a resolved reference is never
+  # one of them, so it is always a reference worth recording.
+  ESym(s, _) -> [pa_ref_sym(s, false, false, false, e.line, e.col), ...acc]
+  # A local read and a mark name no declaration, and a settled effect
+  # operation is the typer's, made after this check.
+  ELocal(_) -> acc
+  EMark(_) -> acc
+  EOp(_) -> acc
+  ECall(callee, args_) ->
+    par_exprs(args_, locals, tps, par_expr(callee, locals, tps, acc))
+  EField(obj, _)   -> par_expr(obj, locals, tps, acc)
+  EIndex(coll, ix) -> par_expr(ix, locals, tps, par_expr(coll, locals, tps, acc))
+  EBinop(_, l, r)  -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EUnop(_, x)      -> par_expr(x, locals, tps, acc)
+  EIf(c, t_, eo) ->
+    par_opt_expr(eo, locals, tps,
+      par_expr(t_, locals, tps, par_expr(c, locals, tps, acc)))
+  EMatch(scr, arms) -> par_arms(arms, locals, tps, par_expr(scr, locals, tps, acc))
+  ELambda(ps, body) ->
+    par_expr(body, list_append(locals, fn_param_names(ps)), tps,
+      par_params_body(ps, tps, acc))
+  ERecordLit(r, fis) -> par_fis(fis, locals, tps, pa_record_ref(r, tps, e.line, e.col, acc))
+  EList(els) -> par_elems(els, locals, tps, acc)
+  ERange(lo, hi, stp) ->
+    par_opt_expr(stp, locals, tps,
+      par_expr(hi, locals, tps, par_expr(lo, locals, tps, acc)))
+  EBlock(stmts, tail) -> {
+    let sc = par_stmts(stmts, locals, tps, acc)
+    par_opt_expr(tail, sc.bound, tps, sc.refs)
+  }
+  EPipe(l, r)        -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EDispatchPipe(_, l, r) -> par_expr(r, locals, tps, par_expr(l, locals, tps, acc))
+  EBang(inner)       -> par_expr(inner, locals, tps, acc)
+  ELitUnit(inner, u) ->
+    par_uexpr(u, tps, false, false, e.line, e.col,
+      par_expr(inner, locals, tps, acc))
+  EHandle(body, eff, tyargs, init_opt, alias_opt, clauses, ret_opt) ->
+    par_handle(body, eff, tyargs, init_opt, alias_opt, clauses, ret_opt,
+      locals, tps, e.line, e.col, acc)
+  EVariantsOf(te, _) -> par_te(te, tps, false, false, acc)
+  EIntrinsic(_, args_) -> par_exprs(args_, locals, tps, acc)
+  EStr(_, _) -> acc
+  # Surface-fidelity wrappers are dissolved by `surface_lower_decls`
+  # before validation; walk their children in case one ever survives.
+  ESurface(sf) -> par_exprs(surface_children(sf), locals, tps, acc)
+  # Qualified calls: the qualified resolver validated the export.
+  EModCall(_, _) -> acc
+  EInt(_, _) -> acc
+  EReal(_, _) -> acc
+  EFixed(_, _) -> acc
+  EIntLit(_) -> acc
+  EDecimalLit(_) -> acc
+  EBool(_) -> acc
+  EChar(_) -> acc
+  EUnit -> acc
+  EUnder -> acc
+  EPlaceholder -> acc
+  EHole(_) -> acc
+  ETodo(_) -> acc
+  EExternBody(_, _) -> acc
+}
+
+fn par_opt_expr(o: Option[Expr], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match o {
+  Some(e) -> par_expr(e, locals, tps, acc)
+  None    -> acc
+}
+
+fn par_exprs(xs: [Expr], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match xs {
+  [] -> acc
+  [x, ...rest] -> par_exprs(rest, locals, tps, par_expr(x, locals, tps, acc))
+}
+
+# A record literal's head: a settled one is checked on its declaration,
+# a written one on its name.
+fn pa_record_ref(r: DeclRef, tps: [TBinder], line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)        -> [pa_ref_sym(s, true, false, false, line, col), ...acc]
+  DrWritten(_, n) ->
+    if written_text(n) == "" or pa_dotted(written_text(n)) { acc }
+    else { [pa_ref(written_text(n), true, false, false, line, col), ...acc] }
+}
+
+# A handler or impl head. A qualified one was gated by the qualified resolver.
+fn pa_head_ref(r: DeclRef, line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)              -> [pa_ref_sym(s, true, false, false, line, col), ...acc]
+  DrWritten(Some(_), _) -> acc
+  DrWritten(None, n)    ->
+    if pa_dotted(written_text(n)) { acc }
+    else { [pa_ref(written_text(n), true, false, false, line, col), ...acc] }
+}
+
+fn par_handle(body: Expr, eff: DeclRef, tyargs: [TypeExpr],
+      init_opt: Option[Expr], alias_opt: Option[Binder],
+      clauses: [HClause], ret_opt: Option[HReturn],
+      locals: [String], tps: [TBinder], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] / Console = {
+  let a1 = pa_head_ref(eff, line, col, acc)
+  let a2 = par_opt_expr(init_opt, locals, tps,
+      par_te_list(tyargs, tps, false, false, a1))
+  let inner = match alias_opt { Some(a) -> [written_text(a.name), ...locals] None -> locals }
+  # A stateful handler's clauses read its state aliases; one an enclosing
+  # binding takes over names something this file may use.
+  let in_clause = list_append(handle_live_aliases(init_opt, inner), inner)
+  let a3 = par_hclauses(clauses, in_clause, tps, par_expr(body, inner, tps, a2))
+  par_hreturn_opt(ret_opt, in_clause, tps, a3)
+}
+
+fn par_arms(arms: [Arm], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match arms {
+  [] -> acc
+  [Arm(pat, guard, body), ...rest] -> {
+    let inner = pat_binder_names(pat, locals)
+    let a1 = par_opt_expr(guard, inner, tps, par_pat(pat, locals, tps, acc))
+    par_arms(rest, locals, tps, par_expr(body, inner, tps, a1))
+  }
+}
+
+fn pa_pat_ref(r: DeclRef, line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrSym(s)        -> [pa_ref_sym(s, false, false, false, line, col), ...acc]
+  DrWritten(_, n) ->
+    if pa_dotted(written_text(n)) { acc }
+    else { [pa_ref(written_text(n), false, false, false, line, col), ...acc] }
+}
+
+fn par_pat(p: Pattern, locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match p.pkind {
+  PWild    -> acc
+  PBind(_) -> acc
+  PHole(_) -> acc
+  PLit(e)  -> par_expr(e, locals, tps, acc)
+  PRange(lo, hi) -> par_expr(hi, locals, tps, par_expr(lo, locals, tps, acc))
+  PList(subs, _) -> par_pats(subs, locals, tps, acc)
+  PVariant(r, subs) ->
+    par_pats(subs, locals, tps, pa_pat_ref(r, p.line, p.col, acc))
+  PVariantRecord(r, pfs) ->
+    par_pfields(pfs, locals, tps, pa_pat_ref(r, p.line, p.col, acc))
+  PRecord(pfs)   -> par_pfields(pfs, locals, tps, acc)
+  PAs(_, inner)  -> par_pat(inner, locals, tps, acc)
+  PNarrow(_, te) -> par_te(te, tps, false, false, acc)
+  PSurface(sp)   -> par_pats(patsurface_children(sp), locals, tps, acc)
+}
+
+fn par_pats(ps: [Pattern], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match ps {
+  [] -> acc
+  [p, ...rest] -> par_pats(rest, locals, tps, par_pat(p, locals, tps, acc))
+}
+
+fn par_pfields(pfs: [PField], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match pfs {
+  [] -> acc
+  [PField(_, sub, _), ...rest] ->
+    par_pfields(rest, locals, tps, par_pat(sub, locals, tps, acc))
+}
+
+fn par_fis(fis: [FieldInit], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match fis {
+  [] -> acc
+  [FI(_, v), ...rest] -> par_fis(rest, locals, tps, par_expr(v, locals, tps, acc))
+}
+
+fn par_elems(els: [ListElem], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match els {
+  [] -> acc
+  [el, ...rest] -> {
+    let a1 = match el {
+      ElPlain(x)  -> par_expr(x, locals, tps, acc)
+      ElSpread(x) -> par_expr(x, locals, tps, acc)
+    }
+    par_elems(rest, locals, tps, a1)
+  }
+}
+
+fn par_stmts(stmts: [Stmt], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : PaScope / Console = match stmts {
+  [] -> PaScope { bound: locals, refs: acc }
+  [s, ...rest] -> {
+    let sc = par_stmt(s, locals, tps, acc)
+    par_stmts(rest, sc.bound, tps, sc.refs)
+  }
+}
+
+fn pa_scope(bound: [String], refs: [PaRef]) : PaScope =
+  PaScope { bound: bound, refs: refs }
+
+fn par_stmt(s: Stmt, locals: [String], tps: [TBinder],
+      acc: [PaRef]) : PaScope / Console = match s {
+  SLet(pat, tyo, e) -> {
+    let a1 = par_opt_annot(tyo, tps, acc)
+    pa_scope(pat_binder_names(pat, locals),
+      par_expr(e, locals, tps, par_pat(pat, locals, tps, a1)))
+  }
+  SVar(b, tyo, init, _, _) ->
+    pa_scope([written_text(b.name), ...locals],
+      par_expr(init, locals, tps, par_opt_annot(tyo, tps, acc)))
+  SAssert(cond, msgo) ->
+    pa_scope(locals, par_opt_expr(msgo, locals, tps,
+      par_expr(cond, locals, tps, acc)))
+  SExprStmt(e) -> pa_scope(locals, par_expr(e, locals, tps, acc))
+  SIndexAssign(obj, ix, v, _, _) ->
+    pa_scope(locals,
+      par_expr(v, locals, tps,
+      par_expr(ix, locals, tps,
+      par_expr(obj, locals, tps, acc))))
+  SAssign(lhs, v, _, _) ->
+    pa_scope(locals, par_expr(v, locals, tps, par_expr(lhs, locals, tps, acc)))
+  SUse(name, line, col) ->
+    pa_scope(locals,
+      if pa_dotted(name) { acc }
+      else { [pa_ref(name, true, false, false, line, col), ...acc] })
+}
+
+fn par_opt_annot(tyo: Option[TypeExpr], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] = match tyo {
+  Some(te) -> par_te(te, tps, false, false, acc)
+  None     -> acc
+}
+
+fn par_hclauses(cs: [HClause], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match cs {
+  [] -> acc
+  [HC(_, ps, body, _, _), ...rest] ->
+    par_hclauses(rest, locals, tps,
+      par_expr(body, list_append(locals, fn_param_names(ps)),
+      tps, acc))
+}
+
+fn par_hreturn_opt(r: Option[HReturn], locals: [String], tps: [TBinder],
+      acc: [PaRef]) : [PaRef] / Console = match r {
+  Some(HR(b, body, _, _)) -> par_expr(body, [written_text(b.name), ...locals], tps, acc)
+  None -> acc
+}
+
+# Type-level reference enumeration for module-privacy validation:
+# the `PaRef` shape plus the walks over `TyKind`, `RowExpr` and
+# `UnitExprT`. The declaration and expression walks build on these in
+# `pub_access_decl.kai`; the decision point consuming the refs is
+# `validate_pub_access` in `pub_access.kai`. Matches carry no
+# catch-all arm on purpose: a new AST form fails this file's compile
+# until its privacy story is decided.
+
+#[doc("What a reference names: the bare name the source wrote, or the declaration a scope pass settled it to.")]
+pub(pkg) type PaName = PnWritten(String) | PnSym(SymId)
+
+#[doc("""
+One free-name reference found in a declaration.
+
+`is_ty` selects the namespace the privacy table resolves the name in;
+`in_sig` marks references that belong to the declaration's exported
+surface (params, return, row, type body); `leakable` clears for
+surface positions invisible to consumers (a `priv` field's type),
+which the pub-signature leak rule skips.
+""")]
+pub(pkg) type PaRef = { name: PaName, is_ty: Bool, in_sig: Bool,
+      leakable: Bool, line: Int, col: Int }
+
+fn pa_ref(name: String, is_ty: Bool, in_sig: Bool, leakable: Bool,
+      line: Int, col: Int) : PaRef =
+  PaRef { name: PnWritten(name), is_ty: is_ty, in_sig: in_sig, leakable: leakable,
+      line: line, col: col }
+
+fn pa_ref_sym(s: SymId, is_ty: Bool, in_sig: Bool, leakable: Bool,
+      line: Int, col: Int) : PaRef =
+  PaRef { name: PnSym(s), is_ty: is_ty, in_sig: in_sig, leakable: leakable,
+      line: line, col: col }
+
+fn pa_dotted(n: String) : Bool = pa_dotted_loop(n, 0, string_length(n))
+
+fn pa_dotted_loop(n: String, i: Int, len: Int) : Bool =
+  if i >= len { false }
+  else if string_slice(n, i, 1) == "." { true }
+  else { pa_dotted_loop(n, i + 1, len) }
+
+# A bound (`T: Sneaky`) references the protocol.
+fn pa_bound_refs(tps0: [TBinder], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match tps0 {
+  [] -> acc
+  [t, ...rest] -> pa_bound_refs(rest, line, col, pa_bound_names(t.bounds, line, col, acc))
+}
+
+#[doc("Type-namespace refs for a list of protocol bounds.")]
+pub(pkg) fn pa_bound_names(bs: [DeclRef], line: Int, col: Int,
+      acc: [PaRef]) : [PaRef] = match bs {
+  [] -> acc
+  [DrSym(s), ...rest] -> pa_bound_names(rest, line, col,
+      [pa_ref_sym(s, true, true, true, line, col), ...acc])
+  [DrWritten(_, n), ...rest] -> pa_bound_names(rest, line, col,
+      [pa_ref(written_text(n), true, true, true, line, col), ...acc])
+}
+
+fn pa_te_name(n: String, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] =
+  if pa_dotted(n) { acc }
+  else { [pa_ref(n, true, in_sig, leakable, line, col), ...acc] }
+
+# A lowercase name still written in type position is one no signature
+# bound, never a reference to a global symbol. Unit symbols and row
+# labels resolve nominally and do not take this rule.
+fn pa_ty_ref(n: String, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] =
+  if pa_lower_start(n) { acc }
+  else { pa_te_name(n, tps, in_sig, leakable, line, col, acc) }
+
+fn pa_lower_start(n: String) : Bool = match char_at(n, 0) {
+  Some(c) -> ch_is_lower(c)
+  None -> false
+}
+
+# A type head: a settled one is checked on its declaration, a written
+# one on its name.
+fn pa_ty_head(r: DeclRef, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrWritten(_, n) -> pa_ty_ref(written_text(n), tps, in_sig, leakable, line, col, acc)
+  DrSym(s)        -> [pa_ref_sym(s, true, in_sig, leakable, line, col), ...acc]
+}
+
+# A row label. A qualified one was gated by the qualified resolver.
+fn pa_label_ref(r: DeclRef, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match r {
+  DrWritten(None, n)    -> pa_te_name(written_text(n), tps, in_sig, leakable, line, col, acc)
+  DrWritten(Some(_), _) -> acc
+  DrSym(s)              -> [pa_ref_sym(s, true, in_sig, leakable, line, col), ...acc]
+}
+
+fn par_te(te: TypeExpr, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      acc: [PaRef]) : [PaRef] = match te.tkind {
+  TyName(r, targs) ->
+    par_te_list(targs, tps, in_sig, leakable,
+      pa_ty_head(r, tps, in_sig, leakable, te.line, te.col, acc))
+  TyList(inner) -> par_te(inner, tps, in_sig, leakable, acc)
+  TyFn(ps, ret, row) -> {
+    let a1 = par_te_list(ps, tps, in_sig, leakable, acc)
+    let a2 = par_te(ret, tps, in_sig, leakable, a1)
+    par_row(row, tps, in_sig, leakable, te.line, te.col, a2)
+  }
+  TyDim(base, u) -> {
+    let a1 = par_te(base, tps, in_sig, leakable, acc)
+    par_uexpr(u, tps, in_sig, leakable, te.line, te.col, a1)
+  }
+  # The refinement predicate is an expression over `self`, checked by
+  # the refinement pipeline; only the base type is a name reference.
+  TyRefine(base, _) -> par_te(base, tps, in_sig, leakable, acc)
+  TyRow(row) -> par_row(row, tps, in_sig, leakable, te.line, te.col, acc)
+  TySurface(ts) -> par_te_list(tysurface_children(ts), tps, in_sig, leakable, acc)
+  TyParam(_, targs) -> par_te_list(targs, tps, in_sig, leakable, acc)
+}
+
+fn par_te_list(ts: [TypeExpr], tps: [TBinder], in_sig: Bool, leakable: Bool,
+      acc: [PaRef]) : [PaRef] = match ts {
+  [] -> acc
+  [t, ...rest] -> par_te_list(rest, tps, in_sig, leakable,
+      par_te(t, tps, in_sig, leakable, acc))
+}
+
+fn par_row(row: RowExpr, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match row {
+  REmpty -> acc
+  RClosed(ls)  -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
+  ROpen(_, ls) -> par_row_labels(ls, tps, in_sig, leakable, line, col, acc)
+}
+
+fn par_row_labels(ls: [RowLabel], tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match ls {
+  [] -> acc
+  [RL(r, targs), ...rest] ->
+    par_row_labels(rest, tps, in_sig, leakable, line, col,
+      par_te_list(targs, tps, in_sig, leakable,
+      pa_label_ref(r, tps, in_sig, leakable, line, col, acc)))
+}
+
+fn par_uexpr(u: UnitExprT, tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match u {
+  UOne    -> acc
+  UVar(_) -> acc
+  USym(s) -> pa_te_name(s, tps, in_sig, leakable, line, col, acc)
+  UMul(a, b)  -> par_uexpr(b, tps, in_sig, leakable, line, col,
+      par_uexpr(a, tps, in_sig, leakable, line, col, acc))
+  UInv(a)     -> par_uexpr(a, tps, in_sig, leakable, line, col, acc)
+  UPow(a, _)  -> par_uexpr(a, tps, in_sig, leakable, line, col, acc)
+  UJoin(a, b) -> par_uexpr(b, tps, in_sig, leakable, line, col,
+      par_uexpr(a, tps, in_sig, leakable, line, col, acc))
+  UDims(us)   -> par_uexprs(us, tps, in_sig, leakable, line, col, acc)
+  UParam(_)   -> acc
+}
+
+fn par_uexprs(us: [UnitExprT], tps: [TBinder], in_sig: Bool, leakable: Bool,
+      line: Int, col: Int, acc: [PaRef]) : [PaRef] = match us {
+  [] -> acc
+  [u, ...rest] -> par_uexprs(rest, tps, in_sig, leakable, line, col,
+      par_uexpr(u, tps, in_sig, leakable, line, col, acc))
+}
+
+# The privacy table: every top-level symbol with its home module,
+# `pub`-ness, namespace and kind word, collected from the per-module
+# decl segments. Consumed by the decision point in `pub_access.kai`.
+
+#[doc("""
+One privacy-table entry: a top-level symbol, its home module, its
+`pub`-ness, its namespace and its kind word.
+
+A name in type position must never resolve against a value entry:
+implicitly-bound type variables fall through to the table and would
+match a same-named `fn` of another module.
+""")]
+pub(pkg) type PaEntry = { name: String, home: String, is_pub: Bool,
+      is_ty: Bool, kind: PaKind }
+
+#[doc("What a privacy-table entry declares.")]
+pub(pkg) type PaKind = PkFn | PkConst | PkType | PkEffect | PkProtocol | PkUnit
+  | PkCtor | PkOp | PkMethod
+
+#[doc("The word a diagnostic names an entry's kind by.")]
+pub(pkg) fn pa_kind_word(k: PaKind) : String = match k {
+  PkFn       -> "fn"
+  PkConst    -> "const"
+  PkType     -> "type"
+  PkEffect   -> "effect"
+  PkProtocol -> "protocol"
+  PkUnit     -> "unit"
+  PkCtor     -> "ctor"
+  PkOp       -> "op"
+  PkMethod   -> "method"
+}
+
+type PaProtoVis = PPV(String, Bool)
+
+#[doc("The privacy table for the given segments, in source order.")]
+pub(pkg) fn pa_table(segs: [CoreSegment], tab: SymTab) : [PaEntry] =
+  list_reverse(pa_entries_segs(segs, tab, pa_protos_segs(segs, tab, []), []))
+
+# ==== table ====
+
+fn pa_protos_segs(segs: [CoreSegment], tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] =
+  match segs {
+    [] -> acc
+    [PSeg(_, ds), ...rest] -> pa_protos_segs(rest, tab, pa_protos_decls(ds, tab, acc))
+  }
+
+fn pa_protos_decls(ds: [Decl], tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] = match ds {
+  [] -> acc
+  [d, ...rest] -> pa_protos_decls(rest, tab, pa_proto_one(d, tab, acc))
+}
+
+fn pa_proto_one(d: Decl, tab: SymTab, acc: [PaProtoVis]) : [PaProtoVis] = match d {
+  DProtocol(is_pub, s, _, _, _, _, _) -> [PPV(pa_name(tab, s), is_pub), ...acc]
+  DDerive(_, inner, _, _)    -> pa_proto_one(inner, tab, acc)
+  DUnstable(inner, _, _)     -> pa_proto_one(inner, tab, acc)
+  DProtoLaws(_, inner, _, _, _) -> pa_proto_one(inner, tab, acc)
+  DImplAxiom(_, inner, _, _, _) -> pa_proto_one(inner, tab, acc)
+  DConstructor(inner, _, _)  -> pa_proto_one(inner, tab, acc)
+  DDoc(_, _, inner, _, _)    -> pa_proto_one(inner, tab, acc)
+  _ -> acc
+}
+
+# The name the table keys a declaration by: the one it was written with.
+fn pa_name(tab: SymTab, s: SymId) : String = written_text(sym_name(tab, s))
+
+# `pub` wins across same-name protocols; an unknown protocol keeps
+# its impl methods visible (the impl itself is diagnosed separately).
+fn pa_proto_pub(protos: [PaProtoVis], name: String) : Bool =
+  pa_proto_pub_loop(protos, name, true, false)
+
+fn pa_proto_pub_loop(protos: [PaProtoVis], name: String,
+      verdict: Bool, seen: Bool) : Bool = match protos {
+  [] -> if seen { verdict } else { true }
+  [PPV(n, is_pub), ...rest] ->
+    if n != name { pa_proto_pub_loop(rest, name, verdict, seen) }
+    else if is_pub { true }
+    else { pa_proto_pub_loop(rest, name, false, true) }
+}
+
+fn pa_entries_segs(segs: [CoreSegment], tab: SymTab, protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match segs {
+  [] -> acc
+  [PSeg(mod_name, ds), ...rest] ->
+    pa_entries_segs(rest, tab, protos, pa_entries_decls(ds, tab, mod_name, protos, acc))
+}
+
+fn pa_entries_decls(ds: [Decl], tab: SymTab, home: String, protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match ds {
+  [] -> acc
+  [d, ...rest] -> pa_entries_decls(rest, tab, home, protos,
+      pa_entry_one(d, tab, home, protos, acc))
+}
+
+fn pa_entry(name: String, home: String, is_pub: Bool, is_ty: Bool,
+      kind: PaKind) : PaEntry =
+  PaEntry { name: name, home: home, is_pub: is_pub, is_ty: is_ty, kind: kind }
+
+fn pa_entry_one(d: Decl, tab: SymTab, home: String, protos: [PaProtoVis],
+      acc: [PaEntry]) : [PaEntry] = match d {
+  DFn(is_pub, fid, _, _, _, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, fnid_sym(fid)), home, is_pub, false, PkFn), ...acc]
+  DAxiom(is_pub, _, name, _, _, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, false, PkFn), ...acc]
+  DConst(is_pub, s, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, s), home, is_pub, false, PkConst), ...acc]
+  # A sum type's variant ctors share the type's `pub`-ness. Ctors sit
+  # in both namespaces (`Some(x)` in expressions, reachable through
+  # the type in signatures) — registered as type entries so both
+  # resolution modes see them.
+  DType(is_pub, s, _, body, _, _, _, _) ->
+    pa_type_entries(tab, s, body, home, is_pub, acc)
+  DExternType(is_pub, name, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, true, PkType), ...acc]
+  DEffect(is_pub, s, _, _, _, _, _, _) ->
+    [pa_entry(pa_name(tab, s), home, is_pub, true, PkEffect), ...acc]
+  # Protocol ops are callable by bare name through the dispatcher, so
+  # each op is a value entry carrying the protocol's `pub`-ness.
+  DProtocol(is_pub, s, _, ops, _, _, _) ->
+    pa_op_entries(ops, home, is_pub,
+      [pa_entry(pa_name(tab, s), home, is_pub, true, PkProtocol), ...acc])
+  DUnit(is_pub, name, _, _, _, _, _) ->
+    [pa_entry(name, home, is_pub, true, PkUnit), ...acc]
+  # Impl methods dispatch cross-module through the protocol; they are
+  # as visible as the protocol they implement.
+  DImpl(proto, _, _, subs, _, _, _, _) ->
+    pa_method_entries(subs, tab, home, pa_impl_pub(protos, tab, proto), acc)
+  DDerive(_, inner, _, _)    -> pa_entry_one(inner, tab, home, protos, acc)
+  DUnstable(inner, _, _)     -> pa_entry_one(inner, tab, home, protos, acc)
+  DProtoLaws(_, inner, _, _, _) -> pa_entry_one(inner, tab, home, protos, acc)
+  DImplAxiom(_, inner, _, _, _) -> pa_entry_one(inner, tab, home, protos, acc)
+  DConstructor(inner, _, _)  -> pa_entry_one(inner, tab, home, protos, acc)
+  DDoc(_, _, inner, _, _)    -> pa_entry_one(inner, tab, home, protos, acc)
+  _ -> acc
+}
+
+# The protocol an impl names: a settled head answers for its declaration,
+# a bare one by name, and a qualified one keeps its methods visible.
+fn pa_impl_pub(protos: [PaProtoVis], tab: SymTab, proto: DeclRef) : Bool = match proto {
+  DrSym(s)              -> not st_valid(tab, s) or sym_exported(tab, s)
+  DrWritten(Some(_), _) -> true
+  DrWritten(None, n)    -> pa_proto_pub(protos, written_text(n))
+}
+
+fn pa_type_entries(tab: SymTab, s: SymId, body: TypeBody, home: String,
+      is_pub: Bool, acc: [PaEntry]) : [PaEntry] = {
+  let a1 = [pa_entry(pa_name(tab, s), home, is_pub, true, PkType), ...acc]
+  match body {
+    TBSum(vs) -> pa_ctor_entries(vs, tab, home, is_pub, a1)
+    _ -> a1
+  }
+}
+
+fn pa_ctor_entries(vs: [Variant], tab: SymTab, home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match vs {
+  [] -> acc
+  [Var(c, _), ...rest] ->
+    pa_ctor_entries(rest, tab, home, is_pub,
+      [pa_entry(pa_name(tab, c), home, is_pub, true, PkCtor), ...acc])
+}
+
+fn pa_op_entries(ops: [ProtoOp], home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match ops {
+  [] -> acc
+  [POp(name, _, _, _, _, _), ...rest] ->
+    pa_op_entries(rest, home, is_pub,
+      [pa_entry(name, home, is_pub, false, PkOp), ...acc])
+}
+
+fn pa_method_entries(ms: [Decl], tab: SymTab, home: String, is_pub: Bool,
+      acc: [PaEntry]) : [PaEntry] = match ms {
+  [] -> acc
+  [m, ...rest] -> match m {
+    DFn(_, fid, _, _, _, _, _, _, _, _) ->
+      pa_method_entries(rest, tab, home, is_pub,
+      [pa_entry(pa_name(tab, fnid_sym(fid)), home, is_pub, false, PkMethod), ...acc])
+    _ -> pa_method_entries(rest, tab, home, is_pub, acc)
+  }
+}

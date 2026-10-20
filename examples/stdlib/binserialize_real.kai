@@ -1,0 +1,27 @@
+# Round-trips a record carrying a Real through its derived codec.
+
+#[derive(BinSerialize)]
+type Sample = { id: Int, value: Real }
+
+fn show_sample(s: Sample) : String =
+  string_concat(
+    string_concat("id=", int_to_string(s.id)),
+    string_concat(" value=", real_to_string(s.value)))
+
+fn round(s: Sample) : Unit / Stdout = {
+  let bs = to_bytes(s)
+  match sample_from_bytes(bs, 0) {
+    Ok(r)  -> {
+      print(show_sample(r.value))
+      print(int_to_string(r.pos))
+    }
+    Err(m) -> print(m)
+  }
+}
+
+fn main() : Int {
+  round(Sample { id: 1, value: 3.14 })
+  round(Sample { id: 2, value: 0.0 })
+  round(Sample { id: 3, value: -1.5 })
+  0
+}
