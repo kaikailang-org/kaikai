@@ -1,0 +1,482 @@
+# compiler/doc_attr.kai — `#[doc("...")]` documentation attribute
+# support (issue #681, Phase 1).
+#
+# The parser wraps a documented declaration in `DDoc` and a
+# module-position doc in `DModuleDoc` (see compiler/ast.kai). This
+# module owns everything that happens to those wrappers after parse:
+#
+# - doc_unquote / doc_text_normalize — turn the raw string-literal
+#   span into the canonical doc text (quotes off, surrounding
+#   whitespace stripped, internal newlines preserved, escapes kept
+#   verbatim — doc bodies are CommonMark, not kaikai strings).
+# - doc_strip_collect / doc_strip_all — single post-parse walk that
+#   strips `DDoc` wrappers into a `DocItem` side table, resolves the
+#   module doc, drops `theory` / `kind` catalog decls, and rejects a
+#   second module-position `#[doc(...)]` with a typed error at the
+#   second occurrence. After this pass no pipeline stage beyond the
+#   formatter ever sees a doc wrapper or a catalog decl.
+# - doc_module_doc_text — the helper the typer entry points use to
+#   lift the root file's module doc into `TypedProgram.module_doc`.
+# - doc_for_line — "surrounding declaration" lookup for --holes-json:
+#   the closest item at or above a source line.
+# - doc_item_json / doc_module_json / doc_builtins_json — stable JSON
+#   rendering for `--doc-json` and `kai info builtins --json`.
+#
+# Cross-module dependencies: ast (Decl shapes), diag (typed errors),
+# util (string helpers + JSON escaping), symtab / decl_text (the names
+# the declarations carry by id). No parse / infer import —
+# parse.kai and infer.kai both import THIS module, so it stays a leaf.
+#
+# Single-line `#[doc(...)]` only in this file — kaic1 consumes the
+# concatenated bundle and treats `#[...]` as a line comment, so
+# triple-quoted attribute bodies are off-limits inside stage2/.
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.kinds
+import compiler.written
+import compiler.decl_names
+import compiler.symtab
+import compiler.decl_text
+import compiler.tbinder
+
+# ---- doc text helpers ----
+
+#[doc("Strip the surrounding quotes from a raw string-literal span (single or triple).")]
+pub fn doc_unquote(span: String) : String {
+  let n = string_length(span)
+  if n >= 6 and string_slice(span, 0, 3) == "\"\"\"" {
+    string_slice(span, 3, n - 6)
+  } else if n >= 2 {
+    string_slice(span, 1, n - 2)
+  } else { span }
+}
+
+fn doc_is_ws(c: Char) : Bool {
+  match c {
+    ' '  -> true
+    '\t' -> true
+    '\n' -> true
+    '\r' -> true
+    _    -> false
+  }
+}
+
+fn doc_trim_start(s: String, i: Int, n: Int) : Int {
+  if i >= n { i }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if doc_is_ws(c) { doc_trim_start(s, i + 1, n) } else { i }
+      None -> i
+    }
+  }
+}
+
+fn doc_trim_end(s: String, j: Int) : Int {
+  if j <= 0 { j }
+  else {
+    match char_at(s, j - 1) {
+      Some(c) -> if doc_is_ws(c) { doc_trim_end(s, j - 1) } else { j }
+      None -> j
+    }
+  }
+}
+
+#[doc("Normalise a doc body: strip surrounding whitespace, preserve internal newlines.")]
+pub fn doc_text_normalize(s: String) : String {
+  let n = string_length(s)
+  let i = doc_trim_start(s, 0, n)
+  let j = doc_trim_end(s, n)
+  if i >= j { "" } else { string_slice(s, i, j - i) }
+}
+
+# ---- side table ----
+
+#[doc("What a doc item shows of its declaration: the id or the text that names it and the pieces of its signature, never its body.")]
+pub type DocHead
+  = DocDecl(SymId)
+  | DocFn(SymId, [Param], Option[TypeExpr], RowExpr)
+  | DocAxiom(String)
+  # The protocol, the target and the members in order.
+  | DocImpl(DeclRef, TypeExpr, [DocHead])
+  # An impl member that is not a bare `fn`: it renders as nothing.
+  | DocOpaque
+
+# One top-level named declaration, documented or not. Undocumented
+# items still get an entry (doc: None) so doc_for_line can use them
+# as boundaries and the JSON dumps can report coverage. The name and
+# the signature are spelled from `head`, through the symbol table,
+# where the JSON is rendered.
+pub type DocItem = { kind: String, line: Int, is_pub: Bool, doc: Option[String], head: DocHead }
+
+# Result of the post-parse strip walk.
+pub type DocStrip = { decls: [Decl], module_doc: Option[String], items: [DocItem], errs: Int, diags: [Diagnostic] }
+
+#[doc("DocItem for a named declaration, seeing through DUnstable / DDerive / DDoc wrappers. None for unnamed decls (tests, imports...).")]
+pub fn doc_item_of(d: Decl, doc: Option[String]) : Option[DocItem] {
+  match d {
+    DFn(p, f, _, ps, rt, ef, _, ln, _, _)  -> Some(doc_item(p, "fn", ln, doc, DocFn(fnid_sym(f), ps, rt, ef)))
+    DType(p, s, _, _, ln, _, _, _)         -> Some(doc_item(p, "type", ln, doc, DocDecl(s)))
+    DEffect(p, s, _, _, _, ln, _, _)       -> Some(doc_item(p, "effect", ln, doc, DocDecl(s)))
+    DProtocol(p, s, _, _, ln, _, _)        -> Some(doc_item(p, "protocol", ln, doc, DocDecl(s)))
+    DAxiom(p, _, nm, _, _, _, _, _, ln, _) -> Some(doc_item(p, "axiom", ln, doc, DocAxiom(nm)))
+    DConst(p, s, _, _, _, ln, _)           -> Some(doc_item(p, "const", ln, doc, DocDecl(s)))
+    DImpl(proto, _, target, ms, ln, _, _, _) -> Some(doc_item(true, "impl", ln, doc, DocImpl(proto, target, map(ms, doc_method_head))))
+    DUnstable(inner, _, _)                 -> doc_item_of(inner, doc)
+    DProtoLaws(_, inner, _, _, _)             -> doc_item_of(inner, doc)
+    DImplAxiom(_, inner, _, _, _)             -> doc_item_of(inner, doc)
+    DConstructor(inner, _, _)              -> doc_item_of(inner, doc)
+    DDerive(_, inner, _, _)                -> doc_item_of(inner, doc)
+    DDoc(_, _, inner, _, _)                -> doc_item_of(inner, doc)
+    DAttr(_, inner, _, _)                  -> doc_item_of(inner, doc)
+    _ -> None
+  }
+}
+
+fn doc_method_head(d: Decl) : DocHead =
+  match d {
+    DFn(_, f, _, ps, rt, ef, _, _, _, _) -> DocFn(fnid_sym(f), ps, rt, ef)
+    _ -> DocOpaque
+  }
+
+fn doc_item(is_pub: Bool, kind: String, line: Int, doc: Option[String], head: DocHead) : DocItem =
+  DocItem { kind: kind, line: line, is_pub: is_pub, doc: doc, head: head }
+
+fn doc_sym_text(tab: SymTab, s: SymId) : String = written_text(decl_name(tab, s))
+
+# A reference as the source spells it, or the name of the declaration
+# it resolved to.
+fn doc_ref_text(r: DeclRef, tab: SymTab) : String = match r {
+  DrWritten(None, n)    -> written_text(n)
+  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
+  DrSym(s)              -> doc_sym_text(tab, s)
+}
+
+fn doc_head_name(h: DocHead, tab: SymTab) : String =
+  match h {
+    DocDecl(s)                -> doc_sym_text(tab, s)
+    DocFn(s, _, _, _)         -> doc_sym_text(tab, s)
+    DocAxiom(nm)              -> nm
+    DocImpl(proto, target, _) -> doc_impl_name(doc_ref_text(proto, tab), target, tab)
+    DocOpaque                 -> ""
+  }
+
+# `(p: T, ...) -> R / Eff` for a `fn`, the member list for an `impl`,
+# None for the other kinds.
+fn doc_head_sig(h: DocHead, tab: SymTab) : Option[String] =
+  match h {
+    DocFn(_, ps, rt, ef) -> Some(doc_sig(ps, rt, ef, tab, []))
+    DocImpl(_, _, ms)    -> Some(doc_impl_sig(ms, tab))
+    _ -> None
+  }
+
+# Drill-down key for an impl, e.g. `Add_for_Decimal` — mirrors the
+# (protocol, type) identity pair ProtocolReg already uses (ast.kai
+# ~1077), punctuated for a shell-safe, unquoted `kai doc mod.name` arg.
+# Uses the target's bare head name, not doc_te's full render — an
+# import-aliased target (`dec.Decimal`) would otherwise leave the
+# alias prefix in the key (`kai doc mod.name` splits on the LAST dot,
+# so a dot inside the key breaks resolution).
+fn doc_impl_name(pname: String, target: TypeExpr, tab: SymTab) : String =
+  concat_all([pname, "_for_", doc_unqualify(doc_target_head(target, tab))])
+
+fn doc_target_head(t: TypeExpr, tab: SymTab) : String =
+  match t.tkind {
+    TyName(DrWritten(_, n), _) -> written_text(n)
+    TyName(DrSym(s), _)        -> doc_sym_text(tab, s)
+    _ -> doc_te(t, tab, [])
+  }
+
+fn doc_unqualify(s: String) : String =
+  match doc_rindex_dot(s, string_length(s) - 1) {
+    Some(i) -> string_slice(s, i + 1, string_length(s) - i - 1)
+    None -> s
+  }
+
+fn doc_rindex_dot(s: String, i: Int) : Option[Int] {
+  if i < 0 { None }
+  else {
+    match char_at(s, i) {
+      Some('.') -> Some(i)
+      _ -> doc_rindex_dot(s, i - 1)
+    }
+  }
+}
+
+# One line per method: `op(args) -> R / Eff`, joined with `; `.
+fn doc_impl_sig(methods: [DocHead], tab: SymTab) : String =
+  join_with(map(methods, (m) => doc_impl_method_sig(m, tab)), "; ")
+
+fn doc_impl_method_sig(h: DocHead, tab: SymTab) : String =
+  match h {
+    DocFn(s, ps, rt, ef) -> concat_all([doc_sym_text(tab, s), doc_sig(ps, rt, ef, tab, [])])
+    _ -> ""
+  }
+
+# ---- signature rendering ----
+#
+# The one surface renderer behind `kai doc` and library completion.
+# Lives here so doc_attr stays a leaf (parse.kai + infer.kai import it).
+
+#[doc("Render a fn's params, return type and effect row as `(p: T, ...) -> R / Eff`, a type parameter by the name its binder among `tps` carries.")]
+pub fn doc_sig(params: [Param], ret: Option[TypeExpr], eff: RowExpr, tab: SymTab, tps: [TBinder]) : String =
+  concat_all(["(", join_with(map(params, (p) => doc_param(p, tab, tps)), ", "), ")", doc_ret(ret, eff, tab, tps)])
+
+fn doc_param(p: Param, tab: SymTab, tps: [TBinder]) : String =
+  match p.ptype {
+    None    -> written_text(p.binder.name)
+    Some(t) -> concat_all([written_text(p.binder.name), ": ", doc_te(t, tab, tps)])
+  }
+
+fn doc_ret(ret: Option[TypeExpr], eff: RowExpr, tab: SymTab, tps: [TBinder]) : String =
+  match ret {
+    None    -> if doc_row_prints(eff) { concat_all([" / ", doc_row(eff, tab, tps)]) } else { "" }
+    Some(t) -> concat_all([" -> ", doc_te_row(t, eff, tab, tps)])
+  }
+
+fn doc_tes(ts: [TypeExpr], tab: SymTab, tps: [TBinder]) : String = join_with(map(ts, (t) => doc_te(t, tab, tps)), ", ")
+
+#[doc("Render a surface type as its declaration spells it, effect rows of arrow types included.")]
+pub fn doc_te(t: TypeExpr, tab: SymTab, tps: [TBinder]) : String =
+  match t.tkind {
+    TyName(r, targs) ->
+      if list_length(targs) == 0 { doc_ref_text(r, tab) }
+      else { concat_all([doc_ref_text(r, tab), "[", doc_tes(targs, tab, tps), "]"]) }
+    TyList(inner)     -> concat_all(["[", doc_te(inner, tab, tps), "]"])
+    TyFn(ps, r, row)  -> concat_all(["(", doc_tes(ps, tab, tps), ") -> ", doc_te_row(r, row, tab, tps)])
+    TyDim(base, _)    -> doc_te(base, tab, tps)
+    TyRefine(base, _) -> doc_te(base, tab, tps)
+    TyRow(row)        -> doc_row(row, tab, tps)
+    TySurface(ts)     -> match ts {
+      TsTuple(tys) -> concat_all(["(", doc_tes(tys, tab, tps), ")"])
+      TsUnitSpan(_, inner) -> doc_te(inner, tab, tps)
+    }
+    TyParam(id, targs) ->
+      if list_length(targs) == 0 { tparam_display(tps, id) }
+      else { concat_all([tparam_display(tps, id), "[", doc_tes(targs, tab, tps), "]"]) }
+  }
+
+fn doc_te_row(t: TypeExpr, row: RowExpr, tab: SymTab, tps: [TBinder]) : String =
+  if doc_row_prints(row) { concat_all([doc_te_grouped(t, tab, tps), " / ", doc_row(row, tab, tps)]) }
+  else { doc_te(t, tab, tps) }
+
+fn doc_row_prints(row: RowExpr) : Bool =
+  match row {
+    REmpty          -> false
+    RClosed(labels) -> list_length(labels) > 0
+    ROpen(_, _)     -> true
+  }
+
+# An arrow's return extends to the end of the type: a row after it binds
+# to that inner arrow unless the arrow is grouped.
+fn doc_te_grouped(t: TypeExpr, tab: SymTab, tps: [TBinder]) : String =
+  match t.tkind {
+    TyFn(_, _, _)     -> concat_all(["(", doc_te(t, tab, tps), ")"])
+    TyRefine(base, _) -> doc_te_grouped(base, tab, tps)
+    _                 -> doc_te(t, tab, tps)
+  }
+
+fn doc_labels(labels: [RowLabel], tab: SymTab, tps: [TBinder]) : String = join_with(map(labels, (l) => doc_label(l, tab, tps)), " + ")
+
+fn doc_row(r: RowExpr, tab: SymTab, tps: [TBinder]) : String =
+  match r {
+    REmpty            -> ""
+    RClosed(labels)   -> doc_labels(labels, tab, tps)
+    ROpen(tail, labels) ->
+      if list_length(labels) == 0 { tail_display(tps, tail) }
+      else { concat_all([doc_labels(labels, tab, tps), " + ", tail_display(tps, tail)]) }
+  }
+
+fn doc_label(l: RowLabel, tab: SymTab, tps: [TBinder]) : String =
+  match l {
+    RL(r, targs) ->
+      if list_length(targs) == 0 { doc_ref_text(r, tab) }
+      else { concat_all([doc_ref_text(r, tab), "[", doc_tes(targs, tab, tps), "]"]) }
+  }
+
+
+#[doc("Post-parse strip for the root file: unwrap DDoc into the side table, keep the first DModuleDoc decl in the stream for the typer.")]
+pub fn doc_strip_collect(file: String, src: String, decls: [Decl]) : DocStrip / Console =
+  dsc_loop(file, src, decls, true, [], [], None, [])
+
+#[doc("Post-parse strip for imported / core modules: same walk, but module docs are dropped from the stream too (Phase 2 will collect them).")]
+pub fn doc_strip_all(file: String, src: String, decls: [Decl]) : DocStrip / Console =
+  dsc_loop(file, src, decls, false, [], [], None, [])
+
+fn dsc_loop(file: String, src: String, ds: [Decl], keep_mod: Bool,
+            acc: [Decl], items: [DocItem], module_doc: Option[String],
+            errs: [Diagnostic]) : DocStrip / Console {
+  match ds {
+    [] -> DocStrip { decls: list_reverse(acc), module_doc: module_doc,
+                     items: list_reverse(items), errs: list_length(errs), diags: list_reverse(errs) }
+    [d, ...rest] -> match d {
+      DDoc(_, text, inner, _, _) -> {
+        let bare = attr_dissolve(inner)
+        dsc_loop(file, src, rest, keep_mod, [bare, ...acc],
+                 if is_pkg_wrapped(inner) { items } else { dsc_push_item(items, bare, Some(text)) }, module_doc, errs)
+      }
+      # Unknown attributes carry no semantics past the formatter:
+      # dissolve the wrapper by re-queuing its inner decl, so nested
+      # shapes (a doc under an attribute, stacked attributes) take
+      # their own arms.
+      DAttr(raw, inner, _, _) ->
+        if raw == pub_pkg_raw() { dsc_loop(file, src, rest, keep_mod, [attr_dissolve(inner), ...acc], items, module_doc, errs) }
+        else { dsc_loop(file, src, [inner, ...rest], keep_mod, acc, items, module_doc, errs) }
+      DModuleDoc(_, text, ln, col) ->
+        dsc_module_arm(file, src, d, text, ln, col, rest, keep_mod,
+                       acc, items, module_doc, errs)
+      # `theory` / `kind` catalog decls are dropped here — they guide
+      # unification (via the hardcoded Measure path in v1), carry no
+      # value, and no pipeline stage past the parser needs them. A
+      # `theory` decl is legal in exactly one file, the kind catalog;
+      # anywhere else is a hard error surfaced here (the sole pass that
+      # sees a `DTheory` with its source file in hand).
+      DTheory(_, props, ln, col, _) ->
+        if kind_catalog_file(file) {
+          dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, errs)
+        } else {
+          dsc_loop(file, src, rest, keep_mod, acc, items, module_doc,
+                   [dsc_error(file, src, ln, col, theory_reject_msg(props)), ...errs])
+        }
+      # `DKind` is kept past the doc strip: the kind-resolution pass
+      # reads its introducer->kind map (over the merged stream) before
+      # stripping it. Builtin kinds (`Type`, `Effect`) and kinds over a
+      # builtin theory are closed — legal only in the catalog file, so
+      # the check anchors here beside the `theory` gate.
+      DKind(_, kname, kthy, _, _, kln, kcol, _) ->
+        dsc_kind_arm(file, src, d, kname, kthy, kln, kcol, rest, keep_mod,
+                     acc, items, module_doc, errs)
+      _ ->
+        dsc_loop(file, src, rest, keep_mod, [d, ...acc],
+                 dsc_push_item(items, d, None), module_doc, errs)
+    }
+  }
+}
+
+fn dsc_error(file: String, src: String, line: Int, col: Int, msg: String) : Diagnostic / Console = {
+  diag_error_from_src(file, src, line, col, msg)
+  mk_diag(SevError, file, line, col, msg, [])
+}
+
+# The DKind arm of dsc_loop: a closed-kind violation drops the decl
+# with its diagnostic; a legal decl is kept for the kind-resolution
+# pass.
+fn dsc_kind_arm(file: String, src: String, d: Decl, kname: String,
+                kthy: String, kln: Int, kcol: Int, rest: [Decl],
+                keep_mod: Bool, acc: [Decl], items: [DocItem],
+                module_doc: Option[String], errs: [Diagnostic]) : DocStrip / Console {
+  match kind_closed_msg(file, kname, kthy) {
+    Some(msg) -> {
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc,
+               [dsc_error(file, src, kln, kcol, msg), ...errs])
+    }
+    None ->
+      dsc_loop(file, src, rest, keep_mod, [d, ...acc],
+               dsc_push_item(items, d, None), module_doc, errs)
+  }
+}
+
+# The DModuleDoc arm of dsc_loop: the first module doc is recorded
+# (and its carrier decl kept only on the root path); a second one is
+# a typed error at the second occurrence, and the carrier is dropped.
+fn dsc_module_arm(file: String, src: String, d: Decl, text: String,
+                  ln: Int, col: Int, rest: [Decl], keep_mod: Bool,
+                  acc: [Decl], items: [DocItem], module_doc: Option[String],
+                  errs: [Diagnostic]) : DocStrip / Console {
+  match module_doc {
+    None ->
+      dsc_loop(file, src, rest, keep_mod,
+               if keep_mod { [d, ...acc] } else { acc },
+               items, Some(text), errs)
+    Some(_) -> {
+      let d = dsc_error(file, src, ln, col,
+        "second module-level `#[doc(...)]` — a file has at most one module doc (a `#[doc(...)]` not directly above a declaration is the module doc)")
+      dsc_loop(file, src, rest, keep_mod, acc, items, module_doc, [d, ...errs])
+    }
+  }
+}
+
+# A `pub(pkg)` declaration is not part of the API a package publishes.
+fn is_pkg_wrapped(d: Decl) : Bool = match d {
+  DAttr(raw, inner, _, _) -> raw == pub_pkg_raw() or is_pkg_wrapped(inner)
+  _ -> false
+}
+
+# A documented decl may still carry attribute wrappers under the doc;
+# strip them so the semantic stream never holds an attribute node.
+fn attr_dissolve(d: Decl) : Decl {
+  match d {
+    DAttr(_, inner, _, _) -> attr_dissolve(inner)
+    _ -> d
+  }
+}
+
+fn dsc_push_item(items: [DocItem], d: Decl, doc: Option[String]) : [DocItem] {
+  match doc_item_of(d, doc) {
+    Some(it) -> [it, ...items]
+    None -> items
+  }
+}
+
+# ---- queries ----
+
+#[doc("First module-level doc text in the decl stream, if any.")]
+pub fn doc_module_doc_text(decls: [Decl]) : Option[String] {
+  match decls {
+    [] -> None
+    [d, ...rest] -> match d {
+      DModuleDoc(_, text, _, _) -> Some(text)
+      _ -> doc_module_doc_text(rest)
+    }
+  }
+}
+
+#[doc("Doc of the closest item declared at or above `line` — the hole's surrounding declaration. Items must be in source order.")]
+pub fn doc_for_line(items: [DocItem], line: Int) : Option[String] =
+  dfl_loop(items, line, None)
+
+fn dfl_loop(items: [DocItem], line: Int, best: Option[String]) : Option[String] {
+  match items {
+    [] -> best
+    [it, ...rest] ->
+      if it.line <= line { dfl_loop(rest, line, it.doc) }
+      else { best }
+  }
+}
+
+# ---- JSON rendering ----
+
+fn json_opt_str(o: Option[String]) : String {
+  match o {
+    Some(s) -> json_quote(s)
+    None -> "null"
+  }
+}
+
+fn json_bool(b: Bool) : String = if b { "true" } else { "false" }
+
+#[doc("One DocItem as a stable JSON object: kind, name, line, pub, sig, doc (sig/doc null when absent).")]
+pub fn doc_item_json(it: DocItem, tab: SymTab) : String =
+  concat_all([
+    "{\"kind\": ", json_quote(it.kind),
+    ", \"name\": ", json_quote(doc_head_name(it.head, tab)),
+    ", \"line\": ", int_to_string(it.line),
+    ", \"pub\": ", json_bool(it.is_pub),
+    ", \"sig\": ", json_opt_str(doc_head_sig(it.head, tab)),
+    ", \"doc\": ", json_opt_str(it.doc),
+    "}"
+  ])
+
+#[doc("One module's doc tree as JSON: module name, module_doc, items array. `tab` names the declarations the items hold.")]
+pub fn doc_module_json(module: String, module_doc: Option[String], items: [DocItem], tab: SymTab) : String =
+  concat_all([
+    "{\"module\": ", json_quote(module),
+    ", \"module_doc\": ", json_opt_str(module_doc),
+    ", \"items\": [", join_with(map(items, (it) => doc_item_json(it, tab)), ", "), "]",
+    "}"
+  ])
+
+#[doc("Assemble per-module JSON objects into the final builtins array.")]
+pub fn doc_builtins_json(mods: [String]) : String =
+  concat_all(["[", join_with(mods, ", "), "]"])

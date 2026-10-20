@@ -1,0 +1,139 @@
+#[doc("""
+Name resolution of a whole program: declarations registered, each
+resolved in its file's scope, rows checked.
+""")]
+
+import compiler.diag
+import compiler.ast
+import compiler.diag_file
+import compiler.modules_homes
+import compiler.symtab
+import compiler.resolve_state
+import compiler.scope_chain
+import compiler.decl_text
+import compiler.scope_file
+import compiler.resolve_callee
+import compiler.kai_builtin
+import compiler.refine_types
+import compiler.resolve_env
+import compiler.resolve_pats
+import compiler.resolve
+import compiler.resolve_register
+import compiler.resolve_rows
+
+#[doc("A walked declaration list: the env after it, and the rewritten declarations.")]
+pub type RDecls = RDecls(Env, [Decl])
+
+# ---- top-level pre-registration ----
+
+#[doc("Pre-register every top-level decl's name into the env so forward references resolve.")]
+pub fn register_decls(e: Env, ds: [Decl], target: String) : Env {
+  match ds {
+    [] -> e
+    [d, ...rest] -> register_decls(register_one(env_at_decl(e, d, target), d), rest, target)
+  }
+}
+
+# The home follows the decl stream, in registration and in the walk
+# alike. An untagged decl belongs to the root file and resets to
+# `target`; inheriting the previous decl's home would resolve a root
+# body from inside the last core module.
+fn env_at_decl(e: Env, d: Decl, target: String) : Env =
+  if rs_recording(e.rs) {
+    let cur = rs_home_name(e.rs)
+    let home = decl_home_hint_reset(d, cur, target)
+    # A known home names itself, so moving into it again changes nothing;
+    # an unknown one reads as "" and is always moved into.
+    if cur != "" and home == cur { e } else { env_with_rs(e, rs_at_home(e.rs, home)) }
+  } else { e }
+
+# ---- entry point ----
+
+#[doc("Resolve `decls` whose files resolve under `views`, against the table `tab` those views index.")]
+pub fn resolve_decls_views(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File {
+  let r = resolve_program_views(df, decls, views, tab, target, ops)
+  ResolvedDecls { errs: r.errs, decls: if r.errs == 0 { r.decls } else { decls }, tab: r.tab, diags: r.diags, params: r.params, env: r.env }
+}
+
+#[doc("`resolve_decls_views`: a reference to a core builtin carries its id on every path.")]
+pub fn resolve_decls_stamped(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : ResolvedDecls / Console + File =
+  resolve_decls_views(df, decls, views, tab, target, ops)
+
+#[doc("A resolved decl stream: the resolver's error count, the declarations downstream passes consume, the table their ids index, and the diagnostics the walk collected.")]
+pub type ResolvedDecls = { errs: Int, decls: [Decl], tab: SymTab, diags: [Diagnostic], params: [ParamIds], env: Env }
+
+#[doc("Resolve a program and keep the resolution: every scope check, with every use site resolved against `tab`.")]
+pub fn resolve_program_with(df: DiagFiles, decls: [Decl], tab: SymTab, target: String) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on(tab, target), tab, [])
+
+#[doc("Resolve a program whose files resolve under `views`: a bare name climbs the file's own imports, picks and cores, not its home alone.")]
+pub fn resolve_program_views(df: DiagFiles, decls: [Decl], views: FileViews,
+      tab: SymTab, target: String, ops: [ProtoRung]) : Resolution / Console + File =
+  resolve_run(df, decls, rs_on_views(tab, views, target, kai_unshadowed(core_names(), decls, tab)), tab, ops)
+
+fn resolve_run(df: DiagFiles, decls: [Decl], rs0: ResState, tab: SymTab,
+      ops: [ProtoRung]) : Resolution / Console + File {
+  let file = df_root(df)
+  let target = rs_home_name(rs0)
+  let e0 = Env { ...env_with_rs(env_new(file), rs0), quiet: df_quiet(df), callees: ct_build(decls, target, ops),
+                 preds: PredCx { tab: tab, views: rs0.views, decls: decls } }
+  let e1 = add_all(e0, core_names())
+  let e2 = register_decls(e1, decls, target)
+  let walked = chk_decls_files(e2, decls, df, target)
+  let e3 = rds_env(walked)
+  let out = rds_decls(walked)
+  let arities = collect_effect_arities(decls)
+  let checks = list_append(check_row_labels(decls, df, tab, arities), check_unbound_tyvars(decls, df, tab))
+  Resolution { errs: if e3.had_error or checks != [] { 1 } else { 0 },
+               decls: out, tab: tab, diags: list_append(finalize_diags(e3.diags), checks), params: e3.params, env: e3 }
+}
+
+#[doc("The env a decl walk ended in.")]
+pub fn rds_env(r: RDecls) : Env = match r { RDecls(e, _) -> e }
+
+fn rds_decls(r: RDecls) : [Decl] = match r { RDecls(_, ds) -> ds }
+
+# The env's file follows the decl being walked, so an error inside an
+# imported module's body is anchored in that module's file.
+fn chk_decls_files(e: Env, ds: [Decl], df: DiagFiles,
+      target: String) : RDecls / Console + File =
+  chk_files_loop(e, ds, df, target, 0, [])
+
+# Locals count from a base the declaration's place in the stream sets, so a body numbers the same
+# whatever resolved before it and no two declarations share an id.
+fn local_base(i: Int) : Int = (i + 1) * 65536
+
+# A body's locals must stay inside its range or they would take its neighbour's ids.
+fn local_overflow(e: Env, d: Decl, i: Int) : Env / Console + File =
+  if local_raw(ch_next_local(e.chain)) <= local_base(i) + 65535 { e } else { match d {
+    DFn(_, fid, _, _, _, _, _, l, c, _) -> {
+      let msg = "`#{decl_name(e.preds.tab, fnid_sym(fid))}` binds more than 65535 locals"
+      diag_error(e.file, l, c, msg)
+      env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, l, c, msg, [])))
+    }
+    _ -> {
+      let msg = "a declaration binds more than 65535 locals"
+      diag_error(e.file, 1, 1, msg)
+      env_mark_err(env_push_diag(e, mk_diag(SevError, e.file, 1, 1, msg, [])))
+    }
+  } }
+
+fn decl_env(e: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Env =
+  env_at_decl(env_with_file(Env { ...e, larity: [], chain: ch_with_next_local(e.chain, local_base(i)) }, decl_diag_file(d, df)), d, target)
+
+#[doc("`d`, the declaration at index `i` of a stream resolved in the environment `env` it ended in, resolved on its own against that environment.")]
+pub fn resolve_complete(env: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Decl / Console + File =
+  match chk_decl(decl_env(env, df, target, i, d), d) { RDecl(_, d1) -> d1 }
+
+fn chk_files_loop(e: Env, ds: [Decl], df: DiagFiles, target: String, i: Int,
+      acc: [Decl]) : RDecls / Console + File = match ds {
+  [] -> RDecls(e, list_reverse(acc))
+  [d, ...rest] -> {
+    let at = decl_env(e, df, target, i, d)
+    match chk_decl(at, d) {
+      RDecl(e1, d1) -> chk_files_loop(local_overflow(e1, d, i), rest, df, target, i + 1, [d1, ...acc])
+    }
+  }
+}

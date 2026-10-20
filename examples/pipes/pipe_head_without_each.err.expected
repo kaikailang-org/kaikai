@@ -1,0 +1,1 @@
+module `tuple` declares `Pair` but does not export `each`

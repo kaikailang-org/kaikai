@@ -1,0 +1,354 @@
+#[doc("kai lint: Clippy-style opinion linter over the typed AST. Warnings only, never blocks a build.")]
+
+import compiler.ast
+import compiler.expr_positions
+import compiler.util
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_handle_walk
+import compiler.infer_dump_text
+import compiler.infer_program
+import compiler.diag_file
+import compiler.lint_idiom
+import compiler.lint_redundant
+import compiler.lint_combinator
+import compiler.lint_spread
+import compiler.lint_deadcode
+import compiler.lint_tail_recursion
+import compiler.lint_effects
+import compiler.call_site_check
+import compiler.modules_paths
+import compiler.symtab
+import compiler.symtab_build
+import compiler.block_scope
+import compiler.core_builtins
+import compiler.core_refs
+import compiler.core_syms
+import compiler.written
+
+# `LintFinding` is defined in `compiler.lint_idiom` and re-exported via
+# import; both modules build the same finding shape.
+
+# ---- discard_pure_value ----------------------------------------------
+
+#[doc("Run every lint over the decls a unit owns: its root file's and those of the modules `owned_mods`. Returns each finding paired with the file that declares it. `src` is the pre-lowering AST, which the dead-code lint reads to tell a user-declared fn from a synthesised one; `written` is the AST before surface lowering, where a form is still the one the source spells.")]
+pub fn lint_program(df: DiagFiles, owned_mods: [SymId], decls: [Decl],
+                    src: [Decl], written: [Decl], tab: SymTab) : [FileFinding] {
+  let root_mod = root_module_name(df_root(df))
+  let owned = lint_owned(decls, root_mod, owned_mods, [])
+  let spelled = lint_owned(written_fns(written), root_mod, owned_mods, [])
+  concat([lint_walk_decls(owned, tab, df, []),
+          lint_walk_written(spelled, df, []),
+          lint_program_wide(owned, decls, tab, df, src, root_mod)])
+}
+
+# An `impl`'s methods are fns the user wrote too; the annotation wrappers
+# are transparent.
+fn written_fns(ds: [Decl]) : [Decl] = flat_map(ds, written_fns_of)
+
+fn written_fns_of(d: Decl) : [Decl] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, _) -> [d]
+  DImpl(_, _, _, ms, _, _, _, _)    -> written_fns(ms)
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> written_fns_of(inner)
+    None        -> []
+  }
+}
+
+fn lint_walk_written(ds: [Decl], df: DiagFiles, acc: [FileFinding]) : [FileFinding] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DFn(_, _, _, _, _, _, body, _, _, _) ->
+      lint_walk_written(rest, df, prepend_tagged(catchall_findings(body), decl_diag_file(d, df), acc))
+    _ -> lint_walk_written(rest, df, acc)
+  }
+}
+
+# A unit merges every imported module into one decl stream, so linting it
+# whole would report on the stdlib and on dependencies too. `owned_mods`
+# holds the modules the package itself declares; a decl from anywhere
+# else is not its code.
+fn lint_owned(ds: [Decl], root_mod: String, owned_mods: [SymId],
+              acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] ->
+    if decl_is_owned(d, root_mod, owned_mods) {
+      lint_owned(rest, root_mod, owned_mods, [d, ...acc])
+    } else { lint_owned(rest, root_mod, owned_mods, acc) }
+}
+
+# A pub decl of the root file is stamped with the root module's own name,
+# so the root module belongs to the owned set alongside the imports.
+# Whether `d` was declared by the unit under lint: the root file
+# (unstamped or stamped with `root_mod`) or one of `owned_mods`.
+fn decl_is_owned(d: Decl, root_mod: String, owned_mods: [SymId]) : Bool =
+  match decl_home_module(d) {
+    None    -> true
+    Some(m) -> m == root_mod or bscope_holds(owned_mods, st_module_id(m))
+  }
+
+# Reachability is judged against the whole unit while the report covers
+# only what the package owns: a private fn called from anywhere in the
+# unit is alive, and a stdlib decl is never reported on.
+fn lint_program_wide(owned: [Decl], all: [Decl], tab: SymTab, df: DiagFiles,
+                     src: [Decl], root: String) : [FileFinding] {
+  let dead = deadcode_file_findings(owned, all, tab, deadcode_declared_fns(src), df, root)
+  list_append(dead, lint_effects_per_file(owned, tab, df, []))
+}
+
+# The effect-row lint reads the root module name, which differs per file.
+fn lint_effects_per_file(ds: [Decl], tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] =
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> {
+      let f = decl_diag_file(d, df)
+      lint_effects_per_file(rest, tab, df,
+        prepend_tagged(effect_findings([d], tab, module_name_of_path(f)), f, acc))
+    }
+  }
+
+fn lint_walk_decls(decls: [Decl], tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
+  match decls {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> lint_walk_decls(rest, tab, df, lint_decl(d, tab, df, acc))
+  }
+}
+
+fn lint_decl(d: Decl, tab: SymTab, df: DiagFiles, acc: [FileFinding]) : [FileFinding] {
+  match d {
+    DFn(_, fid, _, params, _, row, body, _, _, _) ->
+      prepend_tagged(list_append(lint_expr(body, tab, []) |? (f => combinator_finding_stands(tab, fid, body, f)),
+                                 tail_recursion_findings(fid, params, row, body, tab)),
+                     decl_diag_file(d, df), acc)
+    _ -> acc
+  }
+}
+
+# Pair each finding with the file that declares it.
+fn prepend_tagged(xs: [LintFinding], file: String,
+                      acc: [FileFinding]) : [FileFinding] =
+  prepend_tagged_loop(list_reverse(xs), file, acc)
+
+fn prepend_tagged_loop(xs: [LintFinding], file: String,
+                       acc: [FileFinding]) : [FileFinding] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_tagged_loop(rest, file, [FF(file, x), ...acc])
+}
+
+# Recursion into sub-expressions is what reaches blocks nested inside
+# lambda bodies, match arms, and if branches. Idiom nudges are judged at
+# this node before descending; the discard scan lives in the block arm.
+fn lint_expr(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  let here = concat([idiom_findings(e, tab), redundant_findings(e),
+                     combinator_findings(e), spread_findings(e)])
+  let a1 = prepend_all(here, acc)
+  match e.kind {
+    EBlock(stmts, tail) -> lint_block(stmts, tail, tab, a1)
+    _ -> lint_children(e, tab, a1)
+  }
+}
+
+fn prepend_all(xs: [LintFinding], acc: [LintFinding]) : [LintFinding] {
+  match xs {
+    []           -> acc
+    [x, ...rest] -> prepend_all(rest, [x, ...acc])
+  }
+}
+
+# The tail (or its absence) is the block's own value, never a discard;
+# every other statement sits in non-tail position.
+fn lint_block(stmts: [Stmt], tail: Option[Expr], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  let a1 = lint_stmts(stmts, tab, acc)
+  match tail {
+    Some(t) -> lint_expr(t, tab, a1)
+    None    -> a1
+  }
+}
+
+fn lint_stmts(ss: [Stmt], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  match ss {
+    [] -> acc
+    [s, ...rest] -> lint_stmts(rest, tab, lint_stmt(s, tab, acc))
+  }
+}
+
+# Recurse into every sub-expression (to reach nested blocks), then add
+# the discard finding when this statement drops a value worth using.
+fn lint_stmt(s: Stmt, tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  let inner = lint_exprs(stmt_expr_list(s), tab, acc)
+  match s {
+    SExprStmt(x) -> if discard_is_smell(x) { [discard_finding(x, tab), ...inner] } else { inner }
+    _            -> inner
+  }
+}
+
+# Point at the start of the discarded expression. An ECall's own
+# line/col mark its argument parens, so prefer the callee's position;
+# every other node already carries its leftmost span.
+fn discard_finding(x: Expr, tab: SymTab) : LintFinding {
+  let pos = discard_pos(x)
+  LF("discard_pure_value", pos.line, pos.col, discard_message(x, tab))
+}
+
+fn discard_pos(x: Expr) : Expr {
+  match x.kind {
+    ECall(callee, _) -> callee
+    _                -> x
+  }
+}
+
+fn discard_message(x: Expr, tab: SymTab) : String =
+  concat_all(["value of type ", lint_ty_name(x, tab), " discarded; ", discard_advice(x, tab)])
+
+# A dropped `|` result usually wanted the stage's effect alone.
+fn discard_advice(x: Expr, tab: SymTab) : String =
+  if is_map_call(x, tab) { "run the stage for its effect with `|!` instead of `|`, or close it with `|> ignore`" }
+  else { "close it with `|> ignore` or bind it with `let _ =`" }
+
+fn is_map_call(x: Expr, tab: SymTab) : Bool = match x.kind {
+  ECall(callee, [_, _]) -> match callee.kind {
+    ESym(s, _) -> {
+      let op = core_fn_name(CfPipeMap)
+      written_text(sym_name(tab, s)) == op or sym_raw(s) == sym_raw(builtin_sym(op))
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+# A dropped value is a forgotten use unless its type carries nothing to
+# use: `Unit`, or the uninhabited type of a diverging call, which reads
+# as `TyAny` when declared `Nothing` and as an unconstrained variable
+# otherwise. An unknown type stays silent. `a[i] := v` reaches here as
+# an `array_set` call returning the array; the write is the point.
+fn discard_is_smell(x: Expr) : Bool = ty_is_usable(x.ty) and not is_index_write(x)
+
+fn ty_is_usable(t: Option[Ty]) : Bool = match t {
+  Some(TyUnit)    -> false
+  Some(TyAny)     -> false
+  Some(TyVarT(_)) -> false
+  Some(_)         -> true
+  None            -> false
+}
+
+fn is_index_write(x: Expr) : Bool = match x.kind {
+  ECall(callee, _) -> is_builtin_ref(callee, CbArraySet)
+  _                -> false
+}
+
+# ---- structural recursion over children ------------------------------
+#
+# The finding walk descends through xp_positions, the exhaustive
+# enumeration of expression positions.
+
+fn lint_children(e: Expr, tab: SymTab, acc: [LintFinding]) : [LintFinding] =
+  lint_positions(xp_positions(e), tab, acc)
+
+fn opt_list(o: Option[Expr]) : [Expr] {
+  match o {
+    Some(x) -> [x]
+    None    -> []
+  }
+}
+
+fn stmt_expr_list(s: Stmt) : [Expr] {
+  match s {
+    SExprStmt(x)            -> [x]
+    SLet(_, _, rhs)         -> [rhs]
+    SAssert(c, mo)          -> [c, ...opt_list(mo)]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+    SAssign(b, v, _, _) -> [b, v]
+    SVar(_, _, rhs, _, _)   -> [rhs]
+    SUse(_, _, _)           -> []
+  }
+}
+
+fn lint_positions(xs: [XPos], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  match xs {
+    []                  -> acc
+    [XP(_, x), ...rest] -> lint_positions(rest, tab, lint_expr(x, tab, acc))
+  }
+}
+
+fn lint_exprs(xs: [Expr], tab: SymTab, acc: [LintFinding]) : [LintFinding] {
+  match xs {
+    []          -> acc
+    [x, ...rest] -> lint_exprs(rest, tab, lint_expr(x, tab, acc))
+  }
+}
+
+# ---- type display ----------------------------------------------------
+
+fn lint_ty_name(e: Expr, tab: SymTab) : String {
+  match e.ty {
+    Some(t) -> inf_ty_to_string(tab, t)
+    None    -> "?"
+  }
+}
+
+# ---- reporting -------------------------------------------------------
+
+# The findings of a program that typechecks and keeps every call's
+# contract; otherwise the error count, which is the lint's exit status.
+fn lint_checked(file: String, owned_mods: [SymId], decls: [Decl],
+                src: [Decl], written: [Decl], tin: TyperIn) : Result[[FileFinding], Int] / Console + File + Mutable {
+  let tab = tin.tab
+  let r = infer_program(file, decls, tin, false)
+  if r.errs != 0 { Err(r.errs) } else {
+    let contract_errs = check_call_site_refinements(file, r.decls, tab)
+    if contract_errs != 0 { Err(contract_errs) }
+    else { Ok(lint_program(tin.df, owned_mods, r.decls, src, written, tab)) }
+  }
+}
+
+#[doc("Run lints over a typed program and print human-readable findings; returns 0 (lints never block a build) unless the program fails to typecheck or a call statically violates a contract. `src` is the AST before protocol lowering, `written` the AST before surface lowering.")]
+pub fn run_lint(file: String, owned_mods: [SymId], decls: [Decl],
+                 src: [Decl], written: [Decl], tin: TyperIn) : Int / Console + File + Mutable =
+  match lint_checked(file, owned_mods, decls, src, written, tin) {
+    Err(n)       -> n
+    Ok(findings) -> { lint_report_text(findings); 0 }
+  }
+
+fn lint_report_text(findings: [FileFinding]) : Unit / Console {
+  match findings {
+    [] -> ()
+    [ff, ...rest] -> match ff {
+      FF(file, f) -> { print(lint_finding_text(file, f)) lint_report_text(rest) }
+    }
+  }
+}
+
+fn lint_finding_text(file: String, f: LintFinding) : String {
+  match f {
+    LF(rule, line, col, msg) ->
+      concat_all([file, ":", int_to_string(line), ":", int_to_string(col),
+                  ": warning: ", msg, " [", rule, "]"])
+  }
+}
+
+#[doc("Run lints over a typed program and print findings as a JSON array; returns 0 (lints never block a build) unless the program fails to typecheck or a call statically violates a contract. `src` is the AST before protocol lowering, `written` the AST before surface lowering.")]
+pub fn run_lint_json(file: String, owned_mods: [SymId],
+                      decls: [Decl], src: [Decl], written: [Decl], tin: TyperIn) : Int / Console + File + Mutable =
+  match lint_checked(file, owned_mods, decls, src, written, tin) {
+    Err(n)       -> n
+    Ok(findings) -> { print(concat_all(["[", lint_json_body(findings), "]"])); 0 }
+  }
+
+fn lint_json_body(findings: [FileFinding]) : String =
+  string_join(map(findings, (ff) => match ff { FF(file, f) -> lint_finding_json(file, f) }), ", ")
+
+fn lint_finding_json(file: String, f: LintFinding) : String {
+  match f {
+    LF(rule, line, col, msg) ->
+      concat_all([
+        "{\"file\": ", json_quote(file),
+        ", \"line\": ", int_to_string(line),
+        ", \"col\": ", int_to_string(col),
+        ", \"rule\": ", json_quote(rule),
+        ", \"severity\": \"warning\"",
+        ", \"message\": ", json_quote(msg),
+        "}"
+      ])
+  }
+}

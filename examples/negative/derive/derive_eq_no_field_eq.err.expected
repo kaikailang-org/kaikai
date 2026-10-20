@@ -1,0 +1,1 @@
+cannot derive `Eq` for `Pixel`: field `color` has type `Color` which has no `impl Eq for Color`
