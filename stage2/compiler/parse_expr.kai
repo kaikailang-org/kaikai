@@ -1,0 +1,471 @@
+#[doc("Expression entry point and function-body clauses (`requires` / `ensures` / `case`).")]
+
+import compiler.lex
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_ids
+import compiler.parse_state
+import compiler.parse_lexical
+import compiler.parse_types
+import compiler.parse_atoms
+import compiler.parse_control
+import compiler.util
+import compiler.refine_pred
+
+#[doc("Parses an expression.")]
+pub fn parse_expr(p: Parser) : PExpr / Console {
+  if p.depth >= nest_max() { err_e(p_too_deep(p)) }
+  else {
+    let r = parse_bin(p_at_depth(p, p.depth + 1), bin_pipe())
+    PExpr { p: p_at_depth(r.p, p.depth), r: r.r }
+  }
+}
+
+fn parse_bin(p: Parser, lo: Int) : PExpr / Console {
+  let r = parse_unary(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_bin_rest(r.p, lhs, lo, bin_tightest())
+  }
+}
+
+fn parse_bin_rest(p: Parser, lhs: Expr, lo: Int, hi: Int) : PExpr / Console =
+  match bin_op_at(p, lo, hi) {
+    None -> ok_e(p, lhs)
+    Some(op) -> {
+      let r = parse_bin_step(op, lhs)
+      match r.r {
+        None -> r
+        Some(e) -> parse_bin_rest(r.p, e, lo, bin_ceiling(op))
+      }
+    }
+  }
+
+fn parse_bin_step(op: BinOpAt, lhs: Expr) : PExpr / Console = {
+  let t = op.tok
+  let rhs_lo = if op.level == bin_concat() { op.level } else { op.level + 1 }
+  let r = parse_bin(p_advance_nl(op.p), rhs_lo)
+  match r.r {
+    None -> err_e(r.p)
+    Some(rhs) ->
+      if op.level == bin_pipe() { bin_pipe_node(r.p, t, lhs, rhs) }
+      else if op.level == bin_cmp() { bin_cmp_node(r.p, t, lhs, rhs) }
+      else { bin_node(r.p, t, lhs, rhs) }
+  }
+}
+
+# An expression that stops before a pipe: an arrow lambda's body, whose trailing pipe chains at the enclosing level.
+fn parse_bin_or(p: Parser) : PExpr / Console = parse_bin(p, bin_or())
+
+fn prefix_expr(k: TokKind, e: Expr, t: Token) : Expr =
+  match k {
+    TkNot -> expr_at(EUnop(UoNot, e), t)
+    TkAmp -> expr_at(ESurface(SfRefMake(e)), t)
+    _ -> expr_at(EUnop(UoNeg, e), t)
+  }
+
+fn parse_unary_nested(p: Parser) : PExpr / Console {
+  if p.depth >= nest_max() { err_e(p_too_deep(p)) }
+  else {
+    let r = parse_unary(p_at_depth(p, p.depth + 1))
+    PExpr { p: p_at_depth(r.p, p.depth), r: r.r }
+  }
+}
+
+# `@r` / `@r.field…` dereferences a `Ref[T]`; the path is kept for surface lowering to pick the lowering.
+fn parse_deref(p: Parser, t: Token) : PExpr / Console {
+  let id = p_peek(p)
+  if not tk_is(id.kind, TkIdent) { fail_e_at(p, id, "expected a `Ref` binding name after `@`") }
+  else {
+    let path = deref_path(p_advance(p), mk_name(tok_source(p.src, id), id.line, id.col))
+    match path.r {
+      None -> err_e(path.p)
+      Some(target) -> ok_e(path.p, expr_at(ESurface(SfDeref(target)), t))
+    }
+  }
+}
+
+fn deref_path(p: Parser, acc: Expr) : PExpr / Console {
+  if not p_at(p, TkDot) { ok_e(p, acc) }
+  else {
+    let p1 = p_advance(p)
+    let f = p_peek(p1)
+    if not tk_is(f.kind, TkIdent) { fail_e_at(p1, f, "expected a field name after `.` in a `@`-deref path") }
+    else { deref_path(p_advance(p1), mk_expr(EField(acc, tok_source(p1.src, f)), acc.line, acc.col)) }
+  }
+}
+
+# `&x` is `Mutable.ref_make(x)`; like `-` and `not` it binds tighter than the binary operators.
+fn parse_unary(p: Parser) : PExpr / Console {
+  let t = p_peek(p)
+  match t.kind {
+    TkMinus -> unary_operand(p, t)
+    TkNot -> unary_operand(p, t)
+    TkAmp -> unary_operand(p, t)
+    TkAt -> parse_deref(p_advance(p), t)
+    _ -> parse_pow(p)
+  }
+}
+
+fn unary_operand(p: Parser, t: Token) : PExpr / Console {
+  let r = parse_unary_nested(p_advance(p))
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> ok_e(r.p, prefix_expr(t.kind, e, t))
+  }
+}
+
+# `^` is right-associative and binds tighter than `*`; its exponent may carry a sign (`r ^ -2`).
+fn parse_pow(p: Parser) : PExpr / Console {
+  let r = parse_postfix(p)
+  match r.r {
+    None -> r
+    Some(lhs) -> parse_pow_rest(r.p, lhs)
+  }
+}
+
+fn parse_pow_rest(p: Parser, lhs: Expr) : PExpr / Console {
+  let p_look = p_skip_newlines(p)
+  if not p_at(p_look, TkCaret) { ok_e(p, lhs) }
+  else {
+    let t = p_peek(p_look)
+    let rr = parse_unary_nested(p_advance_nl(p_look))
+    match rr.r {
+      None -> err_e(rr.p)
+      Some(rhs) -> ok_e(rr.p, expr_at(EBinop(BoPow, lhs, rhs), t))
+    }
+  }
+}
+
+fn parse_postfix(p: Parser) : PExpr / Console {
+  let r = parse_primary(p)
+  match r.r {
+    None -> r
+    Some(e) -> parse_postfix_rest(r.p, e)
+  }
+}
+
+# Postfix forms never continue from the next line, so this function never skips newlines.
+fn parse_postfix_rest(p: Parser, lhs: Expr) : PExpr / Console {
+  let t = p_peek(p)
+  match t.kind {
+    TkLparen -> parse_postfix_call(p, lhs, t)
+    TkDot -> parse_postfix_field(p, lhs, t)
+    TkLbracket -> parse_postfix_index(p, lhs, t)
+    TkBang -> parse_postfix_rest(p_advance(p), expr_at(EBang(lhs), t))
+    TkLbrace -> if p.allow_trailing_lambda { parse_postfix_lambdas(p, lhs, t) } else { ok_e(p, lhs) }
+    _ -> ok_e(p, lhs)
+  }
+}
+
+fn parse_postfix_lambdas(p: Parser, lhs: Expr, t: Token) : PExpr / Console {
+  let lam = parse_trailing_lambdas(p, [])
+  match lam.r {
+    None -> err_e(lam.p)
+    Some(xs) -> parse_postfix_rest(lam.p, expr_at(ECall(lhs, xs), t))
+  }
+}
+
+fn call_with_lambdas(p: Parser, lhs: Expr, xs: [Expr], t: Token) : PExpr / Console {
+  let lam = if p.allow_trailing_lambda { parse_trailing_lambdas(p, xs) } else { ok_args(p, xs) }
+  match lam.r {
+    None -> err_e(lam.p)
+    Some(ys) -> parse_postfix_rest(lam.p, expr_at(ECall(lhs, desugar_placeholder_args(ys)), t))
+  }
+}
+
+# Call arguments are a delimited context, so record literals are unambiguous there even in an `if` condition.
+fn parse_postfix_call(p: Parser, lhs: Expr, t: Token) : PExpr / Console {
+  let prev_rl = p.allow_record_lit
+  let args = parse_call_args(p_with_record_lit(p_advance(p), true))
+  let p1 = p_with_record_lit(args.p, prev_rl)
+  match args.r {
+    None -> err_e(p1)
+    Some(xs) -> call_with_lambdas(p1, lhs, xs, t)
+  }
+}
+
+fn parse_postfix_field(p: Parser, lhs: Expr, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  let id = p_peek(p1)
+  if tk_is(id.kind, TkIdent) { parse_postfix_rest(p_advance(p1), expr_at(EField(lhs, tok_source(p.src, id)), t)) }
+  else { fail_e(p1, "expected field name after `.`") }
+}
+
+fn index_close(p: Parser, lhs: Expr, idx: Expr, t: Token) : PExpr / Console {
+  let closed = p_eat(p, TkRbracket, "expected `]` after index")
+  if p_failed(closed) { err_e(closed) } else { parse_postfix_rest(closed, expr_at(EIndex(lhs, idx), t)) }
+}
+
+# A stepped `a..b..s` parses too, so the typer can reject it with a typed diagnostic.
+fn parse_postfix_index(p: Parser, lhs: Expr, t: Token) : PExpr / Console {
+  let prev_rl = p.allow_record_lit
+  let r = parse_expr(p_with_record_lit(p_advance(p), true))
+  match r.r {
+    None -> err_e(r.p)
+    Some(first) -> {
+      let ri = parse_index_range(r.p, first)
+      match ri.r {
+        None -> err_e(ri.p)
+        Some(idx) -> index_close(p_with_record_lit(ri.p, prev_rl), lhs, idx, t)
+      }
+    }
+  }
+}
+
+# `.tail` is a point-free section `(__pl) => __pl.tail`, `tail` being any postfix chain.
+fn point_free_section(p: Parser, name: String, t: Token) : PExpr / Console {
+  let pl = point_free_binder()
+  let head = expr_at(EField(mk_local(pl.id, t.line, t.col), name), t)
+  let r = parse_postfix_rest(p, head)
+  match r.r {
+    None -> r
+    Some(body) -> ok_e(r.p, expr_at(ELambda([param_at(pl, t)], body), t))
+  }
+}
+
+fn parse_dot_primary(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance(p)
+  let nxt = p_peek(p1)
+  if tk_is(nxt.kind, TkIdent) { point_free_section(p_advance(p1), tok_source(p1.src, nxt), t) }
+  else { ok_e(p1, expr_at(EPlaceholder, t)) }
+}
+
+fn lambda_result(r: PExpr, params: [Param], t: Token) : PExpr =
+  match r.r {
+    None -> err_e(r.p)
+    Some(body) -> ok_e(r.p, expr_at(ELambda(params, body), t))
+  }
+
+fn bare_name(p: Parser, name: String, t: Token) : PExpr = ok_e(p, mk_name(name, t.line, t.col))
+
+fn brace_ident(p: Parser, p1: Parser, name: String, t: Token) : PExpr / Console =
+  if name == "region" { parse_region(p1, t) }
+  else if p.allow_record_lit and is_upper_ident(p.src, t) { parse_record_lit(p1, ref_written(name), t) }
+  else { bare_name(p1, name, t) }
+
+# `mod.Type { ... }`: the qualifier is validated against the module table before resolve.
+fn dot_ident(p: Parser, p1: Parser, name: String, t: Token) : PExpr / Console =
+  if p.allow_record_lit and at_qualified_member(p, t) and tk_is(p_peek2(p1).kind, TkLbrace) {
+    parse_record_lit(p_advance(p_advance(p1)), ref_qualified(name, tok_source(p1.src, p_peek1(p1))), t)
+  } else { bare_name(p1, name, t) }
+
+# `variants`, `region` and `ensure` are contextual: they take their special form only before `[`, `{` and `(`.
+fn parse_ident_primary(p: Parser, t: Token) : PExpr / Console {
+  let name = tok_source(p.src, t)
+  let p1 = p_advance(p)
+  match p_peek(p1).kind {
+    TkLbracket -> if name == "variants" { parse_variants_of(p1, t) } else { bare_name(p1, name, t) }
+    TkLparen -> if name == "ensure" { parse_ensure_primary(p1, t) } else { bare_name(p1, name, t) }
+    TkFatArrow -> lambda_result(parse_bin_or(p_advance(p1)), [param_at(binder_written(name), t)], t)
+    TkLbrace -> brace_ident(p, p1, name, t)
+    TkDot -> dot_ident(p, p1, name, t)
+    _ -> bare_name(p1, name, t)
+  }
+}
+
+fn parse_empty_parens(p: Parser, t: Token) : PExpr / Console =
+  if p_at(p, TkFatArrow) { lambda_result(parse_bin_or(p_advance(p)), [], t) }
+  else { ok_e(p, expr_at(EUnit, t)) }
+
+fn tuple_expr_done(perr: Parser, pnext: Parser, elems: [Expr], t: Token) : PExpr / Console =
+  match tuple_type_for_arity(list_length(elems)) {
+    None -> fail_e(perr, "n-tuple sugar supports arity 2..4 only — use a named record for wider products")
+    Some(_) -> ok_e(pnext, expr_at(ESurface(SfTuple(elems)), t))
+  }
+
+fn tuple_expr_sep(p: Parser, acc: [Expr], t: Token) : PExpr / Console =
+  if p_at(p, TkComma) { parse_tuple_expr_rest(p_advance_nl(p), acc, t) }
+  else if p_at(p, TkRparen) { tuple_expr_done(p, p_advance(p), list_reverse(acc), t) }
+  else { fail_e(p, "expected `,` or `)` in tuple expression") }
+
+fn parse_tuple_expr_rest(p: Parser, acc: [Expr], t: Token) : PExpr / Console {
+  if p_at(p, TkRparen) { tuple_expr_done(p, p_advance(p), list_reverse(acc), t) }
+  else {
+    let r = parse_expr(p)
+    match r.r {
+      None -> err_e(r.p)
+      Some(e) -> tuple_expr_sep(p_skip_newlines(r.p), [e, ...acc], t)
+    }
+  }
+}
+
+# `-` and `%` cannot lead a continuation line, so a newline before one ended the expression.
+fn leading_op_error(p: Parser, after: Parser) : PExpr / Console {
+  let op = op_of_tok(p_peek(p).kind)
+  fail_e_at(p, p_peek(after), "expression ends at this newline: `#{op}` cannot lead a continuation line — keep `#{op}` at the end of the previous line to continue")
+}
+
+fn parse_group_close(p: Parser, after: Parser, e: Expr, t: Token) : PExpr / Console {
+  if p_at(p, TkRparen) { ok_e(p_advance(p), e) }
+  else if p_at(p, TkComma) { parse_tuple_expr_rest(p_advance_nl(p), [e], t) }
+  else if p_at(after, TkNewline) and (p_at(p, TkMinus) or p_at(p, TkPercent)) { leading_op_error(p, after) }
+  else { fail_e(p, "expected `)` after expression") }
+}
+
+fn parse_grouped_expr(p: Parser, t: Token) : PExpr / Console {
+  let r = parse_expr(p)
+  match r.r {
+    None -> err_e(r.p)
+    Some(e) -> parse_group_close(p_skip_newlines(r.p), r.p, e, t)
+  }
+}
+
+# `(expr)` groups, `()` is unit and `(a, b) => e` is a lambda: parameters are tried first, and `( expr )` is re-parsed when no `=>` follows.
+fn parse_paren_or_lambda(p: Parser, t: Token) : PExpr / Console {
+  let p1 = p_advance_nl(p)
+  if p_at(p1, TkRparen) { parse_empty_parens(p_advance(p1), t) }
+  else {
+    match try_parse_lambda_params(p1) {
+      Some(res) -> lambda_result(parse_bin_or(res.p), res.params, t)
+      None -> parse_grouped_expr(p1, t)
+    }
+  }
+}
+
+fn parse_other_primary(p: Parser, t: Token) : PExpr / Console =
+  match fixed_lit_of_tok(p.src, t) {
+    Some(lit) -> ok_e(p_advance(p), lit)
+    None -> fail_e(p, "expected expression")
+  }
+
+# A delimiter re-enables record literals for its interior; the caller's flag is restored on return.
+fn parse_primary(p: Parser) : PExpr / Console {
+  let t = p_peek(p)
+  let rl = p.allow_record_lit
+  match t.kind {
+    TkInt -> parse_int_atom(p, t)
+    TkReal -> parse_real_atom(p, t)
+    TkDecimal -> parse_decimal_atom(p, t)
+    TkBigInt -> parse_bigint_atom(p, t)
+    TkComplex -> parse_complex_atom(p, t)
+    TkTrue -> ok_e(p_advance(p), expr_at(EBool(true), t))
+    TkFalse -> ok_e(p_advance(p), expr_at(EBool(false), t))
+    TkChar -> ok_e(p_advance(p), expr_at(EChar(decode_char(tok_source(p.src, t))), t))
+    TkString -> parse_str_lit(p, t)
+    TkUnderscore -> ok_e(p_advance(p), expr_at(EUnder, t))
+    TkDot -> parse_dot_primary(p, t)
+    TkHole -> ok_e(p_advance(p), expr_at(EHole(None), t))
+    TkHoleName(nm) -> ok_e(p_advance(p), expr_at(EHole(Some(nm)), t))
+    TkDollar -> parse_intrinsic(p, t)
+    TkTodoBang -> parse_todo_bang(p, t)
+    TkRegex -> parse_regex_sigil(p, t)
+    TkIdent -> parse_ident_primary(p, t)
+    TkLparen -> restore_rl(rl, parse_paren_or_lambda(p_with_record_lit(p, true), t))
+    TkLbracket -> restore_rl(rl, reject_endless(p, parse_list_or_range(p_with_record_lit(p, true), t)))
+    TkLazy -> parse_lazy(p, t)
+    TkLbrace -> restore_rl(rl, parse_brace_primary(p_with_record_lit(p, true), t))
+    TkIf -> parse_if(p, t)
+    TkMatch -> parse_match(p, t)
+    TkHandle -> parse_handle(p_advance(p), t)
+    TkPercent -> parse_collection_lit(p, t)
+    _ -> parse_other_primary(p, t)
+  }
+}
+
+#[doc("The parser after a fn's contract clauses, with their `requires` and `ensures` predicates in source order.")]
+pub type Contracts = { p: Parser, reqs: [Expr], enss: [Expr] }
+
+fn contracts_done(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts =
+  Contracts { p: p, reqs: list_reverse(reqs), enss: list_reverse(enss) }
+
+# A trailing `{` belongs to the declaration's body, never to the predicate.
+fn parse_contract_pred(p: Parser) : PExpr / Console {
+  let prev_atl = p.allow_trailing_lambda
+  let prev_arl = p.allow_record_lit
+  let r = parse_expr(p_with_record_lit(p_with_trailing_lambda(p, false), false))
+  PExpr { p: p_with_record_lit(p_with_trailing_lambda(r.p, prev_atl), prev_arl), r: r.r }
+}
+
+fn check_pred_not_false(p: Parser, pred: Expr, kind: String, kw: Token) : Parser / Console =
+  match try_eval_pred(pred) {
+    Some(false) -> p_error(p, kw, concat_all([
+      "`", kind, "` predicate is statically `false` — the contract ",
+      "would always panic. Remove the clause or fix the predicate."
+    ]))
+    _ -> p
+  }
+
+#[doc("Parses `requires` / `ensures` clauses in any interleaving, up to the body.")]
+pub fn parse_contracts_loop(p: Parser, reqs: [Expr], enss: [Expr]) : Contracts / Console {
+  let p0 = p_skip_newlines(p)
+  let kw = p_peek(p0)
+  match kw.kind {
+    TkRequires -> {
+      let pe = clause_pred(p0, kw, "requires")
+      match pe.r {
+        None -> contracts_done(pe.p, reqs, enss)
+        Some(pred) -> parse_contracts_loop(pe.p, [pred, ...reqs], enss)
+      }
+    }
+    TkEnsures -> {
+      let pe = clause_pred(p0, kw, "ensures")
+      match pe.r {
+        None -> contracts_done(pe.p, reqs, enss)
+        Some(pred) -> parse_contracts_loop(pe.p, reqs, [pred, ...enss])
+      }
+    }
+    _ -> contracts_done(p0, reqs, enss)
+  }
+}
+
+fn clause_pred(p: Parser, kw: Token, kind: String) : PExpr / Console {
+  let pe = parse_contract_pred(p_advance_nl(p))
+  match pe.r {
+    None -> pe
+    Some(pred) -> ok_e(check_pred_not_false(pe.p, pred, kind, kw), pred)
+  }
+}
+
+#[doc("Wraps a fn body in its contract clauses, preserved verbatim for the writer.")]
+pub fn contract_surface(body: Expr, cc: Contracts, t: Token) : Expr =
+  if list_is_empty(cc.reqs) and list_is_empty(cc.enss) { body }
+  else { expr_at(ESurface(SfContract(cc.reqs, cc.enss, body)), t) }
+
+# The `[<attr>]` fn attribute is gone; the shape is still recognised to give a migration error.
+#[doc("Rejects the removed `[<attr>]` fn attribute, leaving the parser unchanged when absent.")]
+pub fn reject_fn_attribute(p: Parser) : Parser / Console {
+  if p_at(p, TkLbracket) and tk_is(p_peek1(p).kind, TkLt) {
+    let p2 = p_advance_nl(p_advance_nl(p))
+    let id = p_peek(p2)
+    let name = if tk_is(id.kind, TkIdent) { tok_source(p2.src, id) } else { "" }
+    p_error(p2, id, concat_all([
+      "`[<", name, ">]` fn attributes are not supported — ",
+      "contract-predicate purity is derived from the effect row ",
+      "(a fn with an empty row is pure); remove the attribute"
+    ]))
+  } else { p }
+}
+
+#[doc("Parses a multi-clause fn body; the first `case` is at `p`.")]
+pub fn parse_clause_block(p: Parser, params: [Param], t: Token) : PExpr / Console {
+  let n = list_length(params)
+  if n == 0 { fail_e(p, "case-block requires at least one parameter to discriminate on") }
+  else if n > 4 { fail_e(p, "case-block supports up to 4 parameters") }
+  else { parse_case_arms(p, [], n, t) }
+}
+
+fn parse_case_arms(p: Parser, acc: [MMArm], n: Int, t: Token) : PExpr / Console {
+  let p0 = p_skip_newlines_and_semis(p)
+  match p_peek(p0).kind {
+    TkRbrace ->
+      if list_is_empty(acc) { fail_e(p0, "case-block must have at least one `case` arm") }
+      else { ok_e(p_advance(p0), expr_at(ESurface(SfCaseBlock(list_reverse(acc))), t)) }
+    TkCase -> case_arm_next(parse_case_arm(p_advance_nl(p0), n), acc, n, t)
+    _ -> fail_e(p0, "case-block must contain only `case` arms; mix with stmt-block by extracting a helper or using `= match { ... }`")
+  }
+}
+
+fn case_arm_next(ra: PMArm, acc: [MMArm], n: Int, t: Token) : PExpr / Console =
+  match ra.r {
+    None -> err_e(ra.p)
+    Some(arm) -> parse_case_arms(ra.p, [arm, ...acc], n, t)
+  }
+
+fn parse_case_arm(p: Parser, n: Int) : PMArm / Console {
+  let r_pats = parse_n_patterns(p, n, [])
+  match r_pats.r {
+    None -> err_marm(r_pats.p)
+    Some(pats) -> parse_marm_body(parse_arm_guard(p_skip_newlines(r_pats.p), TkWhen), pats, "expected `->` in case-arm")
+  }
+}

@@ -1,0 +1,307 @@
+#[doc("Where a module lives: the file an import resolves to, the module a path spells, and dotted names split at their qualifier.")]
+
+import compiler.util
+import compiler.diag
+import compiler.chars
+
+#[doc("""
+Mirror of main.kai's `diag_warning`: emit a warning with a source
+caret. Used by the qualified-type rewriter to flag deprecated /
+unstable references without failing the build. Prefixed `mods_` so
+the flat bundle does not mint a duplicate `kai_diag_warning` C symbol
+against main.kai's own copy (`join_with` / `diag_warning` are ubiqu
+helpers main keeps for its emitter + typer).
+""")]
+pub(pkg) fn mods_diag_warning(file: String, line: Int, col: Int, msg: String) : Unit / Console + File {
+  eprint("warning: #{msg}")
+  eprint("  --> #{file}:#{int_to_string(line)}:#{int_to_string(col)}")
+  emit_source_caret(file, line, col)
+}
+
+#[doc("""
+Mirror of main.kai's `join_with`: comma/arrow-style joins for
+"available exports" diagnostic lists. Prefixed `mods_` for the same
+duplicate-symbol reason as `mods_diag_warning`.
+""")]
+pub(pkg) fn mods_join_with(xs: [String], sep: String) : String = string_join(xs, sep)
+
+# Directory portion of a path. "a/b/c.kai" -> "a/b". If no slash,
+# returns "." (current dir).
+pub(pkg) fn dir_of(path: String) : String {
+  let i = last_slash(path, string_length(path) - 1)
+  if i < 0 { "." }
+  else { string_slice(path, 0, i) }
+}
+
+pub(pkg) fn last_slash(s: String, i: Int) : Int {
+  if i < 0 { -1 }
+  else {
+    match char_at(s, i) {
+      Some(c) -> if c == '/' { i } else { last_slash(s, i - 1) }
+      None -> -1
+    }
+  }
+}
+
+# The name is minted verbatim into C symbols (`kaiu_<mod>__<fn>`), so
+# every non-identifier character maps to `_`. Distinct basenames can
+# sanitise to the same name (`foo.input.kai` / `foo_input.kai`); such a
+# clash resolves exactly like a literal name clash: the root file's
+# entry shadows any same-named module.
+#[doc("The module name a file contributes: its basename, `.kai` suffix removed, non-identifier characters mapped to `_` (`foo.input.kai` -> `foo_input`).")]
+pub(pkg) fn module_name_of_path(path: String) : String {
+  let total = string_length(path)
+  let i = last_slash(path, total - 1)
+  let base = if i < 0 { path } else { string_slice(path, i + 1, total - i - 1) }
+  let n = string_length(base)
+  let stem = if n > 4 and string_slice(base, n - 4, 4) == ".kai" {
+    string_slice(base, 0, n - 4)
+  } else { base }
+  ident_sanitize(stem, 0, string_length(stem), "")
+}
+
+#[doc("""
+Load every core file in `paths`, concatenating their decls in
+argument order and accumulating one ModuleEntry per file. Returns
+None if any single load fails. Empty list yields Some(PLS([], [])).
+
+`caches` is parallel to `paths`. Each slot holds a cache .kab file
+path, or "" to force a full parse. A non-empty cache path is tried
+first; on header / payload mismatch the loader falls back to
+re-parsing the source.
+Core module set. Hard-coded in the compiler: `stdlib_path()`
+returns the absolute path baked at compile time via
+-DKAI_STDLIB_PATH. Every kaikai program receives this set
+automatically — no flags, no driver assistance, no escape hatch
+beyond rebuilding the compiler with a different KAI_STDLIB_PATH.
+""")]
+pub(pkg) fn core_module_files() : [String] = [
+  # Modular typecheck: order matters. Each module is typed
+  # against the inherited deltas of every preceding module — a type
+  # or fn declared in module M only becomes visible to typecheckers
+  # of modules that load AFTER M. Topologically ordered by their
+  # cross-module references:
+  #   char       — leaf (Char is builtin, no kaikai-side deps)
+  #   io         — uses String (builtin)
+  #   tuple      — declares Pair/Triple/Quad (load BEFORE list)
+  #   option     — Option is builtin; defines helpers over it
+  #   result     — Result is builtin; defines helpers over it
+  #   list       — uses Pair (tuple), Option (option), Result (result)
+  #   string     — uses Option (option) for to_int / find / etc.
+  #   numeric    — leaf (over Int/Real builtins)
+  #   complex    — declares Complex; uses Real
+  #   effects    — currently empty (placeholder for runtime helpers)
+  #   protocols  — defines Show/Eq/Ord/Hash impls — depends on every
+  #                core module's types
+  #   array      — uses Array builtin + list helpers
+  "core/char.kai",
+  "core/char_unicode.kai",
+  "core/io.kai",
+  "core/tuple.kai",
+  "core/option.kai",
+  "core/result.kai",
+  "core/list.kai",
+  "core/string.kai",
+  "math/numeric.kai",
+  "math/complex.kai",
+  "effects.kai",
+  "protocols.kai",
+  "array.kai",
+  "effects/concurrent.kai",
+  "effects/os.kai"
+]
+
+#[doc("The module name of the root file at `path`: its stem, or `local__<stem>` when the stem names a core module, which the root never takes the place of.")]
+pub(pkg) fn root_module_name(path: String) : String {
+  let n = module_name_of_path(path)
+  if list_has(map(core_module_files(), module_name_of_path), n) { string_concat("local__", n) } else { n }
+}
+
+#[doc("The dotted path a file's module is imported by: relative to the first of `roots` that holds it, each segment named as `module_name_of_path` names a file (`a/util.kai` -> `a.util`); the file's own module name when none holds it.")]
+pub(pkg) fn imported_module_path(path: String, roots: [String]) : String = match roots {
+  [] -> module_name_of_path(path)
+  [r, ...rest] -> match rel_under(abspath(path), abspath(r)) {
+    Some(rel) -> pmp_dotted(rel)
+    None -> imported_module_path(path, rest)
+  }
+}
+
+fn rel_under(abs: String, root: String) : Option[String] {
+  let n = string_length(root) + 1
+  if string_length(abs) > n and string_slice(abs, 0, n) == string_concat(root, "/") {
+    Some(string_slice(abs, n, string_length(abs) - n))
+  } else { None }
+}
+
+fn pmp_dotted(rel: String) : String {
+  let i = last_slash(rel, string_length(rel) - 1)
+  if i < 0 { module_name_of_path(rel) }
+  else { concat_all([pmp_dotted(string_slice(rel, 0, i)), ".", module_name_of_path(rel)]) }
+}
+
+fn ident_sanitize(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> {
+        let piece = if ch_is_alnum(c) { int_to_byte_string(char_to_int(c)) } else { "_" }
+        ident_sanitize(s, i + 1, n, string_concat(acc, piece))
+      }
+      None -> acc
+    }
+  }
+}
+
+# Map a dotted module path to a filesystem path relative to base_dir.
+# "a.b.c" + "stage2" -> "stage2/a/b/c.kai".
+fn module_to_path(base_dir: String, mod: String) : String {
+  let rel = string_concat(dots_to_slashes(mod), ".kai")
+  if base_dir == "." { rel }
+  else { concat_all([base_dir, "/", rel]) }
+}
+
+fn dots_to_slashes(s: String) : String = dots_to_slashes_loop(s, 0, string_length(s), "")
+
+fn dots_to_slashes_loop(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> {
+        let piece = if c == '.' { "/" } else { int_to_byte_string(char_to_int(c)) }
+        dots_to_slashes_loop(s, i + 1, n, string_concat(acc, piece))
+      }
+      None -> acc
+    }
+  }
+}
+
+# Dotted module paths (`math.arith`) are resolved in order:
+#   1. relative to the root file's directory (`base_dir`), then
+#   2. each directory given via `--path`, in the order passed.
+# The first candidate that exists wins. If none do, the caller
+# reports the original `base_dir` path so the error message points
+# to the most obvious location.
+pub(pkg) type CandidateFile = CF(String, Option[String])
+
+#                      path    source (if read succeeded)
+
+fn try_candidate(abs_path: String) : Option[String] / File {
+  match read_file(abs_path) {
+    Err(_)  -> None
+    Ok(src) -> Some(src)
+  }
+}
+
+fn try_candidates_loop(mod_path: String, dirs: [String], first_tried: String) : CandidateFile / File {
+
+  match dirs {
+    [] -> CF(first_tried, None)
+    [d, ...rest] -> {
+      let p = module_to_path(d, mod_path)
+      match try_candidate(p) {
+        Some(src) -> CF(p, Some(src))
+        None      -> try_candidates_loop(mod_path, rest, first_tried)
+      }
+    }
+  }
+}
+
+#[doc("The files `find_module_file` tries for `mod_path` ahead of `found`, in the order it tries them.")]
+pub(pkg) fn module_files_ahead(base_dir: String, mod_path: String, search_paths: [String], found: String) : [String] =
+  files_ahead([module_to_path(base_dir, mod_path), ...map(search_paths, (d) => module_to_path(d, mod_path))], found)
+
+fn files_ahead(tried: [String], found: String) : [String] = match tried {
+  [] -> []
+  [p, ...rest] -> if p == found { [] } else { [p, ...files_ahead(rest, found)] }
+}
+
+pub(pkg) fn find_module_file(base_dir: String, mod_path: String, search_paths: [String]) : CandidateFile / File {
+
+  let first_try = module_to_path(base_dir, mod_path)
+  match try_candidate(first_try) {
+    Some(src) -> CF(first_try, Some(src))
+    None      -> try_candidates_loop(mod_path, search_paths, first_try)
+  }
+}
+
+# `import_name` is the surface binding the importing file
+# uses to refer to this module — last segment of `IkPath` /
+# `IkSelective`, or the alias from `IkAlias`. The resolver records
+# a ModuleEntry under this name once the file has been parsed
+# successfully (skipped when the file is missing or has lex/parse
+# errors — the fallback diagnostic still fires).
+#
+# When `import_name` is `""`, the caller is asking for plain concat
+# behaviour without registering a module entry — used by paths that
+# load files for other reasons.
+# Format the cycle chain for the diagnostic.
+# `in_progress` is head=deepest, tail=root; the target is the path
+# that the cycle re-entered. The chain we print walks root→deepest
+# (reverse of in_progress) and closes with the target appended once
+# more, so a chain a→b→a reads as `a.kai → b.kai → a.kai`.
+pub(pkg) fn format_cycle_chain(in_progress: [String], target: String) : String {
+  let walked = list_reverse(in_progress)
+  let closed = list_append(walked, [target])
+  join_with_arrow(closed, "")
+}
+
+fn join_with_arrow(xs: [String], acc: String) : String {
+  match xs {
+    [] -> acc
+    [x, ...rest] -> {
+      let sep = if acc == "" { "" } else { " -> " }
+      join_with_arrow(rest, concat_all([acc, sep, x]))
+    }
+  }
+}
+
+#[doc("The directory of the nearest `kai.toml` at or above the file `path`, or `\"\"` when none holds it.")]
+pub(pkg) fn package_root(path: String) : String / File = package_root_from(dir_of(path))
+
+fn package_root_from(dir: String) : String / File =
+  if string_length(dir) <= 1 { "" }
+  else { match read_file(cat2(dir, "/kai.toml")) {
+    Ok(_)  -> dir
+    Err(_) -> package_root_from(dir_of(dir))
+  } }
+
+#[doc("Whether two files are modules of one package: both under the same `kai.toml` directory.")]
+pub(pkg) fn same_package(a: String, b: String) : Bool / File = {
+  let ra = package_root(a)
+  ra != "" and ra == package_root(b)
+}
+
+fn first_dot_index(s: String, i: Int, n: Int) : Int {
+  if i >= n { -1 }
+  else if string_byte_at_int(s, i) == char_to_int('.') { i }
+  else { first_dot_index(s, i + 1, n) }
+}
+
+#[doc("A dotted name split at its first dot: the qualifier and the remainder.")]
+pub(pkg) type QtSplit = QSplit(String, String)
+
+#[doc("Split `mod.Name` into its qualifier and its bare name; `None` when undotted.")]
+pub(pkg) fn split_dotted_qualifier(name: String) : Option[QtSplit] {
+  let n = string_length(name)
+  let i = first_dot_index(name, 0, n)
+  if i < 0 { None }
+  else { Some(QSplit(string_slice(name, 0, i), string_slice(name, i + 1, n - i - 1))) }
+}
+
+#[doc("The bare name behind a possibly module-qualified spelling: `m.P` -> `P`, `P` -> `P`.")]
+pub(pkg) fn dotted_bare(name: String) : String = match split_dotted_qualifier(name) {
+  None -> name
+  Some(q) -> match q { QSplit(_, bare) -> bare }
+}
+
+#[doc("The error for a qualified type whose qualifier names no imported module.")]
+pub(pkg) fn qt_diag_unknown_mod(mod: String, ty: String, file: String, line: Int, col: Int) : Diagnostic =
+  mk_diag(SevError, file, line, col,
+    concat_all(["unknown module qualifier '", mod, "' in qualified type '",
+                mod, ".", ty, "'"]), [])
+
+#[doc("The error for a qualified type its module does not export, listing what the module does export.")]
+pub(pkg) fn qt_diag_missing_type(mod: String, ty: String, exports: [String], file: String, line: Int, col: Int) : Diagnostic =
+  mk_diag(SevError, file, line, col,
+    concat_all(["module '", mod, "' does not export type '", ty,
+                "'; available exports: ", mods_join_with(exports, ", ")]), [])
