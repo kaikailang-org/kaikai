@@ -1,0 +1,23 @@
+pub fn double(n: Int) : Int = n * 2
+
+# `shout` uppercases an ASCII string by mapping each byte through
+# the 'a'..'z' -> 'A'..'Z' offset and appending "!". Deliberately
+# naive — a real stdlib entry would handle UTF-8 + locale.
+pub fn shout(s: String) : String {
+  string_concat(upper_ascii(s, 0, string_length(s), ""), "!")
+}
+
+fn upper_ascii(s: String, i: Int, n: Int, acc: String) : String {
+  if i >= n { acc }
+  else {
+    match char_at(s, i) {
+      Some(c) -> {
+        let up = if char_to_int(c) >= char_to_int('a') and char_to_int(c) <= char_to_int('z') {
+          int_to_char(char_to_int(c) - char_to_int('a') + char_to_int('A'))
+        } else { c }
+        upper_ascii(s, i + 1, n, string_concat(acc, "#{up}"))
+      }
+      None -> acc
+    }
+  }
+}

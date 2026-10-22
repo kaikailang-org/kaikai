@@ -1,0 +1,281 @@
+#[doc("""
+The binaries of `kai build`, `kai test` and `kai run`, memoised by everything their build reads.
+
+A binary is a function of the compiler, its arguments, the entry,
+every source the compile reads, the runtime and C toolchain the link
+uses, and the environment both see; a build's binary is also a function
+of the name it is written under, which the linker signs it with. A memo
+entry under the package's
+user cache, or the shared core cache outside a package, keeps the
+binary, and the run order a grouped build writes beside it; a hit puts
+them where the build would have written them.
+
+Which sources a compile reads is its own to say, so a build asks its
+compiler for them and the memo keeps the answer beside the entries
+(`cli_memo_book`): the next run finds its entry by reading those sources
+again, and starts no compiler.
+
+`KAI_BIN_MEMO=0` turns the memo off.
+""")]
+
+import os.env
+import cli_file_digest
+import cli_fs
+import cli_guard_memo
+import cli_memo_book
+import cli_memo_key
+import cli_memo_place
+import cli_nativedeps
+import cli_plan
+import cli_sys
+import cli_toolchain
+
+const FORMAT : String = "kai-bin-memo 4"
+
+# Entries kept per toolchain; the least recently used go first.
+const KEEP : Int = 24
+
+# What the C compiler and the linker read besides their arguments.
+const CC_ENV : [String] = [
+  "CC", "CFLAGS", "LDFLAGS", "CPATH", "LIBRARY_PATH", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH"
+]
+
+#[doc("""
+Run `build`, the build of plan `p` through backend `backend`, unless a
+binary built from the same inputs is kept; keep what a successful build
+leaves. `build` is handed the plan to build, which asks the compiler for
+the sources it reads. A kept build that found no native backend and fell
+back to C calls `degraded` on a hit, so the run learns it as the build
+would have taught it.
+""")]
+pub fn built(
+  p: Plan,
+  backend: String,
+  build: (Plan) -> Result[Unit, Int] / e,
+  degraded: () -> Unit / e
+) : Result[Unit, Int] / Env + File + Ffi + e {
+  let dir = cli_memo_place.dir(p.flags)
+  if dir == "" or (not memoised_verb(p.job.verb)) or cli_memo_place.off() {
+    build(p)
+  } else {
+    let book = cli_memo_book.path(dir, fixed_of(p, backend, dir))
+    match kept(dir, book, p.job) {
+      Some(hit) -> {
+        let _ = cli_sys.touch(book)
+        cli_memo_place.replay_diags(hit.fst)
+        if hit.snd.degraded and (not cli_sys.no_llvm()) { degraded() }
+        Ok(())
+      }
+      None -> rebuilt(p, dir, book, build)
+    }
+  }
+}
+
+fn memoised_verb(verb: String) : Bool = verb == "test" or verb == "run" or verb == "build"
+
+# A run's and a test's binary go to a scratch path nothing reads back.
+fn signed_name(job: Job) : String = if job.verb == "build" { cli_fs.basename(job.out) } else { "" }
+
+# The entry of the newest build in `book` whose sources are the ones on
+# disk now, put where the build would have written it.
+fn kept(dir: String, book: String, job: Job) : Option[(String, Meta)] / File + Ffi {
+  let known = cli_memo_book.known(book)
+  let now = cli_memo_book.state(cli_memo_book.entry(job.src), cli_memo_book.paths(known))
+  match known |> list.find(k => cli_memo_book.within(k.inputs, now)) {
+    Some(k) -> restore("#{dir}/#{k.key}", job.verb, job.out) | (m => ("#{dir}/#{k.key}", m))
+    None -> None
+  }
+}
+
+# A source written while the build ran is not what the binary was built
+# from, so that build is not kept. The entry is told by its state before
+# and after; what the compile read besides it is known only afterwards,
+# and is told by the time `mark` was written.
+fn rebuilt(
+  p: Plan,
+  dir: String,
+  book: String,
+  build: (Plan) -> Result[Unit, Int] / e
+) : Result[Unit, Int] / File + Ffi + e {
+  let job = p.job
+  let listing = "#{job.tmp}/bin-memo.inputs"
+  let mark = "#{job.tmp}/bin-memo.start"
+  let entry = cli_memo_book.entry(job.src)
+  let was = cli_sys.stat_id(job.src)
+  let _ = write_file(mark, "")
+  let before = cli_sys.no_llvm()
+  let diags = cli_memo_place.record_diags(job.tmp)
+  let r = build(cli_plan.Plan { ...p, flags: p.flags ++ ["--inputs-out", listing] })
+  cli_memo_place.stop_diags()
+  let listed = cli_memo_book.listed(cli_fs.read_or_empty(listing)) | (l => placed(job, l))
+  if (r |> is_ok())
+    and cli_sys.pending_signal() == 0
+    and cli_sys.is_file(listing)
+    and cli_sys.stat_id(job.src) == was {
+    match cli_memo_book.seen(entry, listed, mark) {
+      Some(inputs) -> {
+        let key = key_of(book, inputs)
+        keep("#{dir}/#{key}", job.verb, job.out, diags, (not before) and cli_sys.no_llvm())
+        cli_memo_book.note(book, cli_memo_book.Known { key: key, inputs: inputs })
+      }
+      None -> ()
+    }
+  }
+  r
+}
+
+# The key of a build of the command `book` belongs to, from the state of
+# what it read.
+fn key_of(book: String, inputs: [String]) : String / Ffi {
+  let h = cli_sys.sha_new()
+  cli_memo_key.field(h, cli_fs.basename(book))
+  inputs |> foreach(l => cli_memo_key.field(h, l))
+  cli_sys.sha_hex(h)
+}
+
+# The digest of what a build reads besides its sources: the compiler, the
+# core, its arguments, and what the link reads.
+fn fixed_of(p: Plan, backend: String, dir: String) : String / Env + File + Ffi {
+  let job = p.job
+  let tool = match env.get(cli_guard_memo.TOOLCHAIN_ENV) {
+    Some(d) -> d
+    None -> cli_memo_place.toolchain_digest(dir, p.t.layout.kaic2)
+  }
+  let core = match env.get(cli_guard_memo.CORE_ENV) {
+    Some(d) -> d
+    None -> cli_memo_place.core_digest(dir, p.t.layout.kaic2, job.tmp)
+  }
+  let linked = link_files(p)
+  let digests = cli_file_digest.of(dir, linked)
+  let cc_id = cli_plan.cc_identity(p.t)
+  let h = cli_sys.sha_new()
+  cli_sys.sha_str(h, "#{FORMAT}\n#{tool}\n#{core}\n")
+  cli_memo_key.field(h, backend)
+  cli_memo_key.field(h, signed_name(job))
+  cli_plan.kaic2(p, [], job.src) |> foreach(a => cli_memo_key.field(h, placed(job, a)))
+  feed_link(h, p, linked, digests, cc_id)
+  cli_sys.sha_hex(h)
+}
+
+# The run's scratch paths change every run; what sits under them does not.
+fn placed(job: Job, a: String) : String =
+  string.replace(string.replace(a, job.out, "<out>"), job.tmp, "<tmp>")
+
+# The files the link reads besides the objects the build makes.
+fn link_files(p: Plan) : [String] {
+  let t = p.t
+  [
+    "#{t.inc}/runtime.h",
+    "#{t.inc_c}/runtime.h",
+    t.llvm_c,
+    t.owner_c,
+    t.llvm_bc,
+    t.inline_bc,
+    "#{p.manifest}/kai.toml"
+  ]
+    ++ cli_toolchain.shim_sources(t.cflags)
+    ++ p.libs
+}
+
+fn feed_link(h: cli_sys.Sha, p: Plan, files: [String], digests: [String], cc_id: String) : Unit / Env + File + Ffi {
+  let t = p.t
+  [[t.cc, t.os, t.arch], t.cflags, t.cflags_compile, t.core_cache, p.libs]
+    |> foreach(
+      ws => cli_memo_key.field(h, string.join(ws |> list.map(w => "#{string_length(w)}:#{w}"), ""))
+    )
+  list.zip(files, digests)
+    |> foreach(
+      fd => cli_memo_key.field(h, if fd.snd == "" { "no #{fd.fst}" } else { "#{fd.fst} #{fd.snd}" })
+    )
+  cli_nativedeps.source_keys(t, p.native_info) |> foreach(k => cli_memo_key.field(h, k))
+  CC_ENV |> foreach(v => cli_memo_key.field(h, "#{v}=#{env.get(v) ?? ""}"))
+  cli_memo_key.field(h, cc_id)
+  cli_memo_key.kai_env() |> foreach(v => cli_memo_key.field(h, v))
+}
+
+# An entry is a directory holding `bin`, the run order `plan` when the
+# build wrote one, the compiler's diagnostics `err` when it printed any,
+# and `meta`: the format, both sizes, so a truncated
+# entry is a miss, and whether the build fell back to C.
+type Meta = { bin: Int, plan: Int, degraded: Bool }
+
+fn restore(entry: String, verb: String, out: String) : Option[Meta] / File + Ffi =
+  match meta(entry) {
+    None -> None
+    Some(m) -> if m.bin == cli_sys.size("#{entry}/bin")
+      and m.plan == cli_sys.size("#{entry}/plan")
+      and cli_memo_place.put(verb, "#{entry}/bin", out)
+      and (m.plan < 0 or cli_memo_place.copied("#{entry}/plan", "#{out}.plan"))
+      and cli_sys.touch("#{entry}/meta") {
+      Some(m)
+    } else {
+      None
+    }
+  }
+
+fn meta(entry: String) : Option[Meta] / File =
+  match read_file("#{entry}/meta") {
+    Ok(m) -> match cli_memo_key.lines(m) {
+      [f, b, pl, d] -> if f != FORMAT {
+        None
+      } else {
+        match (string.to_int(b), string.to_int(pl)) {
+          (Some(x), Some(y)) -> Some(Meta { bin: x, plan: y, degraded: d == "1" })
+          _ -> None
+        }
+      }
+      _ -> None
+    }
+    Err(_) -> None
+  }
+
+# Written aside and renamed into place, so a reader sees a whole entry or none.
+fn keep(
+  entry: String,
+  verb: String,
+  out: String,
+  diags: String,
+  degraded: Bool
+) : Unit / File + Ffi {
+  let part = "#{entry}.#{cli_sys.getpid()}.part"
+  let plan = "#{out}.plan"
+  let staged = cli_fs.mkdir_p(part)
+    and cli_memo_place.put(verb, out, "#{part}/bin")
+    and ((not cli_sys.is_file(plan)) or cli_memo_place.copied(plan, "#{part}/plan"))
+    and cli_memo_place.keep_diags(diags, part)
+    and (write_file(
+      "#{part}/meta",
+      "#{FORMAT}\n#{cli_sys.size(out)}\n#{cli_sys.size(plan)}\n#{if degraded { 1 } else { 0 }}\n"
+    )
+      |> is_ok())
+  if not (staged and installed(part, entry)) {
+    let _ = cli_sys.remove_tree(part)
+  }
+  evict(cli_fs.dirname(entry))
+}
+
+# An entry already there is one `restore` just refused, so it goes.
+fn installed(part: String, entry: String) : Bool / File + Ffi =
+  (file_rename(part, entry) |> is_ok())
+    or cli_sys.remove_tree(entry) and (file_rename(part, entry) |> is_ok())
+
+# The least recently used entries past `KEEP` go, and so do the books. An
+# entry is a directory; what the memo keeps beside them is a file.
+fn evict(dir: String) : Unit / File + Ffi {
+  let names = dir_list_dir(dir) |? (e => not string.ends_with(e, ".part"))
+  past_keep(
+    names |? (e => cli_sys.is_dir("#{dir}/#{e}")) | (e => (cli_sys.mtime("#{dir}/#{e}/meta"), e))
+  )
+    |> foreach(e => {
+      let _ = cli_sys.remove_tree("#{dir}/#{e}")
+    })
+  past_keep(names |? (e => cli_memo_book.is_book(e)) | (e => (cli_sys.mtime("#{dir}/#{e}"), e)))
+    |> foreach(e => {
+      let _ = file_delete("#{dir}/#{e}")
+    })
+}
+
+fn past_keep(used: [(Int, String)]) : [String] {
+  let old = used |> list.sort_by((a, b) => cmp(a.fst, b.fst))
+  list.take(old, list.length(old) - KEEP) | (u => u.snd)
+}

@@ -1,0 +1,95 @@
+# BinSerialize round-trip bench harness for issue #489 — wall-time
+# regression gate over the 500-node / ~40 KB payload PR #487
+# benched when flipping the buffer carrier from `[Byte]` to
+# `Array[Byte]`.
+#
+# PR #487 reported single-digit milliseconds per decode after the
+# refactor; #485 reported O(N²) (~19 s) on the prior cons-list
+# substrate. The gate watches for a re-introduction of O(N) shape
+# anywhere on the decode path (a `list_*` helper in a hot loop, an
+# effect-handler installation per byte, a Perceus RC scope leak)
+# that would not surface in `make tier1` because the round-trip
+# would still produce the correct bytes — just slowly.
+#
+# Reproduce:
+#   bin/kai build -o /tmp/bench-binser tools/bench-binserialize-roundtrip.kai
+#   /usr/bin/time -p /tmp/bench-binser >/dev/null
+#
+# The harness encodes the payload once, then iterates 100 decodes
+# back-to-back. Divide wall by 100 to get per-decode cost. The gate
+# in Makefile (target `test-binserialize-budget`) parses the wall
+# and fails if it exceeds the ceiling pinned in
+# `tools/binserialize-budget.txt`.
+#
+# Uses the same hand-rolled `<wrapper>_to_bytes` / `<wrapper>_from_bytes`
+# pattern as `examples/stdlib/binserialize_list.kai`: there is no
+# `impl BinSerialize for [T]` in v1 because the dispatcher resolves
+# on the head type (`List` collides with `Array` for the buffer
+# carrier); the user composes a wrapper over the per-type
+# primitives + `array_concat_bytes`. The original harness called
+# the private `bin_read_len4` directly, which broke after Hanga Roa
+# enforced privacy on stdlib internals (issue #489 lane rewrite,
+# 2026-05-20).
+
+#[derive(BinSerialize)]
+type Node = { id: Int, name: String, payload: [Int] }
+
+fn build_payload(k: Int, acc: [Int]) : [Int] =
+  if k <= 0 { acc }
+  else { build_payload(k - 1, [k, ...acc]) }
+
+fn build_node(i: Int) : Node =
+  Node { id: i,
+         name: string_concat("node-", int_to_string(i)),
+         payload: build_payload(8, []) }
+
+fn build_nodes(n: Int, acc: [Node]) : [Node] =
+  if n <= 0 { acc }
+  else { build_nodes(n - 1, [build_node(n), ...acc]) }
+
+fn empty_bytes() : Array[Byte] = array_make(0, bin_byte(0))
+
+fn nodes_payload(xs: [Node]) : Array[Byte] = match xs {
+  []           -> empty_bytes()
+  [x, ...rest] -> array_concat_bytes(to_bytes(x), nodes_payload(rest))
+}
+
+fn nodes_to_bytes(xs: [Node]) : Array[Byte] = {
+  let n = list_length(xs)
+  array_concat_bytes(to_bytes(n), nodes_payload(xs))
+}
+
+fn nodes_read_n(buf: Array[Byte], pos: Int, n: Int,
+                acc: [Node]) : Result[(Int, [Node]), String] = {
+  if n == 0 { Ok((pos, list_reverse(acc))) }
+  else { match node_from_bytes(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(r)  -> nodes_read_n(buf, r.pos, n - 1, [r.value, ...acc])
+  } }
+}
+
+fn nodes_from_bytes(buf: Array[Byte], pos: Int) : Result[(Int, [Node]), String] = {
+  match int_from_bytes(buf, pos) {
+    Err(m) -> Err(m)
+    Ok(p)  -> nodes_read_n(buf, p.pos, p.value, [])
+  }
+}
+
+fn run_decode(buf: Array[Byte]) : Int = {
+  match nodes_from_bytes(buf, 0) {
+    Err(_) -> 0
+    Ok(r)  -> r.fst
+  }
+}
+
+fn iter(buf: Array[Byte], k: Int, last: Int) : Int =
+  if k == 0 { last } else { iter(buf, k - 1, run_decode(buf)) }
+
+fn main() : Int / Stdout = {
+  let xs = build_nodes(500, [])
+  let buf = nodes_to_bytes(xs)
+  print(string_concat("payload_bytes=", int_to_string(array_length(buf))))
+  let final_pos = iter(buf, 100, 0)
+  print(string_concat("final_pos=", int_to_string(final_pos)))
+  0
+}
