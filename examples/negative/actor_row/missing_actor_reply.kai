@@ -1,0 +1,16 @@
+# `only_request` declares `Actor[Request]` only but receives a
+# `Reply`: parametric effect labels stay distinct, so the missing
+# `Actor[Reply]` is reported instead of being unified with
+# `Actor[Request]`.
+
+type Request = Query(String)
+type Reply   = Answer(String)
+
+fn only_request() : Unit / Actor[Request] = {
+  let got: Reply = Actor.receive()
+  match got {
+    Answer(_) -> ()
+  }
+}
+
+fn main() : Int / Console = 0

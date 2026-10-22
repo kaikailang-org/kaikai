@@ -1,0 +1,72 @@
+#[doc("""
+Sampling helpers built on top of the `Random` effect.
+
+Shuffling is in-place Fisher-Yates over a locally-built `Array[a]`:
+O(n) operations and one Array allocation beyond the input/output
+lists.
+""")]
+
+# Build the index list `[hi, hi - 1, ..., lo]`. The loop walks
+# ascending and prepends, so `[cur, ...acc]` accumulation leaves the
+# result in descending order.
+fn shuffle_indices(hi: Int, lo: Int) : [Int] =
+  shuffle_indices_loop(lo, hi, [])
+
+fn shuffle_indices_loop(cur: Int, hi: Int, acc: [Int]) : [Int] =
+  if cur > hi { acc } else { shuffle_indices_loop(cur + 1, hi, [cur, ...acc]) }
+
+#[doc("""
+Random permutation of `xs`. The output has the same elements as the
+input, in random order. Empty and singleton lists are returned
+unchanged. The imperative inner loop is masked at the function
+boundary: the `Array[a]` is built locally and mutated only through
+`array_set` sites the masking pass classifies as local-non-escaping,
+so the observable signature stays `[a] -> [a] / Random`.
+""")]
+pub fn shuffle(xs: [a]) : [a] / Random = {
+  match xs {
+    []        -> []
+    [_]       -> xs
+    [head, ...rest] -> {
+      # Trap: build the carrier with `array_make` directly. Only a
+      # `let _ = array_make(...)` binding qualifies as a
+      # local-construction binding for the masking pass — a wrapper
+      # call would mark `a` as escaped and add `Mutable` to the row.
+      let n = list_length(xs)
+      let a = array_make(n, head)
+      let _ = list.foldl(xs, 0, (i, x) => {
+        a[i] := x
+        i + 1
+      })
+      let _ = list.foldl(shuffle_indices(n - 1, 1), 0, (_acc, i) => {
+        let j = Random.int_range(0, i + 1)
+        let tmp = a[i]
+        a[i] := a[j]
+        a[j] := tmp
+        _acc
+      })
+      # Walk `a` back to a list by index, inlined rather than via
+      # `array.to_list`: passing `a` to a user fn would mark it
+      # escaped. The `list.foldl` only captures `a` in the lambda
+      # (whose `a[k]` is `array_get`), which the pass keeps local.
+      list.foldl(shuffle_indices(n - 1, 0), [], (acc, k) => [a[k], ...acc])
+    }
+  }
+}
+
+#[doc("A uniformly random element of `xs`. None for the empty list.")]
+pub fn choice(xs: [a]) : Option[a] / Random = {
+  let n = list_length(xs)
+  if n == 0 { None }
+  else { list.nth(xs, Random.int_range(0, n)) }
+}
+
+#[doc("""
+Sample `k` elements without replacement, in random order.
+Returns the full shuffled list if `k >= length(xs)`; the empty
+list if `k <= 0`.
+""")]
+pub fn sample(xs: [a], k: Int) : [a] / Random = {
+  if k <= 0 { [] }
+  else { list.take(shuffle(xs), k) }
+}

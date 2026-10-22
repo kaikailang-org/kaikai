@@ -1,0 +1,404 @@
+#[doc("""
+The native backend driver: program emission and the test and bench runner driver.
+
+compiler/emit_native_test.kai — the synthetic `kai_main` driver the
+native backend emits in test / bench / check mode (`--emit=native --test` /
+`--bench` / `--prop-check`).
+
+The C-direct backend builds a fresh `int main` per build mode
+(emit_c's `emit_main_wrapper`): in test mode it calls each
+`_kai_test_<id>()` and returns `kai_test_summary()`. The native
+backend cannot emit `int main` — `stage0/runtime_llvm.c` owns it and
+always calls `kai_main()`. So in test/bench mode the runner body fns
+already live in `KProgram.fns` (one per block, returning the block's
+final boxed value — see `lower_runner_decls`), and THIS module emits
+the `kai_main` symbol as a driver that runs them through the runtime
+helpers and `exit()`s with the summary code. That driver is the entry
+point of such a build: no `KFn` is, so a user `fn main` is emitted under
+its own symbol like any function.
+
+compiler/emit_native.kai — KIR → in-process libLLVM backend, the
+orchestration layer (KIR Lane 1, docs/kir-design.md §7.2).
+
+`build_native_object` consumes a `KProgram` and constructs the LLVM
+module IN MEMORY by calling the libLLVM C API (via the raw-core
+prims in `native_prims.kai` / `runtime.h`), runs verify + codegen, and
+emits a native object file — one process, no `.ll` text, no `clang`.
+The driver then links that object against the effects runtime to
+produce the executable.
+
+Native is opt-in this lane (`KAI_BACKEND=native` / `--emit=native`); the
+C-text backend stays the default + bootstrap + the differential oracle
+every construct is validated against. The flip to native-default is
+Lane 1.5.
+
+This file is the orchestration: cache the LLVM types, declare every
+user function up front (so a call can forward-reference a fn defined
+later), walk each `KFn` (the per-fn walk lives in `emit_native_fn` /
+`emit_native_ops` / `emit_native_term`), emit the runtime-entry hooks,
+and — IFF every node lowered (`e.ok`) — verify + emit the object. A node
+that breaks a lowering invariant flips `e.ok` false (a loud
+`nemit_unsupported`), and `build_native_object` returns non-zero rather
+than emit a half-built module.
+""")]
+
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.effect_instance
+import compiler.emit_native_def
+import compiler.emit_native_fn
+import compiler.emit_native_proto
+import compiler.emit_native_term
+import compiler.emit_shared_syms
+import compiler.fn_index
+import compiler.fnreg
+import compiler.kir
+import compiler.kir_syms
+import compiler.modules_paths
+import compiler.util
+
+# True when the build mode runs a synthetic runner driver instead of the
+# user's `fn main`.
+pub fn nemit_is_runner_mode(bmode: BuildMode) : Bool = match bmode {
+  BMBuild -> false
+  _       -> true
+}
+
+# Emit the synthetic `kai_main` driver for the active runner mode. Opens
+# `kai_main` with the shim's `ptr ()` signature, registers and drives the
+# test blocks or runs each bench block, then calls the matching
+# `*_summary_exit` (which prints the summary and `exit()`s with its code). The block ends `unreachable`: `*_summary_exit` never
+# returns, but a basic block still needs a terminator.
+fn nemit_build_runner_driver(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console =
+  if nemit_is_runner_mode(bmode) {
+    ndriver_open_kai_main(ctx)
+    nemit_runner_calls(ctx, runners, bmode)
+    match bmode {
+      BMTest -> { let _d = ncall_sig0(ctx, "kaix_test_drive", native_ctx_voidt(ctx)) }
+      _ -> ()
+    }
+    let _e = ncall_sig0(ctx, ndriver_exit_sym(bmode), native_ctx_voidt(ctx))
+    llvm_build_unreachable(native_ctx_b(ctx))
+  } else { () }
+
+# Open `KaiValue *kai_main(void)` + position the builder at its entry.
+# Mirrors `ndef_open_void_fn` but with the `ptr ()` return the shim's
+# `extern KaiValue *kai_main(void)` expects.
+fn ndriver_open_kai_main(ctx: Handle) : Unit = {
+  let m = native_ctx_m(ctx)
+  let fnty = llvm_fn_type_0(native_ctx_ptrt(ctx))
+  let fnval = llvm_add_function(m, "kai_main", fnty)
+  let entry = llvm_append_block(m, fnval, "entry")
+  llvm_position_at_end(native_ctx_b(ctx), entry)
+}
+
+# The `*_summary_exit` forwarder for this mode.
+fn ndriver_exit_sym(bmode: BuildMode) : String = match bmode {
+  BMBench -> "kaix_bench_summary_exit"
+  BMCheck -> "kaix_check_summary_exit"
+  _       -> "kaix_test_summary_exit"
+}
+
+# Does this runner belong to the active driver mode? Each mode runs only
+# its own kind of block — the C oracle drives the same split by emitting a
+# per-mode call list.
+fn nrunner_in_mode(kind: KRunnerKind, bmode: BuildMode) : Bool = match bmode {
+  BMBench -> match kind { KRBench -> true _ -> false }
+  BMCheck -> match kind { KRCheck(_) -> true _ -> false }
+  _       -> match kind { KRTest  -> true _ -> false }
+}
+
+fn nemit_runner_calls(ctx: Handle, runners: [KRunner], bmode: BuildMode) : Unit / Console = match runners {
+  [] -> ()
+  [r, ...rest] -> {
+    if nrunner_in_mode(r.kind, bmode) { nemit_runner_call(ctx, r) } else { () }
+    nemit_runner_calls(ctx, rest, bmode)
+  }
+}
+
+fn nemit_runner_call(ctx: Handle, r: KRunner) : Unit / Console = match r.kind {
+  KRCheck(specs) -> nemit_check_runner_call(ctx, r, specs)
+  _              -> nemit_one_runner_call(ctx, r)
+}
+
+# `kaix_check_run_one(i8* desc, i8* spec, ptr thunk) -> void`. The body is
+# reached through its thunk-ABI forwarder, so the runtime passes the
+# generated params as `args[]` whatever the body's own signature is; `spec`
+# is the `;`-joined `name:Type` list the runtime generates and shrinks from.
+fn nemit_check_runner_call(ctx: Handle, r: KRunner, specs: [String]) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
+  let spec = llvm_build_string_span(b, string_join(specs, ";"))
+  let thunk = nemit_declare_thunk(ctx, c_user_thunk_sym(r.sym))
+  let _c = ncall_sig3(ctx, "kaix_check_run_one", native_ctx_voidt(ctx), p, p, p, desc, spec, thunk)
+  ()
+}
+
+# A test block registers `(desc, body, line, home)` for `kaix_test_drive`; a
+# bench block runs in place through `kaix_bench_run_one(desc, body)`. `desc`
+# is the block's source span decoded to its literal bytes; `body` is the
+# runner fn's `Function*` handle, which under opaque pointers IS the `ptr`.
+fn nemit_one_runner_call(ctx: Handle, r: KRunner) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let b = native_ctx_b(ctx)
+  let desc = llvm_build_string_span(b, nemit_decode_span(r.desc))
+  let bodyfn = llvm_get_or_declare_fn(native_ctx_m(ctx), r.sym, llvm_fn_type_0(p))
+  match r.kind {
+    KRTest -> {
+      let i32t = native_ctx_i32t(ctx)
+      let home = llvm_build_string_span(b, r.home)
+      let _c = ncall_sig4(ctx, "kaix_test_register", native_ctx_voidt(ctx), p, p, i32t, p,
+                          desc, bodyfn, llvm_const_i32(i32t, r.line), home)
+      ()
+    }
+    _ -> {
+      let _c = ncall_sig2(ctx, "kaix_bench_run_one", native_ctx_voidt(ctx), p, p, desc, bodyfn)
+      ()
+    }
+  }
+}
+
+# The defaults `kai_main_install_defaults` stamps: a runner driver calls
+# blocks that may perform any default-handled effect, a program entry
+# only what `main`'s row names.
+pub fn nemit_entry_defaults(kp: KProgram, bmode: BuildMode) : [KDefault] =
+  if nemit_is_runner_mode(bmode) { kp.runner_defaults } else { kp.defaults }
+
+# Build the LLVM module for `kp` in memory and emit it as an object at
+# `out_path`. Returns 0 on success, non-zero on a verify / codegen
+# failure OR an uncovered node (`nemit_unsupported`). Opt-in entry for
+# `--emit=native`.
+#
+# Whole-program is the root-role emission over the full fn list: it defines
+# every fn and owns every whole-program singleton. The modular backend
+# (`emit_native_modular`) reuses `nemit_build_module` with a leaf role to
+# project a partition into its own object, so the shape stays single-sourced.
+pub fn build_native_object(kp: KProgram, decls: [Decl], variants: [VariantEntry],
+                           fns: [EFn], bmode: BuildMode, out_path: String,
+                           src_path: String) : Int / Console = {
+  let m = llvm_module_new("kai_native")
+  let ctx = native_ctx_new(m)
+  nemit_build_module(ctx, kp, decls, variants, fns, bmode, src_path,
+                     kp.fns, kp.fns, NModWhole, ndecl_env(kp, decls))
+  if native_ctx_ok(ctx) == 1 { llvm_emit_object(m, out_path) }
+  else {
+    eprint("native: module not emitted — one or more KIR nodes are outside the current subset (see above)")
+    1
+  }
+}
+
+# Populate one LLVM module: register the evidence-frame ABI, DECLARE every
+# program fn (`all_fns`, so a cross-TU call forward-references its callee's
+# signature), then DEFINE only `define_fns` (the walk). A root TU additionally
+# mints the whole-program singletons; a leaf declares the default globals as
+# externals so its `perform` sites resolve the node the root defines.
+#
+# The per-module artefact is a PROJECTION of the whole-program computation:
+# `all_fns` / `kp` are the SAME whole-program tables every TU sees, so the
+# emitted signatures agree across objects by construction — no serialised ABI
+# to drift.
+pub fn nemit_build_module(ctx: Handle, kp: KProgram, decls: [Decl], variants: [VariantEntry],
+                          fns: [EFn], bmode: BuildMode, src_path: String,
+                          define_fns: [KFn], all_fns: [KFn], role: NModRole, env: NDeclEnv) : Unit / Console = {
+  # DWARF (#500): a no-op unless KAI_BUILD_MODE=debug, so a release build is
+  # byte-identical.
+  ndi_enable(ctx, src_path)
+  ndi_debug_marker(ctx)
+  # Register the per-fn evidence-frame ABI under each fn's emitted symbol,
+  # so signature / call / perform resolve the same slots without threading.
+  let frames = env.frames
+  nframes_register(ctx, kp, decls, frames)
+  # Every fn whose LOWERED body is memory-clean, and every fn that cannot
+  # trap, over the same post-perceus decls the C backend sees, so both stamp
+  # the same set.
+  let const_fns = env.const_fns
+  let free_fns = env.free_fns
+  # Declare every program fn first (forward + cross-TU references).
+  let nm = kp_names(kp)
+  nemit_declare_fns(ctx, nm, all_fns, const_fns, free_fns)
+  # A builtin effect (`Stdout`) has no user `KHandlerDecl`; synthesise one per
+  # default-block effect so `nemit_perform` resolves the op's field index.
+  # DISPATCH uses `synth_defaults` (the SUPERSET) because a dead fn's
+  # `KPerform` still needs a synth handler for its field index or the build
+  # aborts; the actual handler resolves from the evidence stack at runtime.
+  let all_handlers = list_append(kp.handlers, ndef_synth_handlers(kp.tab, kp.synth_defaults))
+  # The default-evidence globals: the owner DEFINES them, a leaf declares them
+  # as an external so its `perform` site resolves the node the owner supplies.
+  # Whole-program keeps internal linkage; modular root uses external so the
+  # definition is visible across objects. `llvm_get_named_global` in the walk
+  # finds every shape.
+  nemit_declare_default_globals_for(ctx, kp.tab, kp.synth_defaults, role)
+  # Walk only this TU's fns; `all_fns` stays the stable P3 call-site lookup.
+  let fx = nfnx_build(all_fns, nm, kp.ids, frames)
+  nemit_walk_fns(ctx, define_fns, all_handlers, fx)
+  # The whole-program singletons live in exactly one TU (the owner, which also
+  # owns the runtime): the fn thunks, the proto impl-table init, the default
+  # install/teardown, and the synthetic `kai_main` runner driver. A leaf emits
+  # none of them. The `else ()` is load-bearing: kaic1 (which compiles stage2)
+  # runs a bodied `if` WITHOUT an else unconditionally, so an if-expression is
+  # the only form that actually gates the block.
+  # A function's thunk lives beside the function, and only when the program
+  # takes the function as a value: a closure over it in another object
+  # resolves the one definition its own object carries, and a function added
+  # to a module leaves every other object as it was. The shared core object
+  # serves every program, so it carries them all.
+  nemit_fn_thunks(ctx, match role {
+    NModSplitCore -> define_fns
+    _             -> filter(define_fns, (f) => ndecl_thunked(kp, env, f))
+  }, fx)
+  let _s = if nmod_owns_singletons(role) {
+    native_build_runtime_hooks(ctx, kp, nemit_entry_defaults(kp, bmode), decls, variants, fns,
+                               nadapters_for(role, define_fns))
+    nemit_build_runner_driver(ctx, kp.runners, bmode)
+  } else { () }
+  # The split core's share of the P3 boxed adapters (the split root registers
+  # every row and resolves these extern).
+  let _a = match role {
+    NModSplitCore -> nproto_emit_adapters_of(ctx, decls, kp.tab, kp.ids, fns, nemit_decls_of(define_fns))
+    _             -> ()
+  }
+  # Resolve DWARF temporaries before verify (a no-op when DI is off).
+  ndi_finalize(ctx)
+}
+
+# The adapter share of a singleton-owning TU: the split root defines only its
+# own partition's adapters; whole-program and the modular root define all.
+fn nadapters_for(role: NModRole, define_fns: [KFn]) : NAdapters = match role {
+  NModSplitRoot -> NAdaptOnly(nemit_decls_of(define_fns))
+  _             -> NAdaptAll
+}
+
+# The declarations among `fns`: an impl row is matched against them.
+fn nemit_decls_of(fns: [KFn]) : [FnId] = map(fns, kfn_fid)
+
+# Replay the AST-derived evidence-frame table into the ctx, one slot per
+# `add_frame_slot` call in canonical order: each declared fn's frame under
+# the symbol it is emitted with, each slot under its instance's label.
+fn nframes_register(ctx: Handle, kp: KProgram, decls: [Decl], frames: EvFrames) : Unit = match decls {
+  [] -> ()
+  [d, ...rest] -> {
+    match d {
+      DFn(_, fid, _, _, _, _, _, _, _, mo) ->
+        nframes_register_slots(ctx, fn_enc(kp.tab, kp.specs, fid, mo).sym,
+                               map(frame_slots_of(frames, fid), (k) => inst_key_text(kp.tab, k)))
+      _ -> ()
+    }
+    nframes_register(ctx, kp, rest, frames)
+  }
+}
+
+fn nframes_register_slots(ctx: Handle, sym: String, slots: [String]) : Unit = match slots {
+  [] -> ()
+  [s, ...rest] -> { native_ctx_add_frame_slot(ctx, sym, s); nframes_register_slots(ctx, sym, rest) }
+}
+
+# Declare every `KFnNormal` (all-boxed) + `KFnClause` (the clause ABI) up
+# front so a call/install site resolves the symbol even when the definition
+# comes later in the list. (Lambda thunks declare lazily at their use.)
+fn nemit_declare_fns(ctx: Handle, nm: KNames, fns: [KFn], const_fns: FnSet, free_fns: FnSet) : Unit = match fns {
+  [] -> ()
+  [f, ...rest] -> match f.kind {
+    # `KFnFfi` shares the all-boxed declaration: its callers invoke the
+    # kaikai-visible wrapper `kai_<name>(boxed args) -> boxed` like any fn;
+    # only its body differs (a synthesised unbox→extern→re-box shim). No
+    # purity attribute: the shim calls into arbitrary C.
+    KFnFfi(_, _, _) -> {
+      let _f = llvm_get_or_declare_fn(native_ctx_m(ctx), nfn_sym(nm, f), llvm_fn_type_boxed(native_ctx_ptrt(ctx), list_length(f.params)))
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
+    }
+    KFnNormal -> {
+      # Bind the declaration handle in a `let` (the handle-binder
+      # exclusion) — NOT a discarded statement. A bare
+      # `llvm_get_or_declare_fn(...)` leaves the returned `Function*` handle
+      # in statement position, where the type-blind kaic1 Perceus
+      # `kai_decref`s the unused value, dereferencing the raw LLVM pointer
+      # and clobbering the just-declared function's object (its type-id
+      # flipped Function->ConstantVector, crashing the AsmPrinter). The
+      # `let _d = <handle-fn>` form keeps it out of Perceus.
+      # P3: the forward declaration MUST use the same (possibly raw mixed)
+      # type as the definition (`nemit_declare_for_abi`) — `get_or_declare`
+      # is type-keyed, so a boxed forward-decl + a raw definition would
+      # bind two distinct functions. `nfn_llvm_type` returns the legacy
+      # boxed `ptr (ptr × n)` for a fully-boxed fn, so non-UFn decls are
+      # unchanged.
+      let sym = nfn_sym(nm, f)
+      let _d = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, nfn_llvm_type(ctx, sym, f))
+      # `memory(none)` only when the confirmation table proved the body
+      # memory-clean; `nounwind` only when nothing in it can trap, since a
+      # trap unwinds through these frames.
+      let _nu = if fn_set_has(free_fns, kfn_fid(f)) { llvm_add_nounwind(_d) } else { () }
+      let _mn = if fn_set_has(const_fns, kfn_fid(f)) { llvm_add_memory_none(_d) } else { () }
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
+    }
+    # A clause thunk is referenced by the install (`kaix_ev_set_op` stores
+    # its address) before its own definition is walked, so forward-declare
+    # it with the clause ABI `ptr (ptr self, <args>, ptr k)`.
+    KFnClause -> {
+      let _c = nemit_declare_clause(ctx, kfn_sym(nm, f), f.params)
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
+    }
+    # The install arms the cleanup thunk's address before its own definition
+    # is walked, so forward-declare it with the `void (ptr self)` ABI.
+    KFnCleanup -> {
+      let _c = nemit_declare_cleanup(ctx, kfn_sym(nm, f))
+      nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
+    }
+    _ -> nemit_declare_fns(ctx, nm, rest, const_fns, free_fns)
+  }
+}
+
+# Walk each fn (imperative over `ctx`; an uncovered node flips `ctx.ok`).
+# `fx` indexes the COMPLETE KFn list, never the walk cursor: a direct
+# call-site reads the callee's raw param/return slots off it.
+fn nemit_walk_fns(ctx: Handle, fns: [KFn], handlers: [KHandlerDecl], fx: NFnIndex) : Unit / Console = match fns {
+  [] -> ()
+  [f, ...rest] -> { nemit_fn(ctx, f, handlers, fx); nemit_walk_fns(ctx, rest, handlers, fx) }
+}
+
+# The three runtime-entry hooks `runtime_llvm.c`'s `int main` calls around
+# `kai_main`: `kai_main_install_defaults`, `kai_main_teardown_defaults`,
+# `_kai_proto_init_llvm`.
+#
+# `install_defaults` / `teardown_defaults` carry REAL bodies now (effects
+# subset 2c): one push/pop per default in `kp.defaults` (main's row ∩ the
+# builtin install order ++ user effects with a `default { }` block, in
+# install order). With an empty `defaults` they emit just `ret void`, so a
+# pure (effect-free) program is byte-equivalent to the old no-op. The
+# C-direct oracle builds the same two functions from `default_setups_for` /
+# `default_pops_for`.
+#
+# `_kai_proto_init_llvm` now carries a REAL body: the protocol impl-table
+# registration (`nproto_build_init`, emit_native_proto), mirroring the
+# C-direct `_kai_register_proto_tables` and the LLVM-text `_kai_proto_init_
+# llvm`. Without it `kai_lookup_impl` stayed NULL and every `hash`/`==`/`<`
+# dispatch panicked "no impl" (hashmap/hashset/crypto). The `decls`/
+# `variants`/`fns` are the post-perceus AST tables the driver already
+# builds for the KIR lowering; the pure collectors live in `emit_shared`.
+fn native_build_runtime_hooks(ctx: Handle, kp: KProgram, defaults: [KDefault], decls: [Decl],
+                              variants: [VariantEntry], fns: [EFn], adapters: NAdapters) : Unit / Console = {
+  nemit_build_install_defaults(ctx, kp.tab, defaults)
+  nemit_build_teardown_defaults(ctx, defaults)
+  nproto_build_init(ctx, decls, kp.tab, kp.ids, variants, fns, adapters, kp.reuse_tags)
+}
+
+# Derive the object-file path from the source path: `foo.kai` -> `foo.o`.
+# A path not ending in `.kai` just gets `.o` appended. The `bin/kai`
+# wrapper (or the test harness) links this object against the effects
+# runtime to the final executable.
+fn native_object_path(src_path: String) : String = {
+  let n = string_length(src_path)
+  if n > 4 and string_slice(src_path, n - 4, 4) == ".kai" {
+    cat2(string_slice(src_path, 0, n - 4), ".o")
+  } else {
+    cat2(src_path, ".o")
+  }
+}
+
+#[doc("The object path for `src_path`: beside it when `dir` is empty, else `dir/<name>.o`.")]
+pub fn native_object_in(dir: String, src_path: String) : String =
+  if dir == "" { native_object_path(src_path) }
+  else {
+    let cut = last_slash(src_path, string_length(src_path) - 1) + 1
+    cat2(dir, cat2("/", native_object_path(string_slice(src_path, cut, string_length(src_path) - cut))))
+  }
