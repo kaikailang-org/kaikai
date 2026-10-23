@@ -1,0 +1,6 @@
+# A bound on another module's `pub fn` is satisfied by an impl that
+# lives beside the type, not at the call site.
+
+import keys
+
+fn main() : Unit / Stdout = Stdout.print(int_to_string(keys.tag(keys.Token(1))))

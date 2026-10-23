@@ -1,0 +1,6 @@
+# Edition cache-isolation smoke. Shared-cache entries fold the
+# edition into their content key, so a build under one edition can
+# never be served an entry written under another. The accompanying
+# `check.sh` exercises the isolation on both backends.
+
+fn main() : Unit / Console = print("ok")
