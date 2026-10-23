@@ -1,0 +1,72 @@
+#[doc("The platform a program is built for, and the effects its `main` may perform there.")]
+
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.diag
+import compiler.core_types
+import compiler.symtab
+import compiler.emit_shared_rows
+import compiler.fnreg
+
+#[doc("A build target: the host the compiler runs on, or a browser page.")]
+pub type Target = TgHost | TgWasm32Browser
+
+#[doc("The target a name spells, or `None` when it spells none.")]
+pub fn target_of_name(n: String) : Option[Target] = match n {
+  "host"           -> Some(TgHost)
+  "wasm32-browser" -> Some(TgWasm32Browser)
+  _                -> None
+}
+
+#[doc("The name a target is selected by.")]
+pub fn target_name(t: Target) : String = match t {
+  TgHost          -> "host"
+  TgWasm32Browser -> "wasm32-browser"
+}
+
+fn browser_refused() : [CoreEffect] =
+  [CeNetTcp, CeNetUdp, CeNetUnix, CeNetDns, CeSignal, CeFile, CeStdin]
+
+fn refused_effect(t: Target, s: SymId) : Option[CoreEffect] = match t {
+  TgHost          -> if effect_is(s, CeJs) { Some(CeJs) } else { None }
+  TgWasm32Browser -> match filter(browser_refused(), (c) => effect_is(s, c)) {
+    [c, ..._] -> Some(c)
+    _         -> None
+  }
+}
+
+fn refusal(t: Target, file: String, line: Int, col: Int, c: CoreEffect) : Diagnostic = {
+  let eff = core_effect_name(c)
+  mk_diag(SevError, file, line, col,
+    "`main` performs effect `#{eff}`, which the `#{target_name(t)}` target cannot run",
+    [ri_help(file, line, col, "handle `#{eff}` in `main` with a handler of your own, or remove it from `main`'s row")])
+}
+
+fn main_site(decls: [Decl], entry: SymId) : Option[[Int]] = match decls {
+  [] -> None
+  [d, ...rest] -> match d {
+    DFn(_, fid, _, _, _, _, _, line, col, _) -> if is_entry(entry, fid) { Some([line, col]) } else { main_site(rest, entry) }
+    _ -> main_site(rest, entry)
+  }
+}
+
+#[doc("One diagnostic for each effect in `main`'s final row that the target cannot run; none on the host.")]
+pub fn target_main_diags(t: Target, file: String, decls: [Decl], tab: SymTab, entry: SymId) : [Diagnostic] =
+  match main_site(decls, entry) {
+    Some([line, col]) -> flat_map(main_row_labels(decls, entry, tab), (s) => match refused_effect(t, s) { Some(c) -> [refusal(t, file, line, col, c)]  None -> [] })
+    _ -> []
+  }
+
+#[doc("One diagnostic for each `extern \"js\"` declaration among `decls`, when the backend is the native one: a JavaScript import is reached through the C backend.")]
+pub fn js_native_diags(file: String, decls: [Decl]) : [Diagnostic] = flat_map(decls, (d) => js_native_diag(file, d))
+
+fn js_native_diag(file: String, d: Decl) : [Diagnostic] = match d {
+  DFn(_, fid, _, _, _, _, body, line, col, _) -> match body_js_path(body) {
+    Some(_) -> [mk_diag(SevError, file, line, col, "`extern \"js\"` is not supported by the native backend",
+                        [ri_help(file, line, col, "build with `--backend=c`, which the `wasm32-browser` target uses")])]
+    None    -> []
+  }
+  DDoc(_, _, inner, _, _) -> js_native_diag(file, inner)
+  DAttr(_, inner, _, _)   -> js_native_diag(file, inner)
+  _                       -> []
+}

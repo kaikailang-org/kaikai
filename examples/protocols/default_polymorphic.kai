@@ -1,0 +1,32 @@
+# Issue #258 / PR #736 — polymorphic `Default` for parametric containers,
+# driven through the impl-table dispatch path. `Default` and its impls for
+# `[T]` / `Option[T]` live in stdlib/protocols.kai and are loaded by
+# default; this fixture uses them directly. It must NOT redefine the
+# protocol or those impls — stdlib already provides them, and redefining
+# them is a `duplicate impl` error (that mistake red-ed main once).
+#
+# `default() : Self` has Self only in the return position, so v1
+# single-dispatch resolves the call via the annotation on each `let`
+# (`let xs : [Int] = default()` pins Self = [Int] before the dispatcher
+# runs). The empty list's `list_length` and the empty Option's variant
+# tag make the chosen impl observable. Companion to default_basic.kai,
+# which covers the scalar impls (Int/Real/Bool/String) whose arity-0
+# boxed shim PR #736 added.
+
+fn main() : Int {
+  let xs : [Int]         = default()
+  let ys : [String]      = default()
+  let oi : Option[Int]   = default()
+  let os : Option[[Int]] = default()
+  print(int_to_string(list_length(xs)))
+  print(int_to_string(list_length(ys)))
+  match oi {
+    None    -> print("None")
+    Some(_) -> print("Some")
+  }
+  match os {
+    None    -> print("None")
+    Some(_) -> print("Some")
+  }
+  0
+}
