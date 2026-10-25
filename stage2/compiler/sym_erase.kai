@@ -1,0 +1,27 @@
+#[doc("""
+Numbers the nodes of every declaration below the monomorphiser.
+
+A reference is its identity from the resolver down to the emitters, so
+nothing is respelled here. What is left of the boundary this module was
+is the site id it gives each node of a declaration's bodies, which the
+unwinder keys its brackets by: the ownership passes run between the two
+entry points, and each rebuilds the bodies it is handed.
+""")]
+
+import compiler.ast_decl
+import compiler.site_ids
+import compiler.symtab
+
+#[doc("The view the two entry points take: the symbol table the program's ids index, and the module whose file is being built.")]
+pub type SymErase = SymErase(SymTab, String)
+
+#[doc("The same declarations with every node of their bodies given a site id of its own, unique within its declaration.")]
+pub fn sym_erase_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(ds)
+
+#[doc("The same declarations with every node of their bodies given a site id of its own, unique within its declaration.")]
+pub fn sym_qualify_decls_in(se: SymErase, ds: [Decl]) : [Decl] / Mutable = se_decls(ds)
+
+fn se_decls(ds: [Decl]) : [Decl] / Mutable = match ds {
+  []           -> []
+  [d, ...rest] -> [site_renumber_decl(d), ...se_decls(rest)]
+}

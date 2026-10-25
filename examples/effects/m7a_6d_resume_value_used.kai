@@ -1,0 +1,23 @@
+# A clause that binds the resume result and uses it. `resume(v)` runs
+# the rest of the body with the op returning `v` and evaluates to the
+# handle's result, after `return`: here the body turns 40 into 400,
+# `return` into 401, and the clause's 403 is the handle's value. Reading
+# `resume` as returning its argument would give 421 instead.
+
+effect Counter {
+  tick() : Int
+}
+
+fn main() : Int {
+  let r = handle {
+    Counter.tick() * 10
+  } with Counter {
+    tick(resume) -> {
+      let x = resume(40)
+      x + 2
+    }
+    return(x) -> x + 1
+  }
+  assert r == 403
+  0
+}
