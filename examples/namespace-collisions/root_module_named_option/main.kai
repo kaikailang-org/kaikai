@@ -1,0 +1,8 @@
+# A root module named like a core one exports its own fn beside the core's
+# function of the same name.
+
+import option
+
+fn main() : Unit / Stdout = {
+  println("#{option.is_some(3)}")
+}
