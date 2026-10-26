@@ -1,0 +1,605 @@
+#[doc("Closure specialisation helpers: the AST rewriting, shared-body detection and emission of specialised copies.")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.emit_shared_alias
+import compiler.expr_positions
+import compiler.fnreg
+import compiler.trmc_self_call
+import compiler.symtab
+import compiler.type_text
+import compiler.tparam_uses
+import compiler.util
+import compiler.written
+
+# Whether a specialised callee pastes its closure argument's body at each
+# application or calls the closure's literal there. A lambda or a handler
+# clause is lifted under its source position, so two pasted copies of one
+# would lift two symbols under a single name.
+
+#[doc("True when the closure's body must stay one copy: it lifts a lambda or a handler clause and the callee applies its parameter `f` more than once.")]
+pub(pkg) fn shares_closure(ca: ClosureArg, body: Expr, f: LocalId) : Bool =
+  holds_lifted(closure_body(ca)) and applications(body, f) > 1
+
+fn closure_body(ca: ClosureArg) : Expr = match ca {
+  CaLambda(_, b) -> b
+  CaNamedFn(d)   -> decl_body(d)
+}
+
+fn applications(e: Expr, f: LocalId) : Int = {
+  let here = match e.kind {
+    ECall(callee, _) -> match callee.kind { ELocal(l) -> if local_eq(l, f) { 1 } else { 0 }  _ -> 0 }
+    _ -> 0
+  }
+  foldl(xp_positions(e), here, (acc, p) => match p { XP(_, c) -> acc + applications(c, f) })
+}
+
+fn holds_lifted(e: Expr) : Bool = match e.kind {
+  ELambda(_, _) -> true
+  EHandle(_, _, _, _, _, _, _) -> true
+  _ -> any(xp_positions(e), (p) => match p { XP(_, c) -> holds_lifted(c) })
+}
+
+# compiler/closure_spec_ast.kai — shared data model + AST helpers for
+# closure specialisation. The request/closure-arg types and the pure
+# sub-expression enumeration / substitution-scaffolding helpers the
+# discovery, rewrite, and emission modules all walk. Split out to keep
+# each closure-spec file small.
+
+# A specialisable functional argument: a syntactic lambda, or a bare
+# reference to a top-level fn resolved to its decl. Both have empty
+# capture environments — the only shapes v1 inlines.
+pub(pkg) type ClosureArg
+  = CaLambda([Param], Expr)
+  | CaNamedFn(Decl)
+
+# One discovered specialisation request: the higher-order callee, the
+# index of its functional parameter among the call args, the closure to
+# inline, and the closure's `closure_disc`, which keys the emitted spec.
+pub(pkg) type CSpecReq = CSReq(Decl, Int, ClosureArg, String, SymId)
+
+pub(pkg) fn remap(e: Expr, k: ExprKind) : Expr =
+  Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+# Direct sub-Exprs of a node, in evaluation order. Enumerated purely
+# rather than via a side-effecting functor: the read walks (capture
+# analysis, request collection) need the child list, and a mutable
+# accumulator over `map_expr_kind` would leak a `Mutable` label into
+# the compiler's own build.
+pub(pkg) fn cspec_kids(e: Expr) : [Expr] =
+  match e.kind {
+    ECall(callee, args_)   -> [callee, ...args_]
+    EField(base, _)        -> [base]
+    EIndex(a, b)           -> [a, b]
+    EBinop(_, a, b)        -> [a, b]
+    EUnop(_, x)            -> [x]
+    EIf(c, t_, eo)         -> [c, t_, ...cs_opt_list(eo)]
+    EMatch(scr, arms)      -> [scr, ...cs_arm_exprs(arms)]
+    ELambda(_, b)          -> [b]
+    ERecordLit(_, fs)      -> cs_field_exprs(fs)
+    EList(els)             -> cs_elem_exprs(els)
+    ERange(a, b, os)       -> [a, b, ...cs_opt_list(os)]
+    EBlock(ss, t)          -> list_append(cs_stmt_exprs(ss), cs_opt_list(t))
+    EPipe(a, b)            -> [a, b]
+    EDispatchPipe(_, a, b) -> [a, b]
+    ELitUnit(inner, _)     -> [inner]
+    EBang(inner)           -> [inner]
+    EIntrinsic(_, args_)   -> args_
+    ESurface(sf)   -> surface_children(sf)
+    EHandle(body, _, _, io, _, cls, ro) ->
+      [body, ...cs_opt_list(io), ...clause_exprs(cls), ...ret_exprs(ro)]
+    _ -> []
+  }
+
+fn cs_opt_list(o: Option[Expr]) : [Expr] =
+  match o { Some(x) -> [x]  None -> [] }
+
+fn cs_arm_exprs(arms: [Arm]) : [Expr] =
+  match arms {
+    [] -> []
+    [Arm(_, g, b), ...rest] -> list_append(list_append(cs_opt_list(g), [b]), cs_arm_exprs(rest))
+  }
+
+fn cs_field_exprs(fs: [FieldInit]) : [Expr] =
+  match fs {
+    [] -> []
+    [FI(_, v), ...rest] -> [v, ...cs_field_exprs(rest)]
+  }
+
+fn cs_elem_exprs(els: [ListElem]) : [Expr] =
+  match els {
+    [] -> []
+    [ElPlain(x), ...rest]  -> [x, ...cs_elem_exprs(rest)]
+    [ElSpread(x), ...rest] -> [x, ...cs_elem_exprs(rest)]
+  }
+
+fn cs_stmt_exprs(ss: [Stmt]) : [Expr] =
+  match ss {
+    [] -> []
+    [s, ...rest] -> list_append(one_stmt_exprs(s), cs_stmt_exprs(rest))
+  }
+
+fn one_stmt_exprs(s: Stmt) : [Expr] =
+  match s {
+    SLet(_, _, rhs)           -> [rhs]
+    SAssert(c, m)             -> [c, ...cs_opt_list(m)]
+    SExprStmt(x)              -> [x]
+    SIndexAssign(b, i, v, _, _) -> [b, i, v]
+  SAssign(b, v, _, _) -> [b, v]
+    SVar(_, _, rhs, _, _)     -> [rhs]
+    SUse(_, _, _)             -> []
+  }
+
+fn clause_exprs(cls: [HClause]) : [Expr] =
+  match cls {
+    [] -> []
+    [HC(_, _, b, _, _), ...rest] -> [b, ...clause_exprs(rest)]
+  }
+
+fn ret_exprs(ro: Option[HReturn]) : [Expr] =
+  match ro { Some(HR(_, b, _, _)) -> [b]  None -> [] }
+
+#[doc("The retargeted callee: the spec `s`, whatever module the original callee had.")]
+pub(pkg) fn retarget_callee(callee: Expr, s: SymId) : Expr = remap(callee, cspec_ref(s))
+
+#[doc("A reference to the spec `s`.")]
+pub(pkg) fn cspec_ref(s: SymId) : ExprKind = ESym(s, spec_none())
+
+#[doc("The id of the spec `nm` homed at `target`.")]
+pub(pkg) fn cspec_sym(nm: String, target: String) : SymId = sym_derive(NCFn, nm, target)
+
+#[doc("The binders the parameters `ps` declare, by id.")]
+pub(pkg) fn cs_param_ids(ps: [Param]) : [LocalId] =
+  match ps {
+    [] -> []
+    [p, ...rest] -> [p.binder.id, ...cs_param_ids(rest)]
+  }
+
+#[doc("The binder of the `n`-th parameter; the unnumbered id past the end.")]
+pub(pkg) fn param_id_at(ps: [Param], n: Int) : LocalId =
+  match ps {
+    [] -> local_none()
+    [p, ...rest] -> if n == 0 { p.binder.id } else { param_id_at(rest, n - 1) }
+  }
+
+#[doc("True when `xs` holds the binder `l`.")]
+pub(pkg) fn cs_has(xs: [LocalId], l: LocalId) : Bool =
+  match xs {
+    [] -> false
+    [x, ...rest] -> local_eq(x, l) or cs_has(rest, l)
+  }
+
+pub(pkg) fn drop_param_at(ps: [Param], n: Int) : [Param] =
+  match ps {
+    [] -> []
+    [p, ...rest] -> if n == 0 { rest } else { [p, ...drop_param_at(rest, n - 1)] }
+  }
+
+pub(pkg) fn drop_at(xs: [Expr], n: Int) : [Expr] =
+  match xs {
+    [] -> []
+    [x, ...rest] -> if n == 0 { rest } else { [x, ...drop_at(rest, n - 1)] }
+  }
+
+pub(pkg) fn elem_at(xs: [Expr], n: Int) : Expr =
+  match xs {
+    [] -> mk_expr(EUnit, 0, 0)
+    [x, ...rest] -> if n == 0 { x } else { elem_at(rest, n - 1) }
+  }
+
+pub(pkg) fn index_of(xs: [LocalId], target: LocalId, i: Int) : Option[Int] =
+  match xs {
+    [] -> None
+    [x, ...rest] -> if local_eq(x, target) { Some(i) } else { index_of(rest, target, i + 1) }
+  }
+
+pub(pkg) fn map_opt(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] =
+  match o { Some(x) -> Some(f(x))  None -> None }
+
+#[doc("The binders a pattern declares, by id, ahead of `acc`.")]
+pub(pkg) fn cs_pat_binders(p: Pattern, acc: [LocalId]) : [LocalId] =
+  match p.pkind {
+    PBind(b)              -> [b.id, ...acc]
+    PAs(b, sub)           -> cs_pat_binders(sub, [b.id, ...acc])
+    PList(subs, rest)     -> pats_binders(subs, opt_bind(rest, acc))
+    PVariant(_, subs)     -> pats_binders(subs, acc)
+    PVariantRecord(_, fs) -> pfields_binders(fs, acc)
+    PRecord(fs)           -> pfields_binders(fs, acc)
+    PNarrow(b, _)         -> [b.id, ...acc]
+    _                     -> acc
+  }
+
+fn opt_bind(o: Option[Binder], acc: [LocalId]) : [LocalId] =
+  match o { Some(b) -> [b.id, ...acc]  None -> acc }
+
+fn pats_binders(ps: [Pattern], acc: [LocalId]) : [LocalId] =
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pats_binders(rest, cs_pat_binders(p, acc))
+  }
+
+fn pfields_binders(fs: [PField], acc: [LocalId]) : [LocalId] =
+  match fs {
+    [] -> acc
+    [PField(_, sub, _), ...rest] -> pfields_binders(rest, cs_pat_binders(sub, acc))
+  }
+
+#[doc("The name a function declaration is spelled with in `tab`; empty for any other decl.")]
+pub(pkg) fn cs_decl_text(tab: SymTab, d: Decl) : String = written_text(decl_name(tab, cs_decl_sym(d)))
+
+pub(pkg) fn decl_body(d: Decl) : Expr =
+  match d { DFn(_, _, _, _, _, _, b, _, _, _) -> b  _ -> mk_expr(EUnit, 0, 0) }
+
+pub(pkg) fn decl_params(d: Decl) : [Param] =
+  match d { DFn(_, _, _, ps, _, _, _, _, _, _) -> ps  _ -> [] }
+
+#[doc("The symbol a function declaration was minted under, or `sym_none()` for any other decl.")]
+pub(pkg) fn cs_decl_sym(d: Decl) : SymId =
+  match d { DFn(_, f, _, _, _, _, _, _, _, _) -> fnid_sym(f)  _ -> sym_none() }
+
+pub(pkg) fn cs_decl_mo(d: Decl) : Option[String] =
+  match d { DFn(_, _, _, _, _, _, _, _, _, mo) -> mo  _ -> None }
+
+# The mangled spec name for a higher-order fn `name` specialised on a
+# closure identified by `disc`. The discriminator — not the call site —
+# keys the spec: a transitive inner call (`group_by → group_by_loop`) has
+# the SAME `(line, col)` for two distinct outer closures, so keying on the
+# site alone would collide their specs onto one. Keying on the closure's
+# own identity keeps them apart. The callee's module is part of the key
+# too (same `<m>__<name>` shape as `c_sym`): `hashmap.filter` and
+# `list.filter` specialised on one closure are distinct specs, and
+# collapsing them retargets the transitive inner call onto the outer
+# spec itself — infinite recursion over the wrong representation.
+pub(pkg) fn cspec_name(mo: Option[String], name: String, disc: String) : String =
+  match mo {
+    Some(m) -> concat_all([m, "__", name, "__cspec__", disc])
+    None    -> concat_all([name, "__cspec__", disc])
+  }
+
+# A stable identity for a closure: a named fn's module and name, or a
+# lambda's body position within `host`, the decl whose body holds the call.
+# The host is part of it because every spec of one callee copies the
+# callee's inner lambdas at the same position, each beta-reduced on a
+# different closure. The module is part of a named fn's because two
+# modules may each pass their own homonymous fn to one callee.
+pub(pkg) fn closure_disc(tab: SymTab, host: SymId, ca: ClosureArg) : String =
+  match ca {
+    CaLambda(_, b) ->
+      concat_all(["L", int_to_string(b.line), "_", int_to_string(b.col), "_", written_text(decl_name(tab, host))])
+    CaNamedFn(d)   -> match cs_decl_mo(d) {
+      Some(m) -> concat_all(["F", m, "__", cs_decl_text(tab, d)])
+      None    -> concat_all(["F", cs_decl_text(tab, d)])
+    }
+  }
+
+# Keep only the tparams the concretised signature still uses as a type —
+# the functional param's row tparam and any argument-pinned tparam (now a
+# concrete type) drop out, so mono sees a concrete spec.
+pub(pkg) fn keep_used(tp: [TBinder], used: [TLocalId]) : [TBinder] =
+  filter(tp, (b) => tids_has(used, b.id))
+
+# ---- spec emission (beta reduction) ----
+
+# compiler/closure_spec_emit.kai — spec emission: beta-reduce the
+# closure into the callee body, retarget the spec's own recursion, close
+# the effect row, and prune the now-unused row tparam. Consumes the
+# shared AST helpers in closure_spec_ast.
+#
+# Substitution is by binder identity: a read is replaced when it carries
+# the parameter's id, so no binder inside the body can hide or capture
+# one. Every pasted copy of the closure takes binders of its own, since a
+# function must not declare one binder twice.
+
+# What one spec's beta-reduction substitutes: the callee's functional
+# parameter, the closure it is bound to, whether that closure stays one
+# literal per application, and the spec's name, which keys the binders
+# of each pasted copy.
+type Beta = { f: LocalId, ca: ClosureArg, sh: Bool, key: String }
+
+# Build the specialised decl `sname`: drop the functional parameter,
+# beta-reduce every `f(args)` in the body, then retarget the body's own
+# recursive `n(..., f)` calls onto this same spec so a self-recursive
+# higher-order (`foldl_loop`) becomes a self-recursive spec — TRMC then
+# re-forms the loop instead of a fresh one-iteration wrapper per
+# recursion site. The callee's module rides inside the spec's name (see
+# `cspec_name`); the spec itself is a root decl (`mo = None`), and its
+# call sites name it by the id of that root-homed name, whether the
+# original callee was `mod.f` or a bare `f`.
+#
+# The callee's body needs no qualifying to move to the root: each call in
+# it names its declaration by id.
+pub(pkg) fn emit_cspec(r: CSpecReq, sname: String, target: String) : Decl =
+  match r {
+    CSReq(callee, idx, ca, _, _) -> match callee {
+      DFn(p, me, tp, ps, rt, row, body, dl, dc, _) -> {
+        let ssym = cspec_sym(sname, target)
+        let f = param_id_at(ps, idx)
+        let bx = Beta { f: f, ca: ca, sh: shares_closure(ca, body, f), key: sname }
+        let body1 = beta_apply_all(retarget_self(body, SelfRef(me), idx, cspec_ref(ssym), f), bx)
+        let ps1 = drop_param_at(ps, idx)
+        # Only pure closures reach here (classify_closure gate), so the
+        # stage adds no effect: the spec keeps the callee's own labels and
+        # drops the now-unused row tparam. Mono then grounds every remaining
+        # tparam a data argument pins — `r` from a fold's `init`, so unbox
+        # lands the loop's accumulator; a return-only tparam (a collect's
+        # element type) stays polymorphic and boxed, but the per-element
+        # indirect call is gone regardless.
+        let tp1 = keep_used(tp, sig_param_ids(ps1, rt, row))
+        DFn(p, fnid_decl(ssym), tp1, ps1, rt, spec_row(row, tp1), body1, dl, dc, None)
+      }
+      _ -> callee
+    }
+  }
+
+# A row variable no remaining parameter names was the stage's, and the
+# stage is pure.
+fn spec_row(r: RowExpr, tps: [TBinder]) : RowExpr = match r {
+  ROpen(v, ls) -> if tbs_has(tps, tail_id(v)) { r } else { match ls { [] -> REmpty  _ -> RClosed(ls) } }
+  _ -> r
+}
+
+# Retarget a body's own recursive `n(args)` that passes the functional
+# param `f` itself at `idx` onto the spec, with that argument dropped.
+# Runs before beta-reduction: a self-call the inlined closure makes passes
+# another closure and must stay a call to `n`.
+fn retarget_self(e: Expr, me: SelfRef, idx: Int, sref: ExprKind, f: LocalId) : Expr =
+  match e.kind {
+    ECall(callee, args_) -> {
+      let args1 = map(args_, (a) => retarget_self(a, me, idx, sref, f))
+      if is_self_callee(callee, me) and passes_param(args_, idx, f) {
+        remap(e, ECall(remap(callee, sref), drop_at(args1, idx)))
+      } else {
+        remap(e, ECall(retarget_self(callee, me, idx, sref, f), args1))
+      }
+    }
+    _ -> remap(e, map_expr_kind(e.kind, (k) => retarget_self(k, me, idx, sref, f)))
+  }
+
+fn passes_param(args_: [Expr], idx: Int, f: LocalId) : Bool =
+  idx < list_length(args_) and match elem_at(args_, idx).kind {
+    ELocal(a) -> local_eq(a, f)
+    _         -> false
+  }
+
+# Rewrite the functional parameter out of the body. A direct
+# application `f(args)` beta-reduces to the inlined closure body; any
+# OTHER use of `f` as a value (`foldl_loop(..., f)`) is replaced by the
+# closure's literal form so the next fixpoint round specialises that
+# inner higher-order call too — this is how the transitive chain
+# `foldl → foldl_loop` reaches the loop that carries the per-element
+# indirect call.
+fn beta_apply_all(e: Expr, bx: Beta) : Expr =
+  match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      ELocal(l) ->
+        if local_eq(l, bx.f) {
+          let args1 = map(args_, (a) => beta_apply_all(a, bx))
+          if bx.sh { remap(e, ECall(closure_literal(bx, callee), args1)) } else { inline_apply(bx, e, args1) }
+        }
+        else { beta_descend(e, bx) }
+      _ -> beta_descend(e, bx)
+    }
+    ELocal(l) -> if local_eq(l, bx.f) { closure_literal(bx, e) } else { e }
+    _ -> beta_descend(e, bx)
+  }
+
+fn beta_descend(e: Expr, bx: Beta) : Expr =
+  Expr { kind: map_expr_kind(e.kind, (k) => beta_apply_all(k, bx)),
+         line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+
+# The key of the copy pasted at `site`: one per spec and position.
+fn paste_key(bx: Beta, site: Expr) : String =
+  concat_all([bx.key, "_", int_to_string(site.line), "_", int_to_string(site.col)])
+
+# The closure as a first-class value, to substitute for a bare use of
+# the functional param. A lambda is its own literal; a named fn is a
+# reference to its declaration. `site` supplies the position/type of the
+# replaced use.
+fn closure_literal(bx: Beta, site: Expr) : Expr =
+  match bx.ca {
+    CaLambda(ps, b) -> {
+      let k = paste_key(bx, site)
+      remap(site, ELambda(fresh_params(ps, k), fresh_expr(b, k)))
+    }
+    CaNamedFn(d)    -> remap(site, ESym(cs_decl_sym(d), spec_none()))
+  }
+
+# Beta-reduce one application of the closure to `args`. A parameter the
+# plan binds reads a fresh `let` holding its argument, evaluated once and
+# outside the body; the rest substitute directly, which is what lets a
+# collect's `k` stay unboxed.
+fn inline_apply(bx: Beta, site: Expr, args_: [Expr]) : Expr = {
+  let k = paste_key(bx, site)
+  match bx.ca {
+    CaLambda(ps, b) -> bind_once_apply(fresh_expr(b, k), fresh_params(ps, k), args_, k)
+    CaNamedFn(d)    -> bind_once_apply(fresh_expr(decl_body(d), k), fresh_params(decl_params(d), k), args_, k)
+  }
+}
+
+fn bind_once_apply(body: Expr, ps: [Param], args_: [Expr], k: String) : Expr = {
+  let plan = plan_binds(body, ps, args_, k)
+  let pasted = subst_params(body, cs_param_ids(ps), plan.repls)
+  match plan.lets {
+    [] -> pasted
+    _  -> Expr { kind: EBlock(plan.lets, Some(pasted)), line: body.line, col: body.col, ty: pasted.ty, mode: MUnknown, site: 0 }
+  }
+}
+
+type BindPlan = { repls: [Expr], lets: [Stmt] }
+
+# For each closure param decide direct substitution vs a fresh let binder.
+# `repls` is what `subst_params` puts at each read of the param (the arg
+# itself, or a read of the fresh binder); `lets` collects the
+# `let fresh = arg` for the bound-once params.
+fn plan_binds(body: Expr, ps: [Param], args_: [Expr], k: String) : BindPlan =
+  match ps {
+    [] -> BindPlan { repls: [], lets: [] }
+    [p, ...prest] -> match args_ {
+      [] -> BindPlan { repls: [], lets: [] }
+      [a, ...arest] -> {
+        let rest = plan_binds(body, prest, arest, k)
+        if bind_once_needed(body, p.binder.id, a) {
+          let fresh = once_binder(body, p, k)
+          BindPlan { repls: [mk_local(fresh.id, body.line, body.col), ...rest.repls],
+                     lets: [SLet(mk_pat(PBind(fresh), body.line, body.col), None, a), ...rest.lets] }
+        } else {
+          BindPlan { repls: [a, ...rest.repls], lets: rest.lets }
+        }
+      }
+    }
+  }
+
+# The binder a bound-once param's argument takes. Its name carries the
+# body position, so it reads apart from the callee's own binders; its id
+# is the pasted copy's own.
+fn once_binder(body: Expr, p: Param, k: String) : Binder = {
+  let spelled = concat_all(["__csb_", int_to_string(body.line), "_", int_to_string(body.col), "_", written_text(p.binder.name)])
+  binder_numbered(binder_minted(spelled), local_minted(concat_all([spelled, "@", k])))
+}
+
+# An argument that runs something is bound once: substituted, it would run
+# once per read, so never for a param the body ignores. A variable is bound
+# when several reads would copy a value that carries RC (a boxed Int outside
+# the immediate range lives on the heap); otherwise it substitutes at each
+# read's own position. Reads are counted syntactically and round up, which
+# only adds a redundant `let`.
+fn bind_once_needed(body: Expr, l: LocalId, arg: Expr) : Bool = {
+  let occ = count_param_reads(body, l)
+  if arg_is_literal(arg) { occ.n > 1 }
+  else if not arg_is_var(arg) { true }
+  else { occ.n > 1 and not opt_ty_unboxable(occ.ty) }
+}
+
+# A literal reads no binder and runs nothing: it is the same wherever it
+# is pasted and however often.
+fn arg_is_literal(a: Expr) : Bool = match a.kind {
+  EInt(_, _)     -> true
+  EReal(_, _)    -> true
+  EBool(_)       -> true
+  EChar(_)       -> true
+  EUnit          -> true
+  EStr(_, _)     -> true
+  _              -> false
+}
+
+fn arg_is_var(a: Expr) : Bool = match a.kind {
+  ELocal(_) -> true
+  _         -> false
+}
+
+fn opt_ty_unboxable(ot: Option[Ty]) : Bool =
+  match ot { Some(t) -> ty_is_unboxable_t(t)  None -> false }
+
+type ReadCount = { n: Int, ty: Option[Ty] }
+
+# Count the reads of the binder `l` in the body and capture one
+# occurrence's resolved type (they share it).
+fn count_param_reads(e: Expr, l: LocalId) : ReadCount =
+  match e.kind {
+    ELocal(x) -> if local_eq(x, l) { ReadCount { n: 1, ty: e.ty } } else { ReadCount { n: 0, ty: None } }
+    _         -> count_reads_kids(cspec_kids(e), l, ReadCount { n: 0, ty: None })
+  }
+
+fn count_reads_kids(es: [Expr], l: LocalId, acc: ReadCount) : ReadCount =
+  match es {
+    [] -> acc
+    [k, ...rest] -> {
+      let c = count_param_reads(k, l)
+      let ty1 = match acc.ty { Some(_) -> acc.ty  None -> c.ty }
+      count_reads_kids(rest, l, ReadCount { n: acc.n + c.n, ty: ty1 })
+    }
+  }
+
+# Substitute each read of a closure parameter by its argument expression.
+fn subst_params(e: Expr, ids: [LocalId], args_: [Expr]) : Expr =
+  match e.kind {
+    ELocal(l) -> match index_of(ids, l, 0) {
+      Some(i) -> at_read(elem_at(args_, i), e)
+      None    -> e
+    }
+    _ -> remap(e, map_expr_kind(e.kind, (k) => subst_params(k, ids, args_)))
+  }
+
+# A variable argument takes the position of the read it replaces, so two
+# reads of one param stay two reads.
+fn at_read(arg: Expr, read: Expr) : Expr = match arg.kind {
+  ELocal(_) -> Expr { kind: arg.kind, line: read.line, col: read.col, ty: arg.ty, mode: arg.mode,  site: read.site }
+  _         -> arg
+}
+
+# ---- a pasted copy's own binders ----
+
+# The copy keyed `k` declares, in place of the binder `l`, the binder this
+# mints; an unnumbered binder stays so.
+fn fresh_id(l: LocalId, k: String) : LocalId =
+  if local_raw(l) == 0 { l }
+  else { local_minted(concat_all([k, "#", int_to_string(local_raw(l))])) }
+
+fn fresh_binder(b: Binder, k: String) : Binder = binder_numbered(b, fresh_id(b.id, k))
+
+fn fresh_opt_binder(o: Option[Binder], k: String) : Option[Binder] =
+  match o { Some(b) -> Some(fresh_binder(b, k))  None -> None }
+
+fn fresh_params(ps: [Param], k: String) : [Param] =
+  map(ps, (p) => Param { binder: fresh_binder(p.binder, k), ptype: p.ptype, pline: p.pline, pcol: p.pcol, pborrow: p.pborrow })
+
+# A closure reads only binders it declares, so every binder and every
+# read in it moves to the copy's ids together.
+fn fresh_expr(e: Expr, k: String) : Expr = remap(e, fresh_kind(e.kind, k))
+
+fn fresh_kind(kind: ExprKind, k: String) : ExprKind =
+  match kind {
+    ELocal(l)         -> ELocal(fresh_id(l, k))
+    EOp(r)            -> EOp(OpRef { eff: r.eff, op: r.op, via: fresh_via(r.via, k) })
+    ELambda(ps, b)    -> ELambda(fresh_params(ps, k), fresh_expr(b, k))
+    EMatch(scr, arms) -> EMatch(fresh_expr(scr, k), map(arms, (a) => fresh_arm(a, k)))
+    EBlock(ss, t)     -> EBlock(map(ss, (s) => fresh_stmt(s, k)), map_opt(t, (x) => fresh_expr(x, k)))
+    EHandle(body, eff, targs, init, alias, cls, ret) ->
+      EHandle(fresh_expr(body, k), eff, targs, map_opt(init, (x) => fresh_expr(x, k)),
+              fresh_opt_binder(alias, k), map(cls, (c) => fresh_clause(c, k)), fresh_return(ret, k))
+    _ -> map_expr_kind(kind, (x) => fresh_expr(x, k))
+  }
+
+fn fresh_via(v: OpVia, k: String) : OpVia = match v {
+  ViaAmbient  -> v
+  ViaAlias(l) -> ViaAlias(fresh_id(l, k))
+  ViaRecv(l)  -> ViaRecv(fresh_id(l, k))
+}
+
+fn fresh_arm(a: Arm, k: String) : Arm = match a {
+  Arm(pat, g, b) -> Arm(fresh_pat(pat, k), map_opt(g, (x) => fresh_expr(x, k)), fresh_expr(b, k))
+}
+
+fn fresh_stmt(s: Stmt, k: String) : Stmt = match s {
+  SLet(pat, ann, rhs)     -> SLet(fresh_pat(pat, k), ann, fresh_expr(rhs, k))
+  SVar(b, ann, rhs, l, c) -> SVar(fresh_binder(b, k), ann, fresh_expr(rhs, k), l, c)
+  _                       -> map_stmt_exprs(s, (x) => fresh_expr(x, k))
+}
+
+fn fresh_clause(c: HClause, k: String) : HClause = match c {
+  HC(h, ps, b, l, col) -> HC(h, fresh_params(ps, k), fresh_expr(b, k), l, col)
+}
+
+fn fresh_return(o: Option[HReturn], k: String) : Option[HReturn] = match o {
+  Some(HR(b, e, l, c)) -> Some(HR(fresh_binder(b, k), fresh_expr(e, k), l, c))
+  None                 -> None
+}
+
+fn fresh_pat(p: Pattern, k: String) : Pattern = mk_pat(fresh_pkind(p.pkind, k), p.line, p.col)
+
+fn fresh_pkind(pk: PatKind, k: String) : PatKind = match pk {
+  PBind(b)              -> PBind(fresh_binder(b, k))
+  PAs(b, sub)           -> PAs(fresh_binder(b, k), fresh_pat(sub, k))
+  PNarrow(b, te)        -> PNarrow(fresh_binder(b, k), te)
+  PList(subs, rest)     -> PList(map(subs, (s) => fresh_pat(s, k)), fresh_opt_binder(rest, k))
+  PVariant(r, subs)     -> PVariant(r, map(subs, (s) => fresh_pat(s, k)))
+  PVariantRecord(r, fs) -> PVariantRecord(r, map(fs, (f) => fresh_pfield(f, k)))
+  PRecord(fs)           -> PRecord(map(fs, (f) => fresh_pfield(f, k)))
+  _                     -> pk
+}
+
+fn fresh_pfield(f: PField, k: String) : PField = match f {
+  PField(n, sub, sh) -> PField(n, fresh_pat(sub, k), sh)
+}
