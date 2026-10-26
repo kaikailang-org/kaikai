@@ -1,0 +1,186 @@
+#[doc("""
+Unsigned magnitude arithmetic on little-endian base-2^32 limb vectors —
+the internal layer beneath `bigint`. A magnitude is an `Array[Int]`
+whose entries are each in `[0, 2^32)`, least-significant first. A
+magnitude is canonical when it has no high zero limbs.
+
+These operations carry no sign and no `BigInt` knowledge; `bigint`
+composes them with a sign to form signed arbitrary-precision integers.
+Limbs are 32-bit because kaikai's bit operations live on `Int`; a
+32-bit limb keeps every add column under 2^33 and lets multiply split
+each limb into 16-bit halves whose partial products stay within `Int`
+range.
+
+Every helper takes settled `Array` parameters, allocates one local
+buffer, fills it inline, and returns it raw, so the `Mutable` demand is
+masked (`docs/effects-stdlib.md` §observable-effects): the buffer never
+crosses a call boundary.
+""")]
+
+import loop
+import math.bits
+
+#[doc("The number of value bits per limb (32).")]
+pub fn limb_bits() : Int = 32
+
+#[doc("2^32, the limb radix.")]
+pub fn limb_radix() : Int = bit_shl(1, 32)
+
+#[doc("The low 32 bits of `x`.")]
+pub fn limb_lo(x: Int) : Int = bit_and(x, bit_shl(1, 32) - 1)
+
+#[doc("`x` shifted right by one limb width — the carry out of a column.")]
+pub fn limb_hi(x: Int) : Int = bit_ushr(x, 32)
+
+#[doc("The number of significant limbs in `mag` (its length with high zero limbs stripped).")]
+pub fn sig_len(mag: Array[Int]) : Int = sig_len_from(mag, array_length(mag))
+
+fn sig_len_from(mag: Array[Int], n: Int) : Int =
+  if n <= 0 { 0 }
+  else if mag[n - 1] == 0 { sig_len_from(mag, n - 1) }
+  else { n }
+
+#[doc("True when `mag` is zero (no significant limbs).")]
+pub fn is_zero_mag(mag: Array[Int]) : Bool = sig_len(mag) == 0
+
+#[doc("""
+Copies the low `n` limbs of `mag` into a fresh array of length
+`max(n, 1)`. Used to trim trailing zero limbs into a canonical
+magnitude.
+""")]
+pub fn take_limbs(mag: Array[Int], n: Int) : Array[Int] = {
+  let len = if n <= 0 { 1 } else { n }
+  let out = array_make(len, 0)
+  var i := 0
+  while { i < n } {
+    out[i] := mag[i]
+    i := i + 1
+  }
+  out
+}
+
+#[doc("Compares two magnitudes: `-1`, `0`, or `1`. Shorter significant length is smaller; equal lengths compare limbs from most significant down.")]
+pub fn mag_cmp(a: Array[Int], b: Array[Int]) : Int = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  if na < nb { 0 - 1 }
+  else if na > nb { 1 }
+  else { mag_cmp_limbs(a, b, na - 1) }
+}
+
+fn mag_cmp_limbs(a: Array[Int], b: Array[Int], i: Int) : Int =
+  if i < 0 { 0 }
+  else if a[i] < b[i] { 0 - 1 }
+  else if a[i] > b[i] { 1 }
+  else { mag_cmp_limbs(a, b, i - 1) }
+
+#[doc("Sum of two magnitudes. The result may carry a high zero limb; the caller canonicalizes.")]
+pub fn mag_add(a: Array[Int], b: Array[Int]) : Array[Int] = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  let n = if na > nb { na } else { nb }
+  let out = array_make(n + 1, 0)
+  var i := 0
+  var carry := 0
+  while { i < n } {
+    let av = if i < na { a[i] } else { 0 }
+    let bv = if i < nb { b[i] } else { 0 }
+    let s = av + bv + carry
+    out[i] := limb_lo(s)
+    carry := limb_hi(s)
+    i := i + 1
+  }
+  out[n] := carry
+  out
+}
+
+#[doc("Difference `a - b`, requiring `a >= b` (caller ensures via `mag_cmp`). The result may carry high zero limbs; the caller canonicalizes.")]
+pub fn mag_sub(a: Array[Int], b: Array[Int]) : Array[Int] = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  let out = array_make(na, 0)
+  var i := 0
+  var borrow := 0
+  while { i < na } {
+    let bv = if i < nb { b[i] } else { 0 }
+    let d = a[i] - bv - borrow
+    if d < 0 { out[i] := d + limb_radix(); borrow := 1 }
+    else { out[i] := d; borrow := 0 }
+    i := i + 1
+  }
+  out
+}
+
+#[doc("Product of two magnitudes by schoolbook multiply. A 32x32 product runs as 16-bit partials so each stays within `Int`; the loops are inline so the buffer never escapes and `Mutable` masks.")]
+pub fn mag_mul(a: Array[Int], b: Array[Int]) : Array[Int] = {
+  let na = sig_len(a)
+  let nb = sig_len(b)
+  let out = array_make(na + nb, 0)
+  var xlo := 0
+  var xhi := 0
+  var ylo := 0
+  var yhi := 0
+  var mid := 0
+  var lo := 0
+  var cur := 0
+  var i := 0
+  while { i < na } {
+    xlo := bit_and(a[i], 65535)
+    xhi := bit_ushr(a[i], 16)
+    var j := 0
+    var carry := 0
+    while { j < nb } {
+      ylo := bit_and(b[j], 65535)
+      yhi := bit_ushr(b[j], 16)
+      mid := xhi * ylo + xlo * yhi
+      lo := xlo * ylo + bit_and(mid, 65535) * 65536
+      cur := out[i + j] + bit_and(lo, 4294967295) + carry
+      out[i + j] := bit_and(cur, 4294967295)
+      carry := xhi * yhi + bit_ushr(mid, 16) + bit_ushr(lo, 32) + bit_ushr(cur, 32)
+      j := j + 1
+    }
+    out[i + nb] := carry
+    i := i + 1
+  }
+  out
+}
+
+#[doc("The magnitude `a * m + c` for a multiplier `m` in `[0, 2^30)` and an addend `c` in `[0, 2^32)`, in one sweep. The result may carry a high zero limb; the caller canonicalizes.")]
+pub fn mag_muladd_limb(a: Array[Int], m: Int, c: Int) : Array[Int] = {
+  let n = sig_len(a)
+  let out = array_make(n + 1, 0)
+  var carry := c
+  var i := 0
+  while { i < n } {
+    let cur = a[i] * m + carry
+    out[i] := limb_lo(cur)
+    carry := limb_hi(cur)
+    i := i + 1
+  }
+  out[n] := carry
+  out
+}
+
+#[doc("""
+Divides magnitude `a` by a single nonzero divisor `d` in `[1, 2^31)`,
+returning `Pair(quotient_magnitude, remainder)`. The remainder is a
+plain `Int` in `[0, d)`. Long division from the most significant limb,
+carrying the running remainder in a 64-bit accumulator. `d` is bounded
+below 2^31 so the `rem * 2^32` term stays within signed `Int` range —
+sufficient for decimal conversion (which divides by 10^9).
+""")]
+pub fn mag_divmod_limb(a: Array[Int], d: Int) : Pair[Array[Int], Int] = {
+  let n = sig_len(a)
+  let q = array_make(if n <= 0 { 1 } else { n }, 0)
+  let radix = limb_radix()
+  var r := 0
+  var i := n - 1
+  while { i >= 0 } {
+    let cur = r * radix + a[i]
+    let digit = cur / d
+    q[i] := digit
+    r := cur - digit * d
+    i := i - 1
+  }
+  Pair { fst: q, snd: r }
+}
