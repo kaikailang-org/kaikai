@@ -1,0 +1,10 @@
+# Negative fixture (derive contract): `#[derive(Json)]` accepts a sum
+# type under the adjacently-tagged envelope, but every variant payload
+# must be JSON-bindable. A generic payload has no monomorphic
+# `of_json` shim, so it is rejected at the derive, naming the offending
+# variant — the same located contract a record field gets.
+
+#[derive(Json)]
+type Event = Tick | Fire(Result[Int, String])
+
+fn main() : Int = 0
