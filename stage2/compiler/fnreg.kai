@@ -1,0 +1,699 @@
+# compiler/fnreg.kai — function-declaration registry + unbox classifier
+# + the free-variable use scanner.
+#
+# Extracted from main.kai under issue #677 Phase 1n3 (the unbox-lane
+# pre-sink). The unbox pass (compiler/unbox.kai) and the Perceus pass
+# (still in main, lane N4) both weave the `[EFn]` registry and the
+# `scan_uses_*` free-variable scanner through their tree walks, and
+# both are emitted *below* this code in the module bundle. main itself
+# also consumes the registry from the C/LLVM emitters and the
+# bare-name-ambiguity diagnostic. The cross-section analysis for the
+# unbox lane (docs/lane-infer-cross-section-analysis.md §"Lane N3")
+# assumed the registry+scanner glue was trivially mirrorable; measuring
+# the classifier closure showed it is shared infrastructure with three
+# consumers (main + unbox + perceus), so per the asu cardinality rule
+# (consumers >=2 -> sink to the module everyone imports downward) it
+# lands here, one module below unbox, rather than being duplicated.
+#
+# What this module owns
+#
+#   - `EFn` / `UFnSig` — the per-decl registry entry: name, arity,
+#     module-of-origin, and the Phase-3 unboxed-signature classification
+#     (`Some(US(param_tys, ret_ty))` for a raw-C-scalar calling
+#     convention, `None` for the classical boxed `KaiValue *` one).
+#   - `register_fn_decls` — build the `[EFn]` registry from a `[Decl]`.
+#   - `fn_of_decl` / `classify_unbox_sig` + the `body_*_effectful`
+#     family — the unbox classifier: decide whether a top-level DFn
+#     takes + returns raw scalars with no effect row / FFI shim / var.
+#   - `resolve_ty` / `row_of_expr` (+ `row_of_expr_with_rbinds` and the
+#     row helpers) and `param_ty` / `ty_is_unboxable_t` — the AST->Ty
+#     resolution the classifier needs to read declared param/return
+#     types.
+#   - `scan_uses_expr` + the `scan_uses_*` family — the use scanner
+#     that unbox / perceus consult to keep let-bindings boxed when
+#     their only read site is inside a captured lambda.
+#
+# Bundle order: ... infer, fnreg, unbox, main. fnreg imports infer for
+# `Use` / `unit_canon`,
+# and ast for the shared AST nodes. It has
+# zero upward references.
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.expr_positions
+import compiler.core_builtins
+import compiler.builtins
+import compiler.util
+import compiler.written
+import compiler.spec_names
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_env_exhaust
+import compiler.diag_type_text
+import compiler.scalar_ty
+import compiler.type_text
+
+# m6.2 v2: EFn now carries the decl's module of origin. None for
+# decls authored in the root file; Some(m) for decls imported from
+# module `m` (or pulled in via --core, see expand_imports +
+# load_core). Codegen reads the field to mint `kai_<m>__<name>`
+# vs `kai_<name>`, and to disambiguate two-modules-export-same-name
+# at bare-name call sites.
+#
+# Phase 3 unboxing (issue #383): the fourth slot is the unboxed-
+# signature classification. `None` means the classical
+# `static <ret> kai_<name>(<per-param>...)` calling convention.
+# `Some(US(param_tys, ret_ty, raw_mask))` means the fn was classified
+# as having AT LEAST ONE raw C-scalar parameter. The third field is a
+# per-param boolean mask: `raw_mask[i] == true` means param `i` is a
+# raw scalar (`int64_t` / `double` / `int` / `uint32_t`), `false` means
+# it stays boxed (`KaiValue *`). `param_tys[i]` always carries the
+# param's real Ty (raw or boxed), indexed positionally by the signature
+# emitter, the call-site marshaller, and the TCO rebind.
+#
+# MIXED signatures (issue #440 follow-up): originally the classifier
+# required ALL params + the return to be unboxable (`US([Ty], Ty)`);
+# `balance(Color, RBTree, Int, Int, RBTree) : RBTree` then stayed fully
+# boxed and the rb-tree rebuild re-boxed k/v on every recursive call.
+# The mask lets per-param raw lowering, so k/v travel as `int64_t`
+# alongside the boxed Color/RBTree pointers, and a boxed return type is
+# now allowed (the return is raw iff `ret_ty` is unboxable, derivable
+# from `ret_ty`; the signature emitter / call-site branch on it).
+# Global gates still hold: no tparams, no FFI, no effect row.
+pub type UFnSig = US([Ty], Ty, [Bool])
+
+# The trailing `SymId` is the declaration's identity, minted by the
+# symbol table from its `(home, class, name)` route. Two homonymous
+# declarations hold two ids, so a lookup that reaches this slot cannot
+# answer one home's question with the other's declaration — the failure
+# the name plus module_origin pair could only paper over with a
+# first-match fallback. The leading name is the one the fn is emitted
+# under: text for an emitter, never a key.
+pub type EFn  = EFn(Written, Int, Option[String], Option[UFnSig], FnId)
+# Issue #440 Phase 2 — payload type list per variant. Carries the
+# parsed `[TypeExpr]` of the constructor's args so the emitter can
+# decide which slots to inline-unbox (Int / Real). Empty list means
+# nullary or unknown — both paths emit the legacy boxed shape.
+#
+# Atom-style global variant tag (issue #688, docs/variant-tags.md):
+# the last slot carries the variant_tag emitted into every
+# kai_variant / kai_variant_u call. Tags 0..10 are reserved for
+# builtins per the convention; user variants start at
+# `user_variant_tag_base() == 11` and increment in declaration order.
+# Today the matcher still routes through strcmp on the variant name,
+# so an out-of-convention tag degrades the runtime nullary/immortal
+# cache hit-rate but does not affect correctness; a follow-up lane
+# flips consumers to `variant_tag == N` once stage 0 / 1 / 2 and the
+# runtime agree on the table.
+
+
+# m6.2 v2: arity helper that wraps the new resolver. Codegen call
+# sites that previously consumed `Option[Int]` keep working unchanged.
+
+#[doc("The name the fn instance `f` is emitted under: a specialisation's from `specs`, a declaration's from `tab`.")]
+pub fn fn_emit_name(tab: SymTab, specs: SpecNames, f: FnId) : Written =
+  if fnid_inst(f) == spec_none() { decl_name(tab, fnid_sym(f)) } else { spec_text(specs, f) }
+
+#[doc("The registry entry for `d`, under the name it is emitted with. `entry` is the program's entry point, which keeps the boxed ABI.")]
+pub fn fn_of_decl_sym(d: Decl, tab: SymTab, specs: SpecNames, entry: SymId) : Option[EFn] {
+  match d {
+    DFn(_, fid, tparams, params, opt_ret, row, body, _, _, mo) ->
+      Some(EFn(fn_emit_name(tab, specs, fid), list_length(params), mo,
+               classify_unbox_sig(is_entry(entry, fid), tparams, params, opt_ret, row, body), fid))
+    _ -> None
+  }
+}
+
+#[doc("The identity `e` was registered with, or `fnid_none()` when the registry was built without a symbol table.")]
+pub fn efn_sym(e: EFn) : FnId = match e { EFn(_, _, _, _, s) -> s }
+
+# Phase 3 unboxing (issue #383): classify a top-level DFn as
+# unboxed-signature candidate. Returns `Some(US(param_tys, ret_ty))`
+# when every param + return is in {Int, Bool, Char, Real} concretely
+# (post-Dim / Refinement strip), with no parametric type variables
+# and no FFI-shim body. Otherwise returns None — the callee keeps the
+# classical `KaiValue *` calling convention.
+#
+# An effect row does not exclude a fn: its evidence frame rides as the
+# first arg beside the raw params, and a perform boxes its args and
+# unboxes its result at the op boundary.
+#
+# Excluded:
+#   - Still-generic functions (`tparams != []`): a parametric T is
+#     not a concrete C scalar. Monomorphic specs arrive here with
+#     `tparams = []` and a concreted signature, so they classify.
+#   - Extern shims (`body_is_extern`): the shim signature is fixed.
+#   - Bodies that install a handler (`body_is_effectful`).
+#   - Functions with closure-typed or non-primitive params /
+#     returns: not in the classify set; stays boxed.
+
+pub fn classify_unbox_sig(entry: Bool, tparams: [TBinder], params: [Param],
+                      opt_ret: Option[TypeExpr], row: RowExpr, body: Expr) : Option[UFnSig] {
+  # The entry point keeps its boxed signature: the runtime starts it
+  # and reads its result as a `KaiValue *` for the closing decref. A
+  # raw-Int entry would clash with that ABI.
+  if entry { None }
+  else if tbs_declared(tparams) != [] { None }
+  else if body_is_extern(body) and not body_has_raw_entry(body) { None }
+  # Protocol-dispatch shims (`body_is_proto_dispatch`) emit a runtime
+  # `kai_lookup_impl` + an indirect call that hands ALL args to the
+  # impl as boxed `KaiValue *`. A mixed/raw signature would mint a
+  # `kair_<p>` param the shim then passes to a boxed fn-pointer slot
+  # (`cc: undeclared identifier 'kai_<p>'`). Keep these fully boxed.
+  else if body_is_proto_dispatch_local(body) { None }
+  else if body_is_effectful(body) { None }
+  # Lambda eligibility bound: a fn whose body contains a lambda is
+  # disqualified from param unboxing. The unbox pass seeds raw params
+  # `MUnboxed` so the body reads `kair_<p>`, but it does NOT propagate that
+  # env into a lambda body — and a closure that CAPTURES a raw param emits
+  # the capture array `(KaiValue *[]){kai_<p>}`, reading the boxed prefix
+  # `kai_<p>` which does not exist for a raw param. This straddles the
+  # boxed↔raw frontier even when EVERY param is unboxable: the capture
+  # array is always `KaiValue *[]`, so a raw int capture needs boxing
+  # (`kai_int(kair_p)`) that the all-raw path never emits.
+  #
+  # Original repro: stdlib `bin_bytes_to_int`'s `(st,k) => buf[pos+k]`
+  # captures the raw `pos` (mixed sig). The all-raw case was wrongly
+  # believed safe ("no frontier to straddle") but `make_adder(n: Int) =
+  # (x) => x + n` — every param unboxable, body is a lambda capturing the
+  # raw `n` — emitted `(KaiValue *[]){kai_n}` (undeclared), breaking tier1
+  # (`capture.c`, `closure_lifecycle_298`). Disqualify ANY lambda-bearing
+  # body, not just mixed signatures. The rb-tree `insert_loop`/`balance_*`
+  # are lambda-free, so they still qualify.
+  else if body_has_lambda(body) { None }
+  else {
+    # A fn is an unboxed candidate when it touches a raw C scalar at
+    # the ABI boundary — either a scalar PARAM or, for an arity-0 fn,
+    # a scalar RETURN. The arity-0 / scalar-return branch is what an
+    # impl like `Default_Int_default() : Int` needs: its raw `i64 ()`
+    # signature must be wrapped in a `__boxed` shim before the impl
+    # table (which calls every entry as `%KaiValue*(...)`) can hold it,
+    # else the LLVM verifier rejects the `i64 ()*`→`%KaiValue*()*`
+    # bitcast (the mismatch that broke v0.85/0.86 releases). Both the
+    # thunk bridge (`emit_fn_thunk` UFn branch) and the boxed impl shim
+    # already handle a raw return, so a non-pimpl arity-0 fn like
+    # `fn answer() : Int = 42` rides the same machinery uniformly.
+    match opt_ret {
+      None -> None
+      Some(rty) -> {
+        let ret_t = resolve_ty(rty)
+        # A scalar RETURN qualifies regardless of arity. A fn like
+        # `rb_size(t: RBTree) : Int` has a boxed (pointer) param but a raw
+        # Int result; unboxing the return alone means `1 + rb_size(l) +
+        # rb_size(r)` lowers to raw int64 adds instead of boxed kai_op_add
+        # (measured: rb_size/rb_height + kai_op_add were ~5% of the rb-tree
+        # bench under callgrind, every one a box/unbox round-trip). The
+        # param_raw_mask is computed independently, so a boxed-param raw-
+        # return fn classifies with an all-false mask and a raw ret_t. The
+        # arity-0 case (impl Default_Int_default() : Int) is the same
+        # branch; both ride the thunk + boxed-shim machinery already in
+        # place for a raw return.
+        let scalar_ret = ty_is_unboxable_t(ret_t)
+        if any_param_unboxable(params) or scalar_ret {
+          Some(US(map(params, param_ty), ret_t, param_raw_mask(params)))
+        } else { None }
+      }
+    }
+  }
+}
+
+# True iff `e` contains a lambda ANYWHERE in its tree. Used to bound
+# mixed-signature eligibility: a fn whose body has a lambda cannot be
+# given a mixed boxed/raw signature, because the unbox pass does not
+# thread the raw-param env into a captured lambda body (the capture
+# would read `kai_<p>` for a raw param). MUST descend INTO `ELambda`
+# bodies as well — a `true` at the top is enough, but nested lambdas in
+# otherwise-non-lambda positions must still be found.
+pub fn body_has_lambda(e: Expr) : Bool = body_kind_has_lambda(e.kind)
+
+pub fn body_kind_has_lambda(k: ExprKind) : Bool {
+  match k {
+    ELambda(_, _) -> true
+    ECall(callee, args_) -> body_has_lambda(callee) or any_has_lambda(args_)
+    EBinop(_, a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EUnop(_, x) -> body_has_lambda(x)
+    EIf(c, t_, eo) -> body_has_lambda(c) or body_has_lambda(t_) or opt_has_lambda(eo)
+    EMatch(scr, arms) -> body_has_lambda(scr) or any_arm_has_lambda(arms)
+    EBlock(stmts, tail) -> any_stmt_has_lambda(stmts) or opt_has_lambda(tail)
+    EField(b, _) -> body_has_lambda(b)
+    EIndex(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    ERecordLit(_, fs) -> any_field_has_lambda(fs)
+    EList(els) -> any_elem_has_lambda(els)
+    ERange(a, b, opt_step) -> body_has_lambda(a) or body_has_lambda(b) or opt_has_lambda(opt_step)
+    EPipe(a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    EDispatchPipe(_, a, b) -> body_has_lambda(a) or body_has_lambda(b)
+    ELitUnit(inner, _) -> body_has_lambda(inner)
+    EBang(x) -> body_has_lambda(x)
+    # Loop intrinsics carry their pred/body lambdas as ARGS; missing
+    # them here classifies the enclosing fn raw-sig while the pasted
+    # loop body still reads the boxed `kai_<p>` prefix (undeclared for
+    # a raw param).
+    EIntrinsic(_, args_) -> any_has_lambda(args_)
+    ESurface(sf) -> any_has_lambda(surface_children(sf))
+    _ -> false
+  }
+}
+
+fn opt_has_lambda(opt: Option[Expr]) : Bool = match opt {
+  Some(e) -> body_has_lambda(e)
+  None    -> false
+}
+
+fn any_has_lambda(es: [Expr]) : Bool = match es {
+  [] -> false
+  [h, ...rest] -> if body_has_lambda(h) { true } else { any_has_lambda(rest) }
+}
+
+fn any_arm_has_lambda(arms: [Arm]) : Bool = match arms {
+  [] -> false
+  [Arm(_, g, b), ...rest] ->
+    if opt_has_lambda(g) { true }
+    else if body_has_lambda(b) { true }
+    else { any_arm_has_lambda(rest) }
+}
+
+fn any_field_has_lambda(fs: [FieldInit]) : Bool = match fs {
+  [] -> false
+  [FI(_, v), ...rest] -> if body_has_lambda(v) { true } else { any_field_has_lambda(rest) }
+}
+
+fn any_elem_has_lambda(els: [ListElem]) : Bool = match els {
+  [] -> false
+  [ElPlain(x), ...rest] -> if body_has_lambda(x) { true } else { any_elem_has_lambda(rest) }
+  [ElSpread(x), ...rest] -> if body_has_lambda(x) { true } else { any_elem_has_lambda(rest) }
+}
+
+fn any_stmt_has_lambda(ss: [Stmt]) : Bool = match ss {
+  [] -> false
+  [s, ...rest] -> if stmt_has_lambda(s) { true } else { any_stmt_has_lambda(rest) }
+}
+
+fn stmt_has_lambda(s: Stmt) : Bool = match s {
+  SLet(_, _, rhs) -> body_has_lambda(rhs)
+  SVar(_, _, _, _, _) -> false
+  SAssert(cond, m) -> body_has_lambda(cond) or opt_has_lambda(m)
+  SExprStmt(x) -> body_has_lambda(x)
+  SIndexAssign(b, i, v, _, _) -> body_has_lambda(b) or body_has_lambda(i) or body_has_lambda(v)
+  SAssign(b, v, _, _) -> body_has_lambda(b) or body_has_lambda(v)
+  SUse(_, _, _) -> false
+}
+
+# Per-param raw mask: `true` at position i iff param i lowers to a raw
+# C scalar (Int / Bool / Char / Real). Mixed-param lane (issue #440
+# follow-up). For an all-raw signature every entry is `true`.
+pub fn param_raw_mask(ps: [Param]) : [Bool] = match ps {
+  [] -> []
+  [p, ...rest] -> [ty_is_unboxable_t(param_ty(p)), ...param_raw_mask(rest)]
+}
+
+# True iff at least one param lowers to a raw C scalar. Gate for the
+# mixed-param signature: a fn with zero raw params has nothing to gain.
+pub fn any_param_unboxable(ps: [Param]) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> if ty_is_unboxable_t(param_ty(p)) { true } else { any_param_unboxable(rest) }
+}
+
+# Body shapes that keep a fn's signature boxed: an `EHandle` or a `var`
+# desugar (SVar) installs a handler whose clauses capture the fn's
+# locals through a boxed env, and `!` or a `Mutable` intrinsic. A
+# plain perform does not: it reaches its handler through the frame.
+
+pub fn body_is_effectful(e: Expr) : Bool = body_kind_is_effectful(e.kind)
+
+pub fn body_kind_is_effectful(k: ExprKind) : Bool {
+  match k {
+    EHandle(_, _, _, _, _, _, _) -> true
+    EBang(_) -> true
+    ESym(s, _) -> match builtin_of(s) { Some(b) -> builtin_is_mutable_intrinsic(b) None -> false }
+    ECall(callee, args_) -> {
+      if body_is_effectful(callee) { true }
+      else { any_arg_effectful(args_) }
+    }
+    EBinop(_, a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    EUnop(_, x) -> body_is_effectful(x)
+    EIf(c, t_, eo) -> body_is_effectful(c) or body_is_effectful(t_) or body_opt_is_effectful(eo)
+    EMatch(scr, arms) -> body_is_effectful(scr) or any_arm_effectful(arms)
+    EBlock(stmts, tail) -> any_stmt_effectful(stmts) or body_opt_is_effectful(tail)
+    ELambda(_, _) -> false
+    EField(b, _) -> body_is_effectful(b)
+    EIndex(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    ERecordLit(_, fs) -> any_field_effectful(fs)
+    EList(els) -> any_elem_effectful(els)
+    ERange(a, b, opt_step) -> body_is_effectful(a) or body_is_effectful(b) or body_opt_is_effectful(opt_step)
+    EPipe(a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    EDispatchPipe(_, a, b) -> body_is_effectful(a) or body_is_effectful(b)
+    ELitUnit(inner, _) -> body_is_effectful(inner)
+    _ -> false
+  }
+}
+
+pub fn body_opt_is_effectful(opt: Option[Expr]) : Bool {
+  match opt {
+    Some(e) -> body_is_effectful(e)
+    None    -> false
+  }
+}
+
+pub fn any_arg_effectful(es: [Expr]) : Bool {
+  match es {
+    [] -> false
+    [h, ...rest] -> if body_is_effectful(h) { true } else { any_arg_effectful(rest) }
+  }
+}
+
+pub fn any_arm_effectful(arms: [Arm]) : Bool {
+  match arms {
+    [] -> false
+    [Arm(_, g, b), ...rest] -> {
+      if body_opt_is_effectful(g) { true }
+      else if body_is_effectful(b) { true }
+      else { any_arm_effectful(rest) }
+    }
+  }
+}
+
+pub fn any_field_effectful(fs: [FieldInit]) : Bool {
+  match fs {
+    [] -> false
+    [FI(_, v), ...rest] -> if body_is_effectful(v) { true } else { any_field_effectful(rest) }
+  }
+}
+
+pub fn any_elem_effectful(els: [ListElem]) : Bool {
+  match els {
+    [] -> false
+    [ElPlain(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
+    [ElSpread(x), ...rest] -> if body_is_effectful(x) { true } else { any_elem_effectful(rest) }
+  }
+}
+
+pub fn any_stmt_effectful(ss: [Stmt]) : Bool {
+  match ss {
+    [] -> false
+    [s, ...rest] -> if stmt_is_effectful(s) { true } else { any_stmt_effectful(rest) }
+  }
+}
+
+pub fn stmt_is_effectful(s: Stmt) : Bool {
+  match s {
+    SLet(_, _, rhs) -> body_is_effectful(rhs)
+    # `var x = init` desugars into a `State[T]` handler at codegen.
+    # That handler installs evidence at run time even when the
+    # declared row is empty, so any SVar disqualifies the enclosing
+    # fn from raw-signature classification.
+    SVar(_, _, _, _, _) -> true
+    SAssert(cond, m) -> body_is_effectful(cond) or body_opt_is_effectful(m)
+    SExprStmt(x) -> body_is_effectful(x)
+    SIndexAssign(b, i, v, _, _) -> body_is_effectful(b) or body_is_effectful(i) or body_is_effectful(v)
+    SAssign(b, v, _, _) -> body_is_effectful(b) or body_is_effectful(v)
+    SUse(_, _, _) -> false
+  }
+}
+
+#[doc("The function registry of a decl stream, each entry carrying its declaration's identity and the name `tab` and `specs` emit it under. `entry` is the program's entry point.")]
+pub fn register_fn_decls(decls: [Decl], tab: SymTab, specs: SpecNames, entry: SymId) : [EFn] = match decls {
+  []           -> []
+  [d, ...rest] -> match fn_of_decl_sym(d, tab, specs, entry) {
+    Some(fs) -> [fs, ...register_fn_decls(rest, tab, specs, entry)]
+    None     -> register_fn_decls(rest, tab, specs, entry)
+  }
+}
+
+# m6.2 v2: a pair of an ambiguous bare-name and the surface names of
+# the modules that export it. Constructed by `find_ambig_efns` and
+# consumed by `report_ambig_efns` (compile-time warning) and
+# `is_ambig_name` (codegen-time short-circuit).
+
+pub fn mo_eq(a: Option[String], b: Option[String]) : Bool {
+  match a {
+    None -> match b { None -> true _ -> false }
+    Some(x) -> match b {
+      Some(y) -> x == y
+      None    -> false
+    }
+  }
+}
+
+# An extern marker body references no param, so a pass that reads one
+# as a body would call every param borrowed or dead: the shim consumes them.
+#[doc("True when a DFn body is the marker of an `extern` fn of any ABI.")]
+pub fn body_is_extern(body: Expr) : Bool = match body.kind {
+  EExternBody(_, _) -> true
+  _                 -> false
+}
+
+#[doc("True when a DFn body is the marker of an `extern \"C\"` or `extern \"js\"` fn, whose shim marshals scalars across the boundary.")]
+pub fn body_is_ffi_extern(body: Expr) : Bool = match body.kind {
+  EExternBody(AbiC, _)  -> true
+  EExternBody(AbiJs, _) -> true
+  _                     -> false
+}
+
+#[doc("The import path of an `extern \"js\" fn`, or None for any other body.")]
+pub fn body_js_path(body: Expr) : Option[String] = match body.kind {
+  EExternBody(AbiJs, path) -> Some(path)
+  _                        -> None
+}
+
+#[doc("The positions of the params that stay boxed under the unboxed signature: what a raw entry reads without taking.")]
+pub fn boxed_param_positions(params: [Param], i: Int) : [Int] = match params {
+  []           -> []
+  [p, ...rest] -> if ty_is_unboxable_t(param_ty(p)) { boxed_param_positions(rest, i + 1) } else { [i, ...boxed_param_positions(rest, i + 1)] }
+}
+
+#[doc("True when a DFn body is the marker of an `extern \"kai\" fn` whose runtime symbol has a raw entry.")]
+pub fn body_has_raw_entry(body: Expr) : Bool = match body_kai_builtin(body) {
+  Some(sym) -> list_has(core_raw_entries(), sym)
+  None      -> false
+}
+
+#[doc("The runtime symbol an `extern \"kai\" fn` binds, or None for any other body.")]
+pub fn body_kai_builtin(body: Expr) : Option[String] = match body.kind {
+  EExternBody(AbiKai, sym) -> Some(sym)
+  _                        -> None
+}
+
+# Local copy of emit_shared's `body_is_proto_dispatch` (fnreg cannot
+# import emit_shared — that module imports fnreg, which would cycle).
+# Detects the protocol-dispatch shim marker (a tail `ETodo` whose
+# message starts with `__kai_proto_dispatch__:`, possibly wrapped in an
+# EBlock by Perceus's exit-drop). Kept byte-compatible with the prefix
+# `proto_dispatch_tag_prefix()` in emit_shared.kai.
+pub fn body_is_proto_dispatch_local(e: Expr) : Bool {
+  match e.kind {
+    ETodo(msg)            -> string_starts_with_q(msg, "__kai_proto_dispatch__:")
+    EBlock(_, Some(tail)) -> body_is_proto_dispatch_local(tail)
+    _                     -> false
+  }
+}
+
+# Issue #261: extract the C-side symbol from an FFI shim body's
+# tag. Returns the override (`__kai_ffi__:strlen` → `strlen`) if
+# present, otherwise `default_name` (the kaikai identifier acts as
+# the C symbol when no override was given). Caller must have
+# already established the body is an FFI shim via `body_is_ffi_extern`.
+
+# §29 const desugar: collect every zero-arg DAttribPure(DFn) name
+# (every const declaration produces this shape; user fns marked
+# `[<refinement_pure>]` with arguments are skipped). Returns the
+# list of names that should be rewritten from `EName(name)` to
+# `ECall(EName(name), [])` in subsequent passes.
+pub fn string_starts_with_q(s: String, prefix: String) : Bool =
+  starts_with_loop(s, prefix, 0)
+
+pub fn starts_with_loop(s: String, prefix: String, i: Int) : Bool {
+  let pn = string_length(prefix)
+  if i >= pn { true }
+  else {
+    let sb = string_byte_at_int(s, i)
+    sb >= 0 and sb == string_byte_at_int(prefix, i) and starts_with_loop(s, prefix, i + 1)
+  }
+}
+
+
+pub fn row_empty() : Row = Row {
+  labels:        [],
+  tail:          None,
+  display_alias: None
+}
+
+pub fn resolve_ty_list(ts: [TypeExpr]) : [Ty] = map(ts, resolve_ty)
+
+# A scalar has no declaration, so its reference stays written; any other
+# written name is a runtime-built type's, or no type at all.
+fn fnreg_written_ty(name: String, targs: [TypeExpr]) : Ty = match undeclared_ty_named(name, SnBoundary) {
+  Some(t) -> t
+  None    -> TyCon(core_type_sym_or_none(name), resolve_ty_list(targs))
+}
+
+pub fn resolve_ty(t: TypeExpr) : Ty {
+  match t.tkind {
+    TyName(DrSym(s), targs)        -> TyCon(s, resolve_ty_list(targs))
+    TyName(DrWritten(None, n), targs) -> fnreg_written_ty(written_text(n), targs)
+    TyName(DrWritten(Some(_), _), targs) -> TyCon(sym_none(), resolve_ty_list(targs))
+    TyList(inner) -> TyListT(resolve_ty(inner))
+    TyFn(fps, fret, rexpr) -> TyFnT(resolve_ty_list(fps), resolve_ty(fret), row_of_expr(rexpr))
+    # m12.5: dimensioned base type. The unit goes through unit_canon
+    # (with empty alias and tparam contexts here) so two textually
+    # different but algebraically equal forms compare equal under unify.
+    TyDim(base, u) -> TyDimT(resolve_ty(base), unit_canon(u))
+    # m12.6.x #1: preserve the refinement on the semantic side.
+    # `TyRefineT(b, p)` ⊑ `b` in the unifier (upcast); narrowing
+    # requires explicit `ensure(...)` or a match-arm `: RefinedT`.
+    TyRefine(base, p) -> TyRefineT(resolve_ty(base), p)
+    # issue #772: a `TyRow` here means a compound row reached *type*
+    # position — `Foo[Stdout + Fail]` where `Foo` is not a
+    # row-parameterised alias, so substitution never dissolved the
+    # carrier. Resolve to the type of no declaration so the natural
+    # "unknown type" cascade reports it instead of a silent fallthrough.
+    TyRow(_) -> TyCon(sym_none(), [])
+    TySurface(_) -> panic("resolve_ty: surface type not lowered")
+    # No binding reaches here: a type parameter is the type of no
+    # declaration.
+    TyParam(_, targs) -> TyCon(sym_none(), resolve_ty_list(targs))
+  }
+}
+
+# A parsed row with no row-var binding context: an open tail gets the
+# placeholder id -1. Callers that bind row vars use
+# `row_of_expr_with_rbinds`.
+
+pub fn row_of_expr(re: RowExpr) : Row {
+  row_of_expr_with_rbinds(re, [])
+}
+
+pub fn rvbind_lookup(binds: [RVBind], id: TLocalId) : Option[Int] {
+  match binds {
+    [] -> None
+    [b, ...rest] -> match b {
+      RVB(n, i) -> if tlocal_eq(n, id) { Some(i) } else { rvbind_lookup(rest, id) }
+    }
+  }
+}
+
+pub fn row_of_expr_with_rbinds(re: RowExpr, rbinds: [RVBind]) : Row {
+  match re {
+    REmpty -> row_empty()
+    RClosed(labels) -> Row {
+      labels: row_labels_of_rls(labels),
+      tail: None,
+      display_alias: None
+    }
+    ROpen(rv, labels) -> Row {
+      labels: row_labels_of_rls(labels),
+      tail: match rvbind_lookup(rbinds, tail_id(rv)) {
+        Some(id) -> Some(id)
+        None     -> Some(-1)
+      },
+      display_alias: None
+    }
+  }
+}
+
+pub fn row_labels_of_rls(ls: [RowLabel]) : [Label] {
+  match ls {
+    [] -> []
+    [rl, ...rest] -> match rl {
+      RL(r, ts) -> [
+        Label { sym: ref_sym(r), ty_args: resolve_ty_list(ts), cell: local_none() },
+        ...row_labels_of_rls(rest)
+      ]
+    }
+  }
+}
+
+# m7b #11: resolve a row label list under a tparam binding. Used at
+# decl boundaries where the `Reader[T]` type arg refers to one of the
+# function's own tparams. Falls back to the unparameterised
+# `row_labels_of_rls` for callers that lack a binding context.
+
+pub fn param_ty(pm: Param) : Ty {
+  match pm.ptype {
+    Some(te) -> resolve_ty(te)
+    None -> TyAny
+  }
+}
+
+# Extract the declared signature of a top-level decl, or None if the
+# decl has no signature shape (DType, DImport).
+
+pub fn ty_is_unboxable_t(t: Ty) : Bool {
+  match t {
+    TyInt  -> true
+    TyReal -> true
+    TyBool -> true
+    TyChar -> true
+    # Byte/Int32/UInt32/UInt64/Int128 are raw scalars on both backends (a
+    # per-type slot with a per-width op family), boxed fresh at every boxed
+    # border. Signedness rides the op (signed/unsigned div+cmp per width),
+    # never the register. Int128 rides an i128 register for `+ - *` and the
+    # comparisons; its `/`/`%`/`^` stay boxed (no i128 checked-div helper),
+    # materialised fresh through `kaix_int128` at the border.
+    TyByte   -> true
+    TyInt32  -> true
+    TyUInt32 -> true
+    TyUInt64 -> true
+    TyInt128 -> true
+    # Marking a type unboxable without a complete raw path on BOTH backends
+    # desyncs the RC plan and frees a still-live operand.
+    # KIR Lane 1: an LLVM C-API handle rides as a raw pointer-width
+    # scalar — unboxable so unbox stamps `MUnboxed` and perceus never
+    # inserts dup/drop (docs/kir-design.md §7.2, the non-RC handle repr).
+    TyHandle -> true
+    TyDimT(inner, _)    -> ty_is_unboxable_t(inner)
+    TyRefineT(inner, _) -> ty_is_unboxable_t(inner)
+    _ -> false
+  }
+}
+
+#[doc("Every read of a local in `e`, in source order; `in_lam` marks a read inside a lambda or handler clause.")]
+pub fn scan_uses_expr(e: Expr, in_lam: Bool) : [Use] =
+  list_reverse(su_expr(e, in_lam, []))
+
+#[doc("`scan_uses_expr` over a statement list.")]
+pub fn scan_uses_in_stmts(stmts: [Stmt], in_lam: Bool) : [Use] =
+  scan_uses_expr(mk_expr(EBlock(stmts, None), 0, 0), in_lam)
+
+# Uses are consed onto `acc` in reverse; the public entries restore source order.
+fn su_expr(e: Expr, in_lam: Bool, acc: [Use]) : [Use] = match e.kind {
+  ELocal(l) -> [U(l, e.line, e.col, in_lam), ...acc]
+  # An op clause compiles to its own function reading captures from a
+  # boxed env, so its reads count as in-lambda; the return clause runs
+  # inline, which the shared position table does not distinguish.
+  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
+    let a1 = su_opt(init_opt, in_lam, su_expr(body, in_lam, acc))
+    let a2 = su_clauses(clauses, su_opt_return(ret_opt, in_lam, a1))
+    a2
+  }
+  _ -> su_positions(xp_positions(e), in_lam, acc)
+}
+
+fn su_positions(ps: [XPos], in_lam: Bool, acc: [Use]) : [Use] = match ps {
+  [] -> acc
+  [XP(r, x), ...rest] -> su_positions(rest, in_lam, su_expr(x, in_lam or not xrole_inline(r), acc))
+}
+
+fn su_opt(o: Option[Expr], in_lam: Bool, acc: [Use]) : [Use] = match o {
+  None -> acc
+  Some(x) -> su_expr(x, in_lam, acc)
+}
+
+fn su_opt_return(o: Option[HReturn], in_lam: Bool, acc: [Use]) : [Use] = match o {
+  None -> acc
+  Some(HR(_, b, _, _)) -> su_expr(b, in_lam, acc)
+}
+
+fn su_clauses(cs: [HClause], acc: [Use]) : [Use] = match cs {
+  [] -> acc
+  [HC(_, _, b, _, _), ...rest] -> su_clauses(rest, su_expr(b, true, acc))
+}
+
+
+# Find the last-use record for `nm` among `uses`. A single in-lambda
+# reference forces `LUBlocked`; otherwise the max (line, col) wins.
+
