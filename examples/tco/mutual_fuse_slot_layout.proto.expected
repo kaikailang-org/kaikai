@@ -1,0 +1,1 @@
+int64_t kaiu_mutual_fuse_slot_layout____kai_fused_count(int64_t p0, KaiValue * p1, KaiValue * p2, int64_t p3, int64_t p4, KaiValue * p5);

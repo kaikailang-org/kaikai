@@ -1,0 +1,123 @@
+#[doc("""
+Which functions cannot trap, over the post-perceus `[Decl]`.
+
+A trap unwinds through every frame between it and the fiber pad, so a
+function that can trap must not be `nounwind`. One that provably cannot
+keeps the attribute: its body only reads values, builds them and does
+scalar arithmetic that is not a division, and calls only functions that
+cannot trap either. Anything else (a runtime builtin, an effect op, a
+closure call, an index, an `assert`) is taken to trap.
+
+The callee constraint is solved as a greatest fixed point over declaration
+identities: every candidate whose own body is clean starts out trap-free
+and is demoted while a callee is not, so a recursive group that never
+traps keeps the attribute. A callee or a declaration without a resolved
+identity is taken to trap, so a homonym never inherits the verdict.
+""")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.ctor_ix
+import compiler.operators
+import compiler.marks
+import compiler.expr_positions
+
+type TCand = TCand(FnId, Option[[FnId]])
+
+#[doc("The functions that cannot trap, by identity.")]
+pub fn trapfree_fns(decls: [Decl], tab: SymTab) : [FnId] = {
+  let cands = tf_cands(decls, tab, [])
+  tf_fix(cands, tf_seed(cands))
+}
+
+fn tf_cands(decls: [Decl], tab: SymTab, acc: [TCand]) : [TCand] = match decls {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DFn(_, id, _, _, _, _, body, _, _, _) ->
+      if sym_raw(fnid_sym(id)) < 0 { tf_cands(rest, tab, acc) }
+      else { tf_cands(rest, tab, [TCand(id, tf_scan(body, tab, Some([]))), ...acc]) }
+    _ -> tf_cands(rest, tab, acc)
+  }
+}
+
+fn tf_seed(cands: [TCand]) : [FnId] = match cands {
+  [] -> []
+  [TCand(id, local), ...rest] -> match local { Some(_) -> [id, ...tf_seed(rest)] None -> tf_seed(rest) }
+}
+
+fn tf_fix(cands: [TCand], free: [FnId]) : [FnId] = {
+  let next = tf_keep(cands, free)
+  if list_length(next) == list_length(free) { free } else { tf_fix(cands, next) }
+}
+
+fn tf_keep(cands: [TCand], free: [FnId]) : [FnId] = match cands {
+  [] -> []
+  [TCand(id, local), ...rest] ->
+    if tf_has(free, id) and tf_callees_free(local, free) { [id, ...tf_keep(rest, free)] }
+    else { tf_keep(rest, free) }
+}
+
+fn tf_callees_free(local: Option[[FnId]], free: [FnId]) : Bool = match local {
+  None -> false
+  Some(cs) -> all(cs, (c) => tf_has(free, c))
+}
+
+fn tf_has(ids: [FnId], id: FnId) : Bool = match ids {
+  [] -> false
+  [i, ...rest] -> fnid_eq(i, id) or tf_has(rest, id)
+}
+
+# `Some(callees)` while nothing in `e` traps but its calls of `callees`;
+# `None` once something does.
+fn tf_scan(e: Expr, tab: SymTab, acc: Option[[FnId]]) : Option[[FnId]] = match acc {
+  None -> None
+  Some(cs) -> match tf_node(e, tab, cs) {
+    None -> None
+    Some(cs1) -> tf_children(xp_positions(e), tab, Some(cs1))
+  }
+}
+
+fn tf_children(ps: [XPos], tab: SymTab, acc: Option[[FnId]]) : Option[[FnId]] = match ps {
+  [] -> acc
+  [XP(r, c), ...rest] -> match r {
+    XLam -> tf_children(rest, tab, acc)
+    _    -> tf_children(rest, tab, tf_scan(c, tab, acc))
+  }
+}
+
+fn tf_node(e: Expr, tab: SymTab, cs: [FnId]) : Option[[FnId]] = match e.kind {
+  EBinop(op, _, _) -> if binop_is_division(op) { None } else { Some(cs) }
+  ECall(f, _) -> tf_head(f, tab, cs)
+  EBlock(ss, _) -> if all(ss, (s) => tf_stmt_clean(s)) { Some(cs) } else { None }
+  EIndex(_, _) -> None
+  EBang(_) -> None
+  EHandle(_, _, _, _, _, _, _) -> None
+  _ -> Some(cs)
+}
+
+fn tf_stmt_clean(s: Stmt) : Bool = match s {
+  SLet(_, _, _) -> true
+  SExprStmt(_) -> true
+  SUse(_, _, _) -> true
+  _ -> false
+}
+
+# A constructor builds a value; a call of a fn adds its identity; a
+# closure or an effect op is not known, so it traps.
+fn tf_head(f: Expr, tab: SymTab, cs: [FnId]) : Option[[FnId]] = match f.kind {
+  ESym(s, inst) -> if sym_is_ctor(tab, s) { Some(cs) } else if sym_raw(s) < 0 { None } else { Some([FnId(s, inst), ...cs]) }
+  EMark(m) -> if tf_mark_clean(m) { Some(cs) } else { None }
+  _ -> None
+}
+
+# A dup or a reuse runs nothing that traps; a self-tail step runs this fn again.
+fn tf_mark_clean(m: Mark) : Bool = match m {
+  MkDup          -> true
+  MkTcrecStep(_) -> true
+  MkTailStep(_)  -> true
+  _              -> mark_is_reuse(m)
+}

@@ -1,0 +1,140 @@
+#[doc("POSIX primitives the kai CLI binds from its C shim (`cli_sys.c`).")]
+
+#[doc("Modification time of `path` in seconds since the epoch, or -1 when it cannot be stat'ed.")]
+extern "C"("kaicli_mtime") pub fn mtime(path: String) : Int / Ffi
+
+#[doc("Size of `path` in bytes, or -1 when it cannot be stat'ed.")]
+extern "C"("kaicli_size") pub fn size(path: String) : Int / Ffi
+
+#[doc("What tells one state of `path` from the next without reading it (size, times to the nanosecond, inode), or empty when it cannot be stat'ed.")]
+extern "C"("kaicli_stat_id") pub fn stat_id(path: String) : String / Ffi
+
+#[doc("True when `path` was last written and last changed strictly before the file `mark` was written, by the whole second when `path`'s clock keeps no finer.")]
+extern "C"("kaicli_before") pub fn before(path: String, mark: String) : Bool / Ffi
+
+#[doc("True when `path` was last written and last changed more than two seconds ago, so any later write shows in its `stat_id`.")]
+extern "C"("kaicli_settled") pub fn settled(path: String) : Bool / Ffi
+
+#[doc("True when both files hold the same bytes.")]
+extern "C"("kaicli_same_bytes") pub fn same_bytes(a: String, b: String) : Bool / Ffi
+
+#[doc("Copy `from` to `to` with its mode, through a sibling renamed into place; whether it succeeded.")]
+extern "C"("kaicli_copy_file") pub fn copy_file(from: String, to: String) : Bool / Ffi
+
+#[doc("Make `to` a hard link to `from`, replacing what was there; whether it succeeded.")]
+extern "C"("kaicli_link_file") pub fn link_file(from: String, to: String) : Bool / Ffi
+
+#[doc("Set the times of the existing file `path` to now; whether it succeeded.")]
+extern "C"("kaicli_touch") pub fn touch(path: String) : Bool / Ffi
+
+#[doc("True when `path` names something, as `test -e` (symlinks followed).")]
+extern "C"("kaicli_exists") pub fn exists(path: String) : Bool / Ffi
+
+#[doc("True when `path` names a directory.")]
+extern "C"("kaicli_is_dir") pub fn is_dir(path: String) : Bool / Ffi
+
+#[doc("True when `path` names a regular file.")]
+extern "C"("kaicli_is_file") pub fn is_file(path: String) : Bool / Ffi
+
+#[doc("True when `path` names a non-directory the process may execute.")]
+extern "C"("kaicli_is_exec") pub fn is_exec(path: String) : Bool / Ffi
+
+#[doc("Append one argument to the argv the next `spawn` or `exec` passes.")]
+extern "C"("kaicli_argv_push") pub fn argv_push(arg: String) : Unit / Ffi
+
+#[doc("Set `name` in the next spawned child's environment only.")]
+extern "C"("kaicli_child_setenv") pub fn child_setenv(name: String, value: String) : Unit / Ffi
+
+#[doc("Remove `name` from the next spawned child's environment only.")]
+extern "C"("kaicli_child_unsetenv") pub fn child_unsetenv(name: String) : Unit / Ffi
+
+#[doc("Append the next spawned child's fd 3 to `path`.")]
+extern "C"("kaicli_child_fd3") pub fn child_fd3(path: String) : Unit / Ffi
+
+#[doc("Replace the process with `path`; returns the reason only when that fails.")]
+extern "C"("kaicli_exec") pub fn exec(path: String) : String / Ffi
+
+#[doc("Start the pushed argv (PATH-searched) in `dir` with stdout/stderr sent to the named files (empty inherits, `&2` joins stderr). Returns a handle for `wait`, or -1.")]
+extern "C"("kaicli_spawn") pub fn spawn(dir: String, out: String, err: String) : Int / Ffi
+
+#[doc("Wait for a spawned child: its exit code, or 128 + the signal that killed it; -1 when unobservable.")]
+extern "C"("kaicli_wait") pub fn wait(child: Int) : Int / Ffi
+
+#[doc("Start the pushed argv (PATH-searched) with its stdout on a pipe; the read end, or -1.")]
+extern "C"("kaicli_spawn_reader") pub fn spawn_reader() : Int / Ffi
+
+#[doc("Block until one more line arrives on `fd`; false once the writer is gone.")]
+extern "C"("kaicli_read_line") pub fn read_line(fd: Int) : Bool / Ffi
+
+#[doc("Catch SIGINT/SIGTERM/SIGHUP so kai outlives an interrupted child and can clean up.")]
+extern "C"("kaicli_defer_signals") pub fn defer_signals() : Unit / Ffi
+
+#[doc("The last deferred signal, or 0 when none arrived.")]
+extern "C"("kaicli_pending_signal") pub fn pending_signal() : Int / Ffi
+
+#[doc("Create a private directory from a mkdtemp template (`...XXXXXX`); empty on failure.")]
+extern "C"("kaicli_mkdtemp") pub fn mkdtemp(template: String) : String / Ffi
+
+#[doc("Remove `path` and everything below it, without following symlinks; true when nothing is left at `path`.")]
+extern "C"("kaicli_remove_tree") pub fn remove_tree(path: String) : Bool / Ffi
+
+#[doc("Write a file's exact bytes to stderr, as `cat path >&2`.")]
+extern "C"("kaicli_copy_to_stderr") pub fn copy_to_stderr(path: String) : Unit / Ffi
+
+#[doc("While `path` is non-empty, also append to `path` everything `copy_to_stderr` writes; an empty path stops.")]
+extern "C"("kaicli_tee_compile_stderr") pub fn tee_compile_stderr(path: String) : Unit / Ffi
+
+#[doc("Record that this kaic2 lacks the native backend, for the rest of the run.")]
+extern "C"("kaicli_mark_no_llvm") pub fn mark_no_llvm() : Unit / Ffi
+
+#[doc("Record that kaic2 was asked for its native backend in this run, whatever it answered.")]
+extern "C"("kaicli_mark_llvm_probed") pub fn mark_llvm_probed() : Unit / Ffi
+
+#[doc("Forget what the run learnt of the native backend: the next build probes it again.")]
+extern "C"("kaicli_clear_no_llvm") pub fn clear_no_llvm() : Unit / Ffi
+
+#[doc("True once `mark_no_llvm` ran in this process.")]
+extern "C"("kaicli_no_llvm") pub fn no_llvm() : Bool / Ffi
+
+#[doc("True once kaic2 was asked for its native backend, or found without it, in this process.")]
+extern "C"("kaicli_llvm_probed") pub fn llvm_probed() : Bool / Ffi
+
+#[doc("Write a file's exact bytes to stdout, as `cat path`.")]
+extern "C"("kaicli_copy_to_stdout") pub fn copy_to_stdout(path: String) : Unit / Ffi
+
+#[doc("The working directory as the invoking shell reports it (logical `$PWD` when valid).")]
+extern "C"("kaicli_cwd") pub fn cwd() : String / Ffi
+
+
+#[doc("Operating system name, as `uname -s` prints it.")]
+extern "C"("kaicli_uname_s") pub fn uname_s() : String / Ffi
+
+#[doc("Machine hardware name, as `uname -m` prints it.")]
+extern "C"("kaicli_uname_m") pub fn uname_m() : String / Ffi
+
+#[doc("Sleep `secs` seconds.")]
+extern "C"("kaicli_sleep") pub fn sleep(secs: Int) : Unit / Ffi
+
+#[doc("This process's id.")]
+extern "C"("kaicli_getpid") pub fn getpid() : Int / Ffi
+
+#[doc("Online CPU count.")]
+extern "C"("kaicli_ncpu") pub fn ncpu() : Int / Ffi
+
+#[doc("Physical memory in bytes, or 0 when the system does not say.")]
+extern "C"("kaicli_phys_mem") pub fn phys_mem() : Int / Ffi
+
+#[doc("A SHA-256 digest in progress, independent of every other.")]
+extern "C" pub opaque Sha
+
+#[doc("Start a new SHA-256 digest.")]
+extern "C"("kaicli_sha_new") pub fn sha_new() : Sha / Ffi
+
+#[doc("Feed a string's bytes to the digest.")]
+extern "C"("kaicli_sha_str") pub fn sha_str(h: Sha, s: String) : Unit / Ffi
+
+#[doc("Feed a file's bytes to the digest; false when it cannot be read.")]
+extern "C"("kaicli_sha_file") pub fn sha_file(h: Sha, path: String) : Bool / Ffi
+
+#[doc("Finish the digest and return it as 64 lowercase hex digits; it takes no more input.")]
+extern "C"("kaicli_sha_hex") pub fn sha_hex(h: Sha) : String / Ffi

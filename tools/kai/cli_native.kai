@@ -1,0 +1,318 @@
+#[doc("The native backend: in-process libLLVM objects from kaic2, linked with one cached runtime owner object.")]
+
+import path
+import cli_caches
+import cli_err
+import cli_fs
+import cli_gc
+import cli_hash
+import cli_layout
+import cli_plan
+import cli_budget
+import cli_proc
+import cli_sys
+import cli_toolchain
+
+#[doc("How a native build ended: linked, or kaic2 lacks libLLVM (the caller degrades or errors).")]
+pub type Outcome = Linked | NoLlvm(String)
+
+#[doc("Whether kaic2 says it was built without libLLVM; a kaic2 that cannot say is taken to have it, and its build finds out. The answer is kept per kaic2 file state, so it is asked once per binary.")]
+pub fn lacks_llvm(t: Toolchain, tmp: String) : Bool / Env + File + Ffi {
+  let id = cli_sys.stat_id(t.layout.kaic2)
+  let dir = cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)
+  let file = "#{dir}/backend-tag-#{cli_hash.digest([cli_hash.lines([t.layout.kaic2, id, t.target])])}"
+  match cli_fs.read_or_empty(file) {
+    "llvm" -> false
+    "none" -> true
+    _ -> asked_lacks_llvm(t, tmp, dir, file, id)
+  }
+}
+
+fn asked_lacks_llvm(
+  t: Toolchain,
+  tmp: String,
+  dir: String,
+  file: String,
+  id: String
+) : Bool / File + Ffi {
+  let sp = cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null", set: target_set(t) }
+  let r = cli_proc.capture([t.layout.kaic2, "--backend-tag"], sp, "#{tmp}/backend-tag")
+  let lacks = r.fst == 0 and string.trim(r.snd) == ""
+  # A kaic2 still being written may change under the same answer: keep only a settled one's.
+  if r.fst == 0 and id != "" and cli_sys.settled(t.layout.kaic2) and cli_fs.mkdir_p(dir) {
+    let part = "#{file}.#{cli_sys.getpid()}.part"
+    if write_file(part, if lacks { "none" } else { "llvm" }) |> is_ok() {
+      let _ = file_rename(part, file)
+    }
+  }
+  lacks
+}
+
+const OWNER_DEFS : [String] = ["-DKAI_SEPARATE_COMPILATION=1", "-DKAI_RUNTIME_OWNER=1"]
+
+# No WebAssembly target has `dl`.
+fn sys_libs(t: Toolchain) : [String] = if t.target == "" { ["-lm", "-ldl"] } else { ["-lm"] }
+
+# The variable kaic2 reads to build for the toolchain's target.
+fn target_set(t: Toolchain) : [(String, String)] =
+  if t.target == "" { [] } else { [("KAI_NATIVE_TARGET", t.target)] }
+
+# `import a.b` resolves as `a/b.kai`; the head segment's sibling counts too.
+fn local_module(src_dir: String, line: String) : Bool / Ffi {
+  let ws = cli_proc.words(line)
+  let raw = list.nth(ws, 1) ?? ""
+  let unsemi = list.head(string.split(raw, ";")) ?? ""
+  let m = list.head(string.split(unsemi, "{")) ?? ""
+  let braced = string_contains(unsemi, "{") and string.ends_with(m, ".")
+  let name = if braced { string_slice(m, 0, string_length(m) - 1) } else { m }
+  let head = list.head(string.split(name, ".")) ?? ""
+  cli_sys.is_file("#{src_dir}/#{string.replace(name, ".", "/")}.kai")
+    or cli_sys.is_file("#{src_dir}/#{head}.kai")
+}
+
+# Partitioning pays only when a local module can be reused: count imports that resolve
+# next to the entry or, for a file under a package (a test beside its sources), at its root.
+# A grouped test build's roots are local modules by construction.
+fn imports_local(p: Plan) : Bool / File + Ffi {
+  (p.job.extra |> contains("--test-root")) or imports_local_file(p)
+}
+
+fn imports_local_file(p: Plan) : Bool / File + Ffi {
+  let roots =
+    if p.manifest == "" or p.manifest == p.src_dir { [p.src_dir] } else { [p.src_dir, p.manifest] }
+  string.split(cli_fs.read_or_empty(p.job.src), "\n")
+    |? (l => list.head(cli_proc.words(l)) == Some("import")
+      and string.starts_with(string.trim_left(l), "import"))
+    |> list.any(l => local_in(roots, l))
+}
+
+fn local_in(roots: [String], line: String) : Bool / Ffi =
+  roots |> list.any(r => local_module(r, line))
+
+#[doc("Whether this native build partitions per module: `KAI_NATIVE_MODULAR` forces it, else a local import decides; never `--debug`.")]
+pub fn modular(p: Plan) : Bool / Env + File + Ffi {
+  let want = match cli_caches.env_or("KAI_NATIVE_MODULAR", "auto") {
+    "0" -> false
+    "1" -> true
+    _ -> imports_local(p)
+  }
+  want and cli_caches.env_or("KAI_BUILD_MODE", "default") != "debug" and p.t.llvm_c != "" and p.t.target == ""
+}
+
+# Every partition plus one runtime owner; without a cached owner, the runtime compiles into the link.
+#[doc("Link `objs` with the runtime owner object compiled with `defs`; without a cached owner object the runtime compiles into the link.")]
+pub fn modular_link(
+  p0: Plan,
+  objs: [String],
+  defs: [String]
+) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let p = cli_plan.with_objects(p0)!
+  let t = p.t
+  let lead = cli_plan.cc(t) ++ t.cflags
+  let ld_flags = cli_toolchain.dead_strip(t)
+  let tail = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
+  let rt = cli_plan.runtime_obj(t, t.llvm_c, defs)
+  let argv = if rt != "" {
+    lead ++ ld_flags ++ objs ++ p.native_objs ++ [rt, ...tail]
+  } else {
+    cli_plan.runtime_cc(t)
+      ++ t.cflags
+      ++ defs
+      ++ ld_flags
+      ++ ["-I", t.inc_c, "-I", t.inc]
+      ++ objs
+      ++ p.native_objs
+      ++ [t.llvm_c, ...tail]
+  }
+  if cli_plan.reads_scheduler_tls(p, objs) {
+    cli_err.die(cli_plan.SCHEDULER_TLS_READ)
+  } else {
+    cli_plan.link(p, argv, "native-modular")
+  }
+}
+
+# One object dir per package, so every entry of it — each test file — shares the
+# partitions it projects identically; an entry outside any package keeps its own.
+fn modular_dir(p: Plan, abs: String) : String / Env + File + Ffi {
+  let t = p.t
+  let bc_tag =
+    if t.inline_bc == "" { "none" } else { cli_hash.digest([cli_hash.Bytes(t.inline_bc)]) }
+  let tid = cli_layout.toolchain_id(t.layout)
+  let owner = if p.manifest == "" { abs } else { cli_fs.absolute(p.manifest) }
+  let key =
+    cli_hash.digest([cli_hash.Text("#{owner}\n#{bc_tag}\n#{if tid == "" { "0" } else { tid }}")])
+  let dir = "#{cli_caches.root("KAI_NATIVE_MODULAR_CACHE_DIR", "nmodular", t.os)}/#{key}"
+  if cli_fs.mkdir_p(dir) { dir } else { p.job.tmp }
+}
+
+# `KAI_KIR_VERIFY=<file>` asks kaic2 for the KIR linearity check's report.
+fn kir_verify_flags() : [String] / Env = match cli_caches.env_or("KAI_KIR_VERIFY", "") {
+  "" -> []
+  f -> ["--kir-verify", f]
+}
+
+#[doc("""
+Separate compilation: one object per module, content-addressed in a
+per-project cache, linked with the runtime owner. A compile error fails
+with status 1; a kaic2 without libLLVM yields `NoLlvm`.
+""")]
+pub fn build_modular(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
+  let abs = "#{p.src_dir}/#{cli_fs.basename(p.job.src)}"
+  check_bc_macros(p.t)!
+  emit_modular(p, modular_dir(p, abs), true)
+}
+
+# An object the emit reused from the cache can be trimmed before the link
+# sees it: the emit then runs once more into the build's scratch dir.
+fn emit_modular(p: Plan, objdir: String, cached: Bool) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let objs_file = "#{p.job.tmp}/native-modular.objs"
+  let err = "#{p.job.tmp}/native-modular.err"
+  let sp = cli_plan.kaic2_spawn([("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc), ...target_set(t)], objs_file, err)
+  let emit = ["--emit=native-modular", "--native-obj-dir", objdir, ...kir_verify_flags()]
+  let rc = cli_budget.run_threads(cli_plan.kaic2(p, emit, p.job.src), sp)
+  let objs = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
+  let trimmed =
+    cached and (objs |> list.any(o => string.starts_with(o, "#{objdir}/") and not cli_gc.refresh(o)))
+  if trimmed {
+    emit_modular(p, p.job.tmp, false)
+  } else if rc == 0 and cli_sys.size(objs_file) > 0 {
+    cli_plan.replay(err)
+    let defs = if t.inline_bc == "" { [] } else { OWNER_DEFS }
+    modular_link(p, objs, defs) | u => Linked
+  } else if cli_plan.c_only(err) {
+    Ok(NoLlvm(err))
+  } else {
+    cli_plan.replay(err)
+    Err(1)
+  }
+}
+
+# The bitcode and the owner object must be built with the same -DKAI_* macros.
+fn check_bc_macros(t: Toolchain) : Result[Unit, Int] / Stderr + File + Ffi =
+  if t.llvm_bc != "" and not cli_toolchain.bc_macros_match(t.llvm_bc, t.cflags) {
+    cli_err.die(
+      "the runtime bitcode was built without the -DKAI_* macros CFLAGS sets, and the runtime owner object would disagree with it on struct layout; unset them, or build with --backend=c"
+    )
+  } else {
+    Ok(())
+  }
+
+fn warn_missing_inline_bc(t: Toolchain) : Unit / Stderr =
+  if t.llvm_bc != "" and t.inline_bc == "" {
+    Stderr.eprint(
+      "kai: warning: runtime_inline.bc missing next to runtime_llvm.bc — native builds fall back to the whole-program runtime merge (slower builds, no core-object cache). Reinstall/upgrade kaikai, or in a checkout run: make KAI_LLVM=1 kaic2"
+    )
+  }
+
+fn whole_link(p0: Plan, objs: [String]) : Result[Unit, Int] / Stderr + Env + File + Ffi {
+  let p = cli_plan.with_objects(p0)!
+  let t = p.t
+  let gc = cli_toolchain.dead_strip(t)
+  if t.llvm_bc == "" {
+    let ld = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
+    cli_plan.link(
+      p,
+      cli_plan.runtime_cc(t)
+        ++ t.cflags
+        ++ gc
+        ++ ["-I", t.inc_c, "-I", t.inc]
+        ++ objs
+        ++ p.native_objs
+        ++ [t.llvm_c, ...ld],
+      "native"
+    )
+  } else {
+    let rt = cli_plan.runtime_obj(t, t.llvm_c, OWNER_DEFS)
+    let ld = ["-o", p.job.out, ...sys_libs(t), ...p.libs]
+    let argv = if rt != "" {
+      cli_plan.cc(t) ++ t.cflags ++ gc ++ objs ++ p.native_objs ++ [rt, ...ld]
+    } else {
+      cli_plan.runtime_cc(t)
+        ++ t.cflags
+        ++ [cli_plan.OWNER_OPT, ...OWNER_DEFS]
+        ++ gc
+        ++ ["-I", t.inc_c, "-I", t.inc]
+        ++ objs
+        ++ p.native_objs
+        ++ [t.llvm_c, ...ld]
+    }
+    cli_plan.link(p, argv, "native")
+  }
+}
+
+# A `--debug` build on Mach-O collects the DWARF next to the binary while the objects still exist.
+fn collect_dsym(out: String) : Unit / Env + Ffi =
+  if cli_caches.env_or("KAI_BUILD_MODE", "default") == "debug"
+    and (cli_proc.which("dsymutil") |> is_some()) {
+    let _ =
+      cli_proc.run(["dsymutil", out], cli_proc.Spawn { ...cli_proc.inherit(), err: "/dev/null" })
+  }
+
+#[doc("""
+Whole-program native: one object (plus a cached core object) written to
+the scratch dir, so no `.o` lands in the user's tree.
+""")]
+pub fn build_whole(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi =
+  emit_whole(p, true)
+
+# A cached core object the emit linked against can be trimmed before the
+# link sees it, and the core was pruned against it: the emit then runs once
+# more over the whole core, which needs nothing from the cache.
+fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
+  let t = p.t
+  let base = cli_fs.basename(p.job.src)
+  let obj = "#{p.job.tmp}/#{string.drop_suffix(base, ".kai") ?? base}.o"
+  let objs_file = "#{p.job.tmp}/native.objs"
+  let err = "#{p.job.tmp}/native.err"
+  let dbg = if path.is_absolute(p.job.src) { p.job.src } else { "#{p.src_dir}/#{base}" }
+  if t.llvm_c == "" {
+    cli_err.die(
+      "native backend: cannot locate runtime_llvm.c (looked under #{t.inc} and #{t.layout.root}/stage0)"
+    )
+  } else {
+    check_bc_macros(t)!
+    warn_missing_inline_bc(t)
+    let set = [
+      ("KAI_DEBUG_SRC", dbg),
+      ("KAI_NATIVE_RUNTIME_BC", t.llvm_bc),
+      ("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc),
+      ...target_set(t)
+    ]
+    let rc = cli_budget.run_threads(
+      cli_plan.kaic2(p, ["--emit=native", "--native-obj-dir", p.job.tmp, ...whole_flags(pruned), ...kir_verify_flags()], p.job.src),
+      cli_plan.kaic2_spawn(set, objs_file, err)
+    )
+    if rc != 0 and cli_plan.c_only(err) {
+      Ok(NoLlvm(err))
+    } else if rc == 0 and pruned and cache_object_lost(p, objs_file) {
+      emit_whole(p, false)
+    } else {
+      cli_plan.replay(err)
+      if rc != 0 { Err(1) } else { link_whole_objects(p, obj, objs_file) }
+    }
+  }
+}
+
+fn whole_flags(pruned: Bool) : [String] = if pruned { [] } else { ["--full-core"] }
+
+# Whether a listed object outside the build's scratch dir is gone; one still
+# there is marked used, so the trim does not take it before the link.
+fn cache_object_lost(p: Plan, objs_file: String) : Bool / File + Ffi =
+  cli_plan.listed(objs_file)
+    |> list.any(o => not string.starts_with(o, "#{p.job.tmp}/") and not cli_gc.refresh(o))
+
+# The objects kaic2 listed (else the one it wrote), linked into the job's binary.
+fn link_whole_objects(
+  p: Plan,
+  obj: String,
+  objs_file: String
+) : Result[Outcome, Int] / Stderr + Env + File + Ffi =
+  if not cli_sys.is_file(obj) {
+    cli_err.die("native backend: no object produced (expected #{obj})")
+  } else {
+    let objs = if cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [obj] }
+    whole_link(p, objs)!
+    collect_dsym(p.job.out)
+    Ok(Linked)
+  }
