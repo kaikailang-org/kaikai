@@ -1,0 +1,753 @@
+#[doc("""
+The `#[derive]` generators for Show, Eq, Hash and Ord.
+""")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.core_refs
+import compiler.util
+import compiler.proto_resolve
+import compiler.symtab
+import compiler.layout_derive
+import compiler.json_derive
+import compiler.derive_reach
+import compiler.protos_registry
+import compiler.protos_derive_binser
+import compiler.protos_impls
+import compiler.protos_check
+import compiler.written
+
+#[doc("""
+Phase 1: expand each `DDerive(names, type_decl)` into its wrapped
+DType followed by one synthetic DImpl per derived protocol.
+DProtocol and ordinary DImpl decls pass through unchanged so the
+next pass can collect them.
+The decl stream with every `#[derive]` expanded, the impls the
+derives minted on their own, and the table row of every function the
+derives declared.
+""")]
+pub(pkg) type Expanded = Expanded([Decl], [Decl], [NEnt])
+
+#[doc("""
+What an expansion resolves and mints against: the protocol scope, the
+generator each protocol picks, the dispatchers by id, and the core
+modules.
+""")]
+pub(pkg) type DeriveCx = { ps: PScope, gens: ShapedGens, ids: ProtoIds, cores: [String] }
+
+#[doc("Every `#[derive]` of `ds` expanded into the impls it generates.")]
+pub(pkg) fn expand_derives(dx: DeriveCx, ds: [Decl], target_mod: String) : Expanded =
+  expand_derives_loop(dx, ds, target_mod, collect_binser_types(dx.ps, ds, false, []), [], [], [])
+
+# `writers` names every type deriving BinSerialize: a field of one of
+# them is encoded by its writer instead of a fresh `to_bytes` array.
+fn expand_derives_loop(dx: DeriveCx, ds: [Decl], target_mod: String, writers: [String], acc: [Decl], minted: [Decl],
+                       rows: [NEnt]) : Expanded {
+  match ds {
+    [] -> Expanded(list_reverse(acc), minted, rows)
+    [d, ...rest] -> match d {
+      DDerive(names, inner, l, c) -> {
+        let home = decl_type_home(inner, target_mod)
+        let dv = derive_impls_for(dx, names, inner, home, writers)
+        let derived = map(dv.decls, (dd) => stamp_derived_home(dd, home, l, c))
+        expand_derives_loop(dx, rest, target_mod, writers,
+                            list_append([inner, ...list_reverse(derived)], acc),
+                            list_append(derived, minted), list_append(dv.rows, rows))
+      }
+      DUnstable(inner, _, _) ->
+        expand_derives_loop(dx, [inner, ...rest], target_mod, writers, acc, minted, rows)
+      # Every other wrapper stays: the `#[constructor]` registry is
+      # collected in the typer, so unwrapping it would lose it.
+      _ -> expand_derives_loop(dx, rest, target_mod, writers, [d, ...acc], minted, rows)
+    }
+  }
+}
+
+#[doc("""
+Phase 2: drop every DProtocol / DImpl from the decl stream after
+the impl-lowering pass has copied their content into ordinary
+DFns. DDerive nodes have already been replaced by `expand_derives`.
+""")]
+pub(pkg) fn strip_protocols(ds: [Decl]) : [Decl] = strip_protocols_loop(ds, [])
+
+fn strip_protocols_loop(ds: [Decl], acc: [Decl]) : [Decl] {
+  match ds {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match d {
+      DProtocol(_, _, _, _, _, _, _) -> strip_protocols_loop(rest, acc)
+      DImpl(_, _, _, _, _, _, _, isym)     -> strip_protocols_loop(rest, acc)
+      DDerive(_, _, _, _)      -> strip_protocols_loop(rest, acc)
+      _ -> strip_protocols_loop(rest, [d, ...acc])
+    }
+  }
+}
+
+fn derive_impls_for(dx: DeriveCx, names: [String], dt: Decl, home: Option[String], writers: [String]) : Derived {
+  match dt {
+    DType(_, tsym, tps, body, line, col, _, _) -> {
+      let tab = ps_tab(dx.ps)
+      let homed = derive_homed(dx.cores, home)
+      let of = (p: SymId) => DerivedType { tsym: tsym, tps: tps,
+                                           body: body, writers: writers, proto: p, ids: dx.ids,
+                                           homed: homed,
+                                           home: proto_home_name(home, ps_root(dx.ps)), tab: tab,
+                                           heads: HeadScope(dx.ps, home) }
+      derive_impls_loop(dx, home, names, of, line, col, derived_none())
+    }
+    _ -> derived_none()
+  }
+}
+
+# A core module's own derive reaches a dispatcher bare, as its
+# interpolations do.
+fn derive_homed(cores: [String], home: Option[String]) : Bool = match home {
+  Some(m) -> not list_has(cores, m)
+  None    -> true
+}
+
+# The protocol an entry resolves to, from the type's file, picks the
+# generator and heads the impl. `of` is the derived type for a protocol.
+fn derive_impls_loop(dx: DeriveCx, home: Option[String], names: [String], of: (SymId) -> DerivedType,
+                     line: Int, col: Int, acc: Derived) : Derived {
+  match names {
+    [] -> Derived { decls: list_reverse(acc.decls), rows: acc.rows }
+    [pspell, ...rest] -> {
+      let dv = match derive_gen(dx.ps, dx.gens, pspell, home) {
+        Some(DeriveGen(p, g)) -> {
+          let dt = of(p)
+          let m = derive_impl_for_protocol(g, dt, line, col)
+          Derived { decls: map(m.decls, (dd) => derive_generalize(impl_with_proto(dd, p), pspell, dt.tsym, dt.tps)),
+                    rows: m.rows }
+        }
+        None -> derived_none()
+      }
+      derive_impls_loop(dx, home, rest, of, line, col,
+                        Derived { decls: list_append(list_reverse(dv.decls), acc.decls),
+                                  rows: list_append(dv.rows, acc.rows) })
+    }
+  }
+}
+
+fn impl_with_proto(d: Decl, psym: SymId) : Decl = match d {
+  DImpl(_, pargs, target, ms, l, c, tps, isym) -> DImpl(DrSym(psym), pargs, target, ms, l, c, tps, isym)
+  _ -> d
+}
+
+# Everything a derive synthesises — the impl's methods and any
+# top-level shim — belongs to the module declaring the type, exactly
+# as if written there by hand. The impl itself sits at the attribute,
+# where a diagnostic about it points.
+fn stamp_derived_home(d: Decl, mo: Option[String], al: Int, ac: Int) : Decl = match d {
+  DImpl(p, pargs, target, ms, _, _, tps, isym) ->
+    DImpl(p, pargs, target, map(ms, (m) => stamp_derived_home(m, mo, al, ac)), al, ac, tps, isym)
+  DFn(p, fid, tps, ps, ret, row, body, l, c, _) ->
+    DFn(p, fid, tps, ps, ret, row, body, l, c, mo)
+  _ -> d
+}
+
+# Synthesise zero or more decls for `#derive(P) type T = ...`. v1
+# supports `Show`, `Eq`, `Hash`, `Ord`, and `BinSerialize` on records
+# and sum types. Nothing is declared when the (P, body)
+# combination is unsupported (the resolver / typer surfaces that as
+# "no impl"). Most protocols return a single `DImpl`; `BinSerialize`
+# additionally returns a top-level `<tname>_from_bytes` shim because
+# v1 single-dispatch cannot route a return-type-only call (issue
+# #459 §"Two design routes" + the `Serialize` prologue in
+# `stdlib/protocols.kai`).
+fn derive_impl_for_protocol(g: CoreProto, dt: DerivedType, line: Int, col: Int) : Derived {
+  match g {
+    CpShow         -> derive_show_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "show"), dt, line, col)
+    CpEq           -> derive_eq_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "eq"), dt, line, col)
+    CpHash         -> derive_hash_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "hash"), dt, line, col)
+    CpOrd          -> derive_ord_impl(derive_op_ref(dt.ids, dt.homed, dt.proto, "cmp"), dt, line, col)
+    CpBinSerialize -> derive_binserialize_impl(dt, line, col)
+    CpLayout       -> {
+      let m = derive_layout_impl(dt.tab, dt.tsym, dt.body, line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    CpJson         -> {
+      let m = derive_json_impl(dt.tab, dt.tsym, heads_body(dt.heads, dt.body),
+                               (o) => derive_op_ref(dt.ids, dt.homed, dt.proto, o), line, col)
+      Derived { decls: m.decls, rows: m.rows }
+    }
+    _              -> derived_none()
+  }
+}
+
+#[doc("""
+m12.8.z: `#derive(Ord)` synthesises three methods to satisfy the
+stdlib `protocol Ord { cmp, min, max }`:
+
+  - `cmp(a, b) : Int` — the load-bearing comparator. Records are
+    lexicographic (compare each field in declaration order, return
+    the first non-zero); sum types are variants-by-position with a
+    payload-lexicographic tie-breaker inside the same variant.
+  - `min(a, b) : Self` — `if cmp(a, b) <= 0 { a } else { b }`,
+    derived from the synthesised `cmp` above.
+  - `max(a, b) : Self` — `if cmp(a, b) >= 0 { a } else { b }`.
+
+`cmp` delegates to each field/payload's own `cmp`, so the typer
+transitively rejects the derive if any sub-component lacks an
+`Ord` impl — naming the missing call site in the diagnostic.
+`min` and `max` only call the just-synthesised `cmp`, so they
+carry no extra requirement on sub-types.
+""")]
+pub(pkg) fn derive_ord_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) ->
+      derive_ord_make_impl(opk, dt, derive_ord_record_body(opk, fields, line, col), line, col)
+    TBSum(variants) ->
+      derive_ord_make_impl(opk, dt, derive_ord_sum_body(opk, variants, line, col), line, col)
+    _ -> derived_none()
+  }
+}
+
+# Build the three-method `impl Ord for T` given a ready-to-use `cmp`
+# body expression. Factored out so the record / sum arms above share
+# the impl assembly, and so `min` / `max` are produced in one place.
+fn derive_ord_make_impl(opk: ExprKind, dt: DerivedType, cmp_body: Expr, line: Int, col: Int) : Derived {
+  let self_ty = derived_self_ty(dt, line, col)
+  let int_ty = mk_ty(TyName(ref_written("Int"), []), line, col)
+  let params2 = [
+    Param { binder: binder_written("a"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false },
+    Param { binder: binder_written("b"), ptype: Some(self_ty), pline: line, pcol: col, pborrow: false }
+  ]
+  let cmp_method = derived_method(dt, CpOrd, "cmp", params2, int_ty, cmp_body, line, col)
+  # Body of min: `if cmp(a, b) <= 0 { a } else { b }`.
+  # Body of max: `if cmp(a, b) >= 0 { a } else { b }`.
+  let a_var = mk_name("a", line, col)
+  let b_var = mk_name("b", line, col)
+  let zero = mk_expr(mk_int_synth(0), line, col)
+  let cmp_call_min = mk_expr(ECall(mk_expr(opk, line, col),
+                                       [a_var, b_var]), line, col)
+  let cmp_call_max = mk_expr(ECall(mk_expr(opk, line, col),
+                                       [a_var, b_var]), line, col)
+  let min_body = mk_expr(EIf(
+    mk_expr(EBinop(BoLe, cmp_call_min, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let max_body = mk_expr(EIf(
+    mk_expr(EBinop(BoGe, cmp_call_max, zero), line, col),
+    a_var, Some(b_var)), line, col)
+  let min_method = derived_method(dt, CpOrd, "min", params2, self_ty, min_body, line, col)
+  let max_method = derived_method(dt, CpOrd, "max", params2, self_ty, max_body, line, col)
+  Derived { decls: [DImpl(DrSym(core_proto_id(CpOrd)), [], self_ty, [cmp_method, min_method, max_method],
+                          line, col, [], sym_none())],
+            rows: derived_method_rows(dt, CpOrd, ["cmp", "min", "max"]) }
+}
+
+fn derive_ord_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [fd, ...rest] -> derive_ord_record_chain(opk, fd, rest, 0, line, col)
+  }
+}
+
+fn derive_ord_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], idx: Int,
+                            line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col),
+                                    [l_access, r_access]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        [next, ...more] -> {
+          let cvar = concat_all(["c", int_to_string(idx)])
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
+                                          mk_expr(mk_int_synth(0), line, col)),
+                             line, col)
+          let then_e = mk_name(cvar, line, col)
+          let else_e = derive_ord_record_chain(opk, next, more, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}
+
+fn derive_ord_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("a", line, col)
+  let arms = derive_ord_sum_outer_arms(opk, variants, variants, 0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+fn derive_ord_sum_outer_arms(opk: ExprKind, remaining: [Variant], all_variants: [Variant],
+                              idx: Int, line: Int, col: Int) : [Arm] {
+  match remaining {
+    [] -> []
+    [v, ...rest] -> {
+      let arm = derive_ord_sum_outer_arm(opk, v, all_variants, idx, line, col)
+      [arm, ...derive_ord_sum_outer_arms(opk, rest, all_variants, idx + 1, line, col)]
+    }
+  }
+}
+
+fn derive_ord_sum_outer_arm(opk: ExprKind, outer_v: Variant, all_variants: [Variant],
+                             outer_idx: Int, line: Int, col: Int) : Arm {
+  match outer_v {
+    Var(vsym, vargs) -> {
+      let outer_pat_subs = derive_ord_sum_pat_subs(vargs, "a", 0, line, col)
+      let outer_pat = mk_pat(PVariant(DrSym(vsym), outer_pat_subs), line, col)
+      let inner = derive_ord_sum_inner_match(opk, outer_v, outer_idx,
+                                              all_variants, line, col)
+      Arm(outer_pat, None, inner)
+    }
+  }
+}
+
+# Like `derive_sum_pat_subs`, but lets the caller pick the binder
+# prefix so the inner match can use `b0/b1/...` instead of `a0/a1/...`.
+fn derive_ord_sum_pat_subs(vargs: [TypeExpr], prefix: String, i: Int,
+                            line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
+       ...derive_ord_sum_pat_subs(rest, prefix, i + 1, line, col)]
+  }
+}
+
+fn derive_ord_sum_inner_match(opk: ExprKind, outer_v: Variant, outer_idx: Int,
+                               all_variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("b", line, col)
+  let arms = derive_ord_sum_inner_arms(opk, outer_v, outer_idx, all_variants,
+                                        0, line, col)
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+# Generates the inner-match arms for one outer variant. For each
+# variant in the type's declaration, with index `idx`:
+#   - idx <  outer_idx → that variant comes earlier in declaration
+#                         order, so `cmp(outer, that) == 1`. Emit an
+#                         explicit `Variant(_, _, ...) -> 1` arm.
+#   - idx == outer_idx → same variant: emit `Variant(b0, b1, ...) ->
+#                         <payload chain>`. After the self arm, fold
+#                         every later variant under a single
+#                         `_ -> -1` wildcard and stop.
+fn derive_ord_sum_inner_arms(opk: ExprKind, outer_v: Variant, outer_idx: Int,
+                              variants: [Variant], idx: Int,
+                              line: Int, col: Int) : [Arm] {
+  match variants {
+    [] -> []
+    [v, ...rest] -> {
+      if idx < outer_idx {
+        let arm = derive_ord_sum_wild_arm(v, 1, line, col)
+        [arm, ...derive_ord_sum_inner_arms(opk, outer_v, outer_idx, rest,
+                                            idx + 1, line, col)]
+      } else if idx == outer_idx {
+        let self_arm = derive_ord_sum_self_arm(opk, outer_v, line, col)
+        match rest {
+          [] -> [self_arm]
+          _  -> [self_arm, derive_ord_sum_default_arm(-1, line, col)]
+        }
+      } else {
+        # Defensive: outer_idx is always within bounds, so this
+        # branch is unreachable. Returning [] keeps the recursion
+        # well-typed without an extra `panic`.
+        []
+      }
+    }
+  }
+}
+
+# `Variant(_, _, ...) -> <int>` — used for variants on the "wrong"
+# side of the outer-vs-inner comparison.
+fn derive_ord_sum_wild_arm(v: Variant, ret: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pats = derive_ord_sum_wild_pats(vargs, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pats), line, col)
+      Arm(pat, None, mk_expr(mk_int_synth(ret), line, col))
+    }
+  }
+}
+
+fn derive_ord_sum_wild_pats(vargs: [TypeExpr], line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PWild, line, col),
+       ...derive_ord_sum_wild_pats(rest, line, col)]
+  }
+}
+
+# `_ -> <int>` — covers every variant after the outer's position.
+fn derive_ord_sum_default_arm(ret: Int, line: Int, col: Int) : Arm {
+  Arm(mk_pat(PWild, line, col), None, mk_expr(mk_int_synth(ret), line, col))
+}
+
+# `Variant(b0, b1, ...) -> <payload chain>` — the same-variant case.
+# Payloads are compared field-by-field in declaration order; the
+# first non-zero `cmp` wins.
+fn derive_ord_sum_self_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let inner_pat_subs = derive_ord_sum_pat_subs(vargs, "b", 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), inner_pat_subs), line, col)
+      let body = derive_ord_payload_chain(opk, vargs, 0, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_ord_payload_chain(opk: ExprKind, vargs: [TypeExpr], idx: Int,
+                             line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [_, ...rest] -> {
+      let av = mk_name(concat_all(["a", int_to_string(idx)]), line, col)
+      let bv = mk_name(concat_all(["b", int_to_string(idx)]), line, col)
+      let cmp_call = mk_expr(ECall(mk_expr(opk, line, col), [av, bv]),
+                             line, col)
+      match rest {
+        [] -> cmp_call
+        _  -> {
+          let cvar = concat_all(["p", int_to_string(idx)])
+          let pat = mk_pat(PBind(binder_written(cvar)), line, col)
+          let let_stmt = SLet(pat, None, cmp_call)
+          let cond = mk_expr(EBinop(BoNe, mk_name(cvar, line, col),
+                                          mk_expr(mk_int_synth(0), line, col)),
+                             line, col)
+          let then_e = mk_name(cvar, line, col)
+          let else_e = derive_ord_payload_chain(opk, rest, idx + 1, line, col)
+          let if_e = mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+          mk_expr(EBlock([let_stmt], Some(if_e)), line, col)
+        }
+      }
+    }
+  }
+}
+
+fn derive_show_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_show_record_body(opk, dt_name(dt), fields, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_show_sum_body(opk, dt.tab, variants, line, col)
+      make_derived_impl(CpShow, dt, "show",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("String"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_show_record_body(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  let parts = derive_show_record_parts(opk, tname, fields, line, col)
+  mk_expr(ECall(derive_concat_all_ref(line, col),
+                [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
+          line, col)
+}
+
+fn derive_show_record_parts(opk: ExprKind, tname: String, fields: [FieldDecl], line: Int, col: Int) : [Expr] {
+  let head = mk_expr(EStr(concat_all(["\"", tname, " { \""]), false), line, col)
+  let body_parts = derive_show_field_parts(opk, fields, line, col, true)
+  let tail = mk_expr(EStr("\" }\"", false), line, col)
+  list_append([head, ...body_parts], [tail])
+}
+
+fn derive_show_field_parts(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int, first: Bool) : [Expr] {
+  match fields {
+    [] -> []
+    [fd, ...rest] -> match fd {
+      FD(_, name, _, _) -> {
+        let prefix_s = if first { concat_all(["\"", name, ": \""]) }
+                       else { concat_all(["\", ", name, ": \""]) }
+        let prefix = mk_expr(EStr(prefix_s, false), line, col)
+        let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
+        let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
+        list_append([prefix, call], derive_show_field_parts(opk, rest, line, col, false))
+      }
+    }
+  }
+}
+
+fn derive_show_sum_body(opk: ExprKind, tab: SymTab, variants: [Variant], line: Int, col: Int) : Expr {
+  let scrut = mk_name("x", line, col)
+  let arms = map(variants, (v) => derive_show_sum_arm(opk, tab, v, line, col))
+  mk_expr(EMatch(scrut, arms), line, col)
+}
+
+fn derive_show_sum_arm(opk: ExprKind, tab: SymTab, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_sum_pat_subs(vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let body = derive_show_sum_arm_body(opk, written_text(sym_name(tab, vsym)), vargs, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_sum_pat_subs(vargs: [TypeExpr], i: Int, line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all(["a", int_to_string(i)]))), line, col),
+       ...derive_sum_pat_subs(rest, i + 1, line, col)]
+  }
+}
+
+fn derive_show_sum_arm_body(opk: ExprKind, name: String, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EStr(concat_all(["\"", name, "\""]), false), line, col)
+    _  -> {
+      let head = mk_expr(EStr(concat_all(["\"", name, "(\""]), false), line, col)
+      let tail = mk_expr(EStr("\")\"", false), line, col)
+      let calls = derive_sum_arg_show_calls(opk, vargs, 0, line, col, true)
+      let parts = list_append([head, ...calls], [tail])
+      mk_expr(ECall(derive_concat_all_ref(line, col),
+                    [mk_expr(EList(map(parts, (e: Expr) => ElPlain(e))), line, col)]),
+              line, col)
+    }
+  }
+}
+
+fn derive_sum_arg_show_calls(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int, first: Bool) : [Expr] {
+  match vargs {
+    [] -> []
+    [_, ...rest] -> {
+      let prefix = if first { mk_expr(EStr("\"\"", false), line, col) }
+                   else { mk_expr(EStr("\", \"", false), line, col) }
+      let av = mk_name(concat_all(["a", int_to_string(i)]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [av]), line, col)
+      list_append([prefix, call], derive_sum_arg_show_calls(opk, rest, i + 1, line, col, false))
+    }
+  }
+}
+
+fn derive_eq_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_eq_record_body(opk, fields, line, col)
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false },
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_eq_sum_body(opk, variants, line, col)
+      make_derived_impl(CpEq, dt, "eq",
+        [Param { binder: binder_written("a"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false },
+         Param { binder: binder_written("b"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Bool"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_eq_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(EBool(true), line, col)
+    [fd, ...rest] -> derive_eq_record_chain(opk, fd, rest, line, col)
+  }
+}
+
+fn derive_eq_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let l_access = mk_expr(EField(mk_name("a", line, col), name), line, col)
+      let r_access = mk_expr(EField(mk_name("b", line, col), name), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l_access, r_access]),
+                         line, col)
+      match rest {
+        [] -> call
+        [next, ...more] -> {
+          let tail_e = derive_eq_record_chain(opk, next, more, line, col)
+          mk_expr(EBinop(BoAnd, call, tail_e), line, col)
+        }
+      }
+    }
+  }
+}
+
+# m12.8.x: `#derive(Eq)` on a sum type. Outer-match on `a`, one arm
+# per variant; each arm rematches `b` for the same variant
+# (returning `eq(la_0, lb_0) and eq(la_1, lb_1) and ...`) with a
+# wildcard arm returning `false`. Empty sums (no variants) are
+# defensive; the parser does not produce them today.
+fn derive_eq_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(EBool(false), line, col)
+    _  -> {
+      let scrut = mk_name("a", line, col)
+      let arms = map(variants, (v) => derive_eq_sum_outer_arm(opk, v, line, col))
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_eq_sum_outer_arm(opk: ExprKind, v: Variant, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("la_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let inner = derive_eq_sum_inner_match(opk, vsym, vargs, line, col)
+      Arm(pat, None, inner)
+    }
+  }
+}
+
+fn derive_eq_sum_inner_match(opk: ExprKind, vsym: SymId, vargs: [TypeExpr], line: Int, col: Int) : Expr {
+  let scrut = mk_name("b", line, col)
+  let pat_subs = derive_eq_sum_pat_subs("lb_", vargs, 0, line, col)
+  let match_pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+  let body = derive_eq_sum_field_chain(opk, vargs, 0, line, col)
+  let arm_match = Arm(match_pat, None, body)
+  let arm_wild  = Arm(mk_pat(PWild, line, col), None,
+                      mk_expr(EBool(false), line, col))
+  mk_expr(EMatch(scrut, [arm_match, arm_wild]), line, col)
+}
+
+fn derive_eq_sum_pat_subs(prefix: String, vargs: [TypeExpr], i: Int,
+                           line: Int, col: Int) : [Pattern] {
+  match vargs {
+    [] -> []
+    [_, ...rest] ->
+      [mk_pat(PBind(binder_written(concat_all([prefix, int_to_string(i)]))), line, col),
+       ...derive_eq_sum_pat_subs(prefix, rest, i + 1, line, col)]
+  }
+}
+
+fn derive_eq_sum_field_chain(opk: ExprKind, vargs: [TypeExpr], i: Int, line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> mk_expr(EBool(true), line, col)
+    [_, ...rest] -> {
+      let l = mk_name(concat_all(["la_", int_to_string(i)]), line, col)
+      let r = mk_name(concat_all(["lb_", int_to_string(i)]), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [l, r]), line, col)
+      match rest {
+        [] -> call
+        _  -> {
+          let tail = derive_eq_sum_field_chain(opk, rest, i + 1, line, col)
+          mk_expr(EBinop(BoAnd, call, tail), line, col)
+        }
+      }
+    }
+  }
+}
+
+fn derive_hash_impl(opk: ExprKind, dt: DerivedType, line: Int, col: Int) : Derived {
+  match dt.body {
+    TBRecord(fields) -> {
+      let body_expr = derive_hash_record_body(opk, fields, line, col)
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
+    }
+    TBSum(variants) -> {
+      let body_expr = derive_hash_sum_body(opk, variants, line, col)
+      make_derived_impl(CpHash, dt, "hash",
+        [Param { binder: binder_written("x"), ptype: Some(derived_self_ty(dt, line, col)),
+                 pline: line, pcol: col, pborrow: false }],
+        mk_ty(TyName(ref_written("Int"), []), line, col),
+        body_expr, line, col)
+    }
+    _ -> derived_none()
+  }
+}
+
+fn derive_hash_record_body(opk: ExprKind, fields: [FieldDecl], line: Int, col: Int) : Expr {
+  match fields {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    [fd, ...rest] -> derive_hash_record_chain(opk, fd, rest, line, col)
+  }
+}
+
+fn derive_hash_record_chain(opk: ExprKind, head: FieldDecl, rest: [FieldDecl], line: Int, col: Int) : Expr {
+  match head {
+    FD(_, name, _, _) -> {
+      let access = mk_expr(EField(mk_name("x", line, col), name), line, col)
+      let call = mk_expr(ECall(mk_expr(opk, line, col), [access]), line, col)
+      match rest {
+        [] -> call
+        [next, ...more] -> {
+          let tail_e = derive_hash_record_chain(opk, next, more, line, col)
+          let mul = mk_expr(EBinop(BoMul, call, mk_expr(mk_int_synth(31), line, col)), line, col)
+          mk_expr(EBinop(BoAdd, mul, tail_e), line, col)
+        }
+      }
+    }
+  }
+}
+
+# m12.8.x: `#derive(Hash)` on a sum type. Match on the value, one arm
+# per variant; each arm seeds the running accumulator with the
+# variant's 1-based tag and folds in `hash(field)` using the same
+# `acc * 31 + h` combination the record helper uses, so two values
+# that are eq via the derived Eq hash to the same Int.
+fn derive_hash_sum_body(opk: ExprKind, variants: [Variant], line: Int, col: Int) : Expr {
+  match variants {
+    [] -> mk_expr(mk_int_synth(0), line, col)
+    _  -> {
+      let scrut = mk_name("x", line, col)
+      let arms = derive_hash_sum_arms(opk, variants, 1, line, col)
+      mk_expr(EMatch(scrut, arms), line, col)
+    }
+  }
+}
+
+fn derive_hash_sum_arms(opk: ExprKind, vs: [Variant], tag: Int, line: Int, col: Int) : [Arm] {
+  match vs {
+    [] -> []
+    [v, ...rest] ->
+      [derive_hash_sum_arm(opk, v, tag, line, col),
+       ...derive_hash_sum_arms(opk, rest, tag + 1, line, col)]
+  }
+}
+
+fn derive_hash_sum_arm(opk: ExprKind, v: Variant, tag: Int, line: Int, col: Int) : Arm {
+  match v {
+    Var(vsym, vargs) -> {
+      let pat_subs = derive_eq_sum_pat_subs("h_", vargs, 0, line, col)
+      let pat = mk_pat(PVariant(DrSym(vsym), pat_subs), line, col)
+      let body = derive_hash_sum_arm_body(opk, vargs, tag, line, col)
+      Arm(pat, None, body)
+    }
+  }
+}
+
+fn derive_hash_sum_arm_body(opk: ExprKind, vargs: [TypeExpr], tag: Int, line: Int, col: Int) : Expr {
+  let head = mk_expr(mk_int_synth(tag), line, col)
+  derive_hash_sum_chain(opk, head, vargs, 0, line, col)
+}
+
+fn derive_hash_sum_chain(opk: ExprKind, acc: Expr, vargs: [TypeExpr], i: Int,
+                          line: Int, col: Int) : Expr {
+  match vargs {
+    [] -> acc
+    [_, ...rest] -> {
+      let v = mk_name(concat_all(["h_", int_to_string(i)]), line, col)
+      let h = mk_expr(ECall(mk_expr(opk, line, col), [v]), line, col)
+      let mul = mk_expr(EBinop(BoMul, acc, mk_expr(mk_int_synth(31), line, col)), line, col)
+      let next = mk_expr(EBinop(BoAdd, mul, h), line, col)
+      derive_hash_sum_chain(opk, next, rest, i + 1, line, col)
+    }
+  }
+}

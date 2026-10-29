@@ -1,0 +1,256 @@
+# Unused-local-binding diagnostics over resolved declarations.
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.diag
+import compiler.emit_c_ctx
+import compiler.emit_c_handle_env
+import compiler.emit_shared_fv
+import compiler.expr_positions
+import compiler.infer_index
+import compiler.module_table
+import compiler.util
+import compiler.written
+
+fn name_is_silenced(name: String) : Bool {
+  match char_at(name, 0) {
+    Some(c0) -> c0 == '_'
+    None -> false
+  }
+}
+
+# Collect (name, line, col) triples for every binder a pattern
+# introduces. Uses the pattern's own line/col — for destructuring
+# patterns (`(x, y)`, `Some(v)`) all sub-binders share the outer
+# pattern's location, which is the closest stable anchor stage 1
+# preserves.
+
+# Collect (name, line, col) triples for every binder a pattern
+# introduces. Uses the pattern's own line/col — for destructuring
+# patterns (`(x, y)`, `Some(v)`) all sub-binders share the outer
+# pattern's location, which is the closest stable anchor stage 1
+# preserves.
+type UBind = UB(Binder, Int, Int)
+
+fn pat_ubinds(pat: Pattern, acc: [UBind]) : [UBind] {
+  let line = pat.line
+  let col = pat.col
+  match pat.pkind {
+    PWild -> acc
+    PLit(_) -> acc
+    PRange(_, _) -> acc
+    PBind(b) -> [UB(b, line, col), ...acc]
+    PList(pats, opt_rest) -> {
+      let acc1 = pat_ubinds_loop(pats, acc)
+      match opt_rest {
+        Some(rb) -> [UB(rb, line, col), ...acc1]
+        None -> acc1
+      }
+    }
+    PVariant(_, subs) -> pat_ubinds_loop(subs, acc)
+    PVariantRecord(_, fields) -> pfield_ubinds_loop(fields, acc)
+    PRecord(fields) -> pfield_ubinds_loop(fields, acc)
+    PHole(_) -> acc
+    PAs(b, sub) -> pat_ubinds(sub, [UB(b, line, col), ...acc])
+    PNarrow(b, _) -> [UB(b, line, col), ...acc]
+    PSurface(sp) -> pat_ubinds_loop(patsurface_children(sp), acc)
+  }
+}
+
+fn pat_ubinds_loop(ps: [Pattern], acc: [UBind]) : [UBind] {
+  match ps {
+    [] -> acc
+    [p, ...rest] -> pat_ubinds_loop(rest, pat_ubinds(p, acc))
+  }
+}
+
+fn pfield_ubinds_loop(fs: [PField], acc: [UBind]) : [UBind] {
+  match fs {
+    [] -> acc
+    [f, ...rest] -> match f {
+      PField(_, sub, _) -> pfield_ubinds_loop(rest, pat_ubinds(sub, acc))
+    }
+  }
+}
+
+# The binders under test enclose the code that reads them.
+fn ubind_scope(ubs: [UBind]) : FvOuter = fv_outer_of(map(ubs, ubind_binder))
+
+fn ubind_binder(u: UBind) : Binder = match u {
+  UB(b, _, _) -> b
+}
+
+fn report_unused_ubinds(file: String, ubs: [UBind], refs: [LocalId]) : [Diagnostic] =
+  flat_map(ubs, (u) => match u {
+    UB(b, line, col) ->
+      if name_is_silenced(written_text(b.name)) or locals_have(refs, b.id) { [] }
+      else {
+        [mk_diag(SevWarning, file, line, col, concat_all(["unused binding `", written_text(b.name), "`"]),
+                 [ri_help(file, line, col, "prefix with `_` to mark as intentionally unused")])]
+      }
+  })
+
+#[doc("Walk a decl looking for unused local bindings: the root file's own, and every block's in the file that declares it (`mods` maps a module to its file). Skips parameter names entirely — interface compliance, protocol dispatch, and axiom signatures all justify silent unused params.")]
+pub fn report_unused_in_decls(file: String, mods: [ModuleEntry], decls: [Decl]) : [Diagnostic] / Console =
+  flat_map(decls, (d) => report_unused_in_decl(file, mods, d))
+
+fn block_file(file: String, mods: [ModuleEntry], mo: Option[String]) : String = match mo {
+  None -> file
+  Some(m) -> match mt_lookup(mods, m) {
+    Some(ME(_, _, path, _, _)) -> path
+    None -> file
+  }
+}
+
+fn report_unused_in_decl(file: String, mods: [ModuleEntry], d: Decl) : [Diagnostic] / Console = match d {
+  DFn(_, _, _, _, _, _, body, _, _, mo) -> match mo {
+    None    -> report_unused_in_expr(file, body)
+    Some(_) -> []
+  }
+  DTest(_, body, _, _, mo)       -> report_unused_in_expr(block_file(file, mods, mo), body)
+  DBench(_, body, _, _, mo)      -> report_unused_in_expr(block_file(file, mods, mo), body)
+  DCheck(_, _, body, _, _, mo)   -> report_unused_in_expr(block_file(file, mods, mo), body)
+  _ -> []
+}
+
+fn report_unused_in_expr(file: String, e: Expr) : [Diagnostic] / Console = match e.kind {
+  EMatch(scr, arms) -> list_append(report_unused_in_expr(file, scr), report_unused_in_arms(file, arms))
+  EBlock(stmts, tail) -> report_unused_in_block(file, stmts, tail)
+  _ -> report_unused_in_children(file, xp_positions(e))
+}
+
+fn report_unused_in_children(file: String, ps: [XPos]) : [Diagnostic] / Console =
+  flat_map(ps, (p) => match p { XP(_, c) -> report_unused_in_expr(file, c) })
+
+fn report_unused_in_arms(file: String, arms: [Arm]) : [Diagnostic] / Console =
+  flat_map(arms, (a) => match a {
+    Arm(pat, opt_g, body) -> {
+      # An arm's pattern binders are visible in the (optional)
+      # guard and the body. Collect references from both, then
+      # warn on any binder absent from the union.
+      let ubs = pat_ubinds(pat, [])
+      let scope = ubind_scope(ubs)
+      let refs0 = match opt_g {
+        Some(g) -> fv_expr(g, [], scope, [])
+        None    -> []
+      }
+      let refs = capture_locals(fv_expr(body, [], scope, refs0))
+      let guard = match opt_g { Some(g) -> report_unused_in_expr(file, g)  None -> [] }
+      list_append(report_unused_ubinds(file, ubs, refs), list_append(guard, report_unused_in_expr(file, body)))
+    }
+  })
+
+# Walk a block in source order. For each `SLet(pat, _, rhs)`:
+#   1. Recurse into `rhs` (its body cannot reference the pattern's
+#      binders — they aren't in scope yet).
+#   2. Compute the locals read in the rest of the block (subsequent
+#      stmts + optional tail).
+#   3. Warn on any pat-binder absent from that read set.
+fn report_unused_in_block(file: String, stmts: [Stmt], tail: Option[Expr]) : [Diagnostic] / Console {
+  let bound = ru_binders(stmts, [])
+  let tail_reads = match tail {
+    Some(t) -> ru_mark(idx_empty(), capture_locals(fv_expr(t, [], fv_outer_of(bound), [])))
+    None    -> idx_empty()
+  }
+  ru_walk(file, stmts, ru_live_after(list_reverse(stmts), bound, idx_empty(), []), tail_reads, tail, [])
+}
+
+# The block's binders, the latest statement's first.
+fn ru_binders(stmts: [Stmt], acc: [Binder]) : [Binder] = match stmts {
+  [] -> acc
+  [SLet(pat, _, _), ...rest] -> ru_binders(rest, pat_bindings(pat, acc))
+  [SVar(b, _, _, _, _), ...rest] -> ru_binders(rest, [b, ...acc])
+  [_, ...rest] -> ru_binders(rest, acc)
+}
+
+# `bound` holds the binders of `s` and of the statements before it: those
+# before it are what `s` itself can read.
+fn ru_bound_before(s: Stmt, bound: [Binder]) : [Binder] = match s {
+  SLet(pat, _, _)     -> ru_drop(bound, list_length(pat_bindings(pat, [])))
+  SVar(_, _, _, _, _) -> ru_drop(bound, 1)
+  _                   -> bound
+}
+
+fn ru_drop(bs: [Binder], n: Int) : [Binder] =
+  if n <= 0 { bs } else { match bs {
+    []           -> []
+    [_, ...rest] -> ru_drop(rest, n - 1)
+  } }
+
+# A binder read after a statement.
+type RuLive = RuRead(LocalId)
+
+# The reads after each statement, in block order. Walking from the end,
+# the reads after a statement are its own reads plus those after the next
+# one, so the block is scanned once.
+fn ru_live_after(rev: [Stmt], bound: [Binder], live: NameIndex[RuLive],
+                 acc: [NameIndex[RuLive]]) : [NameIndex[RuLive]] / Console =
+  match rev {
+    [] -> acc
+    [s, ...earlier] -> {
+      let before = ru_bound_before(s, bound)
+      ru_live_after(earlier, before, ru_step(live, fv_outer_of(before), s), [live, ...acc])
+    }
+  }
+
+fn ru_step(live: NameIndex[RuLive], scope: FvOuter, s: Stmt) : NameIndex[RuLive] / Console = match s {
+  SLet(_, _, rhs) -> ru_mark(live, capture_locals(fv_expr(rhs, [], scope, [])))
+  SVar(_, _, rhs, _, _) -> ru_mark(live, capture_locals(fv_expr(rhs, [], scope, [])))
+  _ -> ru_mark(live, capture_locals(fv_stmt(s, [], scope, [])))
+}
+
+fn ru_mark(live: NameIndex[RuLive], ls: [LocalId]) : NameIndex[RuLive] = match ls {
+  [] -> live
+  [l, ...rest] -> ru_mark(idx_prepend_local(live, l, RuRead(l)), rest)
+}
+
+# A bucket also holds the binders that hash alike, so the entry is matched by id.
+fn ru_read(chain: [RuLive], l: LocalId) : Bool = match chain {
+  [] -> false
+  [RuRead(n), ...rest] -> local_eq(n, l) or ru_read(rest, l)
+}
+
+# The tail is checked without the block's later bindings in scope, so its
+# reads count for every binder of the block.
+fn ru_used(ubs: [UBind], live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [LocalId] = match ubs {
+  [] -> []
+  [UB(b, _, _), ...rest] ->
+    if ru_read(idx_chain_local(live, b.id), b.id) or ru_read(idx_chain_local(tail_reads, b.id), b.id) {
+      [b.id, ...ru_used(rest, live, tail_reads)]
+    } else {
+      ru_used(rest, live, tail_reads)
+    }
+}
+
+fn ru_walk(file: String, stmts: [Stmt], lives: [NameIndex[RuLive]], tail_reads: NameIndex[RuLive],
+           tail: Option[Expr], acc: [Diagnostic]) : [Diagnostic] / Console =
+  match stmts {
+    [] -> match tail {
+      Some(t) -> list_append(acc, report_unused_in_expr(file, t))
+      None    -> acc
+    }
+    [s, ...rest] -> match lives {
+      [] -> acc
+      [live, ...more] -> ru_walk(file, rest, more, tail_reads, tail, list_append(acc, ru_stmt(file, s, live, tail_reads)))
+    }
+  }
+
+fn ru_stmt(file: String, s: Stmt, live: NameIndex[RuLive], tail_reads: NameIndex[RuLive]) : [Diagnostic] / Console =
+  match s {
+    SLet(pat, _, rhs) -> {
+      let ubs = pat_ubinds(pat, [])
+      list_append(report_unused_in_expr(file, rhs), report_unused_ubinds(file, ubs, ru_used(ubs, live, tail_reads)))
+    }
+    SVar(_, _, rhs, _, _) -> report_unused_in_expr(file, rhs)
+    SAssert(c, opt_m) -> list_append(report_unused_in_expr(file, c), match opt_m { Some(m) -> report_unused_in_expr(file, m)  None -> [] })
+    SExprStmt(x) -> report_unused_in_expr(file, x)
+    SIndexAssign(b, i, v, _, _) ->
+      list_append(report_unused_in_expr(file, b), list_append(report_unused_in_expr(file, i), report_unused_in_expr(file, v)))
+    SAssign(b, v, _, _) -> list_append(report_unused_in_expr(file, b), report_unused_in_expr(file, v))
+    SUse(_, _, _) -> []
+  }

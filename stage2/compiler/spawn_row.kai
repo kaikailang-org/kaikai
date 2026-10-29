@@ -1,0 +1,311 @@
+# Spawn-boundary check.
+#
+# A child fiber starts empty: an empty evidence stack, and a heap of
+# its own. Both halves of that are rejected here.
+#
+# The row half: a handler installed around a spawn sits on a frame the
+# child cannot reach. Only two kinds of effect resolve inside a child:
+# one whose `default { }` bridges to a runtime supplier (installed per
+# fiber), and a fiber-local one (bound to the child's own disposition).
+# Any other effect would dispatch against a slot nobody filled.
+#
+# The value half (`spawn_capture`): a captured value is copied into the
+# child, so a mutation the child performs never reaches the parent.
+#
+# Both read the typed AST: inference annotates a lambda with
+# `TyFnT(_, _, row)` and types its body, and the nursery cap rewrite has
+# already turned `n.spawn(f)` into `Spawn.spawn(f)`, so every spawn
+# surface reaches this one check.
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.written
+import compiler.symtab
+import compiler.diag
+import compiler.diag_file
+import compiler.spawn_capture
+import compiler.spawn_cross
+import compiler.util
+import compiler.spawn_param
+import compiler.core_types
+
+#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share; `facts` are the calls each function makes at the spawn boundary.")]
+pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, carriers: [SymId], crossing: [SpawnParam],
+                         facts: [SpawnFacts], all_decls: [Decl]) : [Diagnostic] / Console + File =
+  concat_diags(map(facts, (f) => match f {
+    SF(d, spawns, calls, _) -> {
+      let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
+      concat_diags(list_append(
+        map(spawns, (e) => match e.kind {
+          ECall(_, args_) -> check_spawned_thunk(site, carriers, all_decls, args_)
+          _               -> []
+        }),
+        map(calls, (e) => check_crossing_args(site, crossing, all_decls, e))))
+    }
+  }))
+
+
+fn concat_diags(xs: [[Diagnostic]]) : [Diagnostic] = foldl(list_reverse(xs), [], (a, r) => list_append(r, a))
+
+
+# An argument passed where the callee spawns it is held to the same rule
+# as a thunk handed to `spawn`.
+fn check_crossing_args(site: SpawnSite, crossing: [SpawnParam], decls: [Decl],
+                        e: Expr) : [Diagnostic] / Console + File =
+  if list_is_empty(crossing) { [] } else { match call_target(e) {
+  None             -> []
+  Some((s, args_)) -> foldl(args_at(args_, spawn_params_for(crossing, s)), [],
+                            (acc, a) => list_append(acc, check_crossing_arg(site, decls, a, false, spawn_answered_for(crossing, s))))
+} }
+
+
+# The two halves of the boundary: the row the child cannot resolve, and
+# the values it would mutate as a copy.
+fn check_spawned_thunk(site: SpawnSite, carriers: [SymId], decls: [Decl],
+                        args_: [Expr]) : [Diagnostic] / Console + File {
+  let row_errs = check_spawned_thunk_row(site, decls, args_)
+  match spawn_thunk_arg(args_) {
+    None      -> row_errs
+    Some(thk) -> list_append(row_errs, check_thunk_captures(site, carriers, thk))
+  }
+}
+
+
+# Sub-expressions to descend into. A spawn call can hide anywhere a
+# value can, so this stays exhaustive over the value-carrying forms;
+# a leaf yields none.
+pub(pkg) fn spawn_expr_children(e: Expr) : [Expr] {
+  match e.kind {
+    ECall(callee, args_) -> [callee, ...args_]
+    EField(base, _)      -> [base]
+    EIndex(a, b)         -> [a, b]
+    EBinop(_, a, b)      -> [a, b]
+    EUnop(_, x)          -> [x]
+    EBang(x)             -> [x]
+    ELitUnit(x, _)       -> [x]
+    ELambda(_, body)     -> [body]
+    EPipe(a, b)          -> [a, b]
+    EDispatchPipe(_, a, b) -> [a, b]
+    EIntrinsic(_, args_) -> args_
+    ESurface(sf)         -> surface_children(sf)
+    EList(els)           -> list_elem_exprs(els)
+    ERecordLit(_, fs)    -> field_init_exprs(fs)
+    EIf(c, t, eo)        -> [c, t, ...opt_expr(eo)]
+    ERange(a, b, os)     -> [a, b, ...opt_expr(os)]
+    EMatch(scr, arms)    -> [scr, ...arm_exprs(arms)]
+    EBlock(stmts, tail)  -> cat_exprs(stmt_exprs(stmts), opt_expr(tail))
+    EHandle(body, _, _, io, _, cs, _) ->
+      [body, ...cat_exprs(opt_expr(io), clause_exprs(cs))]
+    _ -> []
+  }
+}
+
+
+fn cat_exprs(a: [Expr], b: [Expr]) : [Expr] = match a {
+  []           -> b
+  [h, ...rest] -> [h, ...cat_exprs(rest, b)]
+}
+
+
+fn opt_expr(o: Option[Expr]) : [Expr] = match o {
+  Some(x) -> [x]
+  None    -> []
+}
+
+
+fn list_elem_exprs(els: [ListElem]) : [Expr] = match els {
+  []            -> []
+  [el, ...rest] -> match el {
+    ElPlain(e)  -> [e, ...list_elem_exprs(rest)]
+    ElSpread(e) -> [e, ...list_elem_exprs(rest)]
+  }
+}
+
+
+fn field_init_exprs(fs: [FieldInit]) : [Expr] = match fs {
+  []           -> []
+  [f, ...rest] -> match f { FI(_, e) -> [e, ...field_init_exprs(rest)] }
+}
+
+
+fn arm_exprs(arms: [Arm]) : [Expr] = match arms {
+  []           -> []
+  [a, ...rest] -> match a {
+    Arm(_, og, body) ->
+      cat_exprs(opt_expr(og), [body, ...arm_exprs(rest)])
+  }
+}
+
+
+fn clause_exprs(cs: [HClause]) : [Expr] = match cs {
+  []           -> []
+  [c, ...rest] -> match c {
+    HC(_, _, body, _, _) -> [body, ...clause_exprs(rest)]
+  }
+}
+
+
+fn stmt_exprs(ss: [Stmt]) : [Expr] = match ss {
+  []           -> []
+  [s, ...rest] -> cat_exprs(stmt_own_exprs(s), stmt_exprs(rest))
+}
+
+
+fn stmt_own_exprs(s: Stmt) : [Expr] = match s {
+  SLet(_, _, e)       -> [e]
+  SVar(_, _, e, _, _) -> [e]
+  SExprStmt(e)        -> [e]
+  SAssert(e, og)      -> [e, ...opt_expr(og)]
+  _                   -> []
+}
+
+
+# The thunk is the last argument on every spawn surface.
+pub(pkg) fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
+  match args_ {
+    []           -> None
+    [a]          -> Some(a)
+    [_, ...rest] -> spawn_thunk_arg(rest)
+  }
+}
+
+
+fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl], args_: [Expr]) : [Diagnostic] / Console + File {
+  match spawn_thunk_arg(args_) {
+    None      -> []
+    Some(thk) -> check_crossing_arg(site, decls, thk, true, [])
+  }
+}
+
+
+# The one rule at every boundary: what a function value may perform must be
+# something a child fiber resolves on its own.
+# A write through an argument is the capture check's to report, once the call
+# is specialised to the type it writes through.
+fn check_crossing_arg(site: SpawnSite, decls: [Decl], arg: Expr, mutable_too: Bool, answered: [SymId]) : [Diagnostic] / Console + File =
+  match arg.ty {
+    Some(TyFnT(_, _, row)) ->
+      report_spawn_row_labels(site, decls, if mutable_too { row.labels } else { filter(row.labels, (l) => not effect_is(l.sym, CeMutable) and not any(answered, (a) => sym_raw(a) == sym_raw(l.sym))) },
+                              arg.line, arg.col, [])
+    _                      -> []
+  }
+
+
+# An effect crosses a spawn when the runtime installs it for the child:
+# an all-`$extern_handler` default supplies it per fiber, and a
+# fiber-local effect resolves against the child's own disposition. An
+# effect this program never declares is not ours to judge, and neither is
+# a `with .. as` cell: its label names one handler, which the thunk
+# captured, not an effect the child has to find. A capability parameter the
+# thunk captured is no such cell: its handler dies with the scope that provided it.
+fn effect_crosses_spawn(l: Label, decls: [Decl]) : Bool {
+  if local_eq(l.cell, capture_cell()) { false } else if local_raw(l.cell) != 0 { true } else { match find_effect_decl(l.sym, decls) {
+    None      -> true
+    Some(blk) ->
+      if spawn_effect_is_fiber_local(l.sym) { true }
+      else { default_block_is_extern(blk) }
+  } }
+}
+
+
+fn find_effect_decl(s: SymId, decls: [Decl]) : Option[Option[DefaultBlock]] {
+  match decls {
+    []           -> None
+    [d, ...rest] -> match d {
+      DEffect(_, esym, _, _, defblk, _, _, _) ->
+        if sym_raw(esym) >= 0 and sym_raw(esym) == sym_raw(s) { Some(defblk) } else { find_effect_decl(s, rest) }
+      _ -> find_effect_decl(s, rest)
+    }
+  }
+}
+
+
+# A `default { }` whose clauses all bridge to `$extern_handler` is
+# supplied by the runtime per fiber; a hand-written clause is not.
+fn default_block_is_extern(defblk: Option[DefaultBlock]) : Bool {
+  match defblk {
+    None      -> false
+    Some(blk) -> match blk {
+      DBlk(clauses, _, _, _) -> clauses_all_extern(clauses)
+    }
+  }
+}
+
+
+fn clauses_all_extern(cs: [HClause]) : Bool {
+  match cs {
+    []           -> false
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) ->
+        if clause_is_extern(body) { rest_all_extern(rest) } else { false }
+    }
+  }
+}
+
+
+fn rest_all_extern(cs: [HClause]) : Bool {
+  match cs {
+    []           -> true
+    [c, ...rest] -> match c {
+      HC(_, _, body, _, _) ->
+        if clause_is_extern(body) { rest_all_extern(rest) } else { false }
+    }
+  }
+}
+
+
+fn clause_is_extern(body: Expr) : Bool {
+  match body.kind {
+    EIntrinsic(InExternHandler, _) -> true
+    _                              -> false
+  }
+}
+
+
+fn spawn_effect_is_fiber_local(s: SymId) : Bool =
+  effect_is_any(s, [CeCancel, CeLink, CeMonitor, CeSpawn, CeActor, CeFfi])
+
+
+
+fn report_spawn_row_labels(site: SpawnSite, decls: [Decl],                             labels: [Label], line: Int, col: Int,
+                            acc: [Diagnostic]) : [Diagnostic] / Console + File {
+  match labels {
+    []           -> acc
+    [l, ...rest] ->
+      if effect_is(l.sym, CeMutable) {
+        let d = report_spawn_mutable(site.file, line, col)
+        report_spawn_row_labels(site, decls, rest, line, col, list_append(acc, [d]))
+      }
+      else if effect_crosses_spawn(l, decls) {
+        report_spawn_row_labels(site, decls, rest, line, col, acc)
+      } else {
+        let d = report_spawn_escape(site.file, written_text(decl_name(site.tab, l.sym)), line, col)
+        report_spawn_row_labels(site, decls, rest, line, col, list_append(acc, [d]))
+      }
+  }
+}
+
+
+# A write the thunk performs on state it did not create lands on the
+# child's copy, so the row alone shows the capture whatever path the
+# thunk took to the spawn.
+fn report_spawn_mutable(file: String, line: Int, col: Int) : Diagnostic / Console + File {
+  let note = ri_note(file, line, col, "the spawned fiber gets a copy of what it captures, so a write is lost to the parent")
+  let help = ri_help(file, line, col, "let one fiber own the state and send it the updates as messages (`kai info actors`)")
+  let d = mk_diag(SevError, file, line, col, "a spawned fiber cannot mutate state it did not create: `Mutable` in its effect row", [note, help])
+  d
+}
+
+
+fn report_spawn_escape(file: String, eff_name: String,
+                        line: Int, col: Int) : Diagnostic / Console + File {
+  let note = ri_note(file, line, col, "a fiber does not inherit the parent's handlers")
+  let help = ri_help(file, line, col, "handle the effect inside the spawned body: `handle { ... } with #{eff_name} { ... }`")
+  let d = mk_diag(SevError, file, line, col, "effect not handled in spawned fiber: #{eff_name}", [note, help])
+  d
+}

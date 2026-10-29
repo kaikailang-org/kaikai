@@ -1,0 +1,9 @@
+fn double(x: Int) : Int = x * 2
+
+fn main() : Unit / Stdout = {
+  let a = array.from([1, 2, 3])
+  a |! println("#{.}")
+  array.to_list(a) | double |! println("#{.}")
+  let none: [Int] = []
+  array.from(none) |! println("never #{.}")
+}
