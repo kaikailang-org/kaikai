@@ -1,0 +1,22 @@
+# Issue #1130 — a closure threaded through a tail-recursive loop, now
+# BORROWED. `go` marks `^f`: `f` is only CALLED (`f(n)`) and re-passed to
+# the SAME (borrowed) position of the self-recursive `go`. The borrowing
+# indirect call (`kai_apply_borrow`) invokes without consuming the closure,
+# so the caller keeps the ref and drops it once after the loop. Under the
+# owned convention this shape paid 2 incref + 2 decref PER ITERATION (the
+# per-call dup for the consuming `kai_apply` + the re-pass dup); with the
+# borrow both collapse — the closure's RC is untouched inside the loop.
+#
+# The counter gate (Makefile) asserts the per-iteration closure RC is gone.
+# The functional result is `sum(1..=N) = N*(N+1)/2`.
+
+fn go(n: Int, acc: Int, ^f: (Int) -> Int) : Int = {
+  if n <= 0 { acc }
+  else { go(n - 1, acc + f(n), f) }
+}
+
+fn main() : Int / Stdout = {
+  let r = go(1000, 0, (x) => x)
+  Stdout.print(int_to_string(r))
+  0
+}
