@@ -1,0 +1,2 @@
+`extern "js"` is supported by the native backend only for the `wasm32-browser` target
+build for `--target=wasm32-browser`, or with `--backend=c`

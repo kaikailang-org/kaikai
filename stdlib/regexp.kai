@@ -1,0 +1,424 @@
+#[doc("""
+RE2-style regular expressions.
+
+Pure kaikai Pike-VM NFA simulation (leftmost-first): one pass over the input,
+with a new thread entering at each position until a match is found.
+RE2-compatible subset:
+  - Char literals + escapes (\\d \\w \\s . \\n \\t \\\\ \\/).
+  - Character classes [abc], [^abc], [a-z], [0-9].
+  - Anchors ^ $.
+  - Greedy quantifiers * + ? {n} {n,} {n,m}.
+  - Groups (...) capturing, (?:...) non-capturing.
+  - Alternation a|b.
+
+Matching is by codepoint; match offsets are byte offsets. Repeat
+counts above 1000 and inverted class ranges are compile errors.
+
+Out of scope: backreferences, lookaround, Unicode property
+classes, non-greedy quantifiers, named captures, inline flags.
+
+`regexp.match` does not exist — `match` is a keyword; the operation
+is `find`. Bare names like `compile` / `split` are heavily shadowed,
+so call sites should use the qualified form.
+""")]
+
+
+import regexp.engine
+import regexp.syntax
+
+# Positions are byte offsets that always sit on a codepoint boundary.
+fn rx_cp_at(s: String, i: Int) : Char = int_to_char(string_cp_at(s, i))
+
+# Byte offset following the codepoint at `i`; past the end it moves one byte.
+fn rx_next_pos(s: String, i: Int) : Int =
+  if i >= string_length(s) { i + 1 } else { i + string_cp_len(s, i) }
+
+# ====================================================================
+# NFA simulation (Pike VM, leftmost-first)
+# ====================================================================
+#
+# Each *thread* is a (state_id, captures) pair. The thread list is kept in
+# priority order: an earlier start, then an earlier alternative or a greedier
+# branch, comes first. A state reached twice belongs to the first thread, and
+# the first accepting thread ends the run, dropping every lower priority one.
+#
+# Each thread carries an immutable `[Capture]`; TGroupOpen sets a start and
+# TGroupClose an end. Group 0 is the whole match, seeded with each new thread.
+
+#[doc("""
+Captured span. `start == -1` means the group has not opened yet
+along this thread; `end == -1` means it opened but did not close.
+""")]
+pub type Capture = { group_id: Int, start: Int, end: Int }
+
+#[doc("A successful match: the matched span (byte offsets `start`..`end`) and its capture groups.")]
+pub type Match = { start: Int, end: Int, groups: [Capture] }
+
+# Thread record: which NFA state and the per-thread capture stack.
+type Thread = { state_id: Int, captures: [Capture] }
+
+fn rx_capture_close(caps: [Capture], gid: Int, pos: Int) : [Capture] =
+  rx_capture_set(caps, gid, -1, pos, false)
+
+fn rx_capture_set(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool) : [Capture] =
+  rx_capture_set_loop(caps, gid, start_v, end_v, is_open, [])
+
+# `before` holds the captures already passed, newest first.
+fn rx_capture_set_loop(caps: [Capture], gid: Int, start_v: Int, end_v: Int, is_open: Bool,
+                       before: [Capture]) : [Capture] = match caps {
+  [] -> rx_caps_rebuild(before,
+    if is_open { [Capture { group_id: gid, start: start_v, end: end_v }] }
+    else       { [Capture { group_id: gid, start: -1, end: end_v }] })
+  [c, ...rest] ->
+    if c.group_id == gid {
+      let new_c = if is_open {
+        Capture { group_id: gid, start: start_v, end: c.end }
+      } else {
+        Capture { group_id: gid, start: c.start, end: end_v }
+      }
+      rx_caps_rebuild(before, [new_c, ...rest])
+    } else {
+      rx_capture_set_loop(rest, gid, start_v, end_v, is_open, [c, ...before])
+    }
+}
+
+# Puts `before` (newest first) back in front of `tail`, oldest first.
+fn rx_caps_rebuild(before: [Capture], tail: [Capture]) : [Capture] = match before {
+  []           -> tail
+  [c, ...more] -> rx_caps_rebuild(more, [c, ...tail])
+}
+
+# ---- Search ----
+
+# The input, the NFA and its states indexed by id.
+type RxSim = { nfa: Nfa, tbl: Vec[NfaState], input: String, n: Int }
+
+fn rx_sim(nfa: Nfa, input: String) : RxSim =
+  RxSim { nfa: nfa, tbl: rx_fill_table(nfa.states, vec_make(rx_max_id(nfa.states, 0) + 1, NfaState { id: -1, transitions: [], accept: false })), input: input, n: string_length(input) }
+
+fn rx_max_id(states: [NfaState], best: Int) : Int = match states {
+  []           -> best
+  [s, ...rest] -> rx_max_id(rest, if s.id > best { s.id } else { best })
+}
+
+fn rx_fill_table(states: [NfaState], tbl: Vec[NfaState]) : Vec[NfaState] = match states {
+  []           -> tbl
+  [s, ...rest] -> rx_fill_table(rest, vec_set(tbl, s.id, s))
+}
+
+#[doc("""
+Simulate `nfa` over `input`. Returns the leftmost match, with
+alternatives and greedy quantifiers resolved in priority order
+(Perl/RE2 semantics), or None if no match exists.
+""")]
+pub fn simulate(nfa: Nfa, input: String) : Option[Match] = rx_search(rx_sim(nfa, input), 0, false)
+
+# Leftmost-first match starting at or after `from_pos`, in one pass. With
+# `full`, only a match that spans from `from_pos` to the end is accepted.
+fn rx_search(sim: RxSim, from_pos: Int, full: Bool) : Option[Match] =
+  if from_pos > sim.n { None }
+  else { rx_search_loop(sim, from_pos, from_pos, full, [], None, vec_make(vec_length(sim.tbl), -1)) }
+
+# `live` holds the threads closed at `pos`, highest priority first, and
+# `seen` stamps the states already reached at `pos`. A new thread enters at
+# the lowest priority until some thread has accepted.
+fn rx_search_loop(sim: RxSim, from_pos: Int, pos: Int, full: Bool, live: [Thread], best: Option[Match],
+                  seen: Vec[Int]) : Option[Match] = {
+  let seeded = match best {
+    None    ->
+      if full and pos > from_pos { RxClosed { threads: list_reverse(live), seen: seen } }
+      else { rx_add(sim, [WVisit(sim.nfa.start, [Capture { group_id: 0, start: pos, end: -1 }])], pos, seen, list_reverse(live)) }
+    Some(_) -> RxClosed { threads: list_reverse(live), seen: seen }
+  }
+  let ch = if pos >= sim.n { None } else { Some(rx_cp_at(sim.input, pos)) }
+  let run = rx_run(sim, list_reverse(seeded.threads), pos, ch, full, [], seeded.seen, best)
+  if pos >= sim.n or (list.is_empty(run.next) and run.best != None) { run.best }
+  else { rx_search_loop(sim, from_pos, rx_next_pos(sim.input, pos), full, list_reverse(run.next), run.best, run.seen) }
+}
+
+# Result of running the threads at one position: the threads advanced to
+# the next position (newest first), the states they reached, the best match.
+type RxRun = { next: [Thread], seen: Vec[Int], best: Option[Match] }
+
+# Runs `threads` in priority order. The first accepting thread ends the
+# run: every thread after it has lower priority and is dropped.
+fn rx_run(sim: RxSim, threads: [Thread], pos: Int, ch: Option[Char], full: Bool, out: [Thread],
+          seen: Vec[Int], best: Option[Match]) : RxRun = match threads {
+  []           -> RxRun { next: out, seen: seen, best: best }
+  [t, ...rest] -> {
+    let st = vec_get(sim.tbl, t.state_id)
+    if st.accept and (pos >= sim.n or not full) {
+      let caps = rx_capture_close(t.captures, 0, pos)
+      RxRun { next: out, seen: seen, best: Some(Match { start: rx_match_start(caps), end: pos, groups: caps }) }
+    } else {
+      match ch {
+        None    -> rx_run(sim, rest, pos, ch, full, out, seen, best)
+        Some(c) -> {
+          let moved = rx_step_thread(sim, st.transitions, t.captures, c, rx_next_pos(sim.input, pos), seen, out)
+          rx_run(sim, rest, pos, ch, full, moved.threads, moved.seen, best)
+        }
+      }
+    }
+  }
+}
+
+fn rx_match_start(caps: [Capture]) : Int = match caps {
+  [] -> 0
+  [c, ...rest] -> if c.group_id == 0 { c.start } else { rx_match_start(rest) }
+}
+
+# ---- ε-closure ----
+#
+# A depth-first walk over zero-width transitions (TEpsilon, TGroupOpen,
+# TGroupClose, TAnchor when satisfied at pos), so threads come out in
+# priority order. A state reached a second time is dropped: the first, higher
+# priority thread owns it. Work is an explicit list, so nesting costs list
+# cells, not stack frames.
+
+type RxWork = WVisit(Int, [Capture]) | WEmit(Int, [Capture])
+
+type RxClosed = { threads: [Thread], seen: Vec[Int] }
+
+# `out` is newest first. A state emits its thread after everything it
+# leads to, so a loop edge is preferred over stopping at an accepting state.
+fn rx_add(sim: RxSim, work: [RxWork], pos: Int, seen: Vec[Int], out: [Thread]) : RxClosed = match work {
+  [] -> RxClosed { threads: out, seen: seen }
+  [WVisit(s, caps), ...rest] ->
+    if vec_get(seen, s) == pos { rx_add(sim, rest, pos, seen, out) }
+    else {
+      let kids = rx_zero_width_targets(vec_get(sim.tbl, s).transitions, caps, sim.n, pos, [])
+      rx_add(sim, list_append(list_reverse(kids), [WEmit(s, caps), ...rest]), pos, vec_set(seen, s, pos), out)
+    }
+  [WEmit(s, caps), ...rest] ->
+    rx_add(sim, rest, pos, seen, if rx_is_live(vec_get(sim.tbl, s)) { [Thread { state_id: s, captures: caps }, ...out] } else { out })
+}
+
+# A state a thread can rest in: it accepts or consumes a character.
+fn rx_is_live(st: NfaState) : Bool = st.accept or rx_consumes(st.transitions)
+
+fn rx_consumes(trs: [NfaTransition]) : Bool = match trs {
+  []           -> false
+  [t, ...rest] -> match t {
+    TChar(_, _)     -> true
+    TClass(_, _, _) -> true
+    TAny(_)         -> true
+    _               -> rx_consumes(rest)
+  }
+}
+
+# Every zero-width transition's target as work, newest first. TAnchor only
+# contributes when the anchor condition holds at `pos`.
+fn rx_zero_width_targets(trs: [NfaTransition], caps: [Capture], n: Int, pos: Int, acc: [RxWork]) : [RxWork] = match trs {
+  []           -> acc
+  [t, ...rest] -> match rx_zero_width_step(t, caps, n, pos) {
+    Some(w) -> rx_zero_width_targets(rest, caps, n, pos, [w, ...acc])
+    None    -> rx_zero_width_targets(rest, caps, n, pos, acc)
+  }
+}
+
+fn rx_zero_width_step(t: NfaTransition, caps: [Capture], n: Int, pos: Int) : Option[RxWork] = match t {
+  TEpsilon(dst)         -> Some(WVisit(dst, caps))
+  TGroupOpen(gid, dst)  -> Some(WVisit(dst, rx_capture_set(caps, gid, pos, -1, true)))
+  TGroupClose(gid, dst) -> Some(WVisit(dst, rx_capture_close(caps, gid, pos)))
+  TAnchor(an, dst)      -> match an {
+    AnchorStart -> if pos == 0 { Some(WVisit(dst, caps)) } else { None }
+    AnchorEnd   -> if pos >= n { Some(WVisit(dst, caps)) } else { None }
+  }
+  _                     -> None
+}
+
+# ---- Step ----
+#
+# Takes every consuming transition that accepts `c`, in order, and closes
+# the target at `npos`, appending to `out`.
+
+fn rx_step_thread(sim: RxSim, trs: [NfaTransition], caps: [Capture], c: Char, npos: Int,
+                  seen: Vec[Int], out: [Thread]) : RxClosed = match trs {
+  []           -> RxClosed { threads: out, seen: seen }
+  [t, ...rest] -> match rx_consume_target(t, c) {
+    Some(dst) -> {
+      let added = rx_add(sim, [WVisit(dst, caps)], npos, seen, out)
+      rx_step_thread(sim, rest, caps, c, npos, added.seen, added.threads)
+    }
+    None -> rx_step_thread(sim, rest, caps, c, npos, seen, out)
+  }
+}
+
+fn rx_consume_target(t: NfaTransition, c: Char) : Option[Int] = match t {
+  TChar(ch, dst)           -> if ch == c { Some(dst) } else { None }
+  TClass(ranges, neg, dst) -> if rx_class_matches(ranges, c) != neg { Some(dst) } else { None }
+  # `.` matches any char except newline.
+  TAny(dst)                -> if c == '\n' { None } else { Some(dst) }
+  _                        -> None
+}
+
+fn rx_class_matches(ranges: [CharRange], c: Char) : Bool = match ranges {
+  [] -> false
+  [r, ...rest] -> match r {
+    CR(lo, hi) ->
+      if char_to_int(c) >= char_to_int(lo) and char_to_int(c) <= char_to_int(hi) { true }
+      else { rx_class_matches(rest, c) }
+  }
+}
+
+# ====================================================================
+# Public API
+# ====================================================================
+#
+# Opaque `Regex` carrier wrapping a compiled `Nfa`. The lowercase
+# name is the public surface; the parser/NFA/simulator types stay
+# exported for power users (debugging, custom drivers) but are not
+# expected to be touched by typical code.
+
+#[doc("An opaque compiled regular expression, wrapping its NFA. Build one with `compile`.")]
+pub type Regex = R(Nfa)
+
+#[doc("""
+Compile a pattern string. The error variant carries a
+human-readable message — the caller does not need to know about
+RxParseError's internals.
+""")]
+pub fn compile(pattern: String) : Result[Regex, String] =
+  match parse_pattern(pattern) {
+    Err(e) -> match e {
+      RxParseError { msg: m, pos: p } ->
+        Err(string_concat_all(["regex parse error at ", int_to_string(p), ": ", m]))
+    }
+    Ok(ast) -> Ok(R(compile_nfa(ast)))
+  }
+
+#[doc("Find the leftmost match of `re` in `s`, preferring earlier alternatives and greedier branches.")]
+pub fn find(re: Regex, s: String) : Option[Match] = match re {
+  R(nfa) -> simulate(nfa, s)
+}
+
+#[doc("""
+Find every non-overlapping match. Zero-width matches advance the
+scan cursor by one character so we don't loop forever on
+patterns like `a*` against `bbb`.
+""")]
+pub fn find_all(re: Regex, s: String) : [Match] = match re {
+  R(nfa) -> rx_find_all_loop(rx_sim(nfa, s), 0, [])
+}
+
+fn rx_find_all_loop(sim: RxSim, from_pos: Int, acc: [Match]) : [Match] = {
+  if from_pos > sim.n { list_reverse(acc) }
+  else { match rx_search(sim, from_pos, false) {
+    None -> list_reverse(acc)
+    Some(m) -> {
+      rx_find_all_loop(sim, rx_after(sim, m), [m, ...acc])
+    }
+  } }
+}
+
+# Where the scan resumes after `m`: its end, or the next codepoint when
+# the match is empty.
+fn rx_after(sim: RxSim, m: Match) : Int =
+  if m.end > m.start { m.end } else { rx_next_pos(sim.input, m.start) }
+
+#[doc("""
+Replace every non-overlapping match with `replacement`. The
+replacement supports `$0` (whole match) and `$1`..`$9` (numbered
+groups). Use `$$` for a literal `$`.
+""")]
+pub fn replace(re: Regex, s: String, replacement: String) : String = match re {
+  R(nfa) -> string_concat_all(list_reverse(rx_replace_loop(rx_sim(nfa, s), replacement, 0, [])))
+}
+
+# `parts` holds the output pieces, newest first.
+fn rx_replace_loop(sim: RxSim, repl: String, from_pos: Int, parts: [String]) : [String] = {
+  if from_pos > sim.n { parts }
+  else { match rx_search(sim, from_pos, false) {
+    None -> [string_slice(sim.input, from_pos, sim.n - from_pos), ...parts]
+    Some(m) -> {
+      # Source [from_pos..m.start) verbatim, then the expanded
+      # replacement. Advance to m.end (or +1 on a zero-width match).
+      let prefix = string_slice(sim.input, from_pos, m.start - from_pos)
+      let parts1 = [string_concat_all(list_reverse(rx_expand_loop(repl, 0, string_length(repl), m, sim.input, [], false))), prefix, ...parts]
+      let next = rx_after(sim, m)
+      # Zero-width: also copy the skipped char so it is not lost.
+      let parts2 = if m.end == m.start and m.start < sim.n {
+        [string_slice(sim.input, m.start, next - m.start), ...parts1]
+      } else { parts1 }
+      rx_replace_loop(sim, repl, next, parts2)
+    }
+  } }
+}
+
+# Expand $N back-references in `repl` against the captured groups.
+# `$$` -> literal `$`. Unknown groups expand to the empty string
+# (mirrors most engines' lenient behaviour). Works byte by byte, which
+# keeps multibyte text intact. `dollar` is set right after a `$`.
+fn rx_expand_loop(repl: String, i: Int, n: Int, m: Match, src: String, parts: [String], dollar: Bool) : [String] =
+  if i >= n { if dollar { ["$", ...parts] } else { parts } }
+  else { match char_at(repl, i) {
+    None    -> parts
+    Some(c) -> rx_expand_loop(repl, i + 1, n, m, src, rx_expand_piece(c, dollar, m, src, parts), not dollar and c == '$')
+  } }
+
+fn rx_expand_piece(c: Char, dollar: Bool, m: Match, src: String, parts: [String]) : [String] =
+  if not dollar { if c == '$' { parts } else { [int_to_byte_string(char_to_int(c)), ...parts] } }
+  else if c == '$' { ["$", ...parts] }
+  else if char.is_digit(c) { [rx_group_span(m.groups, char_to_int(c) - char_to_int('0'), src), ...parts] }
+  else { [int_to_byte_string(char_to_int(c)), "$", ...parts] }
+
+# Look up a captured span by group id; a group that did not take part
+# expands to the empty string. A thread that accepts has closed every
+# group it opened.
+fn rx_group_span(caps: [Capture], gid: Int, src: String) : String = match caps {
+  [] -> ""
+  [c, ...rest] ->
+    if c.group_id == gid { string_slice(src, c.start, c.end - c.start) }
+    else { rx_group_span(rest, gid, src) }
+}
+
+#[doc("""
+Split `s` at every non-overlapping match of `re`. The match
+itself is excluded from the output (mirrors Python `re.split`).
+An empty match also cuts, so `"abc"` split by `"x*"` yields
+`["", "a", "b", "c", ""]`. Leading and trailing empty segments are
+kept.
+""")]
+pub fn split(re: Regex, s: String) : [String] = match re {
+  R(nfa) -> rx_split_loop(rx_sim(nfa, s), 0, 0, [])
+}
+
+# `seg` is where the current segment starts; `from_pos` where the scan resumes.
+fn rx_split_loop(sim: RxSim, seg: Int, from_pos: Int, acc: [String]) : [String] = {
+  if from_pos > sim.n { rx_split_done(sim, seg, acc) }
+  else { match rx_search(sim, from_pos, false) {
+    None    -> rx_split_done(sim, seg, acc)
+    Some(m) -> rx_split_loop(sim, m.end, rx_after(sim, m), [string_slice(sim.input, seg, m.start - seg), ...acc])
+  } }
+}
+
+fn rx_split_done(sim: RxSim, seg: Int, acc: [String]) : [String] =
+  list_reverse([string_slice(sim.input, seg, sim.n - seg), ...acc])
+
+#[doc("""
+The runtime carrier of the `~r/pattern/` regex sigil, which the
+compiler desugars to `compile_or_panic("pattern")`.
+
+By the time it runs the parser has already accepted the literal, so
+an `Err` from `compile` means the supported-subset doc and the
+engine disagree — a compiler bug worth crashing on, not a
+recoverable error worth threading through `Result`.
+""")]
+pub fn compile_or_panic(pattern: String) : Regex = match compile(pattern) {
+  Err(msg) -> panic(string_concat("invalid regex sigil: ", msg))
+  Ok(re)   -> re
+}
+
+#[doc("""
+The predicate-pure refinement-side primitive. Returns true iff the
+*entire* string `s` matches `re` (full match, not substring). The
+typical use is `String where matches ~r/^[a-z]+$/`; the parser's
+refinement-predicate sugar elides the `self` receiver so the source
+reads identically to the spec.
+""")]
+pub fn matches(s: String, re: Regex) : Bool = match re {
+  R(nfa) -> match rx_search(rx_sim(nfa, s), 0, true) {
+    None    -> false
+    Some(_) -> true
+  }
+}
