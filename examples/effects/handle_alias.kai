@@ -1,0 +1,17 @@
+# m7a #4e smoke test (positive) — `Eff as alias` rebinds the
+# capability inside the body. The checker now accepts `log.print`
+# inside the handle body and resolves it through the alias to
+# `Io.print`. Outside the body the alias is no longer in scope.
+
+effect Io {
+  print(s: String) : Unit
+}
+
+fn main() : Int {
+  handle {
+    log.print("via alias")
+    0
+  } with Io as log {
+    print(s, resume) -> resume(())
+  }
+}

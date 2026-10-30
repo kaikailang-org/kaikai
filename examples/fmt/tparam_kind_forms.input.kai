@@ -1,0 +1,20 @@
+# Kind-annotated and bounded type parameters round-trip in every
+# position: protocol head, fn head, impl head (bounds).
+
+protocol Container[s: Shape] {
+  first(xs: s[Int]) : Int
+}
+
+fn area_of[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2> = w * h
+
+type Wrap[t] = { inner: t }
+
+impl[t: Show + Eq] Show for Wrap[t] {
+  fn show(w: Wrap[t]) : String = "Wrap"
+}
+
+impl[t: Show] Eq for Wrap[t] {
+  fn eq(a: Wrap[t], b: Wrap[t]) : Bool = show(a.inner) == show(b.inner)
+}
+
+fn main() : Int = 0

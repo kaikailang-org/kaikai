@@ -1,0 +1,9 @@
+pub const PI : Real = 3.141592653589793
+
+pub const HALF : Real = 0.5
+
+pub const WHOLE : Real = 3.0
+
+fn scale(x: Real) : Real = x * 2.5
+
+fn small(x: Real) : Bool = x < 0.001

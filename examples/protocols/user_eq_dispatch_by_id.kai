@@ -1,0 +1,23 @@
+type Color = Red | Blue
+
+protocol Eq {
+  eq(a: Self, b: Self) : Bool
+}
+
+impl Eq for Color {
+  fn eq(a: Color, b: Color) : Bool = true
+}
+
+fn show(b: Bool) : String = if b { "true" } else { "false" }
+
+fn poly[t : Eq](a: t, b: t) : Bool = eq(a, b)
+
+fn apply(f: (Color, Color) -> Bool, a: Color, b: Color) : Bool = f(a, b)
+
+fn main() {
+  println(show(eq(Red, Blue)))
+  let f = eq
+  println(show(f(Red, Blue)))
+  println(show(poly(Red, Blue)))
+  println(show(apply(eq, Red, Blue)))
+}
