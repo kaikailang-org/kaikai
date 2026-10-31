@@ -1,0 +1,2 @@
+# Both sides of this collision carry a module tag.
+pub fn count[t](s: String, p: t) : Int = string.length(s) * 10

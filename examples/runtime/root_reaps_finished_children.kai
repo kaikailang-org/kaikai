@@ -1,0 +1,46 @@
+# A main that spawns short-lived actors and fibers for as long as it runs
+# holds only the live ones: the root scope drops each finished child, so peak
+# memory stays flat (bounded by `make test-root-reaps-children`). A handle
+# main keeps stays valid across the drops: 100 `Fiber`s are awaited and 100
+# `Pid`s are sent to after 30000 other children came and went.
+import actor
+import spawn
+
+fn ack(parent: Pid[String]) : Unit / Actor[String] = Actor.send(parent, "ack")
+
+fn actors(n: Int, acks: Int) : Int / Actor[String] + Spawn =
+  if n == 0 { acks } else {
+    let me = Actor.self()
+    let _k = spawn_actor(() => ack(me))
+    let _a = Actor.receive()
+    actors(n - 1, acks + 1)
+  }
+
+fn held_actors(k: Int) : Int / Actor[String] + Spawn =
+  if k == 0 { actors(30000, 0) } else {
+    let me = Actor.self()
+    let p = spawn_actor(() => ack(me))
+    let _a = Actor.receive()
+    let r = held_actors(k - 1)
+    Actor.send(p, "late")
+    r + 1
+  }
+
+fn fibers(n: Int, sum: Int) : Int / Spawn =
+  if n == 0 { sum } else {
+    let f = spawn.spawn(() => 1)
+    fibers(n - 1, sum + spawn.await(f))
+  }
+
+fn held_fibers(k: Int) : Int / Spawn =
+  if k == 0 { fibers(30000, 0) } else {
+    let h = spawn.spawn(() => k)
+    let r = held_fibers(k - 1)
+    r + spawn.await(h)
+  }
+
+fn main() : Unit / Spawn + Console = {
+  let acks = with_mailbox { held_actors(100) }
+  let done = held_fibers(100)
+  println("#{acks} actors acked, #{done} fibers done")
+}

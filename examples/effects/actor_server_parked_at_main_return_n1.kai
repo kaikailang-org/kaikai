@@ -1,0 +1,37 @@
+# A server actor that loops on `receive` forever does not hang the program:
+# `main` returning cancels it and the exit code is 0.
+
+import actor
+
+effect Lease {
+  renew() : Unit
+}
+
+fn loop_serve(boss: Pid[String]) : Unit / Actor[String] + Stdout = {
+  let m = Actor.receive()
+  Stdout.print("got #{m}")
+  Actor.send(boss, "ack")
+  loop_serve(boss)
+}
+
+fn serve(boss: Pid[String]) : Unit / Actor[String] + Stdout = handle {
+  loop_serve(boss)
+} with Lease {
+  finally { Stdout.print("server stopped") }
+  renew(resume) -> resume(())
+}
+
+fn run() : Unit / Actor[String] + Spawn + Stdout = {
+  let boss = Actor.self()
+  let pid = spawn_actor(() => serve(boss))
+  Actor.send(pid, "1")
+  let _ = Actor.receive()
+  Actor.send(pid, "2")
+  let _ = Actor.receive()
+}
+
+fn main() : Int / Spawn + Stdout = {
+  with_mailbox { run() }
+  Stdout.print("main returning")
+  0
+}

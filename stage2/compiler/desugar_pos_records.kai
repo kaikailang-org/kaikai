@@ -1,0 +1,478 @@
+#[doc("""
+Positional record literals lowered to named fields, over a whole
+program.
+""")]
+
+import compiler.ast_ids
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.diag_file
+import compiler.symtab
+import compiler.scope_view
+import compiler.desugar_record_lit
+import compiler.handler_alias
+import compiler.util
+import compiler.diag
+import compiler.written
+
+#[doc("Result of the positional-record desugar over a decl stream: the rewritten decls plus the errors reported, in source order.")]
+pub(pkg) type DPRDecls = { decls: [Decl], errs: [Diagnostic] }
+
+#[doc("Positional-record sugar: rewrite `Foo(a, b)` calls to `Foo { f1: a, f2: b }` record literals using the record table; the entry point the driver invokes. A literal's written head is settled against `tab` under the view of its file; `root` is the target module.")]
+pub(pkg) fn desugar_pos_records_decls(ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File =
+  desugar_pos_records_with(collect_records(ds), ds, tab, views, root, df)
+
+#[doc("`desugar_pos_records_decls` against a record table built earlier, so declarations can be rewritten one at a time.")]
+pub(pkg) fn desugar_pos_records_with(recs: [RecInfo], ds: [Decl], tab: SymTab, views: FileViews, root: String, df: DiagFiles) : DPRDecls / Console + File {
+  desugar_pos_records_loop(ds, (d) => RecScope { recs: recs, sc: dsg_scope_of(d, tab, views, root) }, df, [], [])
+}
+
+fn desugar_pos_records_loop(ds: [Decl], scope_of: (Decl) -> RecScope, df: DiagFiles, acc: [Decl], errs: [Diagnostic]) : DPRDecls / Console + File {
+
+  match ds {
+    [] -> DPRDecls { decls: list_reverse(acc), errs: list_reverse(errs) }
+    [d, ...rest] -> {
+      let r = desugar_pos_records_decl(d, scope_of(d), decl_diag_file(d, df), errs)
+      desugar_pos_records_loop(rest, scope_of, df, [r.decl, ...acc], r.errs)
+    }
+  }
+}
+
+type DPRDecl = { decl: Decl, errs: [Diagnostic] }
+
+fn desugar_pos_records_decl(d: Decl, recs: RecScope, file: String, errs: [Diagnostic]) : DPRDecl / Console + File {
+
+  match d {
+    DFn(pub_, fid, tps, ps, ret, row, body, l, c, nlp, ncp, mo) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DFn(pub_, fid, tps, ps, ret, row, r.expr, l, c, nlp, ncp, mo), errs: r.errs }
+    }
+    DTest(desc, body, l, c, mo) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DTest(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DBench(desc, body, l, c, mo) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DBench(desc, r.expr, l, c, mo), errs: r.errs }
+    }
+    DCheck(desc, params, body, l, c, mo) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DCheck(desc, params, r.expr, l, c, mo), errs: r.errs }
+    }
+    DConst(pub_, s, ty, body, mo, l, c, nl, nc) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRDecl { decl: DConst(pub_, s, ty, r.expr, mo, l, c, nl, nc), errs: r.errs }
+    }
+    _ -> DPRDecl { decl: d, errs: errs }
+  }
+}
+
+type DPRExpr = { expr: Expr, errs: [Diagnostic] }
+type DPRStmts = { stmts: [Stmt], errs: [Diagnostic] }
+type DPRStmt = { stmt: Stmt, errs: [Diagnostic] }
+type DPROpt = { opt: Option[Expr], errs: [Diagnostic] }
+type DPRExprs = { exprs: [Expr], errs: [Diagnostic] }
+type DPRArm = { arm: Arm, errs: [Diagnostic] }
+type DPRArms = { arms: [Arm], errs: [Diagnostic] }
+
+fn dpr_expr(e: Expr, recs: RecScope, file: String, errs: [Diagnostic]) : DPRExpr / Console + File {
+
+  let kr = dpr_kind(e.kind, e.line, e.col, recs, file, errs)
+  DPRExpr { expr: Expr { kind: kr.expr.kind, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site },
+            errs: kr.errs }
+}
+
+fn dpr_opt(o: Option[Expr], recs: RecScope, file: String, errs: [Diagnostic]) : DPROpt / Console + File {
+
+  match o {
+    Some(e) -> {
+      let r = dpr_expr(e, recs, file, errs)
+      DPROpt { opt: Some(r.expr), errs: r.errs }
+    }
+    None -> DPROpt { opt: None, errs: errs }
+  }
+}
+
+fn dpr_exprs(es: [Expr], recs: RecScope, file: String, errs: [Diagnostic]) : DPRExprs / Console + File {
+
+  match es {
+    [] -> DPRExprs { exprs: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_expr(h, recs, file, errs)
+      let rt = dpr_exprs(rest, recs, file, rh.errs)
+      DPRExprs { exprs: [rh.expr, ...rt.exprs], errs: rt.errs }
+    }
+  }
+}
+
+fn dpr_fields(fs: [FieldInit], recs: RecScope, file: String, errs: [Diagnostic]) : DPRFields / Console + File {
+
+  match fs {
+    [] -> DPRFields { fields: [], errs: errs }
+    [f, ...rest] -> match f {
+      FI(nm, val) -> {
+        let rv = dpr_expr(val, recs, file, errs)
+        let rt = dpr_fields(rest, recs, file, rv.errs)
+        DPRFields { fields: [FI(nm, rv.expr), ...rt.fields], errs: rt.errs }
+      }
+    }
+  }
+}
+
+fn dpr_stmts(ss: [Stmt], recs: RecScope, file: String, errs: [Diagnostic]) : DPRStmts / Console + File {
+
+  match ss {
+    [] -> DPRStmts { stmts: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_stmt(h, recs, file, errs)
+      let rt = dpr_stmts(rest, recs, file, rh.errs)
+      DPRStmts { stmts: [rh.stmt, ...rt.stmts], errs: rt.errs }
+    }
+  }
+}
+
+fn dpr_stmt(s: Stmt, recs: RecScope, file: String, errs: [Diagnostic]) : DPRStmt / Console + File {
+
+  match s {
+    SLet(p, ann, rhs) -> {
+      let r = dpr_expr(rhs, recs, file, errs)
+      DPRStmt { stmt: SLet(p, ann, r.expr), errs: r.errs }
+    }
+    SAssert(c, m) -> {
+      let rc = dpr_expr(c, recs, file, errs)
+      let rm = dpr_opt(m, recs, file, rc.errs)
+      DPRStmt { stmt: SAssert(rc.expr, rm.opt), errs: rm.errs }
+    }
+    SExprStmt(x) -> {
+      let r = dpr_expr(x, recs, file, errs)
+      DPRStmt { stmt: SExprStmt(r.expr), errs: r.errs }
+    }
+    SIndexAssign(b, i, v, l, c) -> {
+      let rb = dpr_expr(b, recs, file, errs)
+      let ri = dpr_expr(i, recs, file, rb.errs)
+      let rv = dpr_expr(v, recs, file, ri.errs)
+      DPRStmt { stmt: SIndexAssign(rb.expr, ri.expr, rv.expr, l, c), errs: rv.errs }
+    }
+    SAssign(b, v, l, c) -> {
+      let rb = dpr_expr(b, recs, file, errs)
+      let rv = dpr_expr(v, recs, file, rb.errs)
+      DPRStmt { stmt: SAssign(rb.expr, rv.expr, l, c), errs: rv.errs }
+    }
+    SVar(n, ty, rhs, l, c) -> {
+      let r = dpr_expr(rhs, recs, file, errs)
+      DPRStmt { stmt: SVar(n, ty, r.expr, l, c), errs: r.errs }
+    }
+    SUse(n, l, c) -> DPRStmt { stmt: SUse(n, l, c), errs: errs }
+  }
+}
+
+fn dpr_arm(a: Arm, recs: RecScope, file: String, errs: [Diagnostic]) : DPRArm / Console + File {
+
+  match a {
+    Arm(p, g, b) -> {
+      let rg = dpr_opt(g, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, rg.errs)
+      DPRArm { arm: Arm(p, rg.opt, rb.expr), errs: rb.errs }
+    }
+  }
+}
+
+fn dpr_arms(arms: [Arm], recs: RecScope, file: String, errs: [Diagnostic]) : DPRArms / Console + File {
+
+  match arms {
+    [] -> DPRArms { arms: [], errs: errs }
+    [h, ...rest] -> {
+      let rh = dpr_arm(h, recs, file, errs)
+      let rt = dpr_arms(rest, recs, file, rh.errs)
+      DPRArms { arms: [rh.arm, ...rt.arms], errs: rt.errs }
+    }
+  }
+}
+
+# Returned from dpr_kind so we can co-thread the kind and an error
+# count without using `dsg_map_expr_kind` (which has no error channel).
+type DPRKind = { expr: Expr, errs: [Diagnostic] }
+
+fn dpr_kind(k: ExprKind, line: Int, col: Int, recs: RecScope, file: String, errs: [Diagnostic]) : DPRKind / Console + File {
+
+  match k {
+    # The interesting case: rewrite positional record literals using
+    # the record's declared field order. This also intercepts
+    # the `...src, x: 10, ...` spread sugar here — a spread literal
+    # is rewritten into `{ let s = src; T { f1: s.f1, ..., x: 10, ... } }`
+    # so the expanded record-lit lands in the existing emit path.
+    ERecordLit(rh, fis) -> {
+      # Recurse into sub-exprs FIRST so nested positional records
+      # already have real field names by the time we look at this
+      # node's own arity.
+      let rfis = dpr_fields(fis, recs, file, errs)
+      let is_spread = match rfis.fields {
+        [] -> false
+        [f0, ..._rest_] -> match f0 { FI(_, v0) -> field_is_spread(v0) }
+      }
+      if is_spread {
+        let r = dpr_record_spread(rh, rfis.fields, line, col, recs, file, rfis.errs)
+        DPRKind { expr: r.expr, errs: r.errs }
+      } else {
+        let renamed = dpr_record_lit(rh, rfis.fields, line, col, recs, file, rfis.errs)
+        # Named fields keep the order written: the typer lays them in the
+        # order of the record it settles the head to.
+        DPRKind { expr: mk_expr(ERecordLit(pos_head(recs, rh, rfis.fields), renamed.fields), line, col), errs: renamed.errs }
+      }
+    }
+    EBlock(stmts, tail) -> {
+      let rs = dpr_stmts(stmts, recs, file, errs)
+      let rt = dpr_opt(tail, recs, file, rs.errs)
+      DPRKind { expr: mk_expr(EBlock(rs.stmts, rt.opt), line, col), errs: rt.errs }
+    }
+    ECall(callee, args_) -> {
+      let rc = dpr_expr(callee, recs, file, errs)
+      let ra = dpr_exprs(args_, recs, file, rc.errs)
+      DPRKind { expr: mk_expr(ECall(rc.expr, ra.exprs), line, col), errs: ra.errs }
+    }
+    EField(base, nm) -> {
+      let r = dpr_expr(base, recs, file, errs)
+      DPRKind { expr: mk_expr(EField(r.expr, nm), line, col), errs: r.errs }
+    }
+    EIndex(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EIndex(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EBinop(op, a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EBinop(op, ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EUnop(op, x) -> {
+      let r = dpr_expr(x, recs, file, errs)
+      DPRKind { expr: mk_expr(EUnop(op, r.expr), line, col), errs: r.errs }
+    }
+    EIf(c, t_, eo) -> {
+      let rc = dpr_expr(c, recs, file, errs)
+      let rt = dpr_expr(t_, recs, file, rc.errs)
+      let re = dpr_opt(eo, recs, file, rt.errs)
+      DPRKind { expr: mk_expr(EIf(rc.expr, rt.expr, re.opt), line, col), errs: re.errs }
+    }
+    EMatch(scr, arms) -> {
+      let rs = dpr_expr(scr, recs, file, errs)
+      let ra = dpr_arms(arms, recs, file, rs.errs)
+      DPRKind { expr: mk_expr(EMatch(rs.expr, ra.arms), line, col), errs: ra.errs }
+    }
+    ELambda(ps, body) -> {
+      let r = dpr_expr(body, recs, file, errs)
+      DPRKind { expr: mk_expr(ELambda(ps, r.expr), line, col), errs: r.errs }
+    }
+    EList(els) -> {
+      let r = dpr_list_elems(els, recs, file, errs)
+      DPRKind { expr: mk_expr(EList(r.elems), line, col), errs: r.errs }
+    }
+    ERange(a, b, opt_step) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      let rs = dpr_opt(opt_step, recs, file, rb.errs)
+      DPRKind { expr: mk_expr(ERange(ra.expr, rb.expr, rs.opt), line, col), errs: rs.errs }
+    }
+    EPipe(a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EPipe(ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    EDispatchPipe(op, a, b) -> {
+      let ra = dpr_expr(a, recs, file, errs)
+      let rb = dpr_expr(b, recs, file, ra.errs)
+      DPRKind { expr: mk_expr(EDispatchPipe(op, ra.expr, rb.expr), line, col), errs: rb.errs }
+    }
+    ELitUnit(inner, u) -> {
+      let r = dpr_expr(inner, recs, file, errs)
+      DPRKind { expr: mk_expr(ELitUnit(r.expr, u), line, col), errs: r.errs }
+    }
+    EBang(inner) -> {
+      let r = dpr_expr(inner, recs, file, errs)
+      DPRKind { expr: mk_expr(EBang(r.expr), line, col), errs: r.errs }
+    }
+    EHandle(body, eff, eff_tyargs, init_opt, alias_opt, clauses, ret_opt) -> {
+      let rb = dpr_expr(body, recs, file, errs)
+      let ri = dpr_opt(init_opt, recs, file, rb.errs)
+      let rc = dpr_clauses(clauses, recs, file, ri.errs)
+      let rr = dpr_opt_ret(ret_opt, recs, file, rc.errs)
+      DPRKind {
+        expr: mk_expr(EHandle(rb.expr, eff, eff_tyargs, ri.opt, alias_opt, rc.clauses, rr.ret), line, col),
+        errs: rr.errs
+      }
+    }
+    _ -> DPRKind { expr: mk_expr(k, line, col), errs: errs }
+  }
+}
+
+type DPRElems = { elems: [ListElem], errs: [Diagnostic] }
+
+fn dpr_list_elems(els: [ListElem], recs: RecScope, file: String, errs: [Diagnostic]) : DPRElems / Console + File {
+
+  match els {
+    [] -> DPRElems { elems: [], errs: errs }
+    [el, ...rest] -> {
+      let rh = match el {
+        ElPlain(e)  -> {
+          let r = dpr_expr(e, recs, file, errs)
+          DPRElems { elems: [ElPlain(r.expr)], errs: r.errs }
+        }
+        ElSpread(e) -> {
+          let r = dpr_expr(e, recs, file, errs)
+          DPRElems { elems: [ElSpread(r.expr)], errs: r.errs }
+        }
+      }
+      let rt = dpr_list_elems(rest, recs, file, rh.errs)
+      DPRElems { elems: list_append(rh.elems, rt.elems), errs: rt.errs }
+    }
+  }
+}
+
+type DPRClauses = { clauses: [HClause], errs: [Diagnostic] }
+
+fn dpr_clauses(cs: [HClause], recs: RecScope, file: String, errs: [Diagnostic]) : DPRClauses / Console + File {
+
+  match cs {
+    [] -> DPRClauses { clauses: [], errs: errs }
+    [c, ...rest] -> match c {
+      HC(n, ps, body, l, co) -> {
+        let rb = dpr_expr(body, recs, file, errs)
+        let rt = dpr_clauses(rest, recs, file, rb.errs)
+        DPRClauses { clauses: [HC(n, ps, rb.expr, l, co), ...rt.clauses], errs: rt.errs }
+      }
+    }
+  }
+}
+
+type DPROptRet = { ret: Option[HReturn], errs: [Diagnostic] }
+
+fn dpr_opt_ret(or_: Option[HReturn], recs: RecScope, file: String, errs: [Diagnostic]) : DPROptRet / Console + File {
+
+  match or_ {
+    Some(r) -> match r {
+      HR(p, b, l, c) -> {
+        let rb = dpr_expr(b, recs, file, errs)
+        DPROptRet { ret: Some(HR(p, rb.expr, l, c)), errs: rb.errs }
+      }
+    }
+    None -> DPROptRet { ret: None, errs: errs }
+  }
+}
+
+#[doc("A record literal with a spread, lowered: the declared fields in order, an override winning over the spread copy.")]
+fn dpr_record_spread(
+  rh: DeclRef,
+  fis: [FieldInit],
+  line: Int,
+  col: Int,
+  recs: RecScope,
+  file: String,
+  errs: [Diagnostic]
+) : DPRSpread / Console + File = match fis {
+  # The head field is the spread carrying the source; the rest are named
+  # overrides, each pairing a real field name with an already-recursed
+  # expression (the parser rejected every other shape).
+  [] -> DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs }
+  [FI(_, marked), ...overrides] -> match rec_of_head(recs, rh) {
+    None -> {
+      let d = rl_error(file, line, col,
+        concat_all(["unknown record type `", rec_head_text(recs, rh),
+                    "` in `...` spread; declare the type before constructing it"]))
+      DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: [d, ...errs] }
+    }
+    Some(ri) -> dpr_spread_of(rh, ri, fis, field_written(marked), overrides, line, col, recs, file, errs)
+  }
+}
+
+fn dpr_spread_of(rh: DeclRef, ri: RecInfo, fis: [FieldInit], src: Expr, overrides: [FieldInit], line: Int,
+                 col: Int, recs: RecScope, file: String, errs: [Diagnostic]) : DPRSpread / Console + File = match ri {
+  RI(_, tparams, fds, _) -> {
+    # An override listed twice, or naming a field the record does not declare.
+    let dup_errs = check_spread_dup_overrides(overrides, [], file, line, col, [])
+    let bad_errs = check_spread_unknown_overrides(overrides, fds, rec_head_text(recs, rh), file, line, col, [])
+    let errs1 = list_append(list_append(bad_errs, dup_errs), errs)
+    if dup_errs != [] or bad_errs != [] { DPRSpread { expr: mk_expr(ERecordLit(rh, fis), line, col), errs: errs1 } }
+    else { DPRSpread { expr: dpr_spread_block(head_settled(rh, ri), tparams, fds, src, overrides, line, col), errs: errs1 } }
+  }
+}
+
+# `{ let v: T = src; T { f: override or v.f, ... } }`. The annotation
+# makes a source of another record type fail the ordinary let check. A
+# generic record has none: `T[a, b]` cannot be spelled without committing
+# to its arguments, so the typer's field-by-field check stands alone.
+fn dpr_spread_block(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
+                    line: Int, col: Int) : Expr = {
+  match src.kind {
+    # A name is read again for each copied field; binding it first would hide that
+    # the record is read only through projections.
+    EName(w) -> dpr_spread_checked(head, tparams, src, line, col,
+      if any(overrides, (fi) => match fi { FI(_, v) -> expr_mentions(written_text(w), v) }) { dpr_spread_ordered(head, fds, src, overrides, line, col) }
+      else { mk_expr(ERecordLit(head, dpr_spread_copies(fds, overrides, src, line, col, 0)), line, col) })
+    _        -> dpr_spread_bound(head, tparams, fds, src, overrides, line, col)
+  }
+}
+
+# A source of another record type fails the ordinary let check; the check binds
+# nothing, so the source is read again only by the copies.
+fn dpr_spread_checked(head: DeclRef, tparams: [TBinder], src: Expr, line: Int, col: Int, body: Expr) : Expr = match tparams {
+  [] -> mk_expr(EBlock([SLet(mk_pat(PWild, line, col), Some(mk_ty(TyName(head, []), line, col)), src)], Some(body)), line, col)
+  _  -> body
+}
+
+# Each copied field reads the source at a position of its own: the reads of one
+# local are told apart by where they sit.
+fn dpr_spread_copies(fds: [FieldDecl], overrides: [FieldInit], src: Expr, line: Int, col: Int, i: Int) : [FieldInit] = match fds {
+  []                   -> []
+  [FD(_, fname, _, _, _, _), ...rest] -> {
+    let val = match find_override(overrides, fname) {
+      Some(ov) -> ov
+      None     -> mk_expr(EField(Expr { ...src, line: line, col: col + 100000 + i }, fname), line, col)
+    }
+    [FI(fname, val), ...dpr_spread_copies(rest, overrides, src, line, col, i + 1)]
+  }
+}
+
+# An override that reads the source is evaluated before the copies, so the
+# copies are its last reads in position as they are in execution.
+fn dpr_spread_ordered(head: DeclRef, fds: [FieldDecl], src: Expr, overrides: [FieldInit], line: Int, col: Int) : Expr = {
+  let stmts = dpr_override_lets(fds, overrides, line, col, 0)
+  let fields = dpr_ordered_fields(fds, overrides, src, line, col, 0)
+  mk_expr(EBlock(stmts, Some(mk_expr(ERecordLit(head, fields), line, col))), line, col)
+}
+
+fn dpr_override_name(line: Int, col: Int, i: Int) : String =
+  concat_all(["__spread_ov_", int_to_string(line), "_", int_to_string(col), "_", int_to_string(i), "__"])
+
+fn dpr_override_lets(fds: [FieldDecl], overrides: [FieldInit], line: Int, col: Int, i: Int) : [Stmt] = match fds {
+  []                            -> []
+  [FD(_, fname, _, _, _, _), ...rest] -> match find_override(overrides, fname) {
+    Some(v) -> [SLet(mk_pat(PBind(binder_minted(dpr_override_name(line, col, i))), line, col), None, v),
+                ...dpr_override_lets(rest, overrides, line, col, i + 1)]
+    None    -> dpr_override_lets(rest, overrides, line, col, i + 1)
+  }
+}
+
+fn dpr_ordered_fields(fds: [FieldDecl], overrides: [FieldInit], src: Expr, line: Int, col: Int, i: Int) : [FieldInit] = match fds {
+  []                            -> []
+  [FD(_, fname, _, _, _, _), ...rest] -> {
+    let val = match find_override(overrides, fname) {
+      Some(_) -> mk_name(dpr_override_name(line, col, i), line, col)
+      None    -> mk_expr(EField(Expr { ...src, line: line, col: col + 100000 + i }, fname), line, col)
+    }
+    [FI(fname, val), ...dpr_ordered_fields(rest, overrides, src, line, col, i + 1)]
+  }
+}
+
+fn dpr_spread_bound(head: DeclRef, tparams: [TBinder], fds: [FieldDecl], src: Expr, overrides: [FieldInit],
+                    line: Int, col: Int) : Expr = {
+  let var_name = spread_src_var_name(line, col)
+  let bind_pat = mk_pat(PBind(binder_minted(var_name)), line, col)
+  let ann_opt = match tparams {
+    []            -> Some(mk_ty(TyName(head, []), line, col))
+    [_, ..._rest] -> None
+  }
+  let bind_stmt = SLet(bind_pat, ann_opt, src)
+  let expanded = expand_spread_fields(fds, overrides, mk_name(var_name, line, col), line, col)
+  mk_expr(EBlock([bind_stmt], Some(mk_expr(ERecordLit(head, expanded), line, col))), line, col)
+}

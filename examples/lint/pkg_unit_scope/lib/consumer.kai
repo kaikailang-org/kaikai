@@ -1,0 +1,6 @@
+# Linted inside its package's unit, never as a compilation root of its own.
+import lib.pool
+
+pub fn checked(n: Int) : Bool = not is_gone(n)
+
+fn unreferenced(n: Int) : Int = n

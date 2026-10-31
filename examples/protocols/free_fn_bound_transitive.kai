@@ -1,0 +1,15 @@
+# Issue #1099: a generic caller `g[T]` that forwards its own tparam to
+# a bounded `f[T: Eq]` does NOT propagate the constraint onto `g` — it
+# defers to `g`s own instantiation (no Haskell-style propagation). But
+# when `g` is instantiated at a concrete `Q` with no `Eq`, the
+# transitive instance `f@Q` is materialised and the bound is enforced.
+
+type Q = { v: (Int) -> Int }
+
+fn f[t: Eq](xs: [t]) : Int = 0
+fn g[t](xs: [t]) : Int = f(xs)
+
+fn main() : Int = {
+  let _ = g([Q{v: (x: Int) => x}])
+  0
+}

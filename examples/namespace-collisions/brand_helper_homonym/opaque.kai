@@ -1,0 +1,6 @@
+pub fn id[t](x: t) : t {
+  let y = x
+  y
+}
+
+pub fn other() : Int = 1
