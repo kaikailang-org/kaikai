@@ -1,0 +1,32 @@
+# Nested-rotation variant reuse, SHARED-donor branch. A one-level nested
+# sub-pattern (`Node(_, Node(Red, a, ak, b), k, r)`) is reuse-eligible;
+# here the scrutinee is dup'd (the default arm returns `t`), so the arm
+# always takes the shared branch: fresh outer alloc, grand-children read
+# off the still-live inner cell.
+#
+# The trap this guards: the shared branch must NOT drop the inner cell —
+# the donor still references it through its slot, and the donor's own drop
+# cascade revisits that slot when the donor dies (over-release → header
+# read of a freed cell). Grand-children embedded in the rebuild need a dup
+# each. Invisible to output diffs; caught by ASAN with the cell pool
+# disabled (the pool otherwise recycles the freed cell into a live one).
+
+type Color = Red | Black
+type Tree = Leaf | Node(Color, Tree, Int, Tree)
+
+fn rotate(t: Tree) : Tree = match t {
+  Node(_, Node(Red, a, ak, b), k, r) ->
+    Node(Red, Node(Black, a, ak, b), k, r)
+  _ -> t
+}
+
+fn main() : Int / Console = {
+  let inner = Node(Red, Leaf, 1, Leaf)
+  let t = Node(Black, inner, 2, Leaf)
+  let out = rotate(t)
+  let _ = match out {
+    Node(Red, _, k, _) -> print(int_to_string(k))
+    _ -> print("other")
+  }
+  0
+}

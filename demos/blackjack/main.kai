@@ -1,0 +1,92 @@
+# Minimal blackjack — single deal, dealer plays to 17, no betting.
+
+import random
+
+#[derive(Eq)]
+type Suit = Hearts | Diamonds | Clubs | Spades
+
+#[derive(Eq)]
+type Rank
+  = Ace
+  | Num(Int)
+  | Jack
+  | Queen
+  | King
+
+#[derive(Eq)]
+type Card = { rank: Rank, suit: Suit }
+
+fn rank_value(r: Rank) : Int = match r {
+  Ace    -> 11
+  Num(n) -> n
+  Jack   -> 10
+  Queen  -> 10
+  King   -> 10
+}
+
+fn hand_value(cards: [Card]) : Int = match cards {
+  []           -> 0
+  [c, ...rest] -> rank_value(c.rank) + hand_value(rest)
+}
+
+# Override the auto-derived Show for Rank and Suit with the
+# canonical card-game notation (A/J/Q/K, ♥♦♣♠) instead of structural.
+impl Show for Rank {
+  fn show(r: Rank) : String = match r {
+    Ace    -> "A"
+    Num(n) -> "#{n}"
+    Jack   -> "J"
+    Queen  -> "Q"
+    King   -> "K"
+  }
+}
+
+impl Show for Suit {
+  fn show(s: Suit) : String = match s {
+    Hearts   -> "♥"
+    Diamonds -> "♦"
+    Clubs    -> "♣"
+    Spades   -> "♠"
+  }
+}
+
+# Card combines Rank + Suit visually; override the structural derived.
+impl Show for Card {
+  fn show(c: Card) : String = "#{c.rank}#{c.suit}"
+}
+
+fn show_hand(cards: [Card]) : String = match cards {
+  []           -> ""
+  [c]          -> show(c)
+  [c, ...rest] -> "#{c} #{show_hand(rest)}"
+}
+
+fn ranks_all() : [Rank] = [
+  Ace, Num(2), Num(3), Num(4), Num(5), Num(6),
+  Num(7), Num(8), Num(9), Num(10), Jack, Queen, King
+]
+
+fn suits_all() : [Suit] = [Hearts, Diamonds, Clubs, Spades]
+
+fn cards_for_suit(s: Suit) : [Card] =
+  map(ranks_all(), (r) => Card { rank: r, suit: s })
+
+fn build_deck() : [Card] / Random = {
+  let suits = suits_all()
+  let by_suit = map(suits, cards_for_suit)
+  shuffle(list.concat(by_suit))
+}
+
+fn deal(deck: [Card], dealer_min: Int) : Unit / Stdout = {
+  let _ = dealer_min
+  let player = list.take(deck, 2)
+  let dealer = list.take(list.drop(deck, 2), 2)
+  Stdout.print("player: #{show_hand(player)} (#{hand_value(player)})")
+  Stdout.print("dealer: #{show_hand(dealer)} (#{hand_value(dealer)})")
+}
+
+fn main() : Int / Stdout + Random = {
+  let deck = build_deck()
+  deal(deck, 17)
+  0
+}

@@ -1,0 +1,9 @@
+# A zero step is a runtime trap when the elements are not literals (the
+# generator would never terminate). Must trap identically whether the
+# range is consumed or not.
+
+fn stalled(a: Int) : [Int] = [a, a..10]
+
+fn main() : Unit / Stdout = {
+  Stdout.print(int_to_string(length(stalled(1))))
+}

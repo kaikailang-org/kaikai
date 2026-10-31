@@ -1,0 +1,8 @@
+# A qualifier opens nothing: a function of the module is reached through
+# it, never bare.
+import decimal as dec
+
+fn main() : Unit / Stdout = {
+  let d : dec.Decimal = from_parts(1, 5, 1)
+  Stdout.print(int_to_string(d.scale))
+}

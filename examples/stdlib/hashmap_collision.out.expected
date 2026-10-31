@@ -1,0 +1,16 @@
+chain size 4: ok
+K1: ok
+K2: ok
+K3: ok
+K4: ok
+absent K5: ok
+overwrite keeps size 4: ok
+K2 overwritten: ok
+K1 untouched: ok
+remove drops size: ok
+K3 gone: ok
+K1 survives: ok
+K4 survives: ok
+drained size 0: ok
+drained is_empty: ok
+re-insert after drain: ok

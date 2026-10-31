@@ -1,0 +1,14 @@
+# A root type named like the type a `d` literal writes. A bare
+# `Decimal` here is the file's own declaration; the literal is the
+# stdlib type, a different one with its own fields.
+import decimal as dec
+
+type Decimal = { digits: String }
+
+fn show_d(d: Decimal) : String = d.digits
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show_d(Decimal { digits: "12" }))
+  let lit = 2.50d
+  Stdout.print(int_to_string(lit.scale))
+}

@@ -1,0 +1,15 @@
+import le
+
+use Src
+
+fn opened() : String / Src = pick()
+
+fn shadowed() : String = {
+  let pick = () => "local-wins"
+  pick()
+}
+
+fn main() : Unit / Stdout = {
+  let r = handle { "#{shadowed()} #{opened()}" } with Src { pick(resume) -> resume("opened-wins") }
+  Stdout.print(r)
+}

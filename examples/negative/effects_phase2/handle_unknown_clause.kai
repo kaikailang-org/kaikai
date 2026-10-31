@@ -1,0 +1,18 @@
+# m7a #4e negative test — every handler clause name must match a
+# declared op of the effect. Here `Io` declares `print` but the
+# handler tries to handle `unknown`; the checker rejects with a
+# dedicated diagnostic.
+
+effect Io {
+  print(s: String) : Unit
+}
+
+fn main() : Int {
+  handle {
+    Io.print("hi")
+    0
+  } with Io {
+    print(s, resume)   -> resume(())
+    unknown(x, resume) -> resume(())
+  }
+}

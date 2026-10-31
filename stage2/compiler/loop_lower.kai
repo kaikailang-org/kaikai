@@ -1,0 +1,55 @@
+#[doc("""
+Loop combinators lowered to loop intrinsics. A literal double-trailing-lambda call of the core `while`, `until` or `repeat` becomes `$__loop_*(callee, args)`, keeping the lambda wrappers: they never become runtime closures, the emitters run their bodies in the enclosing frame, and a `var` mutated only by the loop stops escaping.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.symtab
+
+# The intrinsic keeps the callee as arg 0, followed by the combinator's
+# args, so the typer types it by delegating to the plain call with that
+# callee: its type and row equal the call's by construction. Perceus and
+# the emitters ignore arg 0.
+
+#[doc("True for the loop intrinsics (`__loop_while` / `__loop_until` / `__loop_repeat`).")]
+pub fn is_loop_intrinsic(i: Intrinsic) : Bool = match i {
+  InLoopWhile  -> true
+  InLoopUntil  -> true
+  InLoopRepeat -> true
+  _            -> false
+}
+
+#[doc("The code a loop-intrinsic argument runs in place: a lambda's body, or the argument itself.")]
+pub fn loop_arg_body(e: Expr) : Expr = match e.kind {
+  ELambda(_, b) -> b
+  _             -> e
+}
+
+#[doc("""
+The call `f(xs)` of resolved operands: a loop intrinsic when `f` is one of `loops`, the core `while`, `until` and `repeat`, and the arguments are the literal lambdas the parser mints; the call itself otherwise.
+""")]
+pub(pkg) fn loop_call_kind(loops: [SymId], f: Expr, xs: [Expr]) : ExprKind = match loops {
+  [w, u, r] -> match f.kind {
+    ESym(s, _) ->
+      if sym_same(s, w) and nullary_lambdas(xs, 2) { EIntrinsic(InLoopWhile, [f, ...xs]) }
+      else if sym_same(s, u) and nullary_lambdas(xs, 2) { EIntrinsic(InLoopUntil, [f, ...xs]) }
+      else if sym_same(s, r) and repeat_shape(xs) { EIntrinsic(InLoopRepeat, [f, ...xs]) }
+      else { ECall(f, xs) }
+    _ -> ECall(f, xs)
+  }
+  _ -> ECall(f, xs)
+}
+
+# while/until: two nullary lambdas.
+fn nullary_lambdas(xs: [Expr], n: Int) : Bool = list_length(xs) == n and not any(xs, (x) => not is_nullary_lam(x))
+
+# repeat: a count expression plus a nullary lambda.
+fn repeat_shape(xs: [Expr]) : Bool = match xs {
+  [_, b] -> is_nullary_lam(b)
+  _      -> false
+}
+
+fn is_nullary_lam(e: Expr) : Bool = match e.kind {
+  ELambda(ps, _) -> match ps { [] -> true  _ -> false }
+  _              -> false
+}

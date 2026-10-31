@@ -1,0 +1,544 @@
+#[doc("The expression, pattern and type syntax tree together with the semantic type: mutually recursive, so they live in one module.")]
+
+import compiler.written
+import compiler.real_lit
+import compiler.escapes
+import compiler.ast_ids
+
+# `mode` records the value representation chosen for this node by the
+# unbox analysis pass (Tier 2.5; see `docs/unboxing-phase2-design.md`).
+# Parser stamps every `Expr` with `MUnknown`; the unbox pass rewrites
+# nodes whose type is unboxable and whose consumer accepts a raw scalar
+# to `MUnboxed`, otherwise `MBoxed`. The emitter consults `mode` to
+# pick between `KaiValue *` and the underlying C scalar (`int64_t` /
+# `int` / `uint32_t`). Phase 1 of the lane (this commit) lands the
+# field with codegen unchanged; the pass + emitter switches arrive in
+# subsequent milestones.
+#[derive(BinSerialize)]
+pub(pkg) type Expr = { kind: ExprKind, line: Int, col: Int,
+              ty: Option[Ty], mode: ValueMode, site: Int }
+
+#[derive(BinSerialize)]
+pub(pkg) type ExprKind
+  # value + raw source span. The span preserves the base and digit
+  # separators the author wrote (`0xFF`, `0b1010`, `1_000_000`), which
+  # `int_to_string` cannot recover from the value; `""` marks a node the
+  # compiler synthesised, which prints from the value. Construct with
+  # `mk_int_lit` / `mk_int_synth` rather than the raw ctor.
+  = EInt(Int, String)
+  | EReal(RealLit, String)                 # value + raw source span (round-trips decimals)
+  # A fixed-width integer literal: the decimal/hex/bin source span
+  # (digits only, suffix stripped) and the width type it was tagged
+  # with (TyInt32/TyUInt32/TyUInt64/TyInt128). The width rides the node
+  # itself, not the fragile `.ty` slot that intermediate passes drop;
+  # like `EReal`, the backend decodes the span at emit time, so even an
+  # `Int128` value above 2^63 survives the compiler's 64-bit decode.
+  | EFixed(String, Ty)
+  # An integer literal whose magnitude exceeds the compiler's 64-bit
+  # decode, carrying its source lexeme verbatim. The parser emits it in
+  # place of the past-i64 error so the typer can mint it to an
+  # arbitrary-precision carrier (`BigInt`/`DecimalBig`) or an `Int128`
+  # when the annotation supplies a concrete target; with no such context
+  # the typer surfaces the out-of-range diagnostic. Invariant: EIntLit
+  # never survives inference — every backend walker treats it as
+  # unreachable.
+  | EIntLit(String)
+  # A `<num>d` literal carrying its source lexeme verbatim, the suffix
+  # form for the `Decimal` carrier. The `d` supplies the target locally
+  # where an annotation is absent (`42d`), so the typer folds an exact
+  # `Decimal { raw, scale }` from the digits and errors on a magnitude
+  # past the `Int128` carrier. Same invariant as EIntLit: never survives
+  # inference, unreachable in every backend walker.
+  | EDecimalLit(String)
+  | EBool(Bool)
+  | EChar(Char)
+  | EStr(String, Bool)                      # raw source span (includes quotes), is_triple
+  | EUnit
+  | EName(Written)
+  # A value reference the resolver has already decided: the id of the
+  # declaration it names. `EVar` is what the parser produces and what a
+  # synthesised reference is minted as; `ESym` is what survives resolve,
+  # so a pass downstream of it cannot re-decide by spelling what the
+  # resolver decided by identity. The name rides along for diagnostics
+  # and for the emitters that spell a C identifier, never as the thing
+  # that is looked up. The Int is the instance (see `FnId`); the name of a
+  # specialisation is emission text, never read back to recover which one.
+  | ESym(SymId, Int)
+  | EUnder                                  # `_`; survives parsing only as a `|>` arg, else the typer rejects it
+  | EPlaceholder                            # `.` placeholder (stage 1 extension; stage 0 rejects)
+  | ECall(Expr, [Expr])
+  | EField(Expr, String)
+  | EIndex(Expr, Expr)
+  | EBinop(BinOp, Expr, Expr)
+  | EUnop(UnOp, Expr)
+  | EIf(Expr, Expr, Option[Expr])
+  | EMatch(Expr, [Arm])
+  | ELambda([Param], Expr)
+  | ERecordLit(DeclRef, [FieldInit])
+  | EList([ListElem])
+  | ERange(Expr, Expr, Option[Expr])
+  | EBlock([Stmt], Option[Expr])
+  | EPipe(Expr, Expr)
+  # `xs | f`, `xs || f`, `xs |? p`, `xs |! f`: the typer rewrites it into
+  # a call of the op of the module owning the head type; codegen never
+  # sees it.
+  | EDispatchPipe(PipeOp, Expr, Expr)
+  # Typed hole (M10). `None` payload → anonymous `?`. `Some(name)` →
+  # `?name`. Checker reports at each hole site; emitter falls back
+  # to a runtime panic so unfilled holes in a binary are loud.
+  | EHole(Option[String])
+  # m7d §1: `todo!(msg) : T` — a typed *unimplemented* marker. The
+  # message is a literal `String` extracted at parse time. Behaves
+  # like `EHole(None)` for inference (any expected type fits) and
+  # like a panic at runtime, but the checker reports it under a
+  # distinct `kind = "todo"` so tooling can tell `?` apart from
+  # "I will fill this in" markers.
+  | ETodo(String)
+  # The body of an `extern` fn — a marker with no kaikai expression.
+  # Payload = the ABI and the runtime symbol: under `AbiC` the C-side
+  # override, or "" when the kaikai identifier is the symbol; under
+  # `AbiKai` always explicit. Only the desugar of an extern fn
+  # constructs it; the backends detect it on a `DFn` body and
+  # synthesise the shim instead of emitting a body. Type-checks
+  # like a hole (any expected type fits) but carries no effect and no
+  # diagnostic. Appearing anywhere but a `DFn` body is a compiler bug.
+  | EExternBody(ExternAbi, String)
+  # m7e §13: `expr!` — postfix `Option`/`Result` propagation.
+  # `e!` on `Option[T]` unwraps `Some(x) -> x`; `None` short-circuits
+  # with `return None` from the enclosing function. On `Result[T, E]`,
+  # `Ok(x) -> x`; `Err(e)` short-circuits with `return Err(e)`. The
+  # enclosing function's return type must be the matching `Option[U]`
+  # or `Result[U, E]` (same E — no `From`-style coercion). The typer
+  # validates the enclosing return type and stamps `x.ty` with the
+  # unwrapped success type, which the emitter consumes to choose the
+  # correct discriminator (`Some` / `Ok`).
+  | EBang(Expr)
+  # Effect handler (m7a #4b). `handle { body } with Eff [as alias]
+  # { clauses [return(x) -> expr] }`. The `alias` (Option[String])
+  # rebinds the capability name inside the body. m7a #4b is parser
+  # only; type-checking and runtime are #4d / #6.
+  # m7b #11: parametric effects. `eff_tyargs` is the `[T1, T2]` after
+  # the effect name in `with Reader[Int]` (empty when none); `init_opt`
+  # is the `(init)` after the type args in `with State[Int](0)` form
+  # (None when the handler is stateless). Both extensions are inert
+  # for stateless effects, so existing handlers parse to `[]` /
+  # `None` and behave as before.
+  # The `SymId` after the name is the effect the head resolves to. The
+  # name alone cannot say WHICH `Emit` a handler handles when two
+  # modules declare one, which is what forced a pass to respell the
+  # effect before anything downstream could tell them apart.
+  # `sym_none()` until the resolver settles it — a core effect, or any
+  # path that runs without a whole-program table.
+  | EHandle(Expr, DeclRef, [TypeExpr], Option[Expr], Option[Binder], [HClause], Option[HReturn])
+  # m12.5: numeric literal annotated with a unit, e.g. `1.50<USD>` or
+  # `42<UserId>`. The inner Expr is always EInt or EReal; the
+  # UnitExprT comes from the source between the angle brackets.
+  | ELitUnit(Expr, UnitExprT)
+  # m7e §11: `variants[T]()` — enumerate the constructors of a sum
+  # type T whose every variant is nullary. The compiler has the
+  # constructor list after resolution; this node is a request to
+  # materialise it as a `[T]` literal in declaration order. The
+  # `()` suffix is required by the syntax but carries no payload —
+  # the parser rejects any argument list. Parser produces this via
+  # an explicit lookahead in `parse_ident_primary` when the source
+  # ident is `variants` and the next token is `[`. Resolver
+  # validates T (sum + nullary-only). Emitter materialises the
+  # ordered constructor list.
+  #
+  # The second field carries the resolved variant names. Parser
+  # leaves it `[]`; the typer fills it in `synth_variants_of` once
+  # T has been validated as a nullary-only sum. The emitter consumes
+  # the list directly — it has no env access to look the names up
+  # itself.
+  | EVariantsOf(TypeExpr, [SymId])
+  # A reference spelled by its home module. `mod.f` becomes this when
+  # `mod` is an imported module no local shadows; the resolver then
+  # turns a function it names into an `ESym`, so what survives is a
+  # constructor, a constant, or a name the symbol table does not hold.
+  # Below the resolver it is also the spelling a settled contest takes
+  # where the bare name would reach another declaration.
+  | EModCall(Written, Written)
+  # `$<ident>(args)`: a compiler intrinsic call. Reserved sigil; user
+  # code cannot define new intrinsics. The typer enforces per-intrinsic
+  # shape rules (e.g. `$extern_handler` takes exactly one string-literal
+  # arg and is only valid inside a clause body that lives in a
+  # `default { }` block).
+  | EIntrinsic(Intrinsic, [Expr])
+  # A surface form the parser preserves verbatim so `kai fmt` prints
+  # what the author wrote. `surface_lower_decls` dissolves every
+  # ESurface before resolution; passes downstream of it treat the node
+  # as unreachable. Generic walkers recurse via `surface_children` /
+  # `surface_rebuild` / `surface_map` without naming the variants.
+  | ESurface(SurfaceForm)
+  # A mark the compiler plants in a body and reads back downstream.
+  # Nothing declares one and no scope binds one, so it is not a
+  # reference and carries no identity — what it carries is which mark
+  # it is, from a set this compiler closes.
+  #
+  # Declared last on purpose: a constructor inserted mid-list renumbers
+  # every variant after it.
+  | EMark(Mark)
+  # A local binder read: the binder's id, which the resolver numbers and
+  # a minting pass derives from its key.
+  | ELocal(LocalId)
+  # An effect operation as a callee, settled by the typer.
+  | EOp(OpRef)
+
+# The surface forms behind `ESurface`. Each variant is one parse-time
+# sugar whose lowering would otherwise erase the author's spelling.
+# Adding a variant forces (through match exhaustiveness) a printer arm
+# in fmt_expr and a lowering arm in surface_lower — a new surface form
+# cannot be lost by omission.
+#[derive(BinSerialize)]
+pub(pkg) type SurfaceForm
+  # `requires` / `ensures` clauses wrapping a fn body, in source order.
+  = SfContract([Expr], [Expr], Expr)
+  # `ensure(value) where pred` primary.
+  | SfEnsure(Expr, Expr)
+  # A lambda written as a block: `{ body }`, `{ params -> body }`, or
+  # `{ pat -> body }`. Wraps the lowered `ELambda`; the Bool is true
+  # when the block trailed a call site (`f(args) { ... }` / `f { ... }`)
+  # rather than standing in ordinary expression position.
+  | SfLamBlock(Expr, Bool)
+  # An n-tuple literal `(a, b[, c[, d]])`; arity 2..4.
+  | SfTuple([Expr])
+  # Handler state written as an `initially { }` clause rather than the
+  # `(init)` parenthesised form. Wraps the init expression in the
+  # `EHandle` state slot; legal nowhere else.
+  | SfHandleInit(Expr)
+  # A BigInt literal `123n`; the digit string, exactly as written.
+  | SfBigIntLit(String)
+  # A map literal `%{ ... }`: optional `...base` spread, then the
+  # entries as a flattened `[k1, v1, k2, v2, ...]` list (even length).
+  | SfMapLit(Option[Expr], [Expr])
+  # A set literal `%[ ... ]`: optional `...base` spread, then elements.
+  | SfSetLit(Option[Expr], [Expr])
+  # A reference take `&x`.
+  | SfRefMake(Expr)
+  # A dereference `@r` / `@r.field…`; the payload is the target path.
+  | SfDeref(Expr)
+  # A multi-scrutinee match `match e1, e2 { p1, p2 -> body ... }`.
+  | SfMultiMatch([Expr], [MMArm])
+  # A `case`-block fn body: `{ case p (when g)? -> body ... }`. The
+  # scrutinees are the owning fn's params, supplied at lowering.
+  | SfCaseBlock([MMArm])
+  # A punned record field `{ x }`. Wraps the value in the field's
+  # `FieldInit` slot, a reference to the name the field shares; legal
+  # nowhere else.
+  | SfFieldPun(Expr)
+  # A stepped range `[first, second..last]`; the step is `second - first`.
+  | SfSteppedRange(Expr, Expr, Expr)
+  # A range with no end, `[first..]` or `[first, second..]`. Legal only
+  # as the bracket of an `SfLazy`.
+  | SfEndlessRange(Expr, Option[Expr])
+  # A lazy sequence `lazy [...]`. The payload is the bracket as the list
+  # parser read it: a list, a range, a stepped or an endless range.
+  | SfLazy(Expr)
+  # An interpolated string literal: the span as written, whether it is
+  # triple-quoted, its parts as scanned, and each `#{...}` body parsed,
+  # in source order.
+  | SfInterp(String, Bool, [IPart], [Expr])
+
+# Surface forms in type position, wrapped by `TySurface`. Same
+# discipline as `SurfaceForm`: exhaustive matches force a printer arm
+# and a lowering arm per variant.
+#[derive(BinSerialize)]
+pub(pkg) type TypeSurface
+  # An n-tuple type `(A, B[, C[, D]])`; arity 2..4.
+  = TsTuple([TypeExpr])
+  # A habitant annotation `Base<...>` with the author's spelling of the
+  # `<...>` interior kept verbatim (qualifiers, introducers, spacing).
+  # The inner type is the lowered `TyDim`.
+  | TsUnitSpan(String, TypeExpr)
+
+# Surface forms in pattern position, wrapped by `PSurface`. Same
+# discipline as `SurfaceForm`.
+# One arm of a multi-scrutinee match or a `case`-block: N patterns
+# (N == scrutinee count), an optional guard, and the body.
+#[derive(BinSerialize)]
+pub(pkg) type MMArm = MMArm([Pattern], Option[Expr], Expr)
+
+#[derive(BinSerialize)]
+pub(pkg) type PatSurface
+  # An n-tuple pattern `(a, b[, c[, d]])`; arity 2..4.
+  = PsTuple([Pattern])
+  # A module-qualified variant pattern `mod.Ctor(..)`; lowering moves
+  # the qualifier into the inner `PVariant`'s home slot.
+  | PsQualified(String, Pattern)
+  # An as-pattern spelled `name as pat` (the legacy spelling `name @ pat`
+  # stays a plain `PAs`).
+  | PsAs(String, Pattern)
+  # A match-arm narrowing `name : Base where pred`; dissolves to
+  # `PBind(name)` plus a guard evaluating the refinement's predicate.
+  | PsRefine(String, TypeExpr)
+  # A list pattern whose rest binds nothing: `[a, ...]`, or `[a, ..._]`
+  # when the flag is set. Lowering names the rest with a unique binder.
+  | PsAnonRest([Pattern], Bool)
+
+#[derive(BinSerialize)]
+pub(pkg) type ListElem = ElPlain(Expr) | ElSpread(Expr)
+
+#[derive(BinSerialize)]
+pub(pkg) type Arm = Arm(Pattern, Option[Expr], Expr)
+
+#[derive(BinSerialize)]
+pub(pkg) type FieldInit = FI(String, Expr)
+
+#[derive(BinSerialize)]
+pub(pkg) type Param = { binder: Binder, ptype: Option[TypeExpr], pline: Int, pcol: Int, pborrow: Bool }
+
+#[derive(BinSerialize)]
+pub(pkg) type Stmt
+  = SLet(Pattern, Option[TypeExpr], Expr)
+  | SAssert(Expr, Option[Expr])
+  | SExprStmt(Expr)
+  # m7b #6: indexed write `a[i] := v` (with `a` an `Ident ("." Ident)*`
+  # field path). Lowered to a `Mutable.array_set`-style call by the
+  # pre-resolve `desugar_index_assign` pass; never reaches the checker.
+  | SIndexAssign(Expr, Expr, Expr, Int, Int)
+  # Scalar / field write `lhs := v` (lhs an `EVar` or a `.`-chain of
+  # fields rooted at an identifier). Surface form of the `.set` call;
+  # `surface_lower_decls` rewrites it before resolution, so no later
+  # pass sees one.
+  | SAssign(Expr, Expr, Int, Int)
+  # m7b #5: local mutable cell `var name [: T] = init`. The parser
+  # produces this node; the pre-resolve `desugar_var_decls` pass
+  # rewrites every block containing an SVar into the canonical
+  # `handle { rest } with State[T](init) as name { canonical clauses }`
+  # form (Doc B §`State[T]` *Syntax note*, Doc C §m7b #5). SVar
+  # therefore never reaches the resolver. The line/col point at the
+  # `var` keyword.
+  | SVar(Binder, Option[TypeExpr], Expr, Int, Int)
+  # m7e §25: `use Effect` at block scope — opens the effect's ops
+  # for bare-name resolution in the rest of the enclosing block.
+  # Same desugar pass as DUse handles both file-scope and block-
+  # scope opens. The line/col point at the `use` keyword.
+  | SUse(String, Int, Int)
+
+#[derive(BinSerialize)]
+pub(pkg) type Pattern = { pkind: PatKind, line: Int, col: Int }
+
+#[derive(BinSerialize)]
+pub(pkg) type PatKind
+  = PWild
+  | PLit(Expr)                              # literal pattern (stores an Expr of literal shape)
+  # Inclusive interval pattern `lo..hi` (Int or Char literal bounds). A
+  # desugar pass rewrites it to `PBind(fresh)` + a `fresh >= lo and
+  # fresh <= hi` guard before the typer, so nothing past desugar handles it.
+  | PRange(Expr, Expr)
+  | PBind(Binder)
+  # Fixed sub-patterns plus optional rest binder: `Some(name)` for
+  # `...name`, `None` for no rest. An anonymous rest (`...`, `..._`)
+  # parses as `PsAnonRest`; `surface_lower_decls` gives it a unique
+  # `__list_rest_<line>_<col>__` binder, so every pass after it sees
+  # a real binder name.
+  | PList([Pattern], Option[Binder])
+  # Home slot: the module the pattern was qualified with, `None` when
+  # written bare. Kept through every pass so a written qualifier is
+  # never dissolved before it can be validated.
+  | PVariant(DeclRef, [Pattern])
+  | PVariantRecord(DeclRef, [PField])
+  | PRecord([PField])
+  | PHole(Option[String])                   # `?` or `?name` in pattern position
+  # m7d §14: `name @ pattern` — bind the whole scrutinee to `name`
+  # while still destructuring it as `pattern`. The bound name must
+  # be a fresh identifier; the inner pattern's bindings (if any)
+  # remain visible in the arm body. Disjoint from m7b §2's prefix
+  # `@cap` (an expression), which never appears in pattern position.
+  | PAs(Binder, Pattern)
+  # A pattern spelling the parser preserves verbatim so `kai fmt`
+  # prints what the author wrote. `surface_lower_decls` dissolves it
+  # before resolution; downstream passes treat it as unreachable.
+  | PSurface(PatSurface)
+  # issue #187 phase 3: type-narrowing pattern `name : T`. Used over a
+  # union scrutinee to bind `name` at component type `T`; covers every
+  # variant of `T` for exhaustiveness purposes. The parser emits this
+  # for every `name : TyName(t, ...)` arm-pattern suffix, including
+  # refinement-type aliases — `lower_pattern_narrow_decls` rewrites
+  # the alias case back into `PBind` + `__ref_pred_t(name)` guard so
+  # m12.6.x semantics are preserved. What survives into the typer is
+  # always a non-refinement narrowing over a union component.
+  | PNarrow(Binder, TypeExpr)
+
+#[derive(BinSerialize)]
+pub(pkg) type PField = PField(String, Pattern, Bool) # field name, sub-pattern, is_shorthand
+
+#[derive(BinSerialize)]
+pub(pkg) type TypeExpr = { tkind: TyKind, line: Int, col: Int }
+
+#[derive(BinSerialize)]
+pub(pkg) type TyKind
+  = TyName(DeclRef, [TypeExpr])                      # Name or Name[T1, T2, ...]
+  | TyList(TypeExpr)
+  | TyFn([TypeExpr], TypeExpr, RowExpr)
+  # m12.5: dimensioned numeric type, e.g. `Real<USD>` or `Int<m/sec>`.
+  # The base TypeExpr is the underlying primitive (parser only ever
+  # produces this with `Real`/`Int` underneath); the UnitExprT carries
+  # the unit annotation that the typer canonicalises and unifies.
+  | TyDim(TypeExpr, UnitExprT)
+  # m12.6: refinement type, `BaseT where Predicate(self)`. The predicate
+  # is parsed as an Expr in the same expression grammar as the rest of
+  # the language; m12.6.b/c restrict it to the decidable subset and
+  # use it for compile-time + runtime contract verification. m12.6.a
+  # only stores the syntactic form; resolve_ty drops the refinement
+  # so it does not affect inference / unification yet.
+  | TyRefine(TypeExpr, Expr, Option[SymId])
+  # issue #772: a compound effect row used as a type argument, e.g.
+  # `Stream[Int, Stdout + Fail]`. Produced by the parser ONLY in
+  # type-argument position when a `+`-joined row follows the first
+  # label. Short-lived like `TyRefine`: it is consumed and dissolved
+  # during transparent-alias substitution (`apply_tp_subst_row` folds
+  # its labels/tail into the alias row) and never survives into a
+  # resolved `Ty` or reaches the emitters. Any other use site is a
+  # parser bug; the row-substitution path is its only legal consumer.
+  | TyRow(RowExpr)
+  # A type spelling the parser preserves verbatim so `kai fmt` prints
+  # what the author wrote. `surface_lower_decls` dissolves it before
+  # resolution; downstream passes treat it as unreachable.
+  | TySurface(TypeSurface)
+  # A use of a type parameter, applied to the arguments the source gave
+  # it: none for a plain parameter, one for a `Shape` carrier `s[A]`.
+  | TyParam(TLocalId, [TypeExpr])
+
+# Syntactic effect row: REmpty for `T` (no `/`), RClosed for `T / Io
+# + Fail`, ROpen for `T / Io + e` or `T / e` where the lowercase tail
+# `e` is a row variable scoped to the enclosing function declaration
+# (m7b #12). In the AST this is the *raw* parsed shape; resolve_ty
+# converts it into the semantic `Row` that lives inside `TyFnT`.
+#
+# m7b #11: each label carries optional type arguments (`Reader[Int]`
+# parses as `RL("Reader", [TyName("Int", [])])`). Stateless effects
+# (and pre-m7b #11 syntax) carry an empty arg list. ROpen merges m7b
+# #11 (parametric labels) with m7b #12 (open row variable in tail).
+#[derive(BinSerialize)]
+pub(pkg) type RowExpr = REmpty | RClosed([RowLabel]) | ROpen(TParamRef, [RowLabel])
+
+#[derive(BinSerialize)]
+pub(pkg) type RowLabel = RL(DeclRef, [TypeExpr])
+
+# Handler clause: `op_name(args..., resume) -> body`, the resume
+# binding conventionally the last param, or a lifecycle clause
+# `finally { body }`, which carries no params.
+#[derive(BinSerialize)]
+pub(pkg) type HClause = HC(ClauseHead, [Param], Expr, Int, Int)
+
+# Optional `return(x) -> expr` clause inside a handle. `pname` is
+# the parameter name bound inside `body`.
+#[derive(BinSerialize)]
+pub(pkg) type HReturn = HR(Binder, Expr, Int, Int)
+
+#[derive(BinSerialize)]
+pub(pkg) type Ty
+  = TyInt
+  | TyReal
+  | TyBool
+  | TyString
+  | TyChar
+  | TyUnit
+  # Unsigned 8-bit integer, nominal — distinct from TyInt at the type
+  # level (`KAI_BYTE` boxes, `uint8_t` payload). Unboxable: a Byte rides
+  # a raw `uint8_t`/`SByte` register on both backends, its `u8` op family
+  # masks at 8 bits per op, and it boxes fresh at every boxed border.
+  # Conversions are explicit (`int_to_byte` range-checks 0..255,
+  # `byte_to_int` widens losslessly); `200u8` is the literal.
+  | TyByte
+  # Fixed-width integers (Orongo 1.0, numeric lane A). Nominal,
+  # kind-distinct from TyInt. Unlike Byte they are NOT unboxable: they
+  # box into a tagged KaiValue and arithmetic dispatches on the tag
+  # (`kai_fixed_arith`), wrapping two's-complement via the unsigned
+  # width. They ride `EFixed` textual literals (Int128 exceeds the
+  # compiler's 64-bit decode). User-facing names Int32/UInt32/UInt64/
+  # Int128 ARE the FFI boundary types (extern "C" int32_t/uint32_t/
+  # uint64_t marshal to them honestly instead of a 64-bit Int cast).
+  | TyInt32
+  | TyUInt32
+  | TyUInt64
+  | TyInt128
+  # KIR Lane 1 (in-process libLLVM backend, docs/kir-design.md §7.2):
+  # an opaque scalar handle for an LLVM C-API object
+  # (LLVMModuleRef / LLVMBuilderRef / LLVMValueRef / LLVMTypeRef /
+  # LLVMBasicBlockRef). It crosses as a RAW pointer-width scalar that
+  # is NEVER reference-counted and NEVER goes through the tagged-Int
+  # runtime (a 48-bit pointer losing a bit to Int tagging would be
+  # silent IR corruption — the worst bug class). `ty_is_unboxable_t`
+  # returns true for it, so unbox stamps `MUnboxed` and perceus's
+  # `prc_pat_bindings_skip_raw` leaves it out of the RC regime
+  # entirely (no dup/drop). It is distinct from `TyInt` at the type
+  # level so the typer cannot confuse a handle with an integer.
+  #
+  # A handle only ever appears in the COMPILER's own backend code
+  # (self-hosted kaikai calling the C-API core primitives at
+  # compile time) — never in a user program's AST and never on the
+  # C-text / bootstrap path. So like `TyUnion`, every new arm below
+  # is dead on the existing corpus and selfhost stays byte-identical:
+  # no existing program produces a `TyHandle` node.
+  | TyHandle
+  | TyListT(Ty)                         # resolved list type
+  | TyFnT([Ty], Ty, Row)                # resolved function type (with effect row)
+  # A nominal type: the declaring module, the name, the type arguments,
+  # and the declaration's identity. The module slot is empty for the root
+  # file and wherever the name alone does not settle the home; the
+  # identity is `sym_none()` where no declaration is known, as for a
+  # builtin nominal type. The identity indexes the symbol table the typer
+  # was given, not any other table built in the same compilation.
+  | TyCon(SymId, [Ty])
+  | TyVarT(Int)                         # unification variable
+  | TyAny                               # placeholder for "not yet resolved"
+  # m12.5: resolved dimensioned type. Inner Ty is always TyInt / TyReal
+  # (or a TyVarT that the unifier later pins to one of them); the
+  # unit lives in canonicalised form once the unifier touches it.
+  | TyDimT(Ty, UnitExprT)
+  # m12.6.x #1: resolved refinement type, `TyRefineT(base, pred, alias)`.
+  # The predicate stays as the syntactic Expr from the parser. The
+  # unifier treats `TyRefineT(b, _)` ⊑ `b` (upcast OK, downcast
+  # demands explicit narrowing via `ensure(...)` or a match-arm
+  # `: RefinedT`); diagnostics, mangling, and most other walkers
+  # transparently recurse on `b`. Predicates are pure (no effects,
+  # no rows) so the row machinery is untouched.
+  | TyRefineT(Ty, Expr, Option[SymId])
+  # issue #187 phase 1: union of types. `TyUnion([T1, T2, ..., Tn])`
+  # represents the union of `n` component types. Components are kept
+  # in normalised form (flattened, deduplicated, sorted by mangle_ty)
+  # whenever the typer compares unions for equality — see
+  # `normalize_union`. Phase 1 only adds the AST node and threads it
+  # through every Ty-walker; no resolver / parser path constructs
+  # `TyUnion` yet (that is Phase 2). Selfhost is byte-identical
+  # because every existing program produces an AST that contains no
+  # `TyUnion` node, so every new arm is dead until Phase 2 lights it
+  # up. Singleton unions and empty unions never appear in the
+  # representation: callers should collapse `TyUnion([T])` to `T`
+  # before constructing the node, and `TyUnion([])` is unreachable
+  # (Phase 2's resolver rejects it at parse time).
+  | TyUnion([Ty])
+  # A `Shape` variable applied to a type argument, `s[A]`. The head is a
+  # unification variable of kind `Shape` (its id shares the `TyVarT`
+  # pool); the single arg keeps arity strictly 1, so no currying or
+  # composition is representable. Unifies first-order against a concrete
+  # `s[A] ~ List[Int]` → `s := List, A := Int`; once the head binds,
+  # `apply_ty`/`subst_ty` reconstruct the concrete `TyListT`/`TyCon`, so
+  # a fully-resolved `TyShapeApp` never survives into mono/codegen. Placed
+  # LAST so its variant tag does not renumber the tags of the arms above
+  # it — the native backend derives per-variant slot masks from the tag,
+  # and shifting `TyAny`/`TyDimT`/`TyRefineT`/`TyUnion` corrupts their RC.
+  | TyShapeApp(Int, Ty)                 # shape var id, type argument
+  # The uninhabited result of a diverging op. Unifies with any type and
+  # binds nothing; equal only to itself. `TyAny` stays the unknown.
+  | TyNothing
+
+# Effect row, per docs/effects-impl.md §*Types: row slot on TyFnT*.
+# The slot is reserved here in m7a #1; row unification (m7a #2) and
+# evidence-bearing rows (m7a #3+) populate it. For now every TyFnT
+# carries an empty row.
+#
+# `sym` is the declaration the label names, `sym_none()` while unsettled.
+# `cell` tells two instances of one effect apart: the alias binder of the
+# `with Eff as a` that owns the label, `local_none()` for the ambient one.
+#[derive(BinSerialize)]
+pub(pkg) type Label = { sym: SymId, ty_args: [Ty], cell: LocalId }
+
+#[derive(BinSerialize)]
+pub(pkg) type Row = {
+  labels:        [Label],          # invariant: sorted by eff, syntactically deduplicated
+  tail:          Option[Int],      # row variable id, parallel to TyVarT
+  display_alias: Option[String],   # for diagnostics only; ignored by unification
+}

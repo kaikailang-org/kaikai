@@ -1,0 +1,16 @@
+# Opening `shapes` makes a bare `Decimal` name `shapes.Decimal`. The
+# stdlib module is bound to a qualifier, which opens nothing, so a `d`
+# literal is still the stdlib type and the bare name is not contested.
+import shapes
+import decimal as dec
+
+fn show_d(d: Decimal) : String = match d {
+  Tenths(n) -> "t#{n}"
+  Whole(n)  -> "w#{n}"
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show_d(tenths(5)))
+  let lit = 2.50d
+  Stdout.print(int_to_string(lit.scale))
+}

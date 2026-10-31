@@ -1,0 +1,25 @@
+# m7b #11i — Reader[Int] and Reader[String] are distinct labels.
+# Each instantiation needs its own enclosing handler; the inferencer
+# keeps them apart in the row, the codegen picks the innermost
+# evidence node by name. This test uses op calls directly because
+# higher-order calls that propagate effect rows through a fn-typed
+# argument are a separate pre-m7b #11 limitation in `synth_call`'s
+# row-empty unification path (out of scope here).
+
+fn main() : Int {
+  let r1 = handle {
+    Reader.ask() + 1
+  } with Reader[Int](42) {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  let r2 = handle {
+    string_length(Reader.ask())
+  } with Reader[String]("hello") {
+    ask(resume) -> resume(state)
+    return(x)   -> x
+  }
+  assert r1 == 43
+  assert r2 == 5
+  0
+}

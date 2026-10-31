@@ -1,0 +1,9 @@
+import net.udp
+import net.unix
+import net.dns
+
+effect Net {
+  go() : Int
+}
+
+fn main() : Int / Net = Net.go()

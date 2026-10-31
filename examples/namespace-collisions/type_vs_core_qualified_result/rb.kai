@@ -1,0 +1,2 @@
+pub type Result[t, e] = { tag: Int }
+pub fn mk() : Result[Int, String] = Result { tag: 8 }

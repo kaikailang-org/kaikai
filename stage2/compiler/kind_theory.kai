@@ -1,0 +1,409 @@
+#[doc("Per-theory engines for the engine-dispatched kinds: the join engine, the semilattice theory and the declaration checks of kind habitants.")]
+
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.kinds
+import compiler.util
+import compiler.diag_file
+import compiler.diag
+
+# One (kind name, theory name) pair the unit pipeline dispatches on.
+pub(pkg) type KindTheory = KTh(String, String)
+
+fn kth_kind(k: KindTheory) : String = match k { KTh(n, _) -> n }
+
+fn kth_theory(k: KindTheory) : String = match k { KTh(_, t) -> t }
+
+fn module_theory_name() : String = "Module"
+
+fn composition_theory_name() : String = "Composition"
+
+fn semilattice_theory_name() : String = "Semilattice"
+
+fn hm_theory_name() : String = "HindleyMilner"
+
+fn base_kind_theories() : [KindTheory] =
+  [KTh("Currency", module_theory_name()),
+   KTh("Perm", semilattice_theory_name()),
+   KTh(dim_kind_name(), hm_theory_name()),
+   KTh("Layout", composition_theory_name())]
+
+#[doc("Every engine-dispatched (Module + Composition + Semilattice) kind visible to the unit pipeline: the shipped base pairs plus the decl stream's `kind K : Thy` declarations. The (kind, theory) table is the single source; there is no separate per-theory name list.")]
+pub(pkg) fn atomic_kind_theories(decls: [Decl]) : [KindTheory] =
+  list_append(base_kind_theories(), declared_kind_theories(decls))
+
+# Every Module, Composition, and Semilattice kind from the decl stream.
+fn declared_kind_theories(decls: [Decl]) : [KindTheory] = mkt_loop(decls, [])
+
+fn mkt_loop(decls: [Decl], acc: [KindTheory]) : [KindTheory] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DKind(_, name, thy, _, _, _, _, _) ->
+      if thy == module_theory_name() or thy == semilattice_theory_name() or
+         thy == composition_theory_name() {
+        mkt_loop(rest, [KTh(name, thy), ...acc])
+      } else { mkt_loop(rest, acc) }
+    _ -> mkt_loop(rest, acc)
+  }
+}
+
+fn composition_theory_kinds(kts: [KindTheory]) : [String] = ctk_loop(kts, [])
+
+fn ctk_loop(kts: [KindTheory], acc: [String]) : [String] = match kts {
+  [] -> list_reverse(acc)
+  [k, ...rest] ->
+    if kth_theory(k) == composition_theory_name() { ctk_loop(rest, [kth_kind(k), ...acc]) }
+    else { ctk_loop(rest, acc) }
+}
+
+fn theory_of_kind(kts: [KindTheory], kind: String) : String = match kts {
+  [] -> ""
+  [k, ...rest] ->
+    if kth_kind(k) == kind { kth_theory(k) } else { theory_of_kind(rest, kind) }
+}
+
+#[doc("True when `kind` is declared over the Semilattice theory.")]
+pub(pkg) fn kind_is_semilattice(kts: [KindTheory], kind: String) : Bool =
+  theory_of_kind(kts, kind) == semilattice_theory_name()
+
+#[doc("""
+True when `kind`'s habitants unify by first-order equality: identity
+plus variable binding, no exponent arithmetic. Module and Composition
+kinds and the HM-core value-index kinds (`Dim`) share that slot verdict;
+they diverge in what each carries beyond it — Composition's summed
+measure and load-bearing order are formation invariants, not part of
+the slot's unification identity.
+""")]
+pub(pkg) fn kind_is_first_order(kts: [KindTheory], kind: String) : Bool {
+  let thy = theory_of_kind(kts, kind)
+  thy == module_theory_name() or thy == composition_theory_name() or
+  thy == hm_theory_name()
+}
+
+fn kind_is_atomic(kts: [KindTheory], kind: String) : Bool {
+  let thy = theory_of_kind(kts, kind)
+  thy == module_theory_name() or thy == composition_theory_name() or
+  thy == hm_theory_name()
+}
+
+# One (habitant symbol, exponent) factor of a canonical unit table.
+pub(pkg) type SymExp = SEx(String, Int)
+
+fn sex_sym(f: SymExp) : String = match f { SEx(s, _) -> s }
+
+fn sex_exp(f: SymExp) : Int = match f { SEx(_, n) -> n }
+
+# One (unit-variable id, exponent) factor of a canonical unit table.
+pub(pkg) type VarExp = VEx(Int, Int)
+
+#[doc("""
+Formation rule shared by the atomic theories, on a canonical table's
+factors: a habitant of an atomic kind stands alone with exponent 1 or
+has cancelled out entirely. Returns the offending qualified symbol.
+This is the structural formation both engines own: `Module` and
+`Composition` habitants have no products or powers, so `USD²`, `be·le`,
+and `be²` are inexpressible — the rejection is a property of the
+engines, not an external guard.
+""")]
+pub(pkg) fn atom_form_violation(syms: [SymExp], nvars: Int, kts: [KindTheory]) : Option[String] =
+  afv_loop(syms, list_length(syms), nvars, kts, false)
+
+#[doc("Operator-site formation: like `atom_form_violation`, but Semilattice habitants also count — joins are written in annotations, never produced by `*`/`/`.")]
+pub(pkg) fn product_form_violation(syms: [SymExp], nvars: Int, kts: [KindTheory]) : Option[String] =
+  afv_loop(syms, list_length(syms), nvars, kts, true)
+
+fn afv_loop(xs: [SymExp], nsyms: Int, nvars: Int, kts: [KindTheory],
+            with_sl: Bool) : Option[String] = match xs {
+  [] -> None
+  [f, ...rest] -> {
+    let k = kind_sym_kind(sex_sym(f))
+    if kind_is_atomic(kts, k) or (with_sl and kind_is_semilattice(kts, k)) {
+      if sex_exp(f) == 1 and nsyms == 1 and nvars == 0 {
+        afv_loop(rest, nsyms, nvars, kts, with_sl)
+      } else { Some(sex_sym(f)) }
+    } else { afv_loop(rest, nsyms, nvars, kts, with_sl) }
+  }
+}
+
+# One side of a nominal unification, classified: dimensionless, a
+# single atom, a unit variable, or an inadmissible compound. Shared by
+# the Module and Composition engines — both unify a slot by atom
+# identity; a compound never reaches here (formation rejects it).
+pub(pkg) type NomSide = MOne | MAtom(String) | MVarSide(Int) | MIll
+
+#[doc("Classify one side's canonical factors for a nominal slot engine: `1`, a lone atom, a lone variable, or an inadmissible compound (which formation already rejects).")]
+pub(pkg) fn nominal_side(syms: [SymExp], vars: [VarExp]) : NomSide = match syms {
+  [] -> match vars {
+    [] -> MOne
+    [VEx(v, n)] -> if n == 1 { MVarSide(v) } else { MIll }
+    _ -> MIll
+  }
+  [SEx(s, n)] -> match vars {
+    [] -> if n == 1 { MAtom(s) } else { MIll }
+    _ -> MIll
+  }
+  _ -> MIll
+}
+
+# A nominal engine's verdict on two classified sides: already equal,
+# refuse, or bind a variable to the other side's unit.
+pub(pkg) type NomVerdict = MEq | MFail | MBind(Int, UnitExprT)
+
+#[doc("""
+Nominal slot unification, the primitive both the Module and Composition
+engines run per `<>` slot: an atom unifies only with itself, a variable
+binds to the other side, and nothing else unifies — no exponents, no
+cancellation, no abelian normalisation. It is plain symbol identity, the
+trivial comparison no theory owns; each engine layers its own structure
+around it (Module's scalar signatures, Composition's ordered summed
+measure), and those layers live in formation and signatures, not here.
+""")]
+pub(pkg) fn nominal_unify_verdict(a: NomSide, b: NomSide) : NomVerdict = match a {
+  MAtom(x) -> match b {
+    MAtom(y) -> if x == y { MEq } else { MFail }
+    MVarSide(v) -> MBind(v, USym(x))
+    _ -> MFail
+  }
+  MOne -> match b {
+    MOne -> MEq
+    MVarSide(v) -> MBind(v, UOne)
+    _ -> MFail
+  }
+  MVarSide(v) -> match b {
+    MAtom(y) -> MBind(v, USym(y))
+    MOne -> MBind(v, UOne)
+    MVarSide(w) -> if v == w { MEq } else { MBind(v, UVar(w)) }
+    MIll -> MFail
+  }
+  MIll -> MFail
+}
+
+# One side of a Semilattice unification, classified from its canonical
+# table: a ground habitant set (possibly empty), a lone unit variable,
+# or an inadmissible mix.
+pub(pkg) type SlSide = SlSet([String]) | SlVarSide(Int) | SlIll
+
+#[doc("Classify one side's canonical factors for the Semilattice engine: a ground set (any positive multiplicity collapses to membership), a lone variable, or an inadmissible mix (negative exponents, a variable joined with symbols).")]
+pub(pkg) fn sl_side(syms: [SymExp], vars: [VarExp]) : SlSide = match vars {
+  [] -> sl_set_of(syms, [])
+  [VEx(v, n)] -> match syms {
+    [] -> if n > 0 { SlVarSide(v) } else { SlIll }
+    _ -> SlIll
+  }
+  _ -> SlIll
+}
+
+fn sl_set_of(syms: [SymExp], acc: [String]) : SlSide = match syms {
+  [] -> SlSet(list_reverse(acc))
+  [f, ...rest] ->
+    if sex_exp(f) > 0 { sl_set_of(rest, [sex_sym(f), ...acc]) } else { SlIll }
+}
+
+# The engine's verdict on two classified sides: subsumed, refuse, or
+# bind a variable to the other side's joined set.
+pub(pkg) type SlVerdict = SlOk | SlFail | SlBind(Int, UnitExprT)
+
+#[doc("""
+Subsumption for Semilattice sides, required side first: a ground set
+unifies into any superset, a variable binds to the other side's join,
+and anything else refuses. The direction is the unifier's contract —
+`unify` always receives the expected side first.
+""")]
+pub(pkg) fn sl_unify_verdict(req: SlSide, prov: SlSide) : SlVerdict = match req {
+  SlSet(a) -> match prov {
+    SlSet(b) -> if sl_subset(a, b) { SlOk } else { SlFail }
+    SlVarSide(v) -> SlBind(v, sl_join_tree(a))
+    SlIll -> SlFail
+  }
+  SlVarSide(v) -> match prov {
+    SlSet(b) -> SlBind(v, sl_join_tree(b))
+    SlVarSide(w) -> if v == w { SlOk } else { SlBind(v, UVar(w)) }
+    SlIll -> SlFail
+  }
+  SlIll -> SlFail
+}
+
+fn sl_subset(a: [String], b: [String]) : Bool = match a {
+  [] -> true
+  [x, ...rest] -> if list_has(b, x) { sl_subset(rest, b) } else { false }
+}
+
+fn sl_join_tree(names: [String]) : UnitExprT = match names {
+  [] -> UOne
+  [x, ...rest] -> sl_join_chain(USym(x), rest)
+}
+
+fn sl_join_chain(acc: UnitExprT, rest: [String]) : UnitExprT = match rest {
+  [] -> acc
+  [x, ...tl] -> sl_join_chain(UJoin(acc, USym(x)), tl)
+}
+
+# A formation violation on a written unit tree: a Semilattice habitant
+# under a product/inverse/power, a join leaf that is not a habitant
+# symbol of a Semilattice kind, or a join across two Semilattice kinds.
+pub(pkg) type SlViolation = SlvProduct(String) | SlvJoinLeaf(String) | SlvJoinMix(String, String)
+
+#[doc("""
+Formation check on a written unit tree: Semilattice habitants may only
+compound through `+`, every join leaf must be a habitant symbol of one
+Semilattice kind, and two Semilattice kinds never join. Returns the
+first violation, `None` when the tree is clean. Symbols are expected
+already kind-qualified; a bare symbol counts as a Measure habitant.
+""")]
+pub(pkg) fn sl_shape_violation(u: UnitExprT, kts: [KindTheory]) : Option[SlViolation] =
+  slv_walk(u, kts, false)
+
+fn slv_walk(u: UnitExprT, kts: [KindTheory], in_prod: Bool) : Option[SlViolation] = match u {
+  UOne -> None
+  UVar(_) -> None
+  UParam(_) -> None
+  USym(s) ->
+    if in_prod and kind_is_semilattice(kts, kind_sym_kind(s)) { Some(SlvProduct(s)) }
+    else { None }
+  UMul(a, b) -> match slv_walk(a, kts, true) {
+    Some(v) -> Some(v)
+    None -> slv_walk(b, kts, true)
+  }
+  UInv(a) -> slv_walk(a, kts, true)
+  UPow(a, _) -> slv_walk(a, kts, true)
+  UJoin(a, b) ->
+    if in_prod {
+      match sl_first_sym(u) {
+        Some(s) -> Some(SlvProduct(s))
+        None -> Some(SlvJoinLeaf("1"))
+      }
+    } else { slv_join_leaves(sl_join_collect(a, sl_join_collect(b, [])), kts, "") }
+  # a positional list's components are independent slots — each is
+  # walked as its own top-level unit.
+  UDims(us) -> slv_walk_list(us, kts, in_prod)
+}
+
+fn slv_walk_list(us: [UnitExprT], kts: [KindTheory], in_prod: Bool) : Option[SlViolation] = match us {
+  [] -> None
+  [u, ...rest] -> match slv_walk(u, kts, in_prod) {
+    Some(v) -> Some(v)
+    None -> slv_walk_list(rest, kts, in_prod)
+  }
+}
+
+# Leaves of a join, collected through nested UJoin only — any other
+# compound stays whole and fails the leaf check below.
+fn sl_join_collect(u: UnitExprT, acc: [UnitExprT]) : [UnitExprT] = match u {
+  UJoin(a, b) -> sl_join_collect(a, sl_join_collect(b, acc))
+  _ -> [u, ...acc]
+}
+
+fn slv_join_leaves(leaves: [UnitExprT], kts: [KindTheory],
+                   kind: String) : Option[SlViolation] = match leaves {
+  [] -> None
+  [l, ...rest] -> match l {
+    USym(s) -> {
+      let k = kind_sym_kind(s)
+      if not kind_is_semilattice(kts, k) { Some(SlvJoinLeaf(kind_sym_bare(s))) }
+      else if kind == "" { slv_join_leaves(rest, kts, k) }
+      else if k == kind { slv_join_leaves(rest, kts, kind) }
+      else { Some(SlvJoinMix(kind, k)) }
+    }
+    UOne -> Some(SlvJoinLeaf("1"))
+    UVar(_) -> Some(SlvJoinLeaf("a unit variable"))
+    _ -> match sl_first_sym(l) {
+      Some(s) -> Some(SlvProduct(s))
+      None -> Some(SlvJoinLeaf("a compound unit"))
+    }
+  }
+}
+
+# First habitant symbol in a subtree, for diagnostics.
+fn sl_first_sym(u: UnitExprT) : Option[String] = match u {
+  UOne -> None
+  UVar(_) -> None
+  UParam(_) -> None
+  USym(s) -> Some(s)
+  UMul(a, b) -> match sl_first_sym(a) { Some(s) -> Some(s) None -> sl_first_sym(b) }
+  UInv(a) -> sl_first_sym(a)
+  UPow(a, _) -> sl_first_sym(a)
+  UJoin(a, b) -> match sl_first_sym(a) { Some(s) -> Some(s) None -> sl_first_sym(b) }
+  UDims(us) -> sl_first_sym_list(us)
+}
+
+fn sl_first_sym_list(us: [UnitExprT]) : Option[String] = match us {
+  [] -> None
+  [u, ...rest] -> match sl_first_sym(u) { Some(s) -> Some(s) None -> sl_first_sym_list(rest) }
+}
+
+#[doc("The error for every habitant declaration and closed habitant set of the decl stream that breaks a formation rule, in source order.")]
+pub(pkg) fn validate_habitant_decls(decls: [Decl], reg: KindReg, df: DiagFiles) : [Diagnostic] {
+  let comps = composition_theory_kinds(atomic_kind_theories(decls))
+  let closed = closed_kind_sets(decls)
+  finalize_diags(vhd_loop(decls, reg, comps, closed, df, []))
+}
+
+fn vhd_loop(decls: [Decl], reg: KindReg, comps: [String], closed: [ClosedKind],
+            df: DiagFiles, acc: [Diagnostic]) : [Diagnostic] = match decls {
+  [] -> acc
+  [d, ...rest] ->
+    vhd_loop(rest, reg, comps, closed, df, vhd_decl(d, reg, comps, closed, decl_diag_file(d, df), acc))
+}
+
+fn vhd_decl(d: Decl, reg: KindReg, comps: [String], closed: [ClosedKind],
+            file: String, acc: [Diagnostic]) : [Diagnostic] = match d {
+  DKind(_, _, thy, _, HabClosed(_, atoms), line, col, _) ->
+    vhd_push(check_closed_set(thy, atoms), file, line, col, acc)
+  DUnit(_, name, body, intro, line, col, _) ->
+    vhd_push(check_habitant(name, body, intro_kind_of(reg, intro), comps, closed), file, line, col, acc)
+  DDerive(_, inner, _, _) -> vhd_decl(inner, reg, comps, closed, file, acc)
+  DUnstable(inner, _, _) -> vhd_decl(inner, reg, comps, closed, file, acc)
+  DProtoLaws(_, inner, _, _, _) -> vhd_decl(inner, reg, comps, closed, file, acc)
+  DImplAxiom(_, inner, _, _, _) -> vhd_decl(inner, reg, comps, closed, file, acc)
+  DConstructor(inner, _, _) -> vhd_decl(inner, reg, comps, closed, file, acc)
+  _ -> acc
+}
+
+# A rule answers with the message of the error it finds.
+fn vhd_push(broken: Option[String], file: String, line: Int, col: Int, acc: [Diagnostic]) : [Diagnostic] = match broken {
+  None      -> acc
+  Some(msg) -> [mk_diag(SevError, file, line, col, msg, []), ...acc]
+}
+
+# Rule 1: every named atom must be engine-known for the theory.
+fn check_closed_set(thy: String, atoms: [String]) : Option[String] {
+  let known = engine_atoms_for_theory(thy)
+  match known {
+    [] -> Some(concat_all(["theory `", thy, "` ships no engine-known habitants, so it",
+                           " takes no closed habitant set"]))
+    _ -> match first_unknown_atom(atoms, known) {
+      None -> None
+      Some(a) -> Some(concat_all(["unknown habitant `", a, "` in the closed set — the `", thy,
+                                  "` engine's habitants are: ", join_with(known, ", ")]))
+    }
+  }
+}
+
+fn first_unknown_atom(atoms: [String], known: [String]) : Option[String] = match atoms {
+  [] -> None
+  [a, ...rest] -> if list_has(known, a) { first_unknown_atom(rest, known) } else { Some(a) }
+}
+
+# Rules 2 + 3 on one habitant declaration.
+fn check_habitant(name: String, body: UnitBody, kind: String, comps: [String],
+                  closed: [ClosedKind]) : Option[String] {
+  let atoms = closed_atoms_lookup(closed, kind)
+  match atoms {
+    [_, ..._] ->
+      Some(concat_all(["`", kind, "` is a closed kind — its habitants are fixed (",
+                       join_with(atoms, ", "), ") and `", name, "` cannot be added"]))
+    [] -> match body {
+      UBMeasure(_) ->
+        if list_has(comps, kind) { None }
+        else {
+          Some(concat_all(["habitant `", name, "` declares a measure, but kind `", kind,
+                           "`'s theory does not sum one — only a `Composition` kind's",
+                           " habitants carry `= N`"]))
+        }
+      _ -> None
+    }
+  }
+}
+
+fn intro_kind_of(reg: KindReg, intro: String) : String =
+  match kind_of_introducer(reg, intro) { Some(k) -> k None -> measure_kind_name() }

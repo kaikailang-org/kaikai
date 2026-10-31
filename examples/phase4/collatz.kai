@@ -1,0 +1,42 @@
+# collatz.kai — ported from demos/collatz.kai to kaikai-minimal.
+#
+# For each n in 1..100, compute the collatz sequence length (number of
+# steps to reach 1). Print the maximum and the winner.
+
+fn chain_len(n: Int, acc: Int) : Int {
+  if n == 1 { acc }
+  else if n % 2 == 0 { chain_len(n / 2, acc + 1) }
+  else { chain_len(n * 3 + 1, acc + 1) }
+}
+
+type Winner = { n: Int, len: Int }
+
+fn max_winner(cur: Winner, cand: Winner) : Winner {
+  if cand.len > cur.len { cand } else { cur }
+}
+
+fn scan(ns: [Int], best: Winner) : Winner {
+  match ns {
+    [] -> best
+    [n, ...rest] -> {
+      let this = Winner { n: n, len: chain_len(n, 1) }
+      scan(rest, max_winner(best, this))
+    }
+  }
+}
+
+fn main() {
+  let w = scan([1..100], Winner { n: 1, len: 1 })
+  println("longest collatz in 1..100 is n=#{int_to_string(w.n)} with length #{int_to_string(w.len)}")
+}
+
+test "chain_len for powers of two" {
+  assert chain_len(1, 1) == 1
+  assert chain_len(2, 1) == 2
+  assert chain_len(4, 1) == 3
+  assert chain_len(8, 1) == 4
+}
+
+test "chain_len for 27 is 112" {
+  assert chain_len(27, 1) == 112
+}

@@ -1,0 +1,570 @@
+#[doc("The root file's ambiguous bare type names, and the dumps and checks of the declaration each written type denotes.")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.modules_paths
+import compiler.modules_segments
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.symtab
+import compiler.name_report
+import compiler.scope_view
+import compiler.diag
+import compiler.written
+import compiler.scalar_ty
+import compiler.type_text
+import compiler.chars
+import compiler.infer_glue
+import compiler.infer_unify_rows
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_handle_walk
+import compiler.diag_type_text
+
+# The scan's fixed inputs: the table every name resolves against, the
+# view of the file being scanned, the unit-kind slots of every type,
+# and what the position being read makes of a name nothing declares.
+type TsChk = { tab: SymTab, view: ScopeView, file: String, units: [TsUnits], pos: TsPos }
+
+# The unit-kind parameter slots of one type declaration.
+type TsUnits = TsU(SymId, [Int])
+
+# A type position, the whole body of the alias declaration `T` in
+# `type T = X`, or an argument slot its head declares unit-kind: there a
+# name with no type meaning is a habitant, which the unit passes judge.
+type TsPos = TsType | TsAlias(SymId) | TsUnitArg
+
+#[doc("The error for every bare type name the scope view of the file that wrote it leaves contested, in source order. `decls` is the segmented stream `segs` marks the imported files of; `views` index `tab`.")]
+pub(pkg) fn tschk_segmented(segs: [ImportSeg], decls: [Decl], tab: SymTab, views: FileViews,
+      target: String, df: DiagFiles) : [Diagnostic] =
+  tschk_segs(segs, decls, tab, views, target, df, tschk_unit_decls(decls, target, []), [])
+
+fn tschk_unit_decls(ds: [Decl], target: String, acc: [TsUnits]) : [TsUnits] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tschk_unit_decls([inner, ...rest], target, acc)
+    None -> match d {
+      DType(_, dsym, tps, _, _, _, _, _, _, _) -> match tschk_unit_idxs(tps, 0) {
+        []   -> tschk_unit_decls(rest, target, acc)
+        idxs -> tschk_unit_decls(rest, target, [TsU(dsym, idxs), ...acc])
+      }
+      _ -> tschk_unit_decls(rest, target, acc)
+    }
+  }
+}
+
+fn tschk_unit_idxs(tps: [TBinder], i: Int) : [Int] = match tps {
+  [] -> []
+  [t, ...rest] ->
+    if tb_is_unit(t) { [i, ...tschk_unit_idxs(rest, i + 1)] } else { tschk_unit_idxs(rest, i + 1) }
+}
+
+# The unit-kind slots of the type a bare head `n` resolves to.
+fn tschk_unit_slots(n: String, cx: TsChk) : [Int] = match cx.units {
+  [] -> []
+  us -> match sv_resolve_type(cx.tab, cx.view, n) {
+    SvSym(s) -> tschk_units_of(us, s)
+    _        -> []
+  }
+}
+
+fn tschk_units_of(us: [TsUnits], s: SymId) : [Int] = match us {
+  [] -> []
+  [TsU(d, idxs), ...rest] -> if sym_raw(d) == sym_raw(s) { idxs } else { tschk_units_of(rest, s) }
+}
+
+# A name is contested only against what the file that wrote it can see,
+# so each segment is judged under its own home's view and reported
+# against its own source file; the root's decls follow the marks.
+fn tschk_segs(segs: [ImportSeg], decls: [Decl], tab: SymTab, views: FileViews,
+      target: String, df: DiagFiles, units: [TsUnits], errs: [Diagnostic]) : [Diagnostic] = match segs {
+  [] -> ts_and(errs, tschk_decls(decls, tschk_cx(tab, views, target, target, df, units), []))
+  [ISeg(home, n), ...rest] -> {
+    let seg_errs = tschk_decls(seg_take(decls, n),
+                               tschk_cx(tab, views, home, target, df, units), [])
+    tschk_segs(rest, seg_drop(decls, n), tab, views, target, df, units, ts_and(errs, seg_errs))
+  }
+}
+
+fn tschk_cx(tab: SymTab, views: FileViews, home: String, target: String,
+      df: DiagFiles, units: [TsUnits]) : TsChk {
+  let file = if home == target { df_root(df) }
+             else { df_file_of(df, home) }
+  TsChk { tab: tab, view: fv_of(views, st_module_id(home)), file: file, units: units, pos: TsType }
+}
+
+fn tschk_decls(ds: [Decl], cx: TsChk, errs: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> errs
+  [d, ...rest] -> tschk_decls(rest, cx, ts_and(errs, tschk_decl(d, cx)))
+}
+
+fn tschk_decl(d: Decl, cx0: TsChk) : [Diagnostic] = match d {
+  DFn(_, _, _, ps, ret, row, body, l, c, _, _, _) ->
+    ts_and(tschk_params(ps, cx0), ts_and(tschk_ty_opt(ret, cx0), ts_and(tschk_row(row, l, c, cx0), tschk_expr(body, cx0))))
+  DConst(_, _, ty, body, _, _, _, _, _) -> ts_and(tschk_ty(ty, cx0), tschk_expr(body, cx0))
+  DTest(_, body, _, _, _)      -> tschk_expr(body, cx0)
+  DBench(_, body, _, _, _)     -> tschk_expr(body, cx0)
+  DCheck(_, ps, body, _, _, _) -> ts_and(tschk_params(ps, cx0), tschk_expr(body, cx0))
+  DType(_, s, _, body, _, _, _, _, _, _) -> tschk_tbody(body, s, cx0)
+  DEffect(_, _, _, ops, _, _, _, _, _, _) -> tschk_ops(ops, cx0)
+  DAxiom(_, _, _, _, _, ps, ret, _, _, _) -> ts_and(tschk_params(ps, cx0), tschk_ty(ret, cx0))
+  DImpl(_, tas, fty, subs, _, _, _, _) ->
+    ts_and(tschk_tys(tas, cx0), ts_and(tschk_ty(fty, cx0), tschk_decls(subs, cx0, [])))
+  DDerive(_, inner, _, _)       -> tschk_decl(inner, cx0)
+  DUnstable(inner, _, _)        -> tschk_decl(inner, cx0)
+  DProtoLaws(_, inner, _, _, _) -> tschk_decl(inner, cx0)
+  DImplAxiom(_, inner, _, _, _) -> tschk_decl(inner, cx0)
+  DConstructor(inner, _, _)     -> tschk_decl(inner, cx0)
+  DDoc(_, _, inner, _, _)       -> tschk_decl(inner, cx0)
+  DAttr(_, inner, _, _)         -> tschk_decl(inner, cx0)
+  _ -> []
+}
+
+fn tschk_at(cx: TsChk, pos: TsPos) : TsChk = TsChk { ...cx, pos: pos }
+
+# Below the name a position was entered for, every name is a type again.
+fn tschk_in(cx: TsChk) : TsChk = match cx.pos {
+  TsType -> cx
+  _      -> tschk_at(cx, TsType)
+}
+
+fn tschk_ops(ops: [EffectOp], cx: TsChk) : [Diagnostic] = match ops {
+  [] -> []
+  [EffOp(_, _, ps, ret, _, _), ...rest] ->
+    ts_and(tschk_params(ps, cx), ts_and(tschk_ty(ret, cx), tschk_ops(rest, cx)))
+}
+
+fn tschk_tbody(b: TypeBody, declared: SymId, cx: TsChk) : [Diagnostic] = match b {
+  TBAlias(t)   -> match t.tkind {
+    TyName(_, []) -> tschk_ty(t, tschk_at(cx, TsAlias(declared)))
+    _                -> tschk_ty(t, cx)
+  }
+  TBRecord(fs) -> tschk_fields(fs, cx)
+  TBSum(vs)    -> tschk_variants(vs, cx)
+  TBEffectAlias(ls) -> tschk_labels(ls, 0, 0, cx)
+}
+
+fn tschk_fields(fs: [FieldDecl], cx: TsChk) : [Diagnostic] = match fs {
+  [] -> []
+  [FD(_, _, t, _, _, _), ...rest] -> ts_and(tschk_ty(t, cx), tschk_fields(rest, cx))
+}
+
+fn tschk_variants(vs: [Variant], cx: TsChk) : [Diagnostic] = match vs {
+  [] -> []
+  [Var(_, ts, _, _), ...rest] -> ts_and(tschk_tys(ts, cx), tschk_variants(rest, cx))
+}
+
+fn tschk_params(ps: [Param], cx: TsChk) : [Diagnostic] = match ps {
+  [] -> []
+  [p, ...rest] -> ts_and(tschk_ty_opt(p.ptype, cx), tschk_params(rest, cx))
+}
+
+fn tschk_ty_opt(o: Option[TypeExpr], cx: TsChk) : [Diagnostic] = match o {
+  None    -> []
+  Some(t) -> tschk_ty(t, cx)
+}
+
+fn tschk_ty(t: TypeExpr, cx0: TsChk) : [Diagnostic] = {
+  let cx = tschk_in(cx0)
+  match t.tkind {
+    TyName(DrWritten(None, n), []) -> tschk_name(written_text(n), t.line, t.col, cx0)
+    TyName(DrWritten(None, n), ts) -> {
+      let nm = written_text(n)
+      ts_and(tschk_list_arity(nm, list_length(ts), t.line, t.col, cx),
+        ts_and(tschk_name(nm, t.line, t.col, cx), tschk_args(ts, tschk_unit_slots(nm, cx), 0, cx)))
+    }
+    TyName(_, ts)       -> tschk_tys(ts, cx)
+    TyParam(_, ts)   -> tschk_tys(ts, cx)
+    TyList(x)        -> tschk_ty(x, cx)
+    TyFn(ps, r, row) -> ts_and(tschk_tys(ps, cx), ts_and(tschk_ty(r, cx), tschk_row(row, t.line, t.col, cx)))
+    TyDim(x, _)      -> tschk_ty(x, cx)
+    TyRefine(x, _, _)   -> tschk_ty(x, cx)
+    _ -> []
+  }
+}
+
+# The core `List` is the list type `[T]`: exactly one element type.
+fn tschk_list_arity(n: String, nargs: Int, l: Int, c: Int, cx: TsChk) : [Diagnostic] =
+  if nargs > 1 and core_ty_is(core_type_sym_or_none(n), CtList) and tschk_resolves_none(n, cx) {
+    [mk_diag(SevError, cx.file, l, c,
+      concat_all(["`List` takes exactly one type argument (`List[T]`, the same type as `[T]`), got ", int_to_string(nargs)]), [])]
+  } else { [] }
+
+fn tschk_resolves_none(n: String, cx: TsChk) : Bool = match sv_resolve_type(cx.tab, cx.view, n) {
+  SvNone -> true
+  _      -> false
+}
+
+fn tschk_args(ts: [TypeExpr], units: [Int], i: Int, cx: TsChk) : [Diagnostic] = match ts {
+  [] -> []
+  [t, ...rest] ->
+    ts_and(tschk_ty(t, if any(units, (u) => u == i) { tschk_at(cx, TsUnitArg) } else { cx }), tschk_args(rest, units, i + 1, cx))
+}
+
+fn tschk_tys(ts: [TypeExpr], cx: TsChk) : [Diagnostic] = match ts {
+  [] -> []
+  [t, ...rest] -> ts_and(tschk_ty(t, cx), tschk_tys(rest, cx))
+}
+
+# A row label carries no position of its own; the enclosing one stands in.
+fn tschk_row(r: RowExpr, l: Int, c: Int, cx: TsChk) : [Diagnostic] = match r {
+  REmpty       -> []
+  RClosed(ls)  -> tschk_labels(ls, l, c, cx)
+  ROpen(_, ls) -> tschk_labels(ls, l, c, cx)
+}
+
+fn tschk_labels(ls: [RowLabel], l: Int, c: Int, cx: TsChk) : [Diagnostic] = match ls {
+  [] -> []
+  [RL(r, ts), ...rest] ->
+    ts_and(tschk_hidden_ref(r, [NCEffect, ...type_classes()], l, c, cx), ts_and(tschk_tys(ts, cx), tschk_labels(rest, l, c, cx)))
+}
+
+# An annotation inside a body reaches the same report as one in a
+# signature. `xp_positions` carries the walk to every sub-expression;
+# the arms here name only the positions that hold a type.
+fn tschk_expr(e: Expr, cx: TsChk) : [Diagnostic] =
+  ts_and(tschk_here(e, cx), tschk_children(xp_positions(e), cx))
+
+fn tschk_here(e: Expr, cx: TsChk) : [Diagnostic] = match e.kind {
+  ELambda(ps, _)        -> tschk_params(ps, cx)
+  EVariantsOf(t, _)     -> tschk_ty(t, cx)
+  EBlock(ss, _)         -> tschk_stmts(ss, cx)
+  EMatch(_, arms)       -> tschk_arms(arms, cx)
+  EHandle(_, r, ts, _, _, _, _) -> ts_and(tschk_hidden_ref(r, [NCEffect, ...type_classes()], e.line, e.col, cx), tschk_tys(ts, cx))
+  ERecordLit(DrWritten(None, n), _) -> tschk_record_lit(written_text(n), e.line, e.col, cx)
+  _ -> []
+}
+
+fn tschk_stmts(ss: [Stmt], cx: TsChk) : [Diagnostic] = match ss {
+  [] -> []
+  [SLet(p, t, _), ...rest] ->
+    ts_and(tschk_pat(p, cx), ts_and(tschk_ty_opt(t, cx), tschk_stmts(rest, cx)))
+  [_, ...rest] -> tschk_stmts(rest, cx)
+}
+
+fn tschk_arms(arms: [Arm], cx: TsChk) : [Diagnostic] = match arms {
+  [] -> []
+  [Arm(p, _, _), ...rest] -> ts_and(tschk_pat(p, cx), tschk_arms(rest, cx))
+}
+
+# A narrowing pattern names a type; every other position only holds
+# sub-patterns.
+fn tschk_pat(p: Pattern, cx: TsChk) : [Diagnostic] = match p.pkind {
+  PNarrow(_, t)              -> tschk_ty(t, cx)
+  PVariant(r, subs)          -> ts_and(tschk_hidden_ref(r, [NCCtor], p.line, p.col, cx), tschk_pats(subs, cx))
+  PVariantRecord(r, fs)      -> ts_and(tschk_hidden_ref(r, [NCCtor], p.line, p.col, cx), tschk_pfields(fs, cx))
+  PRecord(fs)                -> tschk_pfields(fs, cx)
+  PList(subs, _)             -> tschk_pats(subs, cx)
+  PAs(_, inner)              -> tschk_pat(inner, cx)
+  PSurface(ps)               -> tschk_pats(patsurface_children(ps), cx)
+  _ -> []
+}
+
+fn tschk_pats(ps: [Pattern], cx: TsChk) : [Diagnostic] = match ps {
+  [] -> []
+  [p, ...rest] -> ts_and(tschk_pat(p, cx), tschk_pats(rest, cx))
+}
+
+fn tschk_pfields(fs: [PField], cx: TsChk) : [Diagnostic] = match fs {
+  [] -> []
+  [PField(_, sub, _), ...rest] -> ts_and(tschk_pat(sub, cx), tschk_pfields(rest, cx))
+}
+
+fn tschk_children(ps: [XPos], cx: TsChk) : [Diagnostic] = match ps {
+  [] -> []
+  [XP(_, child), ...rest] -> ts_and(tschk_expr(child, cx), tschk_children(rest, cx))
+}
+
+# A record literal names a record type, or a constructor whose payload is
+# a record: a name neither class declares builds nothing.
+fn tschk_record_lit(n: String, l: Int, c: Int, cx: TsChk) : [Diagnostic] =
+  match split_dotted_qualifier(n) {
+    Some(_) -> []
+    None ->
+      if any([...type_classes(), NCCtor], (k) => not list_is_empty(st_candidates(cx.tab, k, n))) { [] }
+      else { [nh_unknown_type_diag(cx.file, l, c, n, None)] }
+  }
+
+# A qualifier IS the choice: it cannot be contested.
+fn tschk_name(n: String, l: Int, c: Int, cx: TsChk) : [Diagnostic] =
+  { match split_dotted_qualifier(n) {
+    Some(_) -> []
+    None -> match sv_resolve_type(cx.tab, cx.view, n) {
+      SvAmbig(ss) -> [nr_ambiguous_diag(cx.file, l, c, NCType, n, tschk_homes(cx.tab, ss, []), "", [])]
+      SvSym(s) -> if sv_reaches(cx.view, sym_owner(cx.tab, s), n) { [] }
+                  else { tschk_unseen(n, type_classes(), l, c, cx) }
+      SvNone   -> match cx.pos {
+        TsUnitArg  -> tschk_unseen(n, [NCExternType], l, c, cx)
+        TsAlias(t) -> tschk_undeclared(n, l, c, cx, Some(sym_name(cx.tab, t)))
+        TsType     -> tschk_undeclared(n, l, c, cx, None)
+      }
+      _ -> tschk_unseen(n, type_classes(), l, c, cx)
+    }
+  } }
+
+# A name no type declaration answers: a foreign type the file does not
+# import is reported as hidden, and a name nothing gives a meaning as unknown.
+fn tschk_undeclared(n: String, l: Int, c: Int, cx: TsChk, alias: Option[Written]) : [Diagnostic] = {
+  let hidden = tschk_unseen(n, [NCExternType], l, c, cx)
+  if not list_is_empty(hidden) or tschk_denotes(n, cx) { hidden }
+  else { [nh_unknown_type_diag(cx.file, l, c, n, alias)] }
+}
+
+# What a bare name can denote with no type declaration behind it: a
+# scalar, a core type, an implicit type or row parameter (any lowercase
+# name), or a declaration of a class that shares the type namespace — a
+# union component is named by its constructor alone.
+fn tschk_denotes(n: String, cx: TsChk) : Bool =
+  is_core_type(n) or tschk_lower(n) or tschk_scalar(n)
+    or any([NCEffect, NCExternType, NCKind, NCProtocol, NCCtor], (k) => not list_is_empty(st_candidates(cx.tab, k, n)))
+
+fn tschk_scalar(n: String) : Bool = match undeclared_ty_named(n, SnValue) {
+  Some(_) -> true
+  None    -> false
+}
+
+fn tschk_lower(n: String) : Bool = match char_at(n, 0) {
+  Some(ch) -> ch_is_lower(ch)
+  None     -> false
+}
+
+# A core type's name the file sees no declaration of names the core type.
+fn tschk_unseen(n: String, cs: [NCls], l: Int, c: Int, cx: TsChk) : [Diagnostic] =
+  if is_core_type(n) { [] } else { tschk_hidden(n, cs, l, c, cx) }
+
+# Only a reference written bare can be hidden: a settled one names its
+# declaration, and a qualified one went through its qualifier.
+fn tschk_hidden_ref(r: DeclRef, cs: [NCls], l: Int, c: Int, cx: TsChk) : [Diagnostic] = match r {
+  DrWritten(None, n) -> tschk_hidden(written_text(n), cs, l, c, cx)
+  _                  -> []
+}
+
+# A bare name the file reaches only through a module it never imported.
+# A qualified name went through its qualifier, and is settled already.
+fn tschk_hidden(n: String, cs: [NCls], l: Int, c: Int, cx: TsChk) : [Diagnostic] =
+  match sv_hidden(cx.tab, cx.view, cs, n) {
+    [] -> []
+    ss -> match split_dotted_qualifier(n) {
+      Some(_) -> []
+      None    -> [nh_diag(cx.tab, cx.view, ss, cx.file, l, c, n)]
+    }
+  }
+
+fn ts_and(a: [Diagnostic], b: [Diagnostic]) : [Diagnostic] = match a {
+  [] -> b
+  _  -> match b {
+    [] -> a
+    _  -> list_append(a, b)
+  }
+}
+
+fn tschk_homes(t: SymTab, ss: [SymId], acc: [String]) : [String] = match ss {
+  [] -> list_reverse(acc)
+  [s, ...rest] -> tschk_homes(t, rest, [written_text(sym_home(t, s)), ...acc])
+}
+
+#[doc("Print the declaration behind every nominal type in the root file's typed function bodies; `tab` holds the program's declarations.")]
+pub(pkg) fn dump_tycon_ids(decls: [Decl], tab: SymTab, root: String) : Int / Console {
+  let names = tid_decl_names(decls, map(core_type_names(), (n) => TidName(core_type_sym(n), Some("core"), false)))
+  tid_decls(decls, tab, names, root)
+  0
+}
+
+# One declaration a nominal type may name: its identity, the module
+# declaring it, and whether it is a constructor.
+type TidName = TidName(SymId, Option[String], Bool)
+
+fn tid_decl_names(ds: [Decl], acc: [TidName]) : [TidName] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tid_decl_names([inner, ...rest], acc)
+    None -> match d {
+      DType(_, s, _, body, _, _, _, _, mo, _) ->
+        tid_decl_names(rest, tid_ctor_names(body, mo, [TidName(s, mo, false), ...acc]))
+      _ -> tid_decl_names(rest, acc)
+    }
+  }
+}
+
+# A type declaration is listed before its constructors, so an id both
+# could answer reads as the type.
+fn tid_ctor_names(body: TypeBody, mo: Option[String], acc: [TidName]) : [TidName] = match body {
+  TBSum(vs) -> list_append(acc, map(vs, (v) => match v { Var(c, _, _, _) -> TidName(c, mo, true) }))
+  _ -> acc
+}
+
+fn tid_in_root(mo: Option[String], root: String) : Bool = match mo {
+  None    -> true
+  Some(m) -> m == root
+}
+
+fn tid_home(mo: Option[String]) : String = match mo {
+  Some(m) -> m
+  None -> "(root)"
+}
+
+fn tid_render(tab: SymTab, names: [TidName], s: SymId) : String =
+  if sym_raw(s) < 0 { "-" } else { tid_lookup(tab, names, s) }
+
+fn tid_lookup(tab: SymTab, names: [TidName], s: SymId) : String = match names {
+  [] -> concat_all(["#", int_to_string(sym_raw(s)), "?"])
+  [TidName(i, mo, is_ctor), ...rest] ->
+    if sym_raw(i) != sym_raw(s) { tid_lookup(tab, rest, s) }
+    else { concat_all([written_text(decl_name(tab, s)), "@", tid_home(mo), if is_ctor { " (constructor)" } else { "" }]) }
+}
+
+fn tid_decls(ds: [Decl], tab: SymTab, names: [TidName], root: String) : Unit / Console = match ds {
+  [] -> ()
+  [d, ...rest] -> {
+    match d {
+      DFn(_, fid, _, _, _, _, body, _, _, _, _, mo) -> if tid_in_root(mo, root) { tid_fn(tab, fid, body, names) } else { () }
+      _ -> ()
+    }
+    tid_decls(rest, tab, names, root)
+  }
+}
+
+fn tid_fn(tab: SymTab, fid: FnId, body: Expr, names: [TidName]) : Unit / Console {
+  print(concat_all(["fn ", written_text(decl_name(tab, fnid_sym(fid)))]))
+  tid_print(tab, list_reverse(tid_expr(tab, body, [])), names)
+}
+
+fn tid_print(tab: SymTab, seen: [Ty], names: [TidName]) : Unit / Console = match seen {
+  [] -> ()
+  [t, ...rest] -> {
+    print(concat_all(["  ", inf_ty_to_string(tab, t), "  ", tid_render(tab, names, tid_head(t))]))
+    tid_print(tab, rest, names)
+  }
+}
+
+fn tid_head(t: Ty) : SymId = match t {
+  TyCon(s, _) -> s
+  _           -> sym_none()
+}
+
+# The nominal types met in a body, newest first; the caller reverses
+# into first-appearance order.
+fn tid_expr(tab: SymTab, e: Expr, acc: [Ty]) : [Ty] {
+  let here = match e.ty {
+    Some(t) -> if is_op_callee(e) { acc } else { tid_ty(tab, t, acc) }
+    None -> acc
+  }
+  tid_children(tab, xp_positions(e), here)
+}
+
+# An op's callee carries the effect instance it performs, not a nominal type.
+fn is_op_callee(e: Expr) : Bool = match e.kind {
+  EOp(_) -> true
+  _      -> false
+}
+
+fn tid_children(tab: SymTab, ps: [XPos], acc: [Ty]) : [Ty] = match ps {
+  [] -> acc
+  [XP(_, c), ...rest] -> tid_children(tab, rest, tid_expr(tab, c, acc))
+}
+
+fn tid_ty(tab: SymTab, t: Ty, acc: [Ty]) : [Ty] = match t {
+  TyCon(_, args) -> tid_tys(tab, args, tid_add(acc, t))
+  TyListT(inner) -> tid_ty(tab, inner, acc)
+  TyFnT(ps, ret, _) -> tid_ty(tab, ret, tid_tys(tab, ps, acc))
+  TyDimT(base, _) -> tid_ty(tab, base, acc)
+  TyRefineT(base, _, _) -> tid_ty(tab, base, acc)
+  _ -> acc
+}
+
+fn tid_tys(tab: SymTab, ts: [Ty], acc: [Ty]) : [Ty] = match ts {
+  [] -> acc
+  [t, ...rest] -> tid_tys(tab, rest, tid_ty(tab, t, acc))
+}
+
+fn tid_add(acc: [Ty], t: Ty) : [Ty] =
+  if tid_has(acc, t) { acc } else { [t, ...acc] }
+
+# One line per structurally distinct type.
+fn tid_has(acc: [Ty], t: Ty) : Bool = match acc {
+  [] -> false
+  [x, ...rest] -> if ty_eq_shape(x, t) { true } else { tid_has(rest, t) }
+}
+
+#[doc("Report each unstamped written name of a declared type; the exit status is the number found.")]
+pub(pkg) fn check_type_ids(decls: [Decl], tab: SymTab) : Int / Console = {
+  let declared = tic_declared(decls, tab, [])
+  let found = tic_decls(decls, tab, declared)
+  each(found, (m) => eprint(m))
+  list_length(found)
+}
+
+# The names a written type could still spell a declaration with.
+fn tic_declared(ds: [Decl], tab: SymTab, acc: [String]) : [String] = match ds {
+  [] -> acc
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> tic_declared([inner, ...rest], tab, acc)
+    None -> match d {
+      DType(_, s, _, body, _, _, _, _, _, _) -> match body {
+        TBAlias(_)       -> tic_declared(rest, tab, acc)
+        TBEffectAlias(_) -> tic_declared(rest, tab, acc)
+        _                -> tic_declared(rest, tab, [written_text(decl_name(tab, s)), ...acc])
+      }
+      _ -> tic_declared(rest, tab, acc)
+    }
+  }
+}
+
+fn tic_decls(ds: [Decl], tab: SymTab, declared: [String]) : [String] = match ds {
+  [] -> []
+  [d, ...rest] -> list_append(tic_decl(d, tab, declared), tic_decls(rest, tab, declared))
+}
+
+fn tic_decl(d: Decl, tab: SymTab, declared: [String]) : [String] = match d {
+  DFn(_, fid, _, ps, ret, row, body, _, _, _, _, _) -> {
+    let cx = TicCx { fname: written_text(decl_name(tab, fnid_sym(fid))), declared: declared }
+    list_append(tic_sig(ps, ret, cx), list_append(tic_row(row, cx), tic_expr(body, cx)))
+  }
+  _ -> []
+}
+
+type TicCx = { fname: String, declared: [String] }
+
+fn tic_sig(ps: [Param], ret: Option[TypeExpr], cx: TicCx) : [String] =
+  list_append(flat_map(ps, (p) => tic_opt(p.ptype, cx)), tic_opt(ret, cx))
+
+fn tic_opt(o: Option[TypeExpr], cx: TicCx) : [String] = match o {
+  Some(te) -> tic_te(te, cx)
+  None     -> []
+}
+
+fn tic_row(row: RowExpr, cx: TicCx) : [String] = match row {
+  REmpty       -> []
+  RClosed(ls)  -> flat_map(ls, (l) => tic_label(l, cx))
+  ROpen(_, ls) -> flat_map(ls, (l) => tic_label(l, cx))
+}
+
+fn tic_label(l: RowLabel, cx: TicCx) : [String] = match l {
+  RL(_, args) -> flat_map(args, (a) => tic_te(a, cx))
+}
+
+fn tic_te(te: TypeExpr, cx: TicCx) : [String] = match te.tkind {
+  TyName(r, args)    -> list_append(tic_name(r, te, cx), flat_map(args, (a) => tic_te(a, cx)))
+  TyParam(_, args)   -> flat_map(args, (a) => tic_te(a, cx))
+  TyList(inner)      -> tic_te(inner, cx)
+  TyFn(ps, ret, row) -> list_append(flat_map(ps, (p) => tic_te(p, cx)), list_append(tic_te(ret, cx), tic_row(row, cx)))
+  TyDim(b, _)        -> tic_te(b, cx)
+  _                  -> []
+}
+
+fn tic_name(r: DeclRef, te: TypeExpr, cx: TicCx) : [String] = {
+  let n = ref_spelled(r)
+  if ref_resolved(r) or not list_has(cx.declared, n) { [] }
+  else { [concat_all(["unstamped type ", n, " in ", cx.fname, " at line ", int_to_string(te.line)])] }
+}
+
+fn tic_expr(e: Expr, cx: TicCx) : [String] = {
+  let own = match e.kind {
+    EHandle(_, _, tas, _, _, _, _) -> flat_map(tas, (a) => tic_te(a, cx))
+    _ -> []
+  }
+  list_append(own, flat_map(xp_positions(e), (p) => match p { XP(_, c) -> tic_expr(c, cx) }))
+}

@@ -1,0 +1,19 @@
+# `encode`/`decode` are ordinary identifiers: nothing in the compiler
+# claims those names, so a user fn by either name is just a user fn.
+# BOTH backends must lower the call to the user symbol, never a
+# `kaix_core_*` forwarder — the native emit once mis-routed `decode` to a
+# non-existent `kaix_core_decode`. This fixture runs under the C/native
+# parity harness so a regression fails the build.
+fn encode(n: Int) : [Int] = [n / 256, n % 256]
+
+fn decode(bytes: [Int]) : Int = match bytes {
+  [hi, lo] -> hi * 256 + lo
+  _ -> 0
+}
+
+fn main() {
+  let n = 258
+  let round = decode(encode(n))
+  if round == n { print("user encode/decode shadow ok") }
+  else { print("MISMATCH") }
+}
