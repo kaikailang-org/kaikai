@@ -1,0 +1,170 @@
+# protocols
+
+Single-dispatch protocols, Go/Clojure/Elixir-style.
+
+## Description
+
+kaikai has SINGLE-DISPATCH PROTOCOLS only. Lookup is `O(1)` over an
+impl table — no constraint propagation, no HKT, no type families,
+which keeps compilation fast.
+
+The dispatching parameter has type `Self` (capitalized). It is
+conventionally named `x` (matching `stdlib/protocols.kai`), though
+`self` or any other identifier is legal — there is no implicit
+receiver. Op declarations inside `protocol { ... }` omit `fn`;
+`impl` bodies use the full `fn name(...) : R = ...` form.
+
+## Stdlib protocols
+
+Show, Eq, Ord, Hash, Serialize, BinSerialize, Layout, Json, Default,
+Numeric (`math.numeric`), and the arithmetic family Add[a] / Sub[a] /
+Mul[a] / Div[a] / Rem[a] / Neg.
+
+An operator on a non-primitive type calls the matching impl: `a + b` is
+`Add.add`, and unary `-x` is `Neg.neg`. A type with no impl is a compile
+error at the operator.
+
+Most user code never declares a new protocol. Implementing the
+stdlib ones for your types is the common case.
+
+## Orphan rule
+
+An `impl P[A] for T` must live in the module that declares `P`, the
+head of `T`, or the head of a protocol argument `A`. Anywhere else it
+is a compile error: write the impl beside the type. Builtins (`Int`,
+`[a]`, `Option[a]`, ...) belong to no module, so implement a CORE
+protocol for one by wrapping it in a type of your own.
+
+## Example
+
+```kaikai
+type Color = Red | Green | Blue
+
+impl Show for Color {
+  fn show(c: Color) : String = match c {
+    Red   -> "red"
+    Green -> "green"
+    Blue  -> "blue"
+  }
+}
+
+impl Eq for Color {
+  fn eq(a: Color, b: Color) : Bool = match (a, b) {
+    (Red, Red)     -> true
+    (Green, Green) -> true
+    (Blue, Blue)   -> true
+    _              -> false
+  }
+}
+
+fn main() : Unit / Stdout = {
+  Stdout.print(show(Red))
+  Stdout.print(show(Blue))
+  Stdout.print(if eq(Red, Red) { "eq" } else { "neq" })
+}
+```
+
+## Unions
+
+`impl P for U` on a union of types (`type U = A | B`) is a compile
+error: implement `P` for each component. A call on a `U`-typed value
+runs the impl of the component it carries, so every component needs
+an impl and the receiver must be the only `Self`-typed parameter.
+
+## Equality and order without an impl
+
+A record or sum type is `Eq` when every field is, with no `impl` or
+`#[derive(Eq)]`: `fn same[T: Eq](a: T, b: T)` accepts it, and `==` and
+`!=` compare it field by field. A hand-written `impl Eq` overrides that
+for its type. A function is never `Eq`, so neither is a type that holds
+one: `f == f` and `same(rec_with_fn, rec_with_fn)` are compile errors
+unless the type has its own `impl Eq`.
+
+Pairs, triples and quads are ordered lexicographically when each
+element is `Ord`: `(1, "x") < (1, "y")`, and `sort` orders them. A
+record has no automatic order: `<` on one is a compile error unless it
+has an `impl Ord`.
+
+## Derive
+
+Some protocols can be derived. The annotation is `#[derive(...)]`
+(square brackets — the bare `#derive(...)` form is rejected).
+
+```kaikai
+#[derive(Show, Eq)]
+type Point = { x: Int, y: Int }
+
+fn main() : Unit / Stdout = {
+  let p = Point { x: 3, y: 4 }
+  Stdout.print(show(p))
+}
+```
+
+Derivable: Show, Eq, Ord, Hash, BinSerialize (partial — see
+`docs/binserialize-collections-design.md`), Layout (records of
+`U<N><be|le>` fields — `kai info kinds`), Json.
+
+A derive of Show, Eq or Hash needs the protocol on every type a field
+reaches, including through a list, an Option or a tuple:
+`[(Int, String)]` needs it on `List`, `Pair`, `Int` and `String`. A
+missing one is reported at the declaration, naming the field and the
+path to the type that lacks it.
+
+A derived protocol may be module-qualified — `#[derive(pa.Show)]` —
+which selects that module's protocol when two imports export the same
+name; a bare name exported by two imports is an error naming both.
+
+A protocol of your own derives through what it declares, never through
+its name: one that declares exactly the operations of Show, Eq, Ord or
+Hash — same labels, same arities — is derived the way that protocol is.
+Its derived impl calls the operation bare, so a field answers through
+any protocol that declares it. Any other protocol has no generator, and
+deriving it is an error.
+
+`#[derive(Json)]` binds a record to the JSON DOM: it generates
+`to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
+Result[T, JsonError]` entry point. The DOM and the readers the derived
+code calls live in `encoding.json_bind`, which the deriving file imports.
+
+```kaikai
+import encoding.json.{json_decode, json_encode}
+import encoding.json_bind
+
+#[derive(Json)]
+type Person = { name: String, age: Int, nick: Option[String] }
+
+fn main() : Unit / Stdout = {
+  let p = Person { name: "ana", age: 30, nick: None }
+  Stdout.print(json_encode(to_json(p)))
+  match json_decode("{\"name\":\"bo\",\"age\":7}") {
+    None -> Stdout.print("bad json")
+    Some(v) -> match person_of_json(v, "") {
+      Ok(q)  -> Stdout.print(q.name)
+      Err(e) -> Stdout.print(json_error_show(e))
+    }
+  }
+}
+```
+
+Field names go to the wire verbatim — no case conversion. An
+`Option[T]` field accepts an explicit `null` and a missing key alike,
+both decoding to `None`; every other field is required. Keys the record
+does not declare are ignored. A failure carries the JSON path to the
+offending node (`address.boxes[2].zip: expected String, got Number`).
+Sum types are not derivable: a tagged-union encoding is a convention
+the derive does not pick for you. See `docs/json-derive-design.md`.
+
+## NOT IN KAIKAI
+
+- Type classes (Haskell). No constraint propagation, no HKT.
+- Functional dependencies, type families, GADTs.
+- Multi-parameter type classes.
+- Multi-method / multiple dispatch (Clojure multimethods).
+- Interface satisfaction by structural typing (Go duck typing on
+  method sets). kaikai requires an explicit `impl`.
+- Inheritance. Protocols compose by writing more impls.
+
+## See also
+
+`kai info syntax`, `kai info pipes` (pipe dispatch is by-convention,
+NOT through protocols), `docs/protocols.md`

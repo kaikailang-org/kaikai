@@ -1,0 +1,4 @@
+type 'String' is a reserved builtin type name and cannot be redeclared
+A primitive's spelling is reserved by the language: redeclaring it is
+refused at the declaration, in the file that wrote it, rather than
+surfacing later as an error inside the standard library.

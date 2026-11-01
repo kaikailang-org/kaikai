@@ -1,0 +1,3 @@
+import shop
+
+fn main() : Unit / Stdout = Stdout.print("#{shop.price() * 2.0} #{shop.total(3.0)}")
