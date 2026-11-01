@@ -1,0 +1,35 @@
+# redundant_match_catchall: a `match` with a single unguarded arm whose
+# pattern is `_` or a bare binding never destructures. `match e { _ ->
+# body }` is `body`; `match e { x -> body }` is `let x = e ... body`.
+# Either way the match is ceremony around a direct expression.
+
+fn answer(n: Int) : Int = match n {
+  _ -> 42
+}
+
+fn bumped(n: Int) : Int = match n {
+  x -> x + 1
+}
+
+type Event = Up | Down
+
+# A `match` inside a clause is one the source spells, as is one in a method.
+fn clause(n: Int, e: Event) : Int {
+  case n, Up -> match n {
+    k -> k
+  }
+  case _, Down -> 0
+}
+
+impl Show for Event {
+  fn show(e: Event) : String = match e {
+    _ -> "event"
+  }
+}
+
+fn main() : Int {
+  assert answer(0) + bumped(1) == 44
+  assert clause(1, Up) == 1
+  assert show(Down) == "event"
+  0
+}

@@ -1,0 +1,3 @@
+pub effect Slot {
+  read() : Int
+}

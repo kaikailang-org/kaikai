@@ -1,0 +1,5 @@
+import dbase
+
+pub type LErr = Failure(Int)
+
+pub fn wrap(m: String) : dbase.Err = dbase.Failure(m)
