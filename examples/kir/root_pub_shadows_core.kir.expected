@@ -1,0 +1,6 @@
+fn kaiu_main() : box {
+  entry:
+    .t0: i64 = kaiu_root_pub_shadows_core__add(1, 2)
+    ret .t0
+}
+

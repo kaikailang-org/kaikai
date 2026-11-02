@@ -1,0 +1,8 @@
+# Negative — `var name` without `:= init` is a syntax error. `var` is a
+# parser-level statement; the initialiser is required so the desugared
+# `handle ... with State[T](init)` always has a state value to thread.
+
+fn main() : Int {
+  var x
+  0
+}
