@@ -1,0 +1,12 @@
+# m7b #5b — typed `var counter: Int = 0`. Doc B §`State[T]` makes the
+# annotation optional; this fixture pins both the annotated form (the
+# `[T]` slot is supplied verbatim) and the unannotated form (the `[T]`
+# slot is left empty and synth_handle infers it from the init's type).
+
+fn main() : Int {
+  var counter: Int := 0
+  counter.set(7)
+  counter.set(counter.get() * 2)
+  assert counter.get() == 14
+  0
+}

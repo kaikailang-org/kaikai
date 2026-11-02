@@ -1,0 +1,16 @@
+# m12.8.z: enum-style sum (no payload) ordered by variant declaration
+# position. Bronze < Silver < Gold < Platinum. The synthesised `cmp`
+# expands to a nested match that returns -1 / 0 / 1 based on each
+# variant's index in the type definition.
+
+#[derive(Ord)]
+type Tier = Bronze | Silver | Gold | Platinum
+
+fn main() : Int {
+  print(int_to_string(cmp(Bronze, Silver)))
+  print(int_to_string(cmp(Gold, Bronze)))
+  print(int_to_string(cmp(Platinum, Platinum)))
+  print(int_to_string(cmp(Silver, Gold)))
+  print(int_to_string(cmp(Platinum, Bronze)))
+  0
+}

@@ -1,0 +1,3 @@
+`render` is not imported in this file
+modules `ta`, `tb`
+qualify it as `first.render`

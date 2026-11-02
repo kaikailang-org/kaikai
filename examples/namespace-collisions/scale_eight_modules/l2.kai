@@ -1,0 +1,1 @@
+pub type L2 = Node(Int)

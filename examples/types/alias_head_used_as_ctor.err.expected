@@ -1,0 +1,2 @@
+unknown type `IdenticalBytecode`
+to declare a one-member sum, write `type Evidence = | IdenticalBytecode`
