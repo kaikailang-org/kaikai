@@ -1,0 +1,30 @@
+# Native-parity regression (lane native-ffi-extern-c) — the `extern "C" fn`
+# wrapper symbol must not collide with the bare C symbol it calls.
+#
+# The native backend does NOT `kai_`-prefix user symbols (the C / LLVM-text
+# oracles do), so before this lane the kaikai wrapper `abs` and the libc
+# extern `abs` shared `@abs` and the wrapper recursed into itself → SIGSEGV.
+# The fix mints `__ffi_<c_sym>` for the wrapper while the extern keeps its
+# verbatim C symbol. This fixture exercises three shapes in one program so a
+# native-vs-C-direct parity diff catches any regression:
+#
+#   - a direct-name extern (`abs`) where the kaikai identifier IS the C
+#     symbol (the wrapper `__ffi_abs` calls the bare `abs`, no self-loop);
+#   - a name-override extern (issue #261) where the kaikai identifier
+#     (`c_atoi`) differs from the C symbol (`atoi`);
+#   - a `String` arg (`c_atoi`) AND an `Int` arg (`abs`), so both the
+#     borrowed-`char *` and the scalar marshalling paths run.
+#
+# Stays libc-only so it links without extra cc flags. Both bind their libc
+# symbol directly, so each declares the C-exact return width `I32` (libc's
+# `int`) — the forward declaration matches the system header.
+
+extern "C" fn abs(n: I32) : I32 / Ffi
+
+extern "C"("atoi") fn c_atoi(s: String) : I32 / Ffi
+
+fn main() : Unit / Console + Ffi {
+  let a = abs(0 - 19)
+  let b = c_atoi("6")
+  print(int_to_string(a + b))
+}
