@@ -1,0 +1,5 @@
+import compiler.ast_ids
+
+#[doc("A row variable of the scheme of the function declared as `SymId` that a spawned fiber runs.")]
+#[derive(BinSerialize)]
+pub type SpawnParam = SPm(SymId, Int)
