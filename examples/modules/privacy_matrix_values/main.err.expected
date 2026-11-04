@@ -1,0 +1,6 @@
+`hidden` is private to module `lib`
+`secret_ax` is private to module `lib`
+main.kai:5:22
+main.kai:8:11
+main.kai:12:47
+main.kai:14:17

@@ -1,0 +1,4 @@
+bare name 'Tok' is exported by multiple modules
+candidates:
+pa.Tok
+pb.Tok

@@ -1,0 +1,17 @@
+# m7b #5b — a function declared `: Int` (pure, no row) can still use
+# `var` because the desugar's `with State[T](init)` handler closes
+# State[T] inside the function. Doc B §`State[T]` *Syntax note*:
+# "sum_costs above is `/ Console`, not `/ Console + State[Int]`."
+
+fn build() : Int {
+  var total := 0
+  total.set(1)
+  total.set(total.get() + 2)
+  total.set(total.get() + 3)
+  total.get()
+}
+
+fn main() : Int {
+  assert build() == 6
+  0
+}

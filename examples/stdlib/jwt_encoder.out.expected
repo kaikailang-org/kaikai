@@ -1,0 +1,16 @@
+=== build ===
+header  : {"alg":"none","typ":"JWT","kid":"beef"}
+payload : {"iat":"1700000000","iss":"kaikai-demo","name":"Eric","sub":"user_42"}
+claims size: 4
+claim sub: user_42
+claim missing: not present
+
+=== encoded ===
+eyJhbGciOiJub25lIiwidHlwIjoiSldUIiwia2lkIjoiYmVlZiJ9.eyJpYXQiOiIxNzAwMDAwMDAwIiwiaXNzIjoia2Fpa2FpLWRlbW8iLCJuYW1lIjoiRXJpYyIsInN1YiI6InVzZXJfNDIifQ==.
+
+=== decoded ===
+header  : {"alg":"none","typ":"JWT","kid":"beef"}
+payload : {"iat":"1700000000","iss":"kaikai-demo","name":"Eric","sub":"user_42"}
+decoded kid : beef
+decoded sub : user_42
+round-trip: ok

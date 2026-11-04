@@ -1,0 +1,8 @@
+pub effect Log {
+  write(s: String) : Unit
+}
+
+pub fn run() : Int / Log {
+  Log.write("b")
+  20
+}

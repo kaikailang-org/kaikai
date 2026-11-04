@@ -1,0 +1,6 @@
+import a.util
+import b.util
+
+# Both imports bind the qualifier `util`, and both modules export `who`:
+# the read warns, naming both, and the first import answers.
+fn main() : Unit / Stdout = Stdout.print("#{util.who()}")

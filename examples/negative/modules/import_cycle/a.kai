@@ -1,0 +1,3 @@
+import b
+
+pub fn a_fn() : Int = b_fn()

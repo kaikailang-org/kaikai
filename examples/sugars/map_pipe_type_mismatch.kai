@@ -1,0 +1,11 @@
+# m7b #9 — negative: passing a non-function as the right operand of
+# `|` is a type error. The pipe lowers to `map(xs, "...")`, and the
+# checker reports the standard "type mismatch in function call" against
+# `map`'s second parameter (`(a) -> b`). Diagnostics line content is
+# asserted by `<name>.err.expected`.
+
+fn main() : Int {
+  let bad = [1, 2, 3] | "not a function"
+  print(int_to_string(reduce(bad, 0, (acc, x) => acc + x)))
+  0
+}

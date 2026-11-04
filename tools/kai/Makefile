@@ -1,0 +1,34 @@
+# The `kai` binary, built into bin/kai by invoking kaic2 directly — the
+# bootstrap never goes through the CLI. scripts/build-release.sh ships it as
+# bin/kai.
+#
+# Fixed flags, not $(CFLAGS): a user's CFLAGS may carry FFI shim sources or
+# sanitisers meant for their program, never for the driver.
+
+ROOT    := $(abspath ../..)
+KAIC2   := $(ROOT)/stage2/kaic2
+STDLIB  := $(ROOT)/stdlib
+EDITION := $(shell cat $(ROOT)/EDITION)
+BIN     := $(ROOT)/bin/kai
+CC      ?= cc
+CLI_CFLAGS := -std=c99 -Wno-unused-function -Wno-unused-variable -O2
+RT_INC  := -I $(ROOT)/stage2 -I $(ROOT)/stage0
+
+SRCS := $(wildcard *.kai)
+
+kai: $(BIN)
+
+$(BIN): $(SRCS) cli_sys.c cli_io.c cli_cache.c cli_budget.c $(KAIC2) $(ROOT)/stage0/runtime_llvm.c $(wildcard $(ROOT)/stage2/runtime/*.h)
+	@mkdir -p build $(ROOT)/bin
+	KAIKAI_STDLIB_PATH=$(STDLIB) $(KAIC2) --edition $(EDITION) --path $(CURDIR) --path $(STDLIB) main.kai > build/kai.c
+	$(CC) $(CLI_CFLAGS) $(RT_INC) -c build/kai.c -o build/kai.o
+	$(CC) $(CLI_CFLAGS) -c cli_sys.c -o build/cli_sys.o
+	$(CC) $(CLI_CFLAGS) -c cli_io.c -o build/cli_io.o
+	$(CC) $(CLI_CFLAGS) -c cli_cache.c -o build/cli_cache.o
+	$(CC) $(CLI_CFLAGS) -c cli_budget.c -o build/cli_budget.o
+	$(CC) build/kai.o build/cli_sys.o build/cli_io.o build/cli_cache.o build/cli_budget.o -o build/kai.$$$$ -lm && mv -f build/kai.$$$$ $@
+
+clean:
+	rm -rf build $(BIN)
+
+.PHONY: kai clean

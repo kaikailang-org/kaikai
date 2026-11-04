@@ -1,0 +1,24 @@
+# m7a #6f smoke test (positive) — clause bodies and return clause
+# now type-check under an env that binds the op's args + `resume`.
+# The return clause refines the handle's overall type from the
+# body's type to the rexpr's type. Here body : String, return clause
+# converts to Int via string_length, so r : Int.
+
+effect Counter {
+  tick() : Unit
+  get() : Int
+}
+
+fn main() : Int {
+  let r = handle {
+    Counter.tick()
+    Counter.tick()
+    "ok"
+  } with Counter {
+    tick(resume) -> resume(())
+    get(resume) -> resume(0)
+    return(x) -> string_length(x) * 21
+  }
+  assert r == 42
+  0
+}
