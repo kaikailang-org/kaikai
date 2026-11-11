@@ -1,0 +1,7 @@
+import encoding.json.{json_encode}
+import encoding.json_bind
+
+#[derive(Json)]
+pub type Item = { name: String }
+
+pub fn dump() : String = json_encode(to_json(Item { name: "x" }))

@@ -1,0 +1,26 @@
+fn kaiu_var_user_while_handler__count(n_0: box) : box {
+  entry:
+    .t0: box = prim int.box(0)
+    .t1: box = kaix_core_ref_make(.t0)
+    i__slot_2: box = .t1
+    .t2: box = prim int.box(0)
+    .t3: box = kaix_core_ref_make(.t2)
+    acc__slot_4: box = .t3
+    .t4: box = closure _kaiu_lam_var_user_while_handler__count_15_9/0 [n_0, i__slot_2]
+    .t5: box = closure _kaiu_lam_var_user_while_handler__count_15_19/0 [i__slot_2, acc__slot_4]
+    .t6: box = kaiu_var_user_while_handler__while(.t4, .t5)
+    do .t6
+    dup acc__slot_4
+    .t7: box = kaix_core_ref_get(acc__slot_4)
+    __pcs_tret_3: box = .t7
+    drop acc__slot_4
+    .t8: box = __pcs_tret_3
+    __pcs_tret_3: box = .t8
+    drop i__slot_2
+    .t9: box = __pcs_tret_3
+    __pcs_ret_1: box = .t9
+    drop n_0
+    .t10: box = __pcs_ret_1
+    ret .t10
+}
+

@@ -1,0 +1,21 @@
+# The compile-time escape check is syntactic: a spawned task that rebinds a
+# closure over a captured `var` to a fresh local (`let g = reader`) compiles.
+# The child's copy of the var cell aborts on first access with a diagnostic.
+import spawn
+
+fn main() : Int / Spawn {
+  var counter := 0
+  let reader = () => {
+    let _ = counter
+    ()
+  }
+  nursery { n ->
+    let f = n.spawn(() => {
+      let g = reader
+      g()
+      ()
+    })
+    ()
+  }
+  0
+}

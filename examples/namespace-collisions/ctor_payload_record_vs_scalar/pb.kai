@@ -1,0 +1,3 @@
+pub type Dim = { w: Int, h: Int }
+
+pub type RB = Box(Dim)
