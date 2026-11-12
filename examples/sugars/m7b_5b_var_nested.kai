@@ -1,0 +1,24 @@
+# m7b #5b — two `var`s in the same scope desugar to NESTED handlers
+# (Doc B §`State[T]` *Syntax note*: "Each var is its own handle,
+# innermost first"). The runtime evidence stack is LIFO and matches
+# State by name, so an inner State[T] handler shadows any outer one
+# during its lifetime — same as a `let` of the same name shadows an
+# outer binding. This fixture pins that shape: the inner var is
+# enclosed in its own sub-block so its handler pops before the outer
+# var is touched again.
+
+fn main() : Int {
+  var outer := 0
+  outer.set(10)
+  let outer_before = outer.get()
+  let inner_total = {
+    var inner := 100
+    inner.set(inner.get() + 1)
+    inner.get()
+  }
+  assert outer_before == 10
+  assert inner_total == 101
+  outer.set(outer.get() + inner_total)
+  assert outer.get() == 111
+  0
+}

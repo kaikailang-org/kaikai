@@ -1,0 +1,7 @@
+fn main() : Int {
+  let x = 42
+  assert x == 42
+  0
+}
+
+# @probe def 3:10
