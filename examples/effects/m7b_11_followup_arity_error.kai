@@ -1,0 +1,7 @@
+# m7b #11j — the resolver rejects a row label whose type-arg arity
+# disagrees with the effect's declaration. `Reader` is declared with
+# one tparam (`effect Reader[T]`); `/ Reader[Int, Bool]` here has two.
+
+fn bad() : Int / Reader[Int, Bool] = 0
+
+fn main() : Int = 0

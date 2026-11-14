@@ -1,0 +1,3 @@
+pub protocol Render {
+  render(x: Self) : String
+}
