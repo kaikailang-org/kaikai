@@ -1,0 +1,232 @@
+#[doc("Typing order for the private fns that omit their row: a fn is typed after every such fn it calls, so a call reads the row its callee settled on; the members of a recursive group are typed together until their rows stop changing.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.scc
+import compiler.expr_positions
+import compiler.effect_instance
+import compiler.infer_index
+import compiler.infer_unify_rows
+import compiler.infer_state
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.type_home
+import compiler.infer_env_exhaust
+import compiler.infer_env_schemes
+import compiler.diag_type_text
+
+#[doc("infer: the env with the scheme of every fn typed ahead, and those fns' typed declarations by identity.")]
+pub(pkg) type RowFirst = { env: TyEnv, done: NameIndex[TypedDecl] }
+
+#[doc("infer: types the declarations in `cands` callee-first, binding each component's settled scheme before the next is typed. The members of a component of several fns are re-typed against one another's rows until the rows settle.")]
+pub(pkg) fn type_rowless_first(
+  typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
+  rk: [RowKindEntry],
+  homes: TyHomes,
+  env: TyEnv,
+  cands: [Decl]
+) : RowFirst / Console + File + Mutable =
+  match cands {
+    [] -> RowFirst { env: env, done: idx_empty() }
+    [first, ..._] -> {
+      let n = list_length(cands)
+      let ix = foldl(
+        zip_index(cands, 0),
+        idx_empty(),
+        (a, p) => match p {
+          (i, d) -> idx_prepend_sym(a, decl_fn_sym(d), i)
+        }
+      )
+      let es = flat_map(
+        zip_index(cands, 0),
+        p => match p {
+          (i, d) -> map(callee_indices(ix, d), j => (i, j))
+        }
+      )
+      let arr = fill_decls(cands, 0, array_make(n, first))
+      type_components(typeit, rk, homes, arr, scc_components(n, es), env, idx_empty())
+    }
+  }
+
+fn zip_index(ds: [Decl], i: Int) : [(Int, Decl)] = match ds {
+  [] -> []
+  [d, ...rest] -> [(i, d), ...zip_index(rest, i + 1)]
+}
+
+fn fill_decls(ds: [Decl], i: Int, arr: Array[Decl]) : Array[Decl] / Mutable = match ds {
+  [] -> arr
+  [d, ...rest] -> fill_decls(rest, i + 1, array_set(arr, i, d))
+}
+
+fn decl_fn_sym(d: Decl) : SymId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
+  _ -> sym_none()
+}
+
+fn callee_indices(ix: NameIndex[Int], d: Decl) : [Int] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> body_callees(ix, body, [])
+  _ -> []
+}
+
+fn body_callees(ix: NameIndex[Int], e: Expr, acc: [Int]) : [Int] {
+  let here = match e.kind {
+    ESym(s, _) -> list_append(idx_chain_sym(ix, s), acc)
+    _ -> acc
+  }
+  foldl(
+    xp_positions(e),
+    here,
+    (a, p) => match p {
+      XP(_, c) -> body_callees(ix, c, a)
+    }
+  )
+}
+
+fn type_components(
+  typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
+  rk: [RowKindEntry],
+  homes: TyHomes,
+  arr: Array[Decl],
+  comps: [[Int]],
+  env: TyEnv,
+  done: NameIndex[TypedDecl]
+) : RowFirst / Console + File + Mutable = match comps {
+  [] -> RowFirst { env: env, done: done }
+  [c, ...rest] -> {
+    let ds = map(c, i => array_get(arr, i))
+    let settled = settle_group(typeit, rk, homes, env, ds)
+    let env2 = foldl(
+      zip_decls(ds, settled),
+      env,
+      (e, p) => match p {
+        (d, t) -> match fn_scheme_of_decl(with_row_of(d, t.decl), rk, homes) {
+          Some(sc) -> env_bind_sym(e, decl_fn_sym(d), sc)
+          None -> e
+        }
+      }
+    )
+    type_components(
+      typeit,
+      rk,
+      homes,
+      arr,
+      rest,
+      env2,
+      foldl(
+        zip_decls(ds, settled),
+        done,
+        (ix, p) => match p {
+          (d, t) -> idx_prepend_sym(ix, decl_fn_sym(d), t)
+        }
+      )
+    )
+  }
+}
+
+fn zip_decls(ds: [Decl], ts: [TypedDecl]) : [(Decl, TypedDecl)] = match (ds, ts) {
+  ([d, ...dr], [t, ...tr]) -> [(d, t), ...zip_decls(dr, tr)]
+  _ -> []
+}
+
+fn with_row_of(orig: Decl, typed: Decl) : Decl = match (orig, typed) {
+  (DFn(ip, fid, a, _, _, _, g, h, i, j, k, m), DFn(_, _, _, ps, ret, row, _, _, _, _, _, _)) ->
+    DFn(ip, fid, a, ps, ret, row, g, h, i, j, k, m)
+  _ -> orig
+}
+
+fn decl_row(d: Decl) : RowExpr = match d {
+  DFn(_, _, _, _, _, row, _, _, _, _, _, _) -> row
+  _ -> REmpty
+}
+
+fn decl_with_row(d: Decl, row: RowExpr) : Decl = match d {
+  DFn(ip, fid, a, b, c, _, g, h, i, j, k, m) -> DFn(ip, fid, a, b, c, row, g, h, i, j, k, m)
+  _ -> d
+}
+
+fn row_labels(r: RowExpr) : [RowLabel] = match r {
+  REmpty -> []
+  RClosed(ls) -> ls
+  ROpen(_, ls) -> ls
+}
+
+# Two labels are one when they name one effect at structurally equal types.
+fn rl_same(a: RowLabel, b: RowLabel) : Bool = match (a, b) {
+  (RL(ra, xs), RL(rb, ys)) ->
+    sym_same(ref_sym(ra), ref_sym(rb))
+      and list_length(xs) == list_length(ys)
+      and all(zip_tes(xs, ys), p => ty_eq_shape(te_as_ty(p.fst), te_as_ty(p.snd)))
+}
+
+fn zip_tes(xs: [TypeExpr], ys: [TypeExpr]) : [(TypeExpr, TypeExpr)] = match (xs, ys) {
+  ([x, ...xr], [y, ...yr]) -> [(x, y), ...zip_tes(xr, yr)]
+  _ -> []
+}
+
+fn rows_same(a: RowExpr, b: RowExpr) : Bool {
+  let tails_same = match (a, b) {
+    (ROpen(TpId(x), _), ROpen(TpId(y), _)) -> tlocal_eq(x, y)
+    (ROpen(_, _), _) -> false
+    (_, ROpen(_, _)) -> false
+    _ -> true
+  }
+  let la = row_labels(a)
+  let lb = row_labels(b)
+  tails_same and list_length(la) == list_length(lb) and all(la, x => any(lb, y => rl_same(x, y)))
+}
+
+# A recursive group's rows are a least fixed point: every member is typed
+# against the rows the last round settled for the group, so each call reads
+# the callee's labels and the handlers around it discharge them by the typer's
+# own rule. A callee's labels only add to its callers', so each round's rows
+# contain the previous round's, over the finitely many labels of the program.
+fn settle_group(
+  typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
+  rk: [RowKindEntry],
+  homes: TyHomes,
+  env: TyEnv,
+  ds: [Decl]
+) : [TypedDecl] / Console + File + Mutable = match ds {
+  [d] -> [typeit(env, d)]
+  _ -> settle_rounds(typeit, rk, homes, env, ds, map(ds, decl_row), 0)
+}
+
+fn settle_rounds(
+  typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
+  rk: [RowKindEntry],
+  homes: TyHomes,
+  env: TyEnv,
+  ds: [Decl],
+  rows: [RowExpr],
+  round: Int
+) : [TypedDecl] / Console + File + Mutable {
+  let env_r = foldl(
+    zip_rows(ds, rows),
+    env,
+    (e, p) => match p {
+      (d, r) -> match fn_scheme_of_decl(decl_with_row(d, r), rk, homes) {
+        Some(sc) -> env_bind_sym(e, decl_fn_sym(d), sc)
+        None -> e
+      }
+    }
+  )
+  let ts = map(ds, d => typeit(env_r, d))
+  let next = map(ts, t => decl_row(t.decl))
+  if all(zip_rows_same(rows, next), b => b) {
+    ts
+  } else {
+    settle_rounds(typeit, rk, homes, env, ds, next, round + 1)
+  }
+}
+
+fn zip_rows(ds: [Decl], rs: [RowExpr]) : [(Decl, RowExpr)] = match (ds, rs) {
+  ([d, ...dr], [r, ...rr]) -> [(d, r), ...zip_rows(dr, rr)]
+  _ -> []
+}
+
+fn zip_rows_same(xs: [RowExpr], ys: [RowExpr]) : [Bool] = match (xs, ys) {
+  ([x, ...xr], [y, ...yr]) -> [rows_same(x, y), ...zip_rows_same(xr, yr)]
+  _ -> []
+}

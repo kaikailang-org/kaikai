@@ -1,0 +1,2 @@
+360:0
+# Bounded by design, not a leak to fix: the C backend has no landing pads (docs/effects-impl.md, "The C backend has no pads"), so each of the 30 trapped workers keeps the set literal's in-flight values and the sets pending across the trapping insert. Native releases them through its pads: 0.
