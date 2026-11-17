@@ -1,0 +1,14 @@
+pub effect Logger {
+  log(s: String) : Unit
+}
+
+pub effect Reader[t] {
+  ask() : t
+}
+
+effect Counter {
+  get() : Int
+  set(v: Int) : Unit
+}
+
+effect Group {}

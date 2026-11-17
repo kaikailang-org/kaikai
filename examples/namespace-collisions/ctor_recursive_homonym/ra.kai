@@ -1,0 +1,1 @@
+pub type Tree = Leaf | Node2(Tree, Tree)
