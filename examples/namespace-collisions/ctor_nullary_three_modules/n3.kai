@@ -1,0 +1,3 @@
+pub type A3 = Idle | Gone
+
+pub fn start() : A3 = Gone

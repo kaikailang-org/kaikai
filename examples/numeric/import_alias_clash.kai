@@ -1,0 +1,14 @@
+# A stdlib module's own import alias must survive the consumer picking a
+# different name for the same module: `money` reaches Decimal through
+# `import decimal as dec`, and this file imports `decimal` plainly.
+
+import decimal
+import money
+
+fn main() {
+  let sum = decimal.from_parts(1, 25, 2) + decimal.from_parts(2, 75, 2)
+  print(decimal.to_string(sum))
+
+  let a: Money[decimal.Decimal]<USD> = 10.50<USD>
+  print(money.to_string(a + a))
+}
