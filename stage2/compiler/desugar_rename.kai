@@ -1,0 +1,103 @@
+#[doc("""
+Whether an expression mentions a cell, whether a task body touches one, and the read and write nodes of a cell.
+""")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.expr_positions
+import compiler.core_types
+
+#[doc("""
+Does the spawn task `e` touch the cell `n` (read/write directly, or apply a
+tainted closure that captured it)? Shadow-aware: a nested binder that rebinds
+`n` masks the cell from that point on, so the inner `n` is its own fiber's.
+""")]
+pub(pkg) fn task_touches_cell(e: Expr, cell: LocalId, tainted: [LocalId]) : Bool =
+  xp_exists(e, false, x => task_node_touches(x, cell, tainted))
+
+fn task_node_touches(e: Expr, cell: LocalId, tainted: [LocalId]) : Bool = match e.kind {
+  ECall(callee, args_) -> {
+    let direct = match cell_access_of(cell, callee, args_) {
+      Some(_) -> true
+      None -> false
+    }
+    let applied = match callee.kind {
+      ELocal(f) -> any(tainted, t => local_eq(t, f))
+      _ -> false
+    }
+    direct or applied
+  }
+  _ -> false
+}
+
+#[doc("""
+Conservative containment check used by the lambda branch of
+`body_escapes`: a closure that mentions `name` at all is treated
+as escape (we have no way to prove the closure does not outlive
+the handle). Returns true if `name` appears anywhere in `e`.
+""")]
+pub(pkg) fn contains_var(cell: LocalId, e: Expr) : Bool =
+  xp_exists(e, false, x => is_cell_read(cell, x))
+
+fn is_cell_read(cell: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(l) -> local_eq(l, cell)
+  _ -> false
+}
+
+#[doc("The op a call performs on the cell `cell`: a read or write node, or an op called on the cell by name.")]
+pub(pkg) fn cell_access_of(cell: LocalId, callee: Expr, args_: [Expr]) : Option[CellOp] =
+  match callee.kind {
+    EMark(MkCellGet) -> if cell_is_arg(cell, args_) { Some(CellGet) } else { None }
+    EMark(MkCellPut) -> if cell_is_arg(cell, args_) { Some(CellSet) } else { None }
+    EField(base, fname) -> match base.kind {
+      ELocal(l) -> if local_eq(l, cell) { cell_op_named(fname) } else { None }
+      _ -> None
+    }
+    _ -> None
+  }
+
+fn cell_is_arg(cell: LocalId, args_: [Expr]) : Bool = match args_ {
+  [a, ..._] -> match a.kind {
+    ELocal(l) -> local_eq(l, cell)
+    _ -> false
+  }
+  [] -> false
+}
+
+#[doc("A read or write node of a cell: the cell's binder, whether it writes, and the operands after the binder.")]
+pub(pkg) type CellNode = { cell: LocalId, write: Bool, rest: [Expr] }
+
+#[doc("The cell node `callee(args_)` is, when it is one.")]
+pub(pkg) fn cell_node(callee: Expr, args_: [Expr]) : Option[CellNode] = match callee.kind {
+  EMark(MkCellGet) -> match args_ {
+    [a] -> match a.kind {
+      ELocal(l) -> Some(CellNode { cell: l, write: false, rest: [] })
+      _ -> None
+    }
+    _ -> None
+  }
+  EMark(MkCellPut) -> match args_ {
+    [a, v] -> match a.kind {
+      ELocal(l) -> Some(CellNode { cell: l, write: true, rest: [v] })
+      _ -> None
+    }
+    _ -> None
+  }
+  _ -> None
+}
+
+#[doc("The op a cell node performs on a cell of effect `esym`.")]
+pub(pkg) fn cell_node_op(esym: SymId, write: Bool) : CellOp =
+  if write { CellSet } else { cell_read_op(esym) }
+
+#[doc("The value a write call stores: the second operand of a write node, the only one of an op called by name.")]
+pub(pkg) fn cell_write_value(callee: Expr, args_: [Expr]) : Option[Expr] = match callee.kind {
+  EMark(MkCellPut) -> match args_ {
+    [_, v] -> Some(v)
+    _ -> None
+  }
+  _ -> match args_ {
+    [v] -> Some(v)
+    _ -> None
+  }
+}

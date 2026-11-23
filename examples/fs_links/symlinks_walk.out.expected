@@ -1,0 +1,21 @@
+metadata link dir=true file=false symlink=false
+metadata flink dir=false file=true symlink=false
+metadata dangling err
+lstat link dir=false file=false symlink=true
+lstat flink dir=false file=false symlink=true
+lstat dangling dir=false file=false symlink=true
+lstat real dir=true file=false symlink=false
+lstat a.txt dir=false file=true symlink=false
+entry dangling symlink
+entry flink symlink
+entry link symlink
+entry real dir
+entry skip dir
+missing: err
+walk: [real/a.txt, real/sub/b.txt, skip/c.txt]
+walk_with all: [dangling:symlink, flink:symlink, link:symlink, real/a.txt:file, real/sub/b.txt:file, real/up:symlink, skip/c.txt:file]
+walk_with prune skip: [dangling:symlink, flink:symlink, link:symlink, real/a.txt:file, real/sub/b.txt:file, real/up:symlink]
+walk_with prune all: [dangling:symlink, flink:symlink, link:symlink]
+walk_with missing root: [ERR missing: No such file or directory]
+walk_with unreadable: [ERR real/locked: Permission denied, dangling:symlink, flink:symlink, link:symlink, real/a.txt:file, real/sub/b.txt:file, real/up:symlink, skip/c.txt:file]
+walk unreadable: [real/a.txt, real/sub/b.txt, skip/c.txt]
