@@ -1,0 +1,5 @@
+error: effect 'Tick' is already declared in this module
+duplicate_pub_effect.kai:1:12)
+duplicate_pub_effect.kai:5:12
+  5 | pub effect Tick {
+    |            ^
