@@ -1,0 +1,51 @@
+# compiler/chars.kai — Char classification primitives.
+#
+# Pure functions over a single `Char`, with no dependency on lexer,
+# parser, or any other compiler state.
+#
+# Why these are NOT taken from `stdlib/core/char.kai`. The compiler
+# (stages 1 and 2) has defined its own `ch_*` predicates since the
+# beginning, for three load-bearing reasons:
+#
+#   1. `ch_is_space` includes `'\r'` so the kaikai lexer can
+#      treat CRLF (Windows line endings) as intra-line whitespace.
+#      The stdlib `core.char.is_space` deliberately does NOT
+#      include `'\r'` and would mis-classify CRLF input.
+#   2. `ch_is_hex_digit` has no stdlib equivalent — it exists
+#      only here, called by the lexer's hex-escape path.
+#   3. Stage 1 predates kaikai's module resolver (M6.1); stage 2
+#      inherited stage 1's source verbatim as its first
+#      milestone, and the compiler has run self-contained on its
+#      own char primitives ever since. Reaching into stdlib from
+#      the compiler now would add a bootstrap dependency for
+#      zero semantic gain.
+#
+#
+# Public surface: 7 top-level `pub fn`, every one of which is
+# called externally (the lexer in compiler/lex.kai uses all
+# seven). The module ships exactly the surface its
+# callers need, no more.
+#
+
+#[doc("True when `c` is an ASCII decimal digit ('0'..='9').")]
+pub fn ch_is_digit(c: Char) : Bool = c >= '0' and c <= '9'
+
+#[doc("True when `c` is an ASCII lowercase letter ('a'..='z').")]
+pub fn ch_is_lower(c: Char) : Bool = c >= 'a' and c <= 'z'
+
+#[doc("True when `c` is an ASCII uppercase letter ('A'..='Z').")]
+pub fn ch_is_upper(c: Char) : Bool = c >= 'A' and c <= 'Z'
+
+#[doc("True when `c` is a letter or underscore — the leading-character class for kaikai identifiers.")]
+pub fn ch_is_alpha(c: Char) : Bool = ch_is_lower(c) or ch_is_upper(c) or c == '_'
+
+#[doc("True when `c` is alphanumeric — the continuation-character class for kaikai identifiers.")]
+pub fn ch_is_alnum(c: Char) : Bool = ch_is_alpha(c) or ch_is_digit(c)
+
+#[doc("True when `c` is intra-line whitespace (space, tab, or carriage return). Newline is NOT whitespace here because the kaikai lexer is newline-significant.")]
+pub fn ch_is_space(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r'
+
+#[doc("True when `c` is an ASCII hex digit ('0'..='9', 'a'..='f', 'A'..='F').")]
+pub fn ch_is_hex_digit(c: Char) : Bool {
+  ch_is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+}

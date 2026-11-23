@@ -1,0 +1,15 @@
+# A cycle through protocol methods of one implementation: the depth stays small on the C backend, which cannot tail call across dispatch.
+
+protocol Hop {
+  hop_even(x: Self, n: Int) : Bool
+  hop_odd(x: Self, n: Int) : Bool
+}
+
+impl Hop for Int {
+  fn hop_even(x: Int, n: Int) : Bool = if n == 0 { true } else { hop_odd(x, n - 1) }
+  fn hop_odd(x: Int, n: Int) : Bool = if n == 0 { false } else { hop_even(x, n - 1) }
+}
+
+fn main() : Unit / Stdout {
+  Stdout.print("#{hop_even(7, 10000)}")
+}

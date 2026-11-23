@@ -1,0 +1,28 @@
+fn kaiu_var_local_while_shadows_core__count(n_0: box) : box {
+  entry:
+    .t0: box = closure _kaiu_var_local_while_shadows_core__spin_thunk/2 []
+    while_2: box = .t0
+    .t1: box = prim int.box(0)
+    .t2: box = kaix_core_ref_make(.t1)
+    i__slot_3: box = .t2
+    .t3: box = prim int.box(0)
+    .t4: box = kaix_core_ref_make(.t3)
+    acc__slot_5: box = .t4
+    .t5: box = closure _kaiu_lam_var_local_while_shadows_core__count_18_9/0 [n_0, i__slot_3]
+    .t6: box = closure _kaiu_lam_var_local_while_shadows_core__count_18_19/0 [i__slot_3, acc__slot_5]
+    .t7: box = call_ind while_2(.t5, .t6)
+    do .t7
+    dup acc__slot_5
+    .t8: box = kaix_core_ref_get(acc__slot_5)
+    __pcs_tret_4: box = .t8
+    drop acc__slot_5
+    .t9: box = __pcs_tret_4
+    __pcs_tret_4: box = .t9
+    drop i__slot_3
+    .t10: box = __pcs_tret_4
+    __pcs_ret_1: box = .t10
+    drop n_0
+    .t11: box = __pcs_ret_1
+    ret .t11
+}
+
