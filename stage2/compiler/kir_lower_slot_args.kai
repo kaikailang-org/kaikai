@@ -1,0 +1,140 @@
+#[doc("Constructor args lowered at their slot kinds, and the flat rebuild that moves one of its cells into the unique scrutinee.")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.ctor_ix
+import compiler.emit_shared_syms
+import compiler.kir
+import compiler.kir_lower
+import compiler.kir_lower_reuse
+import compiler.kir_lower_sig
+import compiler.kir_lower_walk
+import compiler.reuse_kept
+
+# Args lowered at their slot kinds `ks`: a kind-1 Int slot lowers raw, as
+# `lower_ctor_args` does, since the emitter reads that word without
+# consuming the box a boxed value would bring.
+# `ks` must come from the entry the rebuild's tag uses: its type's home here, arity in `lower_ctor_args`.
+pub(pkg) fn lower_kinds_vals(
+  es: [Expr],
+  ks: [Int],
+  i: Int,
+  st: LowerSt,
+  acc: [KVal]
+) : LResMany / Console = match es {
+  [] -> LResMany(acc, st)
+  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), st) {
+    LRes(v, st1) -> lower_kinds_vals(rest, ks, i + 1, st1, list_append(acc, [v]))
+  }
+}
+
+#[doc("`e` lowered at slot kind `k`: raw for an Int slot, a tag immediate for a nullary enum constructor.")]
+pub(pkg) fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
+  if k == 1 {
+    lower_expr_raw_at(e, SInt64, st)
+  } else if k == 3 {
+    lower_enum_slot_arg(e, st)
+  } else {
+    lower_expr(e, st)
+  }
+
+# An enum-slot ctor arg. A NULLARY user ctor lowers to its tag immediate
+# (`KIntV`); everything else lowers boxed (the emitter's `kaix_take_enum`
+# reads whatever tag it carries).
+pub(pkg) fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
+  ESym(s, _) -> match ctor_ix_row(st.ctor_ix, s) {
+    Some(EV(ar, _, tag, _)) ->
+      if ar == 0 and tag >= user_variant_tag_base() {
+        LRes(KIntV(tag), st)
+      } else {
+        lower_expr(e, st)
+      }
+    None -> lower_expr(e, st)
+  }
+  _ -> lower_expr(e, st)
+}
+
+#[doc("True when lowering `cargs` only reads: no arg can consume a child of the reused cell, so the shared branch alone pays the children it embeds.")]
+pub(pkg) fn args_read_only(cargs: [Expr]) : Bool = all(cargs, arg_read_only)
+
+fn arg_read_only(e: Expr) : Bool = match e.kind {
+  ELocal(_) -> true
+  ESym(_, _) -> true
+  EInt(_, _) -> true
+  EBool(_) -> true
+  EUnit -> true
+  ECall(f, [x]) -> match f.kind {
+    EMark(MkDup) -> arg_read_only(x)
+    _ -> false
+  }
+  _ -> false
+}
+
+#[doc("The rebuild arg to move into the unique scrutinee instead of the outer cell, when one keeps more of its slots.")]
+pub(pkg) fn flat_host(st: LowerSt, cargs: [Expr]) : Option[Int] =
+  flat_host_slot(st.rnested.subs, st.rnested.kinds, cargs, e => is_some(donor_ctor(e, true, st)))
+
+# The plan is read before any arg lowers: a match inside an arg re-sets it.
+#[doc("The in-place move of a rebuild of tag `tag` from `cargs` over the arm's unique scrutinee; read before any arg lowers.")]
+pub(pkg) fn move_kind(st: LowerSt, cargs: [Expr], tag: Int) : KReuseKind =
+  RkVariantMove(move_kept(st, cargs), st.rnested.tag >= 0 and st.rnested.tag == tag)
+
+#[doc("The flat fork's move: a held arm takes its slots, so none is kept.")]
+pub(pkg) fn fork_move_kind(held: Bool, cargs: [Expr], tag: Int, st: LowerSt) : KReuseKind =
+  if held { RkVariantMove([], st.rnested.tag == tag) } else { move_kind(st, cargs, tag) }
+
+pub(pkg) fn move_kept(st: LowerSt, cargs: [Expr]) : [Int] =
+  pat_kept_slots(st.rnested.subs, st.rnested.kinds, cargs, 0 - 1)
+
+# The outer rebuild takes the cross-call donor; its arg `j`, a sub-ctor, moves
+# into the scrutinee.
+pub(pkg) fn lower_flat_hosted(
+  donor: KVal,
+  c: CtorLay,
+  cargs: [Expr],
+  j: Int,
+  pos: KPos,
+  st: LowerSt
+) : LRes / Console {
+  let rk = match nth(cargs, j) {
+    Some(e) -> match (e.kind, donor_ctor(e, true, st)) {
+      (ECall(_, cas), Some(c2)) -> move_kind(st, cas, c2.tag)
+      _ -> RkVariantMove([], false)
+    }
+    None -> RkVariantMove([], false)
+  }
+  match lower_flat_host_args(cargs, c.kinds, j, (donor, rk), 0, st, []) {
+    LResMany(avs, st1) ->
+      bind_op(st1, KConReuse(RkDonorVariant, KUnitV, c.name, c.tag, typed_inits(avs, c)), pos)
+  }
+}
+
+fn lower_flat_host_args(
+  es: [Expr],
+  ks: [Int],
+  j: Int,
+  mv: (KVal, KReuseKind),
+  i: Int,
+  st: LowerSt,
+  acc: [KVal]
+) : LResMany / Console = match es {
+  [] -> LResMany(acc, st)
+  [e, ...rest] -> {
+    let r = if i == j { lower_moved_sub(e, mv, st) } else { lower_at_kind(e, kind_at(ks, i), st) }
+    match r {
+      LRes(v, st1) -> lower_flat_host_args(rest, ks, j, mv, i + 1, st1, list_append(acc, [v]))
+    }
+  }
+}
+
+fn lower_moved_sub(e: Expr, mv: (KVal, KReuseKind), st: LowerSt) : LRes / Console =
+  match (e.kind, donor_ctor(e, true, st), mv) {
+    (ECall(_, cas), Some(c2), (donor, rk)) -> match lower_kinds_vals(cas, c2.kinds, 0, st, []) {
+      LResMany(avs, st1) -> bind_op(
+        st1,
+        KConReuse(rk, donor, c2.name, c2.tag, typed_inits(avs, c2)),
+        kpos_of(e)
+      )
+    }
+    _ -> lower_at_kind(e, 0, st)
+  }

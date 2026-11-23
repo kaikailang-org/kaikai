@@ -1,0 +1,9 @@
+# A bounded generic from another module instantiated at that module's
+# types, whose impls (one of them generic) live beside the types.
+
+import shape
+
+fn main() : Unit / Stdout {
+  Stdout.print(shape.render(shape.Sq(1)))
+  Stdout.print(shape.render(shape.Pair(shape.Sq(2), shape.Sq(3))))
+}

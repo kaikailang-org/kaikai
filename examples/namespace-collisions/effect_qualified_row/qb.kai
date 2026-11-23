@@ -1,0 +1,5 @@
+pub effect Emit {
+  put(n: Int) : Unit
+}
+
+pub fn run() : Unit / Emit = Emit.put(42)
