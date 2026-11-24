@@ -1,0 +1,6 @@
+# `variants[T]()` over a name nothing declares: the name is rejected.
+
+fn main() : Int {
+  let xs = variants[NoSuchType]()
+  0
+}
