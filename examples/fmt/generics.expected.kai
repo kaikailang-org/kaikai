@@ -1,0 +1,7 @@
+fn id[t](x: t) : t = x
+
+fn first[a, b](a: a, b: b) : a = a
+
+pub type Box[t] = { contents: t }
+
+fn convert[u: Measure](v: Real<u>) : Real<u> = v
