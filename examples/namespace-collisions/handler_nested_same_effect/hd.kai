@@ -1,0 +1,5 @@
+pub effect Deep {
+  get() : Int
+}
+
+pub fn inner() : Int / Deep = Deep.get()

@@ -1,0 +1,2 @@
+error: type mismatch in handler clause result
+this clause is inherited from the `default { }` of `Gauge`
