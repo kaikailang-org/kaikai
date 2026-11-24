@@ -1,0 +1,36 @@
+# m12.8.x: when both `#derive(Eq)` and `#derive(Hash)` apply to the
+# same sum type, the Hash↔Eq invariant must hold: equal values hash
+# to the same Int. This fixture exercises payloads of every shape:
+# constant variant, single-field variant, multi-field variant.
+
+#[derive(Eq, Hash)]
+type Color = Red | Green | Blue | Custom(Int, Int, Int) | Named(Int)
+
+fn verify(label: String, a: Color, b: Color) : Unit / Console {
+  let are_eq = eq(a, b)
+  let same_hash = hash(a) == hash(b)
+  if are_eq {
+    if same_hash {
+      print(string_concat_all([label, ": eq + same hash (invariant OK)"]))
+    } else {
+      print(string_concat_all([label, ": eq + diff hash (INVARIANT BROKEN)"]))
+    }
+  } else {
+    if same_hash {
+      print(string_concat_all([label, ": neq + same hash (collision)"]))
+    } else {
+      print(string_concat_all([label, ": neq + diff hash"]))
+    }
+  }
+}
+
+fn main() : Int {
+  verify("Red == Red", Red, Red)
+  verify("Red == Green", Red, Green)
+  verify("Custom == Custom (same)", Custom(255, 0, 0), Custom(255, 0, 0))
+  verify("Custom == Custom (diff)", Custom(255, 0, 0), Custom(0, 255, 0))
+  verify("Named == Named (same)", Named(7), Named(7))
+  verify("Named == Named (diff)", Named(7), Named(8))
+  verify("Red == Custom", Red, Custom(0, 0, 0))
+  0
+}
