@@ -1,0 +1,134 @@
+#[doc("""
+Base64 encoder/decoder. Pure functional, no effects. Operates on
+`[Int]` byte lists (each element in `[0, 255]`) and `String`.
+
+Two alphabets:
+  - standard  — RFC 4648 §4: `…0123456789+/`
+  - URL-safe  — RFC 4648 §5: `…0123456789-_`
+
+Both encoders pad with `=` to a 4-char boundary; both decoders
+accept padded *and* unpadded input. `decode` returns `None` on
+any invalid character (including stray padding); decoding never
+panics.
+""")]
+
+# ---- Encoder helpers ---------------------------------------------
+
+fn b64_low_byte(v: Int) : Int = (v % 256 + 256) % 256
+
+# Writes the encoded text of `bs` into `out` from offset `k`: 3 input
+# bytes become 4 output bytes, a 2- / 1-byte tail pads with `=`.
+fn b64_encode_fill(out: Array[Byte], alpha: Array[Byte], bs: [Int], k: Int) : Unit / Mutable =
+  match bs {
+    [] -> ()
+    [v0] -> {
+      let n = b64_low_byte(v0) * 65536
+      out[k] := alpha[n / 262144]
+      out[k + 1] := alpha[n / 4096 % 64]
+      out[k + 2] := 61u8
+      out[k + 3] := 61u8
+    }
+    [v0, v1] -> {
+      let n = b64_low_byte(v0) * 65536 + b64_low_byte(v1) * 256
+      out[k] := alpha[n / 262144]
+      out[k + 1] := alpha[n / 4096 % 64]
+      out[k + 2] := alpha[n / 64 % 64]
+      out[k + 3] := 61u8
+    }
+    [v0, v1, v2, ...rest] -> {
+      let n = b64_low_byte(v0) * 65536 + b64_low_byte(v1) * 256 + b64_low_byte(v2)
+      out[k] := alpha[n / 262144]
+      out[k + 1] := alpha[n / 4096 % 64]
+      out[k + 2] := alpha[n / 64 % 64]
+      out[k + 3] := alpha[n % 64]
+      b64_encode_fill(out, alpha, rest, k + 4)
+    }
+  }
+
+fn b64_encode(alpha: String, bs: [Int]) : String {
+  let len = (list_length(bs) + 2) / 3 * 4
+  let out = array_make(len, 0u8)
+  b64_encode_fill(out, string.to_byte_array(alpha), bs, 0)
+  bytes_get_string(out, 0, len)
+}
+
+# ---- Encoders ----------------------------------------------------
+
+#[doc("Encodes a byte list to a standard-alphabet base64 string (`+`/`/`, `=`-padded).")]
+pub fn encode(bs: [Int]) : String =
+  b64_encode("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", bs)
+
+#[doc("Encodes a byte list to a URL-safe base64 string (`-`/`_` alphabet).")]
+pub fn encode_url(bs: [Int]) : String =
+  b64_encode("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", bs)
+
+# ---- Decoder helpers ---------------------------------------------
+
+# 6-bit value of a base64 byte, or -1. Both alphabets share A-Z/a-z/0-9;
+# only 62 (`+` / `-`) and 63 (`/` / `_`) diverge. Non-ASCII bytes never match.
+fn b64_byte_value(b: Int) : Int {
+  if b >= 65 and b <= 90 {
+    b - 65
+  } else if b >= 97 and b <= 122 {
+    b - 71
+  } else if b >= 48 and b <= 57 {
+    b + 4
+  } else if b == 43 or b == 45 {
+    62
+  } else if b == 47 or b == 95 {
+    63
+  } else {
+    -1
+  }
+}
+
+# End of the data: `n` minus the trailing `=` run.
+fn b64_data_end(s: String, n: Int) : Int =
+  if n > 0 and string_byte_at_int(s, n - 1) == 61 { b64_data_end(s, n - 1) } else { n }
+
+fn b64_val(s: String, i: Int) : Int = b64_byte_value(string_byte_at_int(s, i))
+
+# 4 values -> 3 bytes, 3 -> 2, 2 -> 1; any other tail length is invalid.
+# `acc` holds the decoded bytes, newest first.
+fn b64_decode_loop(s: String, i: Int, end: Int, acc: [Int]) : Option[[Int]] {
+  let rem = end - i
+  if rem == 0 {
+    Some(list_reverse(acc))
+  } else if rem == 1 {
+    None
+  } else {
+    let v0 = b64_val(s, i)
+    let v1 = b64_val(s, i + 1)
+    if v0 < 0 or v1 < 0 {
+      None
+    } else if rem == 2 {
+      Some(list_reverse([v0 * 4 + v1 / 16, ...acc]))
+    } else {
+      let v2 = b64_val(s, i + 2)
+      if v2 < 0 {
+        None
+      } else if rem == 3 {
+        let n = v0 * 1024 + v1 * 16 + v2 / 4
+        Some(list_reverse([n % 256, n / 256 % 256, ...acc]))
+      } else {
+        let v3 = b64_val(s, i + 3)
+        if v3 < 0 {
+          None
+        } else {
+          let n = v0 * 262144 + v1 * 4096 + v2 * 64 + v3
+          b64_decode_loop(s, i + 4, end, [n % 256, n / 256 % 256, n / 65536 % 256, ...acc])
+        }
+      }
+    }
+  }
+}
+
+# ---- Decoders ----------------------------------------------------
+
+#[doc("Decodes a base64 string to bytes, accepting both alphabets with optional padding; `None` on any invalid character or block length.")]
+pub fn decode(s: String) : Option[[Int]] =
+  b64_decode_loop(s, 0, b64_data_end(s, string_length(s)), [])
+
+#[doc("Decodes a URL-safe base64 string to bytes; an alias for `decode`, which already accepts both alphabets.")]
+pub fn decode_url(s: String) : Option[[Int]] =
+  base64.decode(s)

@@ -1,0 +1,10 @@
+fn child() : Unit / Spawn + Stdout {
+  Spawn.yield()
+  println("child")
+}
+
+fn main() : Int / Spawn + Stdout {
+  println("main spawns")
+  let _ = Spawn.spawn(() => child())
+  0
+}

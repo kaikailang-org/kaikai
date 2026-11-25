@@ -1,0 +1,3 @@
+import m76
+
+pub fn v75() : Int = m76.v76()

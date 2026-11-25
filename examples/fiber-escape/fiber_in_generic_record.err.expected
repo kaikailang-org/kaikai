@@ -1,0 +1,1 @@
+error: Fiber[Int] cannot escape `armar`'s structured-concurrency scope
