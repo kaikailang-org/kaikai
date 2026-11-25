@@ -1,0 +1,5 @@
+import ba
+
+fn g(x: ba.Int) : Bool = x.wrapped
+
+fn main() : Unit / Stdout = Stdout.print("#{g(ba.Int { wrapped: true })}")

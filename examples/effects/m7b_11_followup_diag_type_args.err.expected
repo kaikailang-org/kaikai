@@ -1,0 +1,2 @@
+effect not handled: Reader[Int]
+declared row does not include `Reader[Int]`
