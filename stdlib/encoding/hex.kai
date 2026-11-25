@@ -1,0 +1,72 @@
+#[doc("""
+Hexadecimal encoding of `[Int]` byte lists. The encoder emits
+lowercase; the decoder accepts both cases. No `0x` prefix is added or
+required. For an integer in hex use core `to_int_radix(s, 16)` and
+`int_to_string_radix(n, 16)`.
+""")]
+
+# ---- Byte encoding -----------------------------------------------
+
+fn encode_fill(out: Array[Byte], digits: Array[Byte], bs: [Int], k: Int) : Unit / Mutable =
+  match bs {
+    [] -> ()
+    [v, ...rest] -> {
+      let b = (v % 256 + 256) % 256
+      out[k] := digits[b / 16 % 16]
+      out[k + 1] := digits[b % 16]
+      encode_fill(out, digits, rest, k + 2)
+    }
+  }
+
+#[doc("Encodes a byte list to a lowercase hex string, two digits per byte.")]
+pub fn encode(bs: [Int]) : String {
+  let len = list_length(bs) * 2
+  let out = array_make(len, 0u8)
+  encode_fill(out, string.to_byte_array("0123456789abcdef"), bs, 0)
+  bytes_get_string(out, 0, len)
+}
+
+# ---- Byte decoding -----------------------------------------------
+
+# Decode a single hex character to a 4-bit value. Accepts both
+# `0-9 a-f A-F`. None on anything else.
+fn hex_char_value(c: Char) : Option[Int] {
+  if char.is_digit(c) {
+    Some(char_to_int(c) - char_to_int('0'))
+  } else if c >= 'a' and c <= 'f' {
+    Some(char_to_int(c) - char_to_int('a') + 10)
+  } else if c >= 'A' and c <= 'F' {
+    Some(char_to_int(c) - char_to_int('A') + 10)
+  } else {
+    None
+  }
+}
+
+# Walk the input string two chars at a time. Odd-length strings
+# return None — there is no convention for which side gets the
+# implicit zero, so we refuse to guess.
+fn decode_loop(s: String, i: Int, acc: [Int]) : Option[[Int]] {
+  let n = string_length(s)
+  if i >= n {
+    Some(list_reverse(acc))
+  } else if i + 1 >= n {
+    None
+  } else {
+    match char_at(s, i) {
+      None -> None
+      Some(ch) -> match hex_char_value(ch) {
+        None -> None
+        Some(hi) -> match char_at(s, i + 1) {
+          None -> None
+          Some(cl) -> match hex_char_value(cl) {
+            None -> None
+            Some(lo) -> decode_loop(s, i + 2, [hi * 16 + lo, ...acc])
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("Decodes a hex string (mixed case) to bytes; `None` on odd length or any non-hex character.")]
+pub fn decode(s: String) : Option[[Int]] = decode_loop(s, 0, [])

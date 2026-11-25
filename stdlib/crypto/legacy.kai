@@ -1,0 +1,262 @@
+#[doc("""
+stdlib/crypto/legacy.kai — SHA-1 and MD5, for interoperability only.
+
+Both algorithms are broken for security: collisions are practical, so
+never use them for signatures, certificates, password hashing or any
+integrity check an attacker can influence. Prefer `crypto.hash`
+(`sha256`, `sha512`). They exist for protocols and formats that
+mandate them: the WebSocket handshake accept key (RFC 6455), git
+object ids, UUID v3/v5 names, ETags and legacy checksums. Importing
+this module is the marker that legacy hashing is in use.
+
+Surface:
+
+  pub fn sha1(bytes: [Int]) : [Int]   # 20-byte digest (RFC 3174)
+  pub fn md5(bytes: [Int]) : [Int]    # 16-byte digest (RFC 1321)
+
+Input and output follow `crypto.hash.sha256`: a list of byte values in
+[0, 255] in, the raw digest bytes out. Compose with `encoding.hex` for a
+printable digest. Pure kaikai, no FFI; suitable for kilobyte-scale inputs.
+
+`Int` is signed 64-bit, so every word stays masked to 32 bits and no
+shift ever reaches the sign bit.
+""")]
+
+# ---- shared 32-bit helpers ---------------------------------------
+
+fn lg_mask(x: Int) : Int = bit_and(x, 4294967295)
+
+# Left rotation of a 32-bit value; `x` < 2^32 and `n` in [1, 31].
+fn lg_rotl(x: Int, n: Int) : Int =
+  bit_or(lg_mask(bit_shl(x, n)), bit_ushr(x, 32 - n))
+
+fn lg_byte(x: Int, shift: Int) : Int = bit_and(bit_ushr(x, shift), 255)
+
+# Word as 4 bytes, most significant first when `be`.
+fn lg_word_bytes(w: Int, be: Bool) : [Int] =
+  if be {
+    [lg_byte(w, 24), lg_byte(w, 16), lg_byte(w, 8), lg_byte(w, 0)]
+  } else {
+    [lg_byte(w, 0), lg_byte(w, 8), lg_byte(w, 16), lg_byte(w, 24)]
+  }
+
+fn lg_digest_bytes(ws: [Int], be: Bool) : [Int] = match ws {
+  [] -> []
+  [w, ...rest] -> list_append(lg_word_bytes(w, be), lg_digest_bytes(rest, be))
+}
+
+# Message bytes as a vector, padded: 0x80, zeros up to 56 mod 64, then the
+# bit length as 8 bytes.
+fn lg_push_zeros(v: Vec[Int], n: Int) : Vec[Int] =
+  if n == 0 { v } else { lg_push_zeros(vec_push(v, 0), n - 1) }
+
+fn lg_push_length(v: Vec[Int], bits: Int, be: Bool, i: Int) : Vec[Int] =
+  if i == 8 {
+    v
+  } else {
+    let shift = if be { 56 - 8 * i } else { 8 * i }
+    lg_push_length(vec_push(v, lg_byte(bits, shift)), bits, be, i + 1)
+  }
+
+fn lg_padded(bs: [Int], be: Bool) : Vec[Int] {
+  let v = vec_from_list(bs)
+  let n = vec_length(v)
+  let zeros = (119 - n % 64) % 64
+  lg_push_length(lg_push_zeros(vec_push(v, 128), zeros), n * 8, be, 0)
+}
+
+fn lg_word_at(m: Vec[Int], p: Int, be: Bool) : Int {
+  let a = bit_and(vec_get(m, p), 255)
+  let b = bit_and(vec_get(m, p + 1), 255)
+  let c = bit_and(vec_get(m, p + 2), 255)
+  let d = bit_and(vec_get(m, p + 3), 255)
+  if be {
+    bit_or(bit_or(bit_shl(a, 24), bit_shl(b, 16)), bit_or(bit_shl(c, 8), d))
+  } else {
+    bit_or(bit_or(bit_shl(d, 24), bit_shl(c, 16)), bit_or(bit_shl(b, 8), a))
+  }
+}
+
+# Loads the 16 words of the block at byte offset `off` into `w[0..15]`.
+fn lg_load(w: Vec[Int], m: Vec[Int], off: Int, be: Bool, i: Int) : Vec[Int] =
+  if i == 16 {
+    w
+  } else {
+    lg_load(vec_set(w, i, lg_word_at(m, off + 4 * i, be)), m, off, be, i + 1)
+  }
+
+# ====================================================================
+# SHA-1 (RFC 3174)
+# ====================================================================
+
+type Sha1State = { a: Int, b: Int, c: Int, d: Int, e: Int }
+
+fn sha1_initial() : Sha1State = Sha1State {
+  a: 1732584193,
+  b: 4023233417,
+  c: 2562383102,
+  d: 271733878,
+  e: 3285377520
+}
+
+fn sha1_extend(w: Vec[Int], i: Int) : Vec[Int] {
+  if i == 80 {
+    w
+  } else {
+    let x = bit_xor(
+      bit_xor(vec_get(w, i - 3), vec_get(w, i - 8)),
+      bit_xor(vec_get(w, i - 14), vec_get(w, i - 16))
+    )
+    sha1_extend(vec_set(w, i, lg_rotl(x, 1)), i + 1)
+  }
+}
+
+fn sha1_f(t: Int, b: Int, c: Int, d: Int) : Int =
+  if t < 20 {
+    bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+  } else if t < 40 {
+    bit_xor(bit_xor(b, c), d)
+  } else if t < 60 {
+    bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d))
+  } else {
+    bit_xor(bit_xor(b, c), d)
+  }
+
+fn sha1_k(t: Int) : Int =
+  if t < 20 {
+    1518500249
+  } else if t < 40 {
+    1859775393
+  } else if t < 60 {
+    2400959708
+  } else {
+    3395469782
+  }
+
+fn sha1_rounds(s: Sha1State, w: Vec[Int], t: Int) : Sha1State {
+  if t == 80 {
+    s
+  } else {
+    let f = sha1_f(t, s.b, s.c, s.d)
+    let temp = lg_mask(lg_rotl(s.a, 5) + f + s.e + sha1_k(t) + vec_get(w, t))
+    sha1_rounds(
+      Sha1State { a: temp, b: s.a, c: lg_rotl(s.b, 30), d: s.c, e: s.d },
+      w,
+      t + 1
+    )
+  }
+}
+
+fn sha1_block(s: Sha1State, w: Vec[Int], m: Vec[Int], off: Int) : Sha1State {
+  let out = sha1_rounds(s, sha1_extend(lg_load(w, m, off, true, 0), 16), 0)
+  Sha1State {
+    a: lg_mask(s.a + out.a),
+    b: lg_mask(s.b + out.b),
+    c: lg_mask(s.c + out.c),
+    d: lg_mask(s.d + out.d),
+    e: lg_mask(s.e + out.e)
+  }
+}
+
+fn sha1_drive(s: Sha1State, w: Vec[Int], m: Vec[Int], off: Int) : Sha1State =
+  if off >= vec_length(m) { s } else { sha1_drive(sha1_block(s, w, m, off), w, m, off + 64) }
+
+#[doc("Computes the SHA-1 digest of `bytes` as 20 raw bytes; broken for security, for interoperability only.")]
+pub fn sha1(bytes: [Int]) : [Int] {
+  let s = sha1_drive(sha1_initial(), vec_make(80, 0), lg_padded(bytes, true), 0)
+  lg_digest_bytes([s.a, s.b, s.c, s.d, s.e], true)
+}
+
+# ====================================================================
+# MD5 (RFC 1321)
+# ====================================================================
+
+type Md5State = { a: Int, b: Int, c: Int, d: Int }
+
+fn md5_initial() : Md5State = Md5State {
+  a: 1732584193,
+  b: 4023233417,
+  c: 2562383102,
+  d: 271733878
+}
+
+const MD5_K : Vec[Int] = [
+  0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+  0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+  0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+  0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+  0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+  0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+  0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+  0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+  0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+  0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+  0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+  0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+  0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+  0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+  0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+  0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+]
+
+const MD5_S : Vec[Int] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21]
+
+fn md5_shift(i: Int) : Int = vec_get(MD5_S, i / 16 * 4 + i % 4)
+
+fn md5_index(i: Int) : Int =
+  if i < 16 {
+    i
+  } else if i < 32 {
+    (5 * i + 1) % 16
+  } else if i < 48 {
+    (3 * i + 5) % 16
+  } else {
+    7 * i % 16
+  }
+
+fn md5_f(i: Int, b: Int, c: Int, d: Int) : Int =
+  if i < 16 {
+    bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+  } else if i < 32 {
+    bit_or(bit_and(d, b), bit_and(bit_not(d), c))
+  } else if i < 48 {
+    bit_xor(bit_xor(b, c), d)
+  } else {
+    bit_xor(c, bit_or(b, bit_not(d)))
+  }
+
+fn md5_steps(s: Md5State, m: Vec[Int], i: Int) : Md5State {
+  if i == 64 {
+    s
+  } else {
+    let f = lg_mask(md5_f(i, s.b, s.c, s.d) + s.a + vec_get(MD5_K, i) + vec_get(m, md5_index(i)))
+    md5_steps(
+      Md5State { a: s.d, b: lg_mask(s.b + lg_rotl(f, md5_shift(i))), c: s.b, d: s.c },
+      m,
+      i + 1
+    )
+  }
+}
+
+fn md5_block(s: Md5State, m: Vec[Int], bytes: Vec[Int], off: Int) : Md5State {
+  let out = md5_steps(s, lg_load(m, bytes, off, false, 0), 0)
+  Md5State {
+    a: lg_mask(s.a + out.a),
+    b: lg_mask(s.b + out.b),
+    c: lg_mask(s.c + out.c),
+    d: lg_mask(s.d + out.d)
+  }
+}
+
+fn md5_drive(s: Md5State, m: Vec[Int], bytes: Vec[Int], off: Int) : Md5State =
+  if off >= vec_length(bytes) {
+    s
+  } else {
+    md5_drive(md5_block(s, m, bytes, off), m, bytes, off + 64)
+  }
+
+#[doc("Computes the MD5 digest of `bytes` as 16 raw bytes; broken for security, for interoperability only.")]
+pub fn md5(bytes: [Int]) : [Int] {
+  let s = md5_drive(md5_initial(), vec_make(16, 0), lg_padded(bytes, false), 0)
+  lg_digest_bytes([s.a, s.b, s.c, s.d], false)
+}

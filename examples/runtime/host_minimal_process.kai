@@ -1,0 +1,13 @@
+# On a host with no child processes a start stops the program and says so.
+
+fn main() : Int / Process + Stdout {
+  Stdout.print("before")
+  match Process.start("/bin/echo", ["hello"]) {
+    Err(e) -> Stdout.print("lost: #{e}")
+    Ok(child) -> match Process.wait(child) {
+      Ok(_) -> Stdout.print("reaped")
+      Err(e) -> Stdout.print("lost: #{e}")
+    }
+  }
+  0
+}
