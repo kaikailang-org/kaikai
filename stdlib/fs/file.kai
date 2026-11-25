@@ -1,0 +1,102 @@
+#[doc("""
+File operations, reached qualified (`file.read`); each returns a `Result`,
+so none panics on I/O failure. Every `Err` reads
+`<path>: <OS reason> (os error <errno>)`, for example
+`./locked: Permission denied (os error 13)`. `read_range` reads a byte range without
+reading the bytes before it. Module path: `import fs.file`.
+""")]
+
+import time
+
+#[doc("Reads the entire file at `path`, returning `Err(message)` on failure.")]
+pub fn read(path: String) : Result[String, String] / File =
+  __file_read(path)
+
+#[doc("""
+Reads up to `length` bytes of the file at `path` starting at byte `offset`,
+without reading the bytes before it.
+
+An `offset` at or past the end yields `Ok("")`, and a range that crosses the
+end yields the bytes that exist. A negative `offset` or `length` is an `Err`.
+The result is raw bytes, so a range can cut a UTF-8 sequence; use
+`string.ceil_char_boundary` to find a boundary.
+""")]
+pub fn read_range(path: String, offset: Int, length: Int) : Result[String, String] / File =
+  __file_read_range(path, offset, length)
+
+#[doc("Writes `content` to `path`, overwriting any existing contents, returning `Err(message)` on failure.")]
+pub fn write(path: String, content: String) : Result[Unit, String] / File =
+  __file_write(path, content)
+
+#[doc("""
+Appends `content` to the end of `path`, creating the file when it
+does not exist, and returns `Err(message)` on failure. Opens with
+`O_APPEND` and writes only `content`, so the cost does not grow with
+the file and each call lands at the end even with several writers.
+""")]
+pub fn append(path: String, content: String) : Result[Unit, String] / File =
+  __file_append(path, content)
+
+# The wrappers (`exists`/`delete`/`rename`) call the `file_`-prefixed
+# core builtins directly without self-recursing, since the short
+# wrapper names do not shadow the prefixed builtins.
+
+#[doc("True when `path` exists on the filesystem.")]
+pub fn exists(path: String) : Bool / File =
+  __file_exists(path)
+
+#[doc("Deletes the file at `path`, returning `Err(message)` on failure.")]
+pub fn delete(path: String) : Result[Unit, String] / File =
+  __file_delete(path)
+
+#[doc("Renames (or moves) `from` to `to`, returning `Err(message)` on failure.")]
+pub fn rename(from: String, to: String) : Result[Unit, String] / File =
+  __file_rename(from, to)
+
+#[doc("""
+Read the file at `path` as a raw `Array[Byte]` buffer, returning
+`Err(message)` on failure.
+
+Round-trips arbitrary bytes (including 0x00 and 0xFF) that the
+String-based `read` cannot carry through interpolation.
+""")]
+pub fn read_bytes(path: String) : Result[Array[Byte], String] / File =
+  __file_read_bytes(path)
+
+#[doc("Writes the raw byte buffer to `path` (truncating any existing file), returning `Err(message)` on failure.")]
+pub fn write_bytes(path: String, buf: Array[Byte]) : Result[Unit, String] / File =
+  __file_write_bytes(path, buf)
+
+#[doc("Size in bytes, modification time and kind of a file, as reported by the OS; `is_symlink` is true only for metadata read without following a link.")]
+pub type FileMetadata = {
+  size: Int,
+  modified: WallTime,
+  is_dir: Bool,
+  is_file: Bool,
+  is_symlink: Bool
+}
+
+#[doc("The metadata of `path`, following symlinks (`is_symlink` is always false); `Err` names the path and the OS reason.")]
+pub fn metadata(path: String) : Result[FileMetadata, String] / File =
+  decode_metadata("file.metadata", file_metadata(path))
+
+#[doc("The metadata of `path` itself, without following a final symlink: a link reports `is_symlink` and neither `is_dir` nor `is_file`; `Err` names the path and the OS reason.")]
+pub fn symlink_metadata(path: String) : Result[FileMetadata, String] / File =
+  decode_metadata("file.symlink_metadata", file_symlink_metadata(path))
+
+#[doc("The absolute form of `path` with every symlink resolved and `.` and `..` removed (`realpath(3)`); `Err` names the path and the OS reason when it does not exist or cannot be resolved. Unlike `path.normalize`, it follows links.")]
+pub fn canonicalize(path: String) : Result[String, String] / File =
+  file_canonicalize(path)
+
+fn decode_metadata(op: String, reply: Result[[Int], String]) : Result[FileMetadata, String] =
+  match reply {
+    Ok([size, secs, nanos, dir, file, link]) -> Ok(FileMetadata {
+      size: size,
+      modified: WallTime { secs: secs, nanos: nanos },
+      is_dir: dir == 1,
+      is_file: file == 1,
+      is_symlink: link == 1
+    })
+    Ok(_) -> Err("#{op}: malformed runtime reply")
+    Err(e) -> Err(e)
+  }
