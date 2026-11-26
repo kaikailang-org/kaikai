@@ -1,0 +1,19 @@
+# tools/fmt-width-baseline.txt — the line-width gate's pinned values.
+#
+# Measured by tests/fmt_width.sh over examples/fmt/width/. Every value
+# is exact: a run that measures anything else fails and names the
+# number that moved.
+#
+#   budget    the target line width in columns (docs/fmt-width.md)
+#   soft      over-budget lines the writer could have broken
+#   soft_max  the widest such line
+#   collapse  lines removed relative to the hand-wrapped source
+#
+# The three counters are zero and stay zero: the writer breaks every
+# line it can bring inside the budget and keeps every break the author
+# wrote at one of its own break points.
+
+budget 100
+soft 0
+soft_max 0
+collapse 0

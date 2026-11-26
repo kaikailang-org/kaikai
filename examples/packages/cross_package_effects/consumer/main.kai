@@ -1,0 +1,17 @@
+import mid
+import leaf
+
+fn main() {
+  let total = {
+    var n := 0
+    handle {
+      mid.tick_three()
+    } with Counter {
+      bump(resume) -> {
+        n := n + 1
+        resume(n)
+      }
+    }
+  }
+  print(int_to_string(total))
+}

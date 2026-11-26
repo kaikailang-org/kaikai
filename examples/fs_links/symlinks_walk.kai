@@ -1,0 +1,82 @@
+import fs.dir
+import fs.file
+import os.process
+
+fn sh(script: String) : Unit / Process {
+  match process.start("sh", ["-c", script]) {
+    Err(_) -> ()
+    Ok(child) -> match process.wait(child) {
+      _ -> ()
+    }
+  }
+}
+
+fn build(root: String) : Unit / Process {
+  sh(
+    "rm -rf #{root} && mkdir -p #{root}/real/sub #{root}/skip && cd #{root} && echo x > real/a.txt && echo y > real/sub/b.txt && echo z > skip/c.txt && ln -s real link && ln -s real/a.txt flink && ln -s nowhere dangling && ln -s .. real/up"
+  )
+}
+
+fn kind(k: dir.EntryKind) : String = match k {
+  dir.EntryFile -> "file"
+  dir.EntryDir -> "dir"
+  dir.EntrySymlink -> "symlink"
+  dir.EntryOther -> "other"
+}
+
+fn show_meta(label: String, r: Result[file.FileMetadata, String]) : Unit / Stdout =
+  match r {
+    Ok(m) -> Stdout.print("#{label} dir=#{m.is_dir} file=#{m.is_file} symlink=#{m.is_symlink}")
+    Err(_) -> Stdout.print("#{label} err")
+  }
+
+fn rel(root: String, ps: [String]) : [String] =
+  list.sort(ps | (p => (string.drop_prefix(p, "#{root}/") |> option.unwrap_or(p))))
+
+fn tagged(root: String, es: [Result[dir.DirEntry, String]]) : [String] =
+  rel(root, es | (r => item(root, r)))
+
+fn item(root: String, r: Result[dir.DirEntry, String]) : String = match r {
+  Ok(e) -> "#{e.path}:#{kind(e.kind)}"
+  Err(m) -> "ERR #{string.drop_prefix(m, "#{root}/") |> option.unwrap_or(m)}"
+}
+
+fn main() : Int / Stdout + File + Process {
+  let root = "/tmp/kai-fs-links-fixture"
+  build(root)
+
+  show_meta("metadata link", file.metadata("#{root}/link"))
+  show_meta("metadata flink", file.metadata("#{root}/flink"))
+  show_meta("metadata dangling", file.metadata("#{root}/dangling"))
+  show_meta("lstat link", file.symlink_metadata("#{root}/link"))
+  show_meta("lstat flink", file.symlink_metadata("#{root}/flink"))
+  show_meta("lstat dangling", file.symlink_metadata("#{root}/dangling"))
+  show_meta("lstat real", file.symlink_metadata("#{root}/real"))
+  show_meta("lstat a.txt", file.symlink_metadata("#{root}/real/a.txt"))
+
+  match dir.list_entries(root) {
+    Ok(es) -> list.sort_by(es, (a, b) => cmp(a.name, b.name))
+      |! (e => Stdout.print("entry #{e.name} #{kind(e.kind)}"))
+    Err(_) -> Stdout.print("list_entries err")
+  }
+  match dir.list_entries("#{root}/missing") {
+    Ok(_) -> Stdout.print("missing: ok")
+    Err(_) -> Stdout.print("missing: err")
+  }
+
+  Stdout.print("walk: #{rel(root, dir.walk(root))}")
+  Stdout.print("walk_with all: #{tagged(root, dir.walk_with(root, (e) => true))}")
+  Stdout.print(
+    "walk_with prune skip: #{tagged(root, dir.walk_with(root, (e) => e.name != "skip"))}"
+  )
+  Stdout.print("walk_with prune all: #{tagged(root, dir.walk_with(root, (e) => false))}")
+  Stdout.print(
+    "walk_with missing root: #{tagged(root, dir.walk_with("#{root}/missing", (e) => true))}"
+  )
+
+  sh("mkdir #{root}/real/locked && chmod 000 #{root}/real/locked")
+  Stdout.print("walk_with unreadable: #{tagged(root, dir.walk_with(root, (e) => true))}")
+  Stdout.print("walk unreadable: #{rel(root, dir.walk(root))}")
+  sh("chmod 755 #{root}/real/locked && rm -rf #{root}")
+  0
+}

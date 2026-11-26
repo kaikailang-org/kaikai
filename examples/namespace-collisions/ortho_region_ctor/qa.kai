@@ -1,0 +1,5 @@
+pub type RA = Cellx(Int)
+
+pub fn ra_show(c: RA) : String = match c {
+  Cellx(n) -> "r:#{n}"
+}
