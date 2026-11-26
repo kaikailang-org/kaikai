@@ -1,0 +1,69 @@
+# A fiber-local builtin performed in a handler clause costs the same with 64 unrelated handlers between the clause and the perform.
+
+import math.int
+import time
+
+effect Tick {
+  tick() : Unit
+}
+
+effect Other {
+  other() : Unit
+}
+
+fn burst(n: Int) : Unit / Spawn =
+  if n == 0 {
+    ()
+  } else {
+    Spawn.scope_enter()
+    Spawn.scope_exit()
+    burst(n - 1)
+  }
+
+fn nest(depth: Int) : Unit / Tick =
+  if depth == 0 {
+    Tick.tick()
+  } else {
+    handle {
+      nest(depth - 1)
+    } with Other {
+      other(resume) -> resume(())
+      return(x) -> x
+    }
+  }
+
+fn run(depth: Int, n: Int) : Unit / Spawn =
+  handle {
+    nest(depth)
+  } with Tick {
+    tick(resume) -> {
+      burst(n)
+      resume(())
+    }
+    return(x) -> x
+  }
+
+fn timed(depth: Int, n: Int) : Int / Spawn + Clock {
+  let start = monotonic()
+  run(depth, n)
+  duration_to_nanos(elapsed_since(start, monotonic()))
+}
+
+fn minima(n: Int, reps: Int, flat: Int, deep: Int) : (Int, Int) / Spawn + Clock =
+  if reps == 0 {
+    (flat, deep)
+  } else {
+    let f = timed(0, n)
+    let d = timed(64, n)
+    minima(n, reps - 1, min(flat, f), min(deep, d))
+  }
+
+fn main() : Int / Stdout + Spawn + Clock {
+  # Load only adds time: a depth-dependent cost raises every deep run, noise
+  # cannot lower the minima of interleaved runs.
+  # The depth is capped by the wasm stack, not by the property.
+  let (flat, deep) = minima(500000, 15, 9223372036854775807, 9223372036854775807)
+  let ok = deep < flat * 2
+  Stdout.print(if ok { "depth-independent" } else { "FAIL flat=#{flat} deep=#{deep}" })
+  if ok { 0 } else { 1 }
+}

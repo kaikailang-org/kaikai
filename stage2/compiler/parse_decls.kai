@@ -1,0 +1,235 @@
+#[doc("Top-level declaration dispatch, attributes and the program entry point.")]
+
+import compiler.util
+import compiler.diag
+import compiler.lex
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.parse_state
+import compiler.parse_attrs
+import compiler.ast_binders
+import compiler.parse_type_decls
+import compiler.parse_fns
+import compiler.parse_stmt
+import compiler.parse_types
+import compiler.parse_expr
+import compiler.parse_lexical
+
+fn fail_d(p: Parser, msg: String) : PDecl / Console = err_d(p_error_here(p, msg))
+
+fn parse_decl(p: Parser) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let t = p_peek(p0)
+  if parse_at_legacy_extern_c_attribute(p0) {
+    fail_d(
+      p0,
+      "`[<extern_c>] axiom` is removed — use `extern \"C\" fn name(...) : T / Ffi` instead"
+    )
+  } else if tk_is(t.kind, TkExtern) {
+    parse_extern_decl(p_advance(p0), t)
+  } else if at_pub_pkg(p0) {
+    parse_pub_pkg_decl(p0, t)
+  } else {
+    parse_decl_after_extern(p0, tk_is(t.kind, TkPub))
+  }
+}
+
+# `pub(pkg)` exports to the modules of the declaration's package alone: the rows it mints say so, and the
+# wrapper keeps the spelling for the formatter.
+fn parse_pub_pkg_decl(p0: Parser, pub_tok: Token) : PDecl / Console {
+  let p1 = p_eat(p_advance(p_advance(p_advance(p0))), TkRparen, "expected `)` to close `pub(pkg`")
+  let hd = p_peek(p1)
+  match pub_rejection(hd) {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> {
+      package_wrap(parse_decl_head(p1, true, hd), pub_tok)
+    }
+  }
+}
+
+fn package_wrap(inner: PDecl, pub_tok: Token) : PDecl = match inner.r {
+  None -> inner
+  Some(d) -> PDecl {
+    p: inner.p,
+    r: Some(DAttr(pub_pkg_raw(), d, pub_tok.line, pub_tok.col)),
+    bounds: inner.bounds,
+    names: map(inner.names, package_row)
+  }
+}
+
+fn package_row(e: NEnt) : NEnt = match e {
+  NEnt(cls, name, home, exported, mint) ->
+    NEnt(cls, name, home, exported, if exported { NmPackage } else { mint })
+}
+
+fn parse_decl_after_extern(p0: Parser, is_pub: Bool) : PDecl / Console {
+  let p1 = if is_pub { p_advance(p0) } else { p0 }
+  let hd = p_peek(p1)
+  match if is_pub { pub_rejection(hd) } else { None } {
+    Some(msg) -> err_d(p_error(p1, hd, msg))
+    None -> parse_decl_head(p1, is_pub, hd)
+  }
+}
+
+fn pub_rejection(hd: Token) : Option[String] =
+  match hd.kind {
+    TkImpl -> Some("`pub` is not allowed on an impl")
+    TkHashOpen -> Some(
+      "`pub` must come AFTER the `#[...]` attribute, not before — write `#[unstable] pub fn ...`"
+    )
+    TkTest -> Some("`pub` is not allowed on a test")
+    TkBench -> Some("`pub` is not allowed on a bench")
+    TkCheck -> Some("`pub` is not allowed on a check")
+    TkImport -> Some("`pub` is not allowed on an import")
+    TkUse -> Some("`pub` is not allowed on a `use` declaration")
+    TkTheory -> Some("`pub` is not allowed on a `theory` declaration")
+    _ -> None
+  }
+
+fn parse_decl_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console {
+  let p2 = p_advance(p1)
+  match hd.kind {
+    TkFn -> parse_fn_decl(p2, is_pub, hd)
+    TkType -> parse_type_decl(p2, is_pub, hd)
+    TkEffect -> parse_effect_decl(p2, is_pub, hd)
+    TkProtocol -> parse_protocol_decl(p2, is_pub, hd)
+    TkAxiom -> parse_axiom_decl(p2, is_pub, None, "", hd)
+    TkConst -> parse_const_decl(p2, is_pub, hd)
+    TkImpl -> parse_impl_decl(p2, hd)
+    TkHashOpen -> parse_attributed(p2, hd, parse_attr_target)
+    TkTest -> parse_test_decl(p2, hd)
+    TkBench -> parse_bench_decl(p2, hd)
+    TkCheck -> parse_check_decl(p2, hd)
+    TkImport -> parse_import_decl(p2, hd)
+    TkUse -> parse_use_decl(p2, hd)
+    TkTheory -> parse_theory_decl(p2, hd)
+    _ -> parse_kind_head(p1, is_pub, hd)
+  }
+}
+
+fn parse_kind_head(p1: Parser, is_pub: Bool, hd: Token) : PDecl / Console =
+  if decl_head_is_kind(p1, hd) {
+    parse_kind_decl(p_advance(p1), is_pub, hd)
+  } else if decl_head_is_user_introducer(p1, hd) {
+    parse_unit_decl(p_advance(p1), is_pub, hd)
+  } else {
+    err_d(p_error(p1, hd, decl_head_expected_msg(p1, hd)))
+  }
+
+fn decl_head_expected_msg(p: Parser, hd: Token) : String {
+  let base =
+    "expected `fn`, `type`, `effect`, `protocol`, `impl`, `test`, `unit`, `use`, `axiom`, `const`, or `import`"
+  let names = [
+    "fn", "type", "effect", "protocol", "impl", "test", "unit", "use", "axiom", "const", "import",
+    "pub", "kind", "theory"
+  ]
+  match if tk_is(hd.kind, TkIdent) { closest_name(tok_source(p.src, hd), names) } else { None } {
+    Some(sug) -> concat_all([base, " (did you mean `", sug, "`?)"])
+    None -> base
+  }
+}
+
+fn parse_attr_target(p: Parser, unstable: Bool) : PDecl / Console =
+  if unstable and p_at(p, TkPub) and (not at_pub_pkg(p)) {
+    let p1 = p_advance_nl(p)
+    parse_decl_head(p1, true, p_peek(p1))
+  } else {
+    parse_decl(p)
+  }
+
+fn parse_failed(p: Parser) : PParser = PParser { p: p, decls: None, fn_bounds: [], names: [] }
+
+fn names_onto(ns: [NEnt], acc: [NEnt]) : [NEnt] =
+  match ns {
+    [] -> acc
+    [n, ...rest] -> names_onto(rest, [n, ...acc])
+  }
+
+fn fn_bounds_seed(d: Decl, bs: [FnTPBound], names: [NEnt], bacc: [FnBoundsRec]) : [FnBoundsRec] =
+  match bs {
+    [] -> bacc
+    _ -> match (d, names) {
+      (DFn(_, _, _, _, _, _, _, _, _, _, _, mo), [NEnt(_, name, _, _, _), ..._]) ->
+        [FBR(name, mo, bs), ...bacc]
+      (DAttr(_, inner, _, _), _) -> fn_bounds_seed(inner, bs, names, bacc)
+      _ -> bacc
+    }
+  }
+
+fn parse_program_loop(
+  p: Parser,
+  acc: [Decl],
+  bacc: [FnBoundsRec],
+  nacc: [NEnt]
+) : PParser / Console {
+  let p0 = p_skip_newlines(p)
+  if p_at(p0, TkEof) {
+    # An error recorded while a declaration still parsed in shape must not read as success.
+    if p_failed(p0) {
+      parse_failed(p0)
+    } else {
+      PParser {
+        p: p0,
+        decls: Some(list_reverse(if p0.fmt_spec { [fmt_lib_import(), ...acc] } else { acc })),
+        fn_bounds: list_reverse(bacc),
+        names: list_reverse(nacc)
+      }
+    }
+  } else {
+    let r = parse_decl(p0)
+    match r.r {
+      None -> parse_failed(r.p)
+      Some(d) -> parse_program_loop(
+        r.p,
+        [d, ...acc],
+        fn_bounds_seed(d, r.bounds, r.names, bacc),
+        names_onto(r.names, nacc)
+      )
+    }
+  }
+}
+
+#[doc("`parse_program` for a source `kai migrate` is about to repair: names spelled against the convention of a migratable kind parse as written.")]
+pub fn parse_program_legacy(
+  file: String,
+  src: String,
+  toks: [Token],
+  home: String
+) : PParser / Console =
+  parse_program_from(
+    Parser { ...parser_new(file, src, toks, home, parse_expr), legacy_names: true }
+  )
+
+#[doc("Parses the file `file`. `home` is the module the file's declarations belong to: every declaration and constructor id is derived with it.")]
+pub fn parse_program(file: String, src: String, toks: [Token], home: String) : PParser / Console =
+  parse_program_from(parser_new(file, src, toks, home, parse_expr))
+
+#[doc("`parse_program` without the binder pass: for the shipped core, which `tools/stdlib-naming-gate.sh` holds to the table, and for a second read of a file the loader has already checked.")]
+pub fn parse_program_unchecked(
+  file: String,
+  src: String,
+  toks: [Token],
+  home: String
+) : PParser / Console =
+  parse_program_with(false, parser_new(file, src, toks, home, parse_expr))
+
+fn parse_program_from(p: Parser) : PParser / Console = parse_program_with(true, p)
+
+fn parse_program_with(check_names: Bool, p: Parser) : PParser / Console {
+  let r = parse_program_loop(p, [], [], [])
+  match r.decls {
+    None -> r
+    Some(ds) -> match if check_names {
+      binder_violation(r.p.legacy_names, ds, st_of_entries(r.names))
+    } else {
+      None
+    } {
+      Some(Violation(l, c, msg)) -> parse_failed(p_error_at(r.p, l, c, msg))
+      None -> match nest_first_over(ds) {
+        None -> r
+        Some(e) -> parse_failed(p_fail_at(r.p, e.line, e.col, nest_msg()))
+      }
+    }
+  }
+}
